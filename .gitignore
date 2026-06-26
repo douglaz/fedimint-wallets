@@ -1,0 +1,10 @@
+# Upstream wallet clones analyzed in this repo — NOT vendored here.
+# These are other projects' repos (each has its own .git + remote).
+# Clone them yourself; sources are listed in the README and the report.
+/ecash-app/
+/harbor/
+/vipr-wallet/
+
+# Local scratch
+*.tmp
+.DS_Store
