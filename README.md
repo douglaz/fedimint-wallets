@@ -21,3 +21,14 @@ These are upstream projects, cloned locally only for analysis:
 | harbor | pure Rust (iced), desktop | https://github.com/HarborWallet/harbor |
 | vipr-wallet | Vue 3 + TS PWA | https://github.com/ngutech21/vipr-wallet |
 | Fedi | Rust core + React Native/PWA | the Fedi monorepo |
+
+## Design docs
+
+- [CONTEXT.md](./CONTEXT.md) — domain glossary for the new wallet.
+- [docs/adr/](./docs/adr/) — architecture decision records (resilience allocator,
+  recovery, recurringd, Allocator strategy, licensing, etc.).
+
+## License
+
+AGPL-3.0 — see [LICENSE](./LICENSE) and
+[ADR-0009](./docs/adr/0009-license-agpl.md).
