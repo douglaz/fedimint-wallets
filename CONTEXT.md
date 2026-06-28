@@ -35,7 +35,9 @@ _Avoid_: "primary account", "main wallet"
 A small balance the Allocator keeps in one vetted federation *other than* the
 Spending federation, so a sudden federation failure never leaves the user with
 nothing to spend. The Allocator otherwise stays concentrated (see
-[ADR-0006](./docs/adr/0006-allocator-concentrated-warm-standby.md)).
+[ADR-0006](./docs/adr/0006-allocator-concentrated-warm-standby.md)). Selected for
+guardian-independence from the spending federation (see
+[ADR-0010](./docs/adr/0010-warm-standby-selection.md)).
 
 **Private** (the precise meaning of "more private than WoS/Blink"):
 (1) **No KYC** to start. (2) The provider/federation is **blind to your balance
