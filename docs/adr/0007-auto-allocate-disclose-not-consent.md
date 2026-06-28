@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0014
 ---
 # Auto-allocate without per-action consent; disclose once
 

@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0013
 ---
 # Run our own stateless recurringd (zero retention)
 

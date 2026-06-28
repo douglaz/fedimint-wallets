@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0015
 ---
 # Open-source, donation-funded; gateway fees secondary
 

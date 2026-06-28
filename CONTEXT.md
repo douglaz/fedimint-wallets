@@ -87,8 +87,17 @@ not enforced). **A wallet can run its own**: the daemon holds no funds and canno
 claim payments (receive keys derive from the user), so an arbitrary recurringd is
 custody-safe. Prefer the **stateless v2** (`recurringdv2`, LNv2) — it joins no
 federation and persists nothing — but it still sees receive metadata in transit
-(handle → federation → amount → time). This wallet runs its own (zero retention,
-see [ADR-0005](./docs/adr/0005-run-own-recurringd.md)).
+(handle → federation → amount → time). The device chooses among several
+public/community recurringds; we may run one but only as **one of many**, never a
+sticky default (see [ADR-0013](./docs/adr/0013-recurringd-one-of-many.md)).
+
+**Standing instruction**:
+The user's one-time, upfront, gating acknowledgement (before any funds are
+received) authorizing the on-device software to auto-manage funds across
+federations on a best-effort, no-guarantees basis. It is what makes the Allocator
+the user's own on-device agent rather than a service that controls funds (see
+[ADR-0014](./docs/adr/0014-on-device-agent-standing-instruction.md)).
+_Avoid_: "terms of service" (this is a specific in-app consent gate, recorded)
 
 **Incoming contract**:
 The federation-held contract a gateway funds when someone pays your Lightning
