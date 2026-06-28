@@ -1,0 +1,6 @@
+[workspace]
+members = ["wallet-core"]
+resolver = "2"
+# Cargo resolves the workspace root by filesystem ancestry, ignoring .gitignore.
+# Exclude the analysis clones so `cargo` inside them isn't captured by this workspace.
+exclude = ["ecash-app", "harbor", "vipr-wallet"]
