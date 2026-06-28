@@ -15,9 +15,12 @@ quotable, latency). Everything else is a hint:
   admin-curated (~17 mainnet feds, not a census), explicitly unstable, and its
   `deposits` field is wrong (net peg-in; use the `/utxos` sum). Treat it as an
   UNTRUSTED convenience prior, behind the probe gate — never as the gate.
-- **Nostr** is a discovery feed (kind 38173) plus a faint, web-of-trust-weighted
-  popularity prior (kind 38000 recommender count). NOT a trust input: live ratings are
-  ~85% 5/5, single-client (Amethyst), Sybil-able, with no failure signal.
+- **Nostr** is a **discovery feed only** (kind 38173). Its kind-38000 ratings are not a
+  trust input. The intuition that *negative* reviews might be higher-signal was tested and
+  rejected: of 739 live reviews only 15 are 1-2 star, every one is a content-free `[N/5]`
+  (no failure narrative), spread across 15 distinct pubkeys (not griefing), and none
+  predictive — every negatively-reviewed federation the Observer tracks is ~99.97% online.
+  Drop kind-38000 ratings entirely, positive and negative.
 - **Meta** fields (name, `vetted_gateways`, `recurringd_api`, expiry) are operator-set,
   unenforced, and sparse (usually only `federation_name`) — labels/hints only.
 
