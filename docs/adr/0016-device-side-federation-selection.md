@@ -24,3 +24,7 @@ selection logic runs on-device over public inputs.
 - Supersedes the "curated allowlist" idea from ADR-0007; in
   [ADR-0010](./0010-warm-standby-selection.md) read "publicly-scored federations"
   for "curated allowlist."
+- Grounded against real public data in
+  [../federation-data-sources-spec.md](../federation-data-sources-spec.md) and refined
+  by [ADR-0019](./0019-federation-signals-trust-model.md): Nostr reputation is a weak
+  prior only; probes + the authenticated config are the trust.
