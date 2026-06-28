@@ -127,12 +127,10 @@ Hints only (never gate or promote):
 - Meta labels, advertised gateway fees. (Nostr is discovery-only — not a scoring input.)
 
 ## Open decisions (for the scorer build)
-1. **Observer-as-source vs. own-collection.** Consuming the Observer API is cheap and
-   rich, but adds a trust dependency on a curated, unstable, single service with ~17-fed
-   coverage. Running our own (config fetch + our own probes + Nostr 38173 discovery) is
-   sovereign and full-coverage but more work and needs our own discovery. Likely answer:
-   **own probes for the gate + structural config for the floor; Observer optionally as a
-   convenience prior / bootstrap, clearly marked untrusted and behind the probe gate.**
+1. ~~Observer-as-source vs. own-collection~~ — **RESOLVED ([ADR-0020](./adr/0020-observer-untrusted-prior.md)):**
+   own probes + structural config are the trust gate (on-device); the Observer is an
+   optional, untrusted, swappable prior behind the gate (discovery, pre-filter, historical
+   depth), never load-bearing. The wallet is correct if the Observer is wrong/down/gone.
 2. ~~Nostr trust anchor~~ — **MOOT.** Kind-38000 ratings are dropped entirely (the
    negative tail was tested and rejected, §E), so no reviewer-weighting anchor is needed.
    Nostr's only role is kind-38173 discovery.
