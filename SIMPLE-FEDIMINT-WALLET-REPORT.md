@@ -3,6 +3,13 @@
 **A design report informed by four existing wallets**
 *Target: pure Rust · Android-only · Slint UI · Draft — 2026-06-26*
 
+> ⚠️ **Canonical sources: `docs/adr/` and `CONTEXT.md`, plus `TODOS.md` for the build backlog.**
+> This report body predates the ADR restructuring (the `/autoplan` review, 2026-06-28) and
+> retains stale terms — "risk engine" (now **Allocator**, ADR-0001), "curated allowlist" (now
+> **device-side public-data selection**, ADR-0014/0016/0017), and "v1 on-chain deposit/withdraw"
+> (v1 is **Lightning-only**, ADR-0004). Where the body conflicts with an ADR, **the ADR wins.**
+> §0.5 is the most current narrative; the ADRs are authoritative.
+
 ---
 
 ## 0. Thesis
