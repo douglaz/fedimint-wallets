@@ -9,7 +9,10 @@ API claims verified against `~/p/fedimint` (branch `docs/custodial-receive-spec`
 ## 0. Goal + scope
 Smallest thing that proves a cross-federation ecash move works and survives a crash. Exit
 gate: a devimint test moves ecash A→B via `apply()`, survives `reconcile()` (killed at every
-step), with no double-pay and no double-invoice.
+step), with **no double-pay and no second committed/payable invoice**. (A kill in the
+pre-commit window — gateway minted the invoice before the client persisted the receive op —
+leaves only an unpaid orphan that expires, not a double-credit; see §5. The gate is scoped
+to post-commit crashes, not that window.)
 
 **In scope:** async refactor of the `wallet-core` executor + identity newtypes; `MultiClient`
 (join/open/balance/receive/pay); `FedimintExecutor` (executes `Move`); the op-log-backed
@@ -38,8 +41,12 @@ wallet-fedimint/    (NEW; depends on fedimint-client + wallet-core)
   + `Arc<FedimintJournal>`; shared, `Send + Sync`. Mock impls use interior mutability
   (`Mutex<…>`) to record. `Journal` methods are `&self` too.
 - `ExecError` gets explicit variants (was unit-like): `Retryable(String)` (leave the intent
-  `Pending` for the next `reconcile`), `Permanent(String)` (mark `Failed`), `Unsupported`
-  (non-`Move` action in Phase 1). `drive`/`reconcile` branch on these.
+  `Pending` so the next `reconcile` retries it), `Permanent(String)` (mark `Failed` —
+  **terminal; NOT auto-re-driven**), `Unsupported` (non-`Move` action in Phase 1; → `Failed`).
+  `drive` branches on these. **This changes the executor's prior reconcile semantics**
+  (which re-drove `pending`+`failed`): `reconcile` now re-drives **`pending()` only**; a
+  `Failed`/`Permanent` intent stays failed until an explicit manual retry resets it to
+  `Pending` (so fee-over-cap / unsupported don't re-run every launch).
 - The storage engine (fedimint `Database`) is itself async, so nothing forces a sync bridge.
 
 ## 3. Identity + types — newtypes throughout
@@ -62,12 +69,16 @@ formatting (currently `u32`) formats `hex(FederationId)` + `Occurrence`.
 ### 3.1 Action (T12) — define all, execute only `Move`
 ```rust
 pub enum Action {
-    Move { from: FederationId, to: FederationId, amount: Msat, fee_cap: Msat, occurrence: Occurrence },
+    Move { from: FederationId, to: FederationId, amount: Msat, fee_cap: Msat, gateway: GatewayUrl, occurrence: Occurrence },
     DirectInflow { to: FederationId },                                                          // Phase 2
-    Evacuate { from: FederationId, to: FederationId, amount: Msat, fee_cap: Msat, occurrence: Occurrence }, // Phase 2
+    Evacuate { from: FederationId, to: FederationId, amount: Msat, fee_cap: Msat, gateway: GatewayUrl, occurrence: Occurrence }, // Phase 2
     RefuseInflow,  Cap { fed: FederationId, limit: Msat },                                      // advisory; not executed
 }
 ```
+The **`gateway` is part of the durable `Move`/`Evacuate` intent** (picked once: Phase 2 by the
+allocator from the gateways shared by both feds, Phase 1 from the bundled config), so a
+resumed move reads `rec.gateway` from the intent and never reselects a different or
+non-shared gateway after a crash.
 
 ### 3.2 Balance (T13) — structured; Phase 1 fills `spendable`
 ```rust
@@ -148,16 +159,25 @@ rely on "persist-before-act". Instead:
   - The only true orphan: crash after the gateway mints B's invoice but before the receive op
     commits — the invoice expires unpaid; the Intent record tells us the move was intended, so
     we surface/retry cleanly. Bounded to one move.
+  - **Backfill requires the client DB to survive (a process crash).** A device loss /
+    restore-from-seed has NO op-log or send-dedup state to scan, so backfill cannot repair it
+    — a resent invoice could double-pay. That is the bounded restore hazard: mitigate by
+    backing up in-flight move state (ADR-0003) so we detect/avoid the resend, else accept the
+    bound from the v1 balance cap (ADR-0018). Backfill is for crashes, not device loss.
 
 ## 6. Fee policy (NEW per codex P1) — `fee_cap` must be enforced by US
 `send()` does NOT enforce our `fee_cap`; it only enforces lnv2's high built-in cap (100 sat +
-1.5% send). So before the irreversible `Pay`:
-1. Fetch the gateway `routing_info` (the `send_fee = base + ppm`) for the pinned gateway.
-2. Add the federation tx fee (peg/contract fees from config).
-3. If `total_fee > fee_cap` → `ExecError::Permanent("fee over cap")`, do not send.
-Amount semantics: the outgoing contract is `amount + gateway_send_fee` (we over-fund; the
-gateway keeps the spread). `Msat` fields are gross where noted; `reserved_fee` tracks the
-quoted fee for the balance snapshot.
+1.5% send). `fee_cap` bounds the **total cost of moving `amount`**, so the preflight must sum
+BOTH legs, before the irreversible `Pay`:
+1. From the pinned gateway's `routing_info`: the **`send_fee`** (A side) AND the **`receive_fee`**
+   (B side — it reduces B's incoming contract, so it's a real cost of the move).
+2. Both federations' tx fees (contract/mint fees from each `ClientConfig`): `tx_fee_A` + `tx_fee_B`.
+3. `total = send_fee + receive_fee + tx_fee_A + tx_fee_B`. If `total > fee_cap` →
+   `ExecError::Permanent("fee over cap")`, do not send.
+Amount semantics: the outgoing contract is `amount + send_fee` (we over-fund A; the gateway
+keeps the spread), and B nets `amount − receive_fee` — so B's `receive(amount)` is sized gross
+and `receive_fee` is charged against the cap. `reserved_fee` in the balance snapshot tracks
+`total`. (The receive_fee preflight needs B's gateway routing_info too, fetched up front.)
 
 ## 7. FedimintExecutor::perform (async; op-log-aware)
 ```rust
@@ -195,8 +215,9 @@ within our state). `pending()`/`failed()` are typed prefix scans.
 ## 9. Resume loop (runtime.rs, async)
 1. read `FederationKey` rows → `MultiClient::open_all(...)` (each client self-resumes its SMs).
 2. **op-log backfill:** for each client, `mc.backfill_moves(id)` → upsert the rebuilt MoveRecords.
-3. `wallet_core::reconcile(journal, executor).await` — re-drive `pending`+`failed` intents;
-   `perform` now sees backfilled MoveRecords + reattaches via deterministic op-ids.
+3. `wallet_core::reconcile(journal, executor).await` — re-drive **`pending()` only**
+   (Pending|Executing); `Failed`/`Permanent` intents stay terminal (not auto-re-driven, §2);
+   `perform` sees backfilled MoveRecords + reattaches via deterministic op-ids.
 
 ## 10. Test plan
 - **Pure unit (`cargo test`):** `next_step` resume-from-every-phase; async `apply`/`reconcile`
@@ -204,8 +225,10 @@ within our state). `pending()`/`failed()` are typed prefix scans.
 - **devimint e2e (`--features devimint-e2e`):** the gate + the explicit crash-window cases —
   (a) `apply(Move A→B)` moves ecash; (b) crash after receive-commit-before-MoveRecord → backfill
   prevents a second invoice; (c) crash after send-commit-before-MoveRecord → no double-pay;
-  (d) restore-from-seed with a missing journal → op-log backfill repairs; (e) misbehaving-gateway
-  double (T4). Fed bootstrapped once per session (runbook §6).
+  (d) restore-from-seed mid-move (client DB gone): backfill CANNOT repair (no op-log) — assert
+  the bounded hazard, i.e. backed-up move state (ADR-0003) detects/avoids the resend, else the
+  loss is bounded by the v1 balance cap (ADR-0018); (e) misbehaving-gateway double (T4). Fed
+  bootstrapped once per session (runbook §6).
 
 ## 11. Build order
 0. **Foundational `wallet-core` refactor (behavior-preserving):** async `Executor`/`Journal`
