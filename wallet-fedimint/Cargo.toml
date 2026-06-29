@@ -1,0 +1,12 @@
+[package]
+name = "wallet-fedimint"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+# Phase 1 step 1 holds ONLY the pure, deterministic core of the cross-federation
+# move (`move_protocol`) plus the identity newtypes. The fedimint SDK, the journal,
+# `MultiClient`, and the executor arrive in steps 2-4 — there are intentionally NO
+# fedimint / network / db / async dependencies here yet.
+[dependencies]
+wallet-core = { path = "../wallet-core" }

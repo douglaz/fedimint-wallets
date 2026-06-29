@@ -82,3 +82,10 @@ dependencies = [
  "async-trait",
  "tokio",
 ]
+
+[[package]]
+name = "wallet-fedimint"
+version = "0.1.0"
+dependencies = [
+ "wallet-core",
+]
