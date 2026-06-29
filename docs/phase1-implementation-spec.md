@@ -6,6 +6,37 @@ mechanics ([fedimint-mechanics.md](./fedimint-mechanics.md)) and the devimint ru
 API claims verified against `~/p/fedimint` (branch `docs/custodial-receive-spec`).
 **Status: hardened through 12 codex passes (gpt-5.5 / xhigh).** Decisions settled in §11.
 
+## Executive summary
+Phase 1 turns the built, tested **pure decision core** (scorer / allocator / executor) into
+code that actually **moves ecash across federations and survives crashes**. It adds one crate,
+`wallet-fedimint`, holding all fedimint I/O; `wallet-core` stays pure (no fedimint/network/db).
+
+- **What gets built:** a `MultiClient` (one `fedimint_client::Client` per federation, one async
+  RocksDB with per-fed key prefixes), a `FedimintExecutor` that performs **two actions** —
+  `Move` (cross-fed transfer A→B) and `DirectInflow` (route a receive to a chosen fed, the
+  cheap primary lever) — plus the op-log-backed journal, the resume loop, and the devimint harness.
+- **The money path (validated live):** a cross-fed move is **two ordinary fedimint operations**
+  — `B.receive` then `A.send` through a shared gateway's internal swap. The fedimint clients
+  self-resume their own state machines, so we don't re-implement them; we own only a thin
+  coordination record linking the two op-ids.
+- **Crash safety (the hard part):** the **fedimint op-log is the source of truth** — we embed a
+  `move_id` in each operation's `custom_meta`, and on startup **backfill** our records from the
+  op-log (including `Executing`/`Awaiting` intents) **before any retry**, so a crash never
+  double-pays or double-invoices. The send dedup is the client's own (deterministic op-id →
+  `InvoiceAlreadyPaid`). `DirectInflow`'s external-payer claim is finalized by a `recv_op`
+  subscription, not by blocking `apply`.
+- **Fees:** `fee_cap` bounds the **total** move cost; the destination credit is grossed up via a
+  **fixed point** (gateway fee on the invoice, federation fee on the post-gateway contract); the
+  send leg is re-quoted right before paying.
+- **Settled decisions:** 100% async (no `block_on`); newtypes throughout (`FederationId([u8;32])`,
+  `Msat`, …); one RocksDB (no SQLite); gateway pinned in the durable intent; concrete-over-traits.
+- **Exit gate:** a devimint test moves ecash A→B via `apply()` and survives `reconcile()` killed
+  at every step (no double-pay, no second payable invoice), plus a `DirectInflow` that nets
+  exactly the target amount.
+- **Build order:** (0) behavior-preserving `wallet-core` async + newtype refactor → (1) the pure
+  move state machine → (2) the journal over fedimint's `Database` → (3) `MultiClient` →
+  (4) `FedimintExecutor` + fees → (5) two-fed crash/reconcile gate.
+
 ## 0. Goal + scope
 Smallest thing that proves a cross-federation ecash move works and survives a crash. Exit
 gate: a devimint test moves ecash A→B via `apply()`, survives `reconcile()` (killed at every
