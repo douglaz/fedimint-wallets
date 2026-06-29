@@ -141,8 +141,11 @@ merge never overwrites a leg with a blank or drops `fee_cap`.
 **Verified fedimint calls (this branch):**
 - Build: `Client::builder().await?` → `.with_module(..)` → `ClientPreview::join(db, secret)`
   (first) or `ClientBuilder::open(connectors, db, secret)` (existing). NOT `Client::builder(db)`.
-- Secret: `get_default_client_secret(&global_root_secret, &federation_id)` — **2 args** (wallet 0
-  hardcoded). NOT a 3-arg call.
+- Secret: pass **`RootSecret::StandardDoubleDerive(global_root_secret)`** to `join`/`open` —
+  the builder derives the per-fed client secret INTERNALLY (mixing in `federation_id` via
+  `get_default_client_secret`/`to_inner`). **Apps must NOT pre-derive it** (the builder docs
+  say so); a raw derived secret won't match the signature and re-deriving it would reopen the
+  wrong funds. (`RootSecret::Custom(prederived)` only if you truly pre-derive.)
 - Balance: `client.get_balance_for_btc()` (or `get_balance_for_unit(AmountUnit::BITCOIN)`). NOT `get_balance()`.
 - lnv2: `client.get_first_module::<LightningClientModule>()?` then
   `.receive(Amount::from_msats(n), 3600, Bolt11InvoiceDescription::Direct(String::new()), Some(SafeUrl::parse(&gw.0)?), custom_meta_json)`
@@ -256,6 +259,9 @@ so a replayed move reattaches to its existing ops. `gross_up` (§6) sizes the in
 fixed point + cap-checks the receive side, **once at `CreateInvoice`** (invoice then fixed);
 the **send side is re-quoted at each `Pay`** (the gateway may have changed fees). `DirectInflow`
 returns after `CreateInvoice` — its payer is external, so the claim is finalized async (§9.4).
+`PerformOutcome::Awaiting` is a marker (wallet-core is pure and can't carry a BOLT11 type); the
+**invoice is surfaced via a runtime read API** `Runtime::invoice_for(&intent.key) -> Option<Invoice>`
+(reads the journal's `MoveRecord.invoice`), which the UI displays and the §10 test pays.
 
 ## 8. Journal storage — fedimint `Database`, prefix `[0x00]` (async)
 `FedimintJournal` implements async `wallet_core::Journal` over `db.with_prefix(vec![0x00])`.
@@ -291,10 +297,11 @@ within our state). `pending()`/`failed()` are typed prefix scans.
   (d) restore-from-seed mid-move (client DB gone): backfill CANNOT repair (no op-log) — assert
   the bounded hazard, i.e. backed-up move state (ADR-0003) detects/avoids the resend, else the
   loss is bounded by the v1 balance cap (ADR-0018); (e) misbehaving-gateway double (T4);
-  (f) **`apply(DirectInflow to=B)`** generates a receive invoice on B and returns; the test
-  then **pays that invoice from an external LN node** (the simulated incoming payment), the
-  subscription observes `Claimed`, and B nets exactly `amount` (fixed-point gross-up — the
-  cheap-lever gate, ADR-0022). Fed bootstrapped once per session (runbook §6).
+  (f) **`apply(DirectInflow to=B)`** generates a receive invoice on B and returns `Awaiting`;
+  the test reads it via `Runtime::invoice_for(key)` and **pays it from an external LN node**
+  (the simulated incoming payment), the subscription observes `Claimed`, the intent → `Done`,
+  and B nets exactly `amount` (fixed-point gross-up — the cheap-lever gate, ADR-0022). Fed
+  bootstrapped once per session (runbook §6).
 
 ## 11. Build order
 0. **Foundational `wallet-core` refactor (behavior-preserving):** async `Executor`/`Journal`
