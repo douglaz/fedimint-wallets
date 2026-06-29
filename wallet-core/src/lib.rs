@@ -1,4 +1,6 @@
-//! Pure, dependency-free core wallet logic.
+//! Dependency-light core wallet logic: sync pure decision functions
+//! (`allocator::decide`, `scorer::score`) plus async I/O traits (`Executor`,
+//! `Journal`). No fedimint, no network, no db.
 
 pub mod allocator;
 pub mod executor;

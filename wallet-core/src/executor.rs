@@ -1,19 +1,24 @@
-use crate::types::{Action, AllocatorDecision, Sats};
+use crate::types::{Action, AllocatorDecision, IdempotencyKey, Msat};
+use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IntentStatus {
     Pending,
     Executing,
     Done,
+    /// A `DirectInflow` whose EXTERNAL payer has not yet paid. Owned by the `recv_op`
+    /// subscription (§9.5); `reconcile` does NOT re-drive it through `perform`.
+    Awaiting,
     Failed,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Intent {
-    pub idempotency_key: String,
+    pub idempotency_key: IdempotencyKey,
     pub action: Action,
-    pub max_fee: Sats,
+    pub max_fee: Msat,
     pub status: IntentStatus,
 }
 
@@ -28,7 +33,10 @@ impl Intent {
     }
 }
 
-/// Outcome counts from [`apply`]/[`reconcile`].
+/// Outcome counts from [`apply`]/[`reconcile`]. An `Awaiting` outcome counts as
+/// `performed` (the side effect ran; only the external settlement is outstanding).
+/// `failed` counts attempts that did not complete in this pass, including retryable
+/// failures that leave the intent `Pending` for a later retry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExecutionSummary {
     pub performed: usize,
@@ -36,23 +44,51 @@ pub struct ExecutionSummary {
     pub failed: usize,
 }
 
-/// Opaque execution failure. Intentionally information-free for this pure seam; a richer
-/// retryable-vs-terminal taxonomy (and the retry policy that would key off it) is out of
-/// scope here (TODOS T2).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ExecError;
-
-pub trait Journal {
-    fn upsert(&mut self, intent: &Intent) -> Result<(), ExecError>;
-    fn get(&self, key: &str) -> Option<Intent>;
-    fn set_status(&mut self, key: &str, status: IntentStatus) -> Result<(), ExecError>;
-    fn pending(&self) -> Vec<Intent>;
-    fn failed(&self) -> Vec<Intent>;
+/// The result of a successful [`Executor::perform`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PerformOutcome {
+    /// The intent's effect completed; mark it `Done`.
+    Done,
+    /// The effect was started but completion depends on an EXTERNAL event (a
+    /// `DirectInflow` payer paying the surfaced invoice). Mark `Awaiting`; the
+    /// `recv_op` subscription finalizes it (§2/§9.5), NOT a re-drive.
+    Awaiting,
 }
 
-#[derive(Clone, Debug, Default)]
+/// A typed execution failure (was information-free). The variant decides how
+/// [`drive`] updates the intent's status.
+///
+/// The `Retryable`/`Permanent` payloads are diagnostic context for the real
+/// `Executor` impl (wallet-fedimint, a later step) to log when it surfaces a failure.
+/// `drive` dispatches on the VARIANT alone in this phase — dependency-light
+/// `wallet-core` has no log seam yet and `ExecutionSummary` only carries counts — so
+/// the strings are carried, not yet emitted. (Kept per spec §2, which mandates the
+/// `String` payloads.)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecError {
+    /// Transient: leave the intent `Pending` so the next [`reconcile`] retries it.
+    Retryable(String),
+    /// Terminal: mark `Failed`. NOT auto-re-driven; only a manual retry resets it.
+    Permanent(String),
+    /// The action is not executable in this phase (e.g. `Evacuate`/advisory). → `Failed`.
+    Unsupported,
+}
+
+#[async_trait]
+pub trait Journal: Send + Sync {
+    async fn upsert(&self, intent: &Intent) -> Result<(), ExecError>;
+    async fn get(&self, key: &IdempotencyKey) -> Option<Intent>;
+    async fn set_status(&self, key: &IdempotencyKey, status: IntentStatus)
+        -> Result<(), ExecError>;
+    /// Intents to re-drive on the next pass: `Pending | Executing` ONLY (never
+    /// `Awaiting`/`Failed`, which are terminal-or-subscription-owned).
+    async fn pending(&self) -> Vec<Intent>;
+    async fn failed(&self) -> Vec<Intent>;
+}
+
+#[derive(Debug, Default)]
 pub struct MemJournal {
-    intents: BTreeMap<String, Intent>,
+    intents: Mutex<BTreeMap<IdempotencyKey, Intent>>,
 }
 
 impl MemJournal {
@@ -62,6 +98,8 @@ impl MemJournal {
 
     fn with_status(&self, accept: impl Fn(IntentStatus) -> bool) -> Vec<Intent> {
         self.intents
+            .lock()
+            .expect("journal mutex poisoned")
             .values()
             .filter(|intent| accept(intent.status))
             .cloned()
@@ -69,29 +107,42 @@ impl MemJournal {
     }
 }
 
+#[async_trait]
 impl Journal for MemJournal {
-    fn upsert(&mut self, intent: &Intent) -> Result<(), ExecError> {
+    async fn upsert(&self, intent: &Intent) -> Result<(), ExecError> {
         self.intents
+            .lock()
+            .expect("journal mutex poisoned")
             .insert(intent.idempotency_key.clone(), intent.clone());
         Ok(())
     }
 
-    fn get(&self, key: &str) -> Option<Intent> {
-        self.intents.get(key).cloned()
+    async fn get(&self, key: &IdempotencyKey) -> Option<Intent> {
+        self.intents
+            .lock()
+            .expect("journal mutex poisoned")
+            .get(key)
+            .cloned()
     }
 
-    fn set_status(&mut self, key: &str, status: IntentStatus) -> Result<(), ExecError> {
+    async fn set_status(
+        &self,
+        key: &IdempotencyKey,
+        status: IntentStatus,
+    ) -> Result<(), ExecError> {
         self.intents
+            .lock()
+            .expect("journal mutex poisoned")
             .get_mut(key)
             .map(|intent| intent.status = status)
-            .ok_or(ExecError)
+            .ok_or_else(|| ExecError::Permanent("journal: intent not found".into()))
     }
 
-    fn pending(&self) -> Vec<Intent> {
+    async fn pending(&self) -> Vec<Intent> {
         self.with_status(|status| matches!(status, IntentStatus::Pending | IntentStatus::Executing))
     }
 
-    fn failed(&self) -> Vec<Intent> {
+    async fn failed(&self) -> Vec<Intent> {
         self.with_status(|status| status == IntentStatus::Failed)
     }
 }
@@ -99,24 +150,36 @@ impl Journal for MemJournal {
 /// The side-effecting step that turns a journaled [`Intent`] into a real-world effect
 /// (later: a real cross-federation Lightning move).
 ///
+/// # `&self` + interior mutability
+///
+/// `perform` takes `&self`: the real implementation holds shared `Arc`s (a
+/// `MultiClient` + a `Database`-backed journal) and must be `Send + Sync`. Test
+/// doubles ([`MockExecutor`]) use interior mutability for their recorded state.
+///
 /// # Idempotency contract (load-bearing)
 ///
 /// `perform` MUST be idempotent keyed on `intent.idempotency_key`. After a crash,
-/// [`reconcile`] re-drives any intent left `Pending`/`Executing` and calls `perform` again
-/// on an intent that may already have moved money, so a real implementation must dedupe on
-/// the key (e.g. reuse the in-flight payment registered under that key) and move the
-/// underlying funds AT MOST ONCE per key. A naive impl that performs unconditionally would
-/// double-spend on replay; the crash-safety of the whole write-ahead-log design rests on
-/// this guarantee. [`MockExecutor`] models the contract by recording each key and returning
-/// `Ok` without re-performing a key it has already seen.
-pub trait Executor {
-    fn perform(&mut self, intent: &Intent) -> Result<(), ExecError>;
+/// [`reconcile`] re-drives any intent left `Pending`/`Executing` and calls `perform`
+/// again on an intent that may already have moved money, so a real implementation
+/// must dedupe on the key (e.g. reuse the in-flight payment registered under that
+/// key) and move the underlying funds AT MOST ONCE per key. [`MockExecutor`] models
+/// the contract by recording each key and returning `Ok` without re-performing a key
+/// it has already seen.
+#[async_trait]
+pub trait Executor: Send + Sync {
+    async fn perform(&self, intent: &Intent) -> Result<PerformOutcome, ExecError>;
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct MockExecutor {
-    fail_keys: BTreeSet<String>,
-    performed_keys: Vec<String>,
+    inner: Mutex<MockState>,
+}
+
+#[derive(Debug, Default)]
+struct MockState {
+    fail: BTreeMap<IdempotencyKey, ExecError>,
+    awaiting: BTreeSet<IdempotencyKey>,
+    performed_keys: Vec<IdempotencyKey>,
 }
 
 impl MockExecutor {
@@ -125,37 +188,75 @@ impl MockExecutor {
     }
 
     #[doc(hidden)] // test-only failure injection; not part of the supported API surface
-    pub fn fail(&mut self, key: impl Into<String>) {
-        self.fail_keys.insert(key.into());
+    pub fn fail_retryable(&self, key: &str) {
+        self.inner.lock().expect("mock mutex poisoned").fail.insert(
+            IdempotencyKey(key.to_string()),
+            ExecError::Retryable("injected".into()),
+        );
     }
 
     #[doc(hidden)] // test-only failure injection; not part of the supported API surface
-    pub fn succeed(&mut self, key: &str) {
-        self.fail_keys.remove(key);
+    pub fn fail_permanent(&self, key: &str) {
+        self.inner.lock().expect("mock mutex poisoned").fail.insert(
+            IdempotencyKey(key.to_string()),
+            ExecError::Permanent("injected".into()),
+        );
     }
 
-    pub fn performed_keys(&self) -> &[String] {
-        &self.performed_keys
+    #[doc(hidden)] // test-only failure injection; not part of the supported API surface
+    pub fn succeed(&self, key: &str) {
+        self.inner
+            .lock()
+            .expect("mock mutex poisoned")
+            .fail
+            .remove(&IdempotencyKey(key.to_string()));
+    }
+
+    #[doc(hidden)] // test-only: make this key return `Ok(Awaiting)` (a `DirectInflow`)
+    pub fn set_awaiting(&self, key: &str) {
+        self.inner
+            .lock()
+            .expect("mock mutex poisoned")
+            .awaiting
+            .insert(IdempotencyKey(key.to_string()));
+    }
+
+    pub fn performed_keys(&self) -> Vec<IdempotencyKey> {
+        self.inner
+            .lock()
+            .expect("mock mutex poisoned")
+            .performed_keys
+            .clone()
     }
 }
 
+#[async_trait]
 impl Executor for MockExecutor {
-    fn perform(&mut self, intent: &Intent) -> Result<(), ExecError> {
-        if self.performed_keys.contains(&intent.idempotency_key) {
-            return Ok(());
+    async fn perform(&self, intent: &Intent) -> Result<PerformOutcome, ExecError> {
+        let mut state = self.inner.lock().expect("mock mutex poisoned");
+        if state.performed_keys.contains(&intent.idempotency_key) {
+            // Idempotent replay: already acted under this key; do not repeat the effect.
+            return if state.awaiting.contains(&intent.idempotency_key) {
+                Ok(PerformOutcome::Awaiting)
+            } else {
+                Ok(PerformOutcome::Done)
+            };
         }
-        if self.fail_keys.contains(&intent.idempotency_key) {
-            return Err(ExecError);
+        if let Some(err) = state.fail.get(&intent.idempotency_key) {
+            return Err(err.clone());
         }
-
-        self.performed_keys.push(intent.idempotency_key.clone());
-        Ok(())
+        state.performed_keys.push(intent.idempotency_key.clone());
+        if state.awaiting.contains(&intent.idempotency_key) {
+            Ok(PerformOutcome::Awaiting)
+        } else {
+            Ok(PerformOutcome::Done)
+        }
     }
 }
 
-pub fn apply<J: Journal, E: Executor>(
-    journal: &mut J,
-    executor: &mut E,
+pub async fn apply<J: Journal, E: Executor>(
+    journal: &J,
+    executor: &E,
     decisions: &[AllocatorDecision],
 ) -> ExecutionSummary {
     let mut summary = ExecutionSummary::default();
@@ -167,20 +268,31 @@ pub fn apply<J: Journal, E: Executor>(
             continue;
         }
 
-        // Skipping a key already `Done` dedupes idempotent REPLAY of the same intent
-        // (crash recovery). It also means an identical decision that legitimately RECURS
-        // later is permanently skipped, because the allocator's key is per-logical-intent
-        // with no occurrence/epoch nonce. Reviving recurring allocations needs an epoch in
-        // the key (allocator/types) — tracked as a follow-up in TODOS.md.
-        match journal.get(&decision.idempotency_key) {
-            Some(intent) if intent.status == IntentStatus::Done => summary.skipped += 1,
+        // Terminal/owned states are NOT refreshed by a fresh allocator tick:
+        //  - `Done`: idempotent REPLAY of a completed intent (crash recovery). It also
+        //    means an identical decision that legitimately RECURS later is permanently
+        //    skipped, because the allocator key is per-logical-intent with no occurrence
+        //    nonce; reviving recurring allocations needs an epoch in the key (TODOS).
+        //  - `Failed`: terminal until a MANUAL retry resets it (§2). A recurring tick
+        //    must NOT resurrect a fee-over-cap/unsupported failure back to `Pending`.
+        //  - `Awaiting`: a `DirectInflow` owned by its `recv_op` subscription (§9.5);
+        //    re-driving through `perform` would mint a second invoice.
+        match journal.get(&decision.idempotency_key).await {
+            Some(intent)
+                if matches!(
+                    intent.status,
+                    IntentStatus::Done | IntentStatus::Failed | IntentStatus::Awaiting
+                ) =>
+            {
+                summary.skipped += 1;
+            }
             _ => {
                 let intent = Intent::from_decision(decision);
-                if journal.upsert(&intent).is_err() {
+                if journal.upsert(&intent).await.is_err() {
                     summary.failed += 1;
                     continue;
                 }
-                drive(journal, executor, &intent, &mut summary);
+                drive(journal, executor, &intent, &mut summary).await;
             }
         }
     }
@@ -188,29 +300,27 @@ pub fn apply<J: Journal, E: Executor>(
     summary
 }
 
-pub fn reconcile<J: Journal, E: Executor>(journal: &mut J, executor: &mut E) -> ExecutionSummary {
+pub async fn reconcile<J: Journal, E: Executor>(journal: &J, executor: &E) -> ExecutionSummary {
     let mut summary = ExecutionSummary::default();
-    let mut seen = BTreeSet::new();
 
-    // `seen` is defensive: pending() (Pending|Executing) and failed() (Failed) are disjoint
-    // status sets today, but a future journal could overlap; never drive a key twice per pass.
-    for intent in journal.pending().into_iter().chain(journal.failed()) {
-        if seen.insert(intent.idempotency_key.clone()) {
-            drive(journal, executor, &intent, &mut summary);
-        }
+    // Re-drive `pending()` (Pending|Executing) ONLY. `Failed`/`Permanent` stay terminal
+    // and `Awaiting` is subscription-owned (§2/§9.4): neither is re-driven here.
+    for intent in journal.pending().await {
+        drive(journal, executor, &intent, &mut summary).await;
     }
 
     summary
 }
 
-fn drive<J: Journal, E: Executor>(
-    journal: &mut J,
-    executor: &mut E,
+async fn drive<J: Journal, E: Executor>(
+    journal: &J,
+    executor: &E,
     intent: &Intent,
     summary: &mut ExecutionSummary,
 ) {
     if journal
         .set_status(&intent.idempotency_key, IntentStatus::Executing)
+        .await
         .is_err()
     {
         summary.failed += 1;
@@ -220,10 +330,15 @@ fn drive<J: Journal, E: Executor>(
     let mut executing = intent.clone();
     executing.status = IntentStatus::Executing;
 
-    match executor.perform(&executing) {
-        Ok(()) => {
+    match executor.perform(&executing).await {
+        Ok(outcome) => {
+            let next = match outcome {
+                PerformOutcome::Done => IntentStatus::Done,
+                PerformOutcome::Awaiting => IntentStatus::Awaiting,
+            };
             if journal
-                .set_status(&intent.idempotency_key, IntentStatus::Done)
+                .set_status(&intent.idempotency_key, next)
+                .await
                 .is_ok()
             {
                 summary.performed += 1;
@@ -231,8 +346,17 @@ fn drive<J: Journal, E: Executor>(
                 summary.failed += 1;
             }
         }
-        Err(ExecError) => {
-            let _ = journal.set_status(&intent.idempotency_key, IntentStatus::Failed);
+        Err(ExecError::Retryable(_)) => {
+            // Leave the intent Pending so the next reconcile retries it (NOT Failed).
+            let _ = journal
+                .set_status(&intent.idempotency_key, IntentStatus::Pending)
+                .await;
+            summary.failed += 1;
+        }
+        Err(ExecError::Permanent(_)) | Err(ExecError::Unsupported) => {
+            let _ = journal
+                .set_status(&intent.idempotency_key, IntentStatus::Failed)
+                .await;
             summary.failed += 1;
         }
     }

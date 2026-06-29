@@ -7,7 +7,7 @@ use wallet_core::{
 /// Tests clone this and tweak the one field under test.
 fn healthy() -> FederationFacts {
     FederationFacts {
-        id: FederationId(1),
+        id: FederationId([1; 32]),
         guardian_count: 4,
         threshold: 4,
         is_mainnet: true,
