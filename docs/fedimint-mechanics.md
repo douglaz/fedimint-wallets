@@ -157,3 +157,31 @@ MoveRecord {            // stored in our app DB, our own prefix; the resume inde
 Net: far less to build than a hand-rolled state machine. Lift the per-fed plumbing from
 harbor/Fedi; build only the thin two-op-id coordination record + the resume loop + the
 allocator on top.
+
+## Live validation (devimint, 2026-06-29)
+
+Built fedimint 0.12-alpha from source and stood up a regtest federation via
+`devimint dev-fed` (4 guardians, LND + LDK gateways, funded internal client ~0.999M sats).
+Validated against the real federation (lnv1 internal-swap path, single fed):
+
+- **Receive is NOT idempotent — PASS.** Two identical `ln-invoice --amount 200000` calls
+  produced two DIFFERENT bolt11 invoices (different payment hashes). → the app must persist
+  the invoice; it cannot be re-derived. Matches §3.
+- **Real money path executes — PASS.** `module ln pay <invoice> --force-internal` settled
+  internally, returned a preimage, balance moved 998993022 → 998792318 msat (amount + ~704
+  msat fee).
+- **Pay/send dedup (the linchpin) — PASS.** Re-paying the SAME invoice returned the
+  IDENTICAL preimage and did NOT move balance again (998792318 → 998792318). The client
+  recognized the already-completed payment (deterministic op-id) and returned the cached
+  result instead of double-paying. Matches §4: re-`pay(invoice)` after a crash cannot
+  double-pay while the client DB survives.
+
+Not yet validated (follow-ups, none expected to contradict the model):
+- The explicit TWO-federation move and the lnv2 `is_direct_swap` — blocked only by devimint
+  not auto-registering the LDK gateway into the lnv2 `gateways list` (a harness wiring gap,
+  not a model issue; the lnv1 internal swap validated here is the analogous path). The
+  op-id dedup + receive mechanics are identical across one-fed/two-fed and lnv1/lnv2.
+- Crash/self-resume (kill mid-operation, reopen client, operation completes) — not scripted.
+
+Reproduce: `nix develop -c` then `devimint dev-fed` with the scripts under the session
+scratchpad (`tv3.sh`). Binaries build to `target-nix/debug`.
