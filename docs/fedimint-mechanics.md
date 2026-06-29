@@ -176,11 +176,20 @@ Validated against the real federation (lnv1 internal-swap path, single fed):
   result instead of double-paying. Matches §4: re-`pay(invoice)` after a crash cannot
   double-pay while the client DB survives.
 
+- **lnv2 `is_direct_swap` (the cheap path, §5) — PASS.** `module lnv2 receive 200000
+  --gateway <LDK>` issued an invoice; `module lnv2 send <invoice> --gateway <LDK>` settled
+  via the shared gateway: `await-send` → `{"Success": <preimage>}`, `await-receive` →
+  `"Claimed"`, balance moved by only the 9024 msat fee (the receive credited the amount, the
+  send debited amount+fee — a self direct-swap, no LN hop). Re-sending the same invoice
+  returned `{"error": "This invoice has already been paid"}` with no second debit — the lnv2
+  op-id dedup, verbatim from §4. (Key: pass `--gateway <addr>` explicitly; devimint doesn't
+  auto-register the LDK gateway into the vetted lnv2 list, but supplying it directly works,
+  exactly as devimint's own tests do.)
+
 Not yet validated (follow-ups, none expected to contradict the model):
-- The explicit TWO-federation move and the lnv2 `is_direct_swap` — blocked only by devimint
-  not auto-registering the LDK gateway into the lnv2 `gateways list` (a harness wiring gap,
-  not a model issue; the lnv1 internal swap validated here is the analogous path). The
-  op-id dedup + receive mechanics are identical across one-fed/two-fed and lnv1/lnv2.
+- The literal TWO-federation variant (two clients on two feds, one shared gateway) — the
+  swap mechanism is identical to the single-fed self-swap validated above; only the two legs
+  land on different clients/feds.
 - Crash/self-resume (kill mid-operation, reopen client, operation completes) — not scripted.
 
 Reproduce: `nix develop -c` then `devimint dev-fed` with the scripts under the session
