@@ -189,12 +189,16 @@ rely on "persist-before-act". Instead:
 `send()` does NOT enforce our `fee_cap`; it only enforces lnv2's high built-in cap (100 sat +
 1.5% send). `fee_cap` bounds the **total cost of moving `amount`**, so the preflight must sum
 BOTH legs, before the irreversible `Pay`:
-1. Use the **client's own fee-quote APIs**, not static `ClientConfig` fee constants — the tx
-   fee depends on note selection/change/dust, so config fees under-quote. lnv2 exposes
-   `receive_fee_quote(amount)` (B side: gateway `receive_fee` + B's tx fee) and
-   `send_fee_quote(..)` (A side: gateway `send_fee` + A's tx fee).
-2. `total = send_quote + receive_quote` (the receive quote is a real cost — it reduces B's
-   incoming contract). If `total > fee_cap` → `ExecError::Permanent("fee over cap")`, abort.
+The total fee has TWO sources per leg — combine both (the `*_fee_quote` APIs do NOT include
+the gateway fee):
+1. **Federation tx fee** via the client APIs `receive_fee_quote(amount)` (B) / `send_fee_quote(..)`
+   (A) — these account for note selection/change/dust (config constants under-quote), but quote
+   ONLY the on-federation tx fee.
+2. **Gateway fee** SEPARATELY from the pinned gateway's `routing_info`: `receive_fee` (B side)
+   and `send_parameters(&invoice)`'s send fee (A side).
+3. `receive_quote = recv_tx_fee + recv_gateway_fee`; `send_quote = send_tx_fee + send_gateway_fee`;
+   `total = send_quote + receive_quote`. If `total > fee_cap` → `ExecError::Permanent("fee over cap")`,
+   abort. (`quote()` in §7 returns these sums.)
 **`amount` is the NET credit the destination must end up with** (the allocator's target
 transfer/top-up). lnv2 subtracts the receive quote, so we **gross up** the invoice:
 `invoice_amount = amount + receive_quote`; A funds `invoice_amount + send_quote`; B nets
