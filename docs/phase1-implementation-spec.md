@@ -99,6 +99,7 @@ pub struct MoveRecord {
     pub from: Option<FederationId>, pub to: FederationId, pub amount: Msat, pub fee_cap: Msat,
     pub gateway: GatewayUrl,
     pub send_required: bool,              // Move = true; DirectInflow = false (receive-only, from = None)
+    pub receive_quote: Msat,             // receive-side cost cached at CreateInvoice (for the Pay re-check)
     pub invoice: Option<Invoice>, pub recv_op: Option<OperationId>, pub send_op: Option<OperationId>,
     pub phase: MovePhase, pub outcome: Option<String>,
 }
@@ -199,14 +200,19 @@ the gateway fee):
 3. `receive_quote = recv_tx_fee + recv_gateway_fee`; `send_quote = send_tx_fee + send_gateway_fee`;
    `total = send_quote + receive_quote`. If `total > fee_cap` → `ExecError::Permanent("fee over cap")`,
    abort. (`quote()` in §7 returns these sums.)
-**`amount` is the NET credit the destination must end up with** (the allocator's target
-transfer/top-up). lnv2 subtracts the receive quote, so we **gross up** the invoice:
-`invoice_amount = amount + receive_quote`; A funds `invoice_amount + send_quote`; B nets
-exactly `amount`. The quote + cap check + gross-up run **at the `CreateInvoice` step** (which
-sizes the invoice) — the *first* time only, so a move resumed past that step **never
-re-quotes** and a later gateway-fee change can't spuriously fail an in-flight move.
-`reserved_fee` tracks `total`. For `DirectInflow` only the receive side applies:
-`invoice_amount = amount + receive_quote` (`send_quote = 0`).
+**`amount` is the NET credit the destination must end up with.** lnv2 subtracts the receive
+fee from the GROSS invoice amount, and the gateway `receive_fee` has a ppm component, so the
+gross-up is a **fixed point**, not a single add: find `invoice_amount` s.t. `invoice_amount −
+recv_gateway_fee(invoice_amount) − recv_tx_fee = amount`. For `recv_fee = base + ppm·x`:
+`invoice_amount = (amount + recv_base + recv_tx_fee) / (1 − recv_ppm)` (or iterate to a fixed
+point). A funds `invoice_amount + send_quote`; B nets exactly `amount`.
+- **Receive side** (the invoice size + cap-relevant receive cost) is computed once **at the
+  `CreateInvoice` step** and the invoice amount is then **fixed** (never re-quoted on resume).
+- **Send side**: the gateway can change its send fee after the invoice exists, and lnv2
+  `send()` re-fetches routing info at send time, so **re-quote the send leg immediately before
+  each `Pay`** and abort (`Permanent`) if `current send_quote + receive_quote > fee_cap`. The
+  invoice stays fixed; only the cap re-check moves to `Pay`.
+`reserved_fee` tracks `total`. For `DirectInflow` only the receive side applies (`send_quote = 0`).
 
 ## 7. FedimintExecutor::perform (async; op-log-aware)
 ```rust
@@ -217,27 +223,30 @@ async fn perform(&self, intent: &Intent) -> Result<(), ExecError> {
     let mut rec = self.assemble_record(intent, &p).await?;        // FIRST: intent + backfilled artifacts, so a replayed
                                                                   // move reattaches (no re-quote, no spurious over-cap fail).
     loop { match next_step(&rec) {                                 // respects rec.send_required
-        CreateInvoice => { // fee gate lives HERE — only when starting a NEW invoice, never on resume past this step
-                           let q = self.quote(&p, p.amount).await?;                  // §6, via client *_fee_quote APIs
-                           if q.total > p.fee_cap { return Err(Permanent("fee over cap".into())); }
-                           let inv_amt = p.amount + q.receive_quote;                 // gross up: destination nets `amount`
+        CreateInvoice => { // size the invoice (fixed point, §6) + cap-check the receive side ONCE here
+                           let inv_amt = self.gross_up(&p).await?;                    // §6 fixed-point; receive cap-check
                            let (inv, op) = self.mc.receive(&p.to, inv_amt, &p.gateway, &intent.key).await?;
-                           rec.invoice = Some(inv); rec.recv_op = Some(op); self.journal.put_move(&rec).await?; }
-        Pay           => { match self.mc.pay(p.from.as_ref().unwrap(), rec.invoice.as_ref().unwrap(), &p.gateway, &intent.key).await? {
+                           rec.invoice = Some(inv); rec.recv_op = Some(op); self.journal.put_move(&rec).await?;
+                           if !rec.send_required {                                    // DirectInflow: payer is EXTERNAL —
+                               return Ok(());                                         // surface the invoice + return; do NOT
+                           } }                                                        // block on await (claim finalized async, §9)
+        Pay           => { // re-quote the send leg NOW (gateway may have changed fees since CreateInvoice); invoice stays fixed
+                           if self.send_quote(&p).await? + rec.receive_quote > p.fee_cap { return Err(Permanent("fee over cap".into())); }
+                           match self.mc.pay(p.from.as_ref().unwrap(), rec.invoice.as_ref().unwrap(), &p.gateway, &intent.key).await? {
                                Started(op)|AlreadyInFlight(op)|AlreadyPaid(op) => rec.send_op = Some(op), }
                            self.journal.put_move(&rec).await?; }
-        AwaitSettle   => { let recv = self.mc.await_receive(&p.to, rec.recv_op.unwrap()).await?;
-                           let send = if rec.send_required { Some(self.mc.await_send(p.from.as_ref().unwrap(), rec.send_op.unwrap()).await?) } else { None };
+        AwaitSettle   => { let recv = self.mc.await_receive(&p.to, rec.recv_op.unwrap()).await?;  // Move: A paid, claim is fast
+                           let send = Some(self.mc.await_send(p.from.as_ref().unwrap(), rec.send_op.unwrap()).await?);
                            rec.phase = settle(send, recv); self.journal.put_move(&rec).await?; }
         Done => return Ok(()), Failed => return Err(Permanent("move failed".into())),
     }}
 }
 ```
 `assemble_record` (called FIRST) merges the Intent with the backfilled op-log artifacts (§4),
-so a replayed move reattaches to its existing ops. `quote` (§6, via the client `*_fee_quote`
-APIs) runs **inside the `CreateInvoice` step** — only when minting a new invoice, never on
-resume — so the invoice is sized grossed-up, no irreversible op starts over-cap, and a fee
-change can't fail an already-started move.
+so a replayed move reattaches to its existing ops. `gross_up` (§6) sizes the invoice via the
+fixed point + cap-checks the receive side, **once at `CreateInvoice`** (invoice then fixed);
+the **send side is re-quoted at each `Pay`** (the gateway may have changed fees). `DirectInflow`
+returns after `CreateInvoice` — its payer is external, so the claim is finalized async (§9.4).
 
 ## 8. Journal storage — fedimint `Database`, prefix `[0x00]` (async)
 `FedimintJournal` implements async `wallet_core::Journal` over `db.with_prefix(vec![0x00])`.
@@ -259,6 +268,10 @@ within our state). `pending()`/`failed()` are typed prefix scans.
 3. `wallet_core::reconcile(journal, executor).await` — re-drive **`pending()` only**
    (Pending|Executing); `Failed`/`Permanent` intents stay terminal (not auto-re-driven, §2);
    `perform` sees backfilled MoveRecords + reattaches via deterministic op-ids.
+4. **DirectInflow claims are finalized asynchronously:** `perform` returns once the invoice
+   exists (the payer is external), so a subscription on `recv_op` (re-attached on startup, like
+   harbor/Fedi) observes `Claimed` and marks the intent Done + updates balance — `apply` never
+   blocks waiting for an external payment.
 
 ## 10. Test plan
 - **Pure unit (`cargo test`):** `next_step` resume-from-every-phase; async `apply`/`reconcile`
@@ -269,9 +282,10 @@ within our state). `pending()`/`failed()` are typed prefix scans.
   (d) restore-from-seed mid-move (client DB gone): backfill CANNOT repair (no op-log) — assert
   the bounded hazard, i.e. backed-up move state (ADR-0003) detects/avoids the resend, else the
   loss is bounded by the v1 balance cap (ADR-0018); (e) misbehaving-gateway double (T4);
-  (f) **`apply(DirectInflow to=B)`** generates a receive on B, claims, and B nets exactly
-  `amount` (grossed-up invoice — the cheap-lever gate, ADR-0022). Fed bootstrapped once per
-  session (runbook §6).
+  (f) **`apply(DirectInflow to=B)`** generates a receive invoice on B and returns; the test
+  then **pays that invoice from an external LN node** (the simulated incoming payment), the
+  subscription observes `Claimed`, and B nets exactly `amount` (fixed-point gross-up — the
+  cheap-lever gate, ADR-0022). Fed bootstrapped once per session (runbook §6).
 
 ## 11. Build order
 0. **Foundational `wallet-core` refactor (behavior-preserving):** async `Executor`/`Journal`
