@@ -104,7 +104,6 @@ pub struct MoveRecord {
     pub from: Option<FederationId>, pub to: FederationId, pub amount: Msat, pub fee_cap: Msat,
     pub gateway: GatewayUrl,
     pub send_required: bool,              // Move = true; DirectInflow = false (receive-only, from = None)
-    pub receive_quote: Msat,             // receive-side cost cached at CreateInvoice (for the Pay re-check)
     pub invoice: Option<Invoice>, pub recv_op: Option<OperationId>, pub send_op: Option<OperationId>,
     pub phase: MovePhase, pub outcome: Option<String>,
 }
@@ -227,21 +226,27 @@ async fn perform(&self, intent: &Intent) -> Result<PerformOutcome, ExecError> { 
                                                                   // move reattaches (no re-quote, no spurious over-cap fail).
     loop { match next_step(&rec) {                                 // respects rec.send_required
         CreateInvoice => { // size the invoice (fixed point, §6) + cap-check the receive side ONCE here
-                           let (inv_amt, recv_q) = self.gross_up(&p).await?;          // §6 fixed-point; receive cap-check
-                           rec.receive_quote = recv_q;                               // PERSIST it — the Pay re-check needs it on resume
+                           let inv_amt = self.gross_up(&p).await?;                    // §6 fixed-point; receive cap-check
                            let (inv, op) = self.mc.receive(&p.to, inv_amt, &p.gateway, &intent.key).await?;
                            rec.invoice = Some(inv); rec.recv_op = Some(op); self.journal.put_move(&rec).await?;
                            if !rec.send_required {                                    // DirectInflow: payer is EXTERNAL —
                                return Ok(PerformOutcome::Awaiting);                   // surface invoice; intent stays AWAITING,
                            } }                                                        // claim finalized by the recv_op subscription (§9.4)
-        Pay           => { // re-quote the send leg NOW (gateway may have changed fees since CreateInvoice); invoice stays fixed
-                           if self.send_quote(&p).await? + rec.receive_quote > p.fee_cap { return Err(Permanent("fee over cap".into())); }
-                           match self.mc.pay(p.from.as_ref().unwrap(), rec.invoice.as_ref().unwrap(), &p.gateway, &intent.key).await? {
+        Pay           => { // re-check the cap NOW. receive cost is recomputed crash-safely from the (op-log-recoverable)
+                           // invoice: receive_quote = invoice_amount − amount. send fee is quoted FROM the invoice.
+                           let inv = rec.invoice.as_ref().unwrap();
+                           let receive_quote = amount_of(inv) - p.amount;            // = recv fee; both inputs survive a crash
+                           if self.send_quote(&p, inv).await? + receive_quote > p.fee_cap { return Err(Permanent("fee over cap".into())); }
+                           match self.mc.pay(p.from.as_ref().unwrap(), inv, &p.gateway, &intent.key).await? {
                                Started(op)|AlreadyInFlight(op)|AlreadyPaid(op) => rec.send_op = Some(op), }
                            self.journal.put_move(&rec).await?; }
-        AwaitSettle   => { let recv = self.mc.await_receive(&p.to, rec.recv_op.unwrap()).await?;
-                           let send = if rec.send_required { Some(self.mc.await_send(p.from.as_ref().unwrap(), rec.send_op.unwrap()).await?) } else { None };
-                           rec.phase = settle(send, recv); self.journal.put_move(&rec).await?; }   // guard: DirectInflow has no send leg
+        AwaitSettle   => { if !rec.send_required { return Ok(PerformOutcome::Awaiting); }   // DirectInflow: subscription owns the claim
+                           // Move: the SEND leg is authoritative (A pays → swap → preimage). Await it first; only on Success
+                           // wait on the (now-fast) receive claim — never block on B's invoice expiry for a refund.
+                           match self.mc.await_send(p.from.as_ref().unwrap(), rec.send_op.unwrap()).await? {
+                               Success(pre) => { let r = self.mc.await_receive(&p.to, rec.recv_op.unwrap()).await?; rec.phase = settle_ok(pre, r); }
+                               Refunded|Failed => rec.phase = MovePhase::Refunded, }
+                           self.journal.put_move(&rec).await?; }
         Done => return Ok(PerformOutcome::Done), Failed => return Err(Permanent("move failed".into())),
     }}
 }
