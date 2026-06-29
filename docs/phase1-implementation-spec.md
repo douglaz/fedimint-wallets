@@ -12,14 +12,17 @@ gate: a devimint test moves ecash A→B via `apply()`, survives `reconcile()` (k
 step), with **no double-pay and no second committed/payable invoice**. (A kill in the
 pre-commit window — gateway minted the invoice before the client persisted the receive op —
 leaves only an unpaid orphan that expires, not a double-credit; see §5. The gate is scoped
-to post-commit crashes, not that window.)
+to post-commit crashes, not that window.) **Also gated:** a `DirectInflow` generates + claims
+a receive on the chosen federation — the cheap primary lever (ADR-0022), proven alongside the
+expensive swap, not deferred.
 
 **In scope:** async refactor of the `wallet-core` executor + identity newtypes; `MultiClient`
-(join/open/balance/receive/pay); `FedimintExecutor` (executes `Move`); the op-log-backed
-durability model + the `Database`-backed journal; the resume/backfill loop; the devimint harness.
+(join/open/balance/receive/pay); `FedimintExecutor` (executes `Move` AND `DirectInflow`); the
+op-log-backed durability model + the `Database`-backed journal; the resume/backfill loop; the
+devimint harness.
 
 **Out of scope (Phase 2/3; types shaped now, not executed):** scorer/allocator wiring,
-discovery, the orchestrator tick, executing `DirectInflow`/`Evacuate`, UI.
+discovery, the orchestrator tick, executing `Evacuate`, UI.
 
 ## 1. Crate layout
 ```
@@ -70,7 +73,7 @@ formatting (currently `u32`) formats `hex(FederationId)` + `Occurrence`.
 ```rust
 pub enum Action {
     Move { from: FederationId, to: FederationId, amount: Msat, fee_cap: Msat, gateway: GatewayUrl, occurrence: Occurrence },
-    DirectInflow { to: FederationId },                                                          // Phase 2
+    DirectInflow { to: FederationId, amount: Msat, gateway: GatewayUrl, occurrence: Occurrence }, // Phase 1: receive on `to`
     Evacuate { from: FederationId, to: FederationId, amount: Msat, fee_cap: Msat, gateway: GatewayUrl, occurrence: Occurrence }, // Phase 2
     RefuseInflow,  Cap { fed: FederationId, limit: Msat },                                      // advisory; not executed
 }
@@ -112,10 +115,18 @@ impl MultiClient {
     async fn pay(&self, id, invoice: &Invoice, gw: &GatewayUrl, move_id: &IdempotencyKey) -> Result<SendStart>;
     async fn await_send(&self, id, op: OperationId) -> Result<SendOutcome>;     // Success(Preimage)|Refunded|Failed
     async fn await_receive(&self, id, op: OperationId) -> Result<RecvOutcome>;  // Claimed|Expired
-    async fn backfill_moves(&self, id: &FederationId) -> Result<Vec<MoveRecord>>;  // page op-log, read custom_meta
+    async fn backfill_ops(&self, id: &FederationId) -> Result<Vec<OpArtifact>>;  // page op-log, read custom_meta
 }
 pub enum SendStart { Started(OperationId), AlreadyInFlight(OperationId), AlreadyPaid(OperationId) }
+pub enum Leg { Send, Receive }
+pub struct OpArtifact { pub move_id: IdempotencyKey, pub leg: Leg, pub op_id: OperationId, pub invoice: Option<Invoice> }
 ```
+**Backfill returns per-op artifacts, NOT full MoveRecords:** one client's op-log only sees
+**one leg** of a move, and the move's params (`fee_cap`, `amount`, `gateway`) live in the
+journaled `Intent`, not the op meta. So `reconcile` ASSEMBLES the MoveRecord by merging, per
+`move_id`: the `Intent` (authoritative for params) + the `OpArtifact`s from each client (recv
+leg from B, send leg from A; authoritative for op-ids/invoice) + any cached `MoveRecord`. The
+merge never overwrites a leg with a blank or drops `fee_cap`.
 **Verified fedimint calls (this branch):**
 - Build: `Client::builder().await?` → `.with_module(..)` → `ClientPreview::join(db, secret)`
   (first) or `ClientBuilder::open(connectors, db, secret)` (existing). NOT `Client::builder(db)`.
@@ -147,8 +158,10 @@ rely on "persist-before-act". Instead:
 - **The `MoveRecord` is a derived cache/index** of (the Intent) + (the op-log entries tagged
   with this `move_id`). It is best-effort to keep current; it is never the only copy.
 - **Startup BACKFILL precedes any retry:** `reconcile` first pages each client's op-log
-  (`paginate_operations_rev`), reads `custom_meta`, and rebuilds the `MoveRecord` for each
-  `move_id` (recv_op/send_op/invoice from meta) BEFORE `next_step` can issue anything.
+  (`paginate_operations_rev`), reads `custom_meta` → per-op `OpArtifact`s keyed by `move_id`,
+  and ASSEMBLES each `MoveRecord` = journaled `Intent` (params) + merged op artifacts (op-ids
+  /invoice, one leg per client) BEFORE `next_step` can issue anything. Params never come from
+  the op-log; op-ids/invoice never come from the Intent.
 - **Crash-window behavior, made explicit:**
   - Crash after `receive()` commits, before MoveRecord write → backfill finds the receive op
     by `move_id` ⇒ no second invoice.
@@ -174,31 +187,57 @@ BOTH legs, before the irreversible `Pay`:
 2. Both federations' tx fees (contract/mint fees from each `ClientConfig`): `tx_fee_A` + `tx_fee_B`.
 3. `total = send_fee + receive_fee + tx_fee_A + tx_fee_B`. If `total > fee_cap` →
    `ExecError::Permanent("fee over cap")`, do not send.
-Amount semantics: the outgoing contract is `amount + send_fee` (we over-fund A; the gateway
-keeps the spread), and B nets `amount − receive_fee` — so B's `receive(amount)` is sized gross
-and `receive_fee` is charged against the cap. `reserved_fee` in the balance snapshot tracks
-`total`. (The receive_fee preflight needs B's gateway routing_info too, fetched up front.)
+**`amount` is the NET credit the destination must end up with** (the allocator's target
+transfer/top-up). lnv2 subtracts `receive_fee` + the B-side claim tx fee, so we **gross up**
+the invoice: `invoice_amount = amount + receive_fee + tx_fee_B`; A funds `invoice_amount +
+send_fee`; B nets exactly `amount`. The fee quote therefore runs **up front, before
+`CreateInvoice`** (the grossed-up size needs `receive_fee`), not only before `Pay`; if
+`total > fee_cap` → `Permanent` before any operation starts. `reserved_fee` tracks `total`.
+(Fetch both the A-side and B-side gateway `routing_info` up front; for `DirectInflow` only
+the receive side applies: `invoice_amount = amount + receive_fee + tx_fee`.)
 
 ## 7. FedimintExecutor::perform (async; op-log-aware)
 ```rust
 async fn perform(&self, intent: &Intent) -> Result<(), ExecError> {
-    let Action::Move { from, to, amount, fee_cap, .. } = &intent.action else { return Err(Unsupported) };
-    let mut rec = self.journal.get_move(&intent.key).await?.unwrap_or_else(|| MoveRecord::new(intent)); // backfilled at startup
-    loop { match next_step(&rec) {
-        CreateInvoice => { let (inv, op) = self.mc.receive(to, *amount, &rec.gateway, &intent.key).await?;
-                           rec.invoice = Some(inv); rec.recv_op = Some(op); self.journal.put_move(&rec).await?; }
-        Pay           => { self.preflight_fee(from, &rec, *fee_cap).await?;                       // §6, may be Permanent
-                           match self.mc.pay(from, rec.invoice.as_ref().unwrap(), &rec.gateway, &intent.key).await? {
-                               Started(op)|AlreadyInFlight(op)|AlreadyPaid(op) => rec.send_op = Some(op), }
-                           self.journal.put_move(&rec).await?; }
-        AwaitBoth     => { let s = self.mc.await_send(from, rec.send_op.unwrap()).await?;
-                           let r = self.mc.await_receive(to, rec.recv_op.unwrap()).await?;
-                           rec.phase = settle(s, r); self.journal.put_move(&rec).await?; }
-        Done   => return Ok(()),
-        Failed => return Err(ExecError::Permanent("move failed".into())),
-    }}
+    match &intent.action {
+        Action::DirectInflow { to, amount, gateway, .. } => {
+            // cheap lever: receive only. Quote receive-side fee up front, gross up, claim.
+            let q = self.quote(None, Some(to), gateway).await?;                 // receive_fee + tx_fee
+            if q.total > /*no fee_cap on inflow; bound by receive_fee_limit*/ q.limit { return Err(Permanent("recv fee".into())); }
+            let inv_amt = *amount + q.receive_fee + q.tx_fee_b;                  // gross up so B nets `amount`
+            let mut rec = self.assemble_record(intent).await?;                  // intent + backfilled artifacts
+            loop { match next_step(&rec) {
+                CreateInvoice => { let (inv, op) = self.mc.receive(to, inv_amt, gateway, &intent.key).await?;
+                                   rec.invoice = Some(inv); rec.recv_op = Some(op); self.journal.put_move(&rec).await?; }
+                AwaitBoth     => { rec.phase = recv_settle(self.mc.await_receive(to, rec.recv_op.unwrap()).await?);
+                                   self.journal.put_move(&rec).await?; }
+                Done => return Ok(()), Failed => return Err(Permanent("inflow failed".into())), _ => {}
+            }}
+        }
+        Action::Move { from, to, amount, fee_cap, gateway, .. } => {
+            let q = self.quote(Some(from), Some(to), gateway).await?;           // §6: BOTH legs, up front
+            if q.total > *fee_cap { return Err(Permanent("fee over cap".into())); }
+            let inv_amt = *amount + q.receive_fee + q.tx_fee_b;                 // gross up: B nets `amount`
+            let mut rec = self.assemble_record(intent).await?;                 // intent params + backfilled artifacts
+            loop { match next_step(&rec) {
+                CreateInvoice => { let (inv, op) = self.mc.receive(to, inv_amt, gateway, &intent.key).await?;
+                                   rec.invoice = Some(inv); rec.recv_op = Some(op); self.journal.put_move(&rec).await?; }
+                Pay           => { match self.mc.pay(from, rec.invoice.as_ref().unwrap(), gateway, &intent.key).await? {
+                                       Started(op)|AlreadyInFlight(op)|AlreadyPaid(op) => rec.send_op = Some(op), }
+                                   self.journal.put_move(&rec).await?; }
+                AwaitBoth     => { let s = self.mc.await_send(from, rec.send_op.unwrap()).await?;
+                                   let r = self.mc.await_receive(to, rec.recv_op.unwrap()).await?;
+                                   rec.phase = settle(s, r); self.journal.put_move(&rec).await?; }
+                Done => return Ok(()), Failed => return Err(Permanent("move failed".into())),
+            }}
+        }
+        _ => Err(Unsupported),   // Evacuate (Phase 2), advisory actions
+    }
 }
 ```
+`quote` fetches the up-front fee preflight (§6); `assemble_record` merges the Intent with the
+op-log artifacts (§4). The fee gate runs **before** `CreateInvoice` so the invoice is sized
+grossed-up and no irreversible op starts over-cap.
 
 ## 8. Journal storage — fedimint `Database`, prefix `[0x00]` (async)
 `FedimintJournal` implements async `wallet_core::Journal` over `db.with_prefix(vec![0x00])`.
@@ -214,7 +253,9 @@ within our state). `pending()`/`failed()` are typed prefix scans.
 
 ## 9. Resume loop (runtime.rs, async)
 1. read `FederationKey` rows → `MultiClient::open_all(...)` (each client self-resumes its SMs).
-2. **op-log backfill:** for each client, `mc.backfill_moves(id)` → upsert the rebuilt MoveRecords.
+2. **op-log backfill + merge:** for each client, `mc.backfill_ops(id)` → group `OpArtifact`s by
+   `move_id`; for each pending Intent, assemble `MoveRecord` = Intent params + merged artifacts
+   (+ cached record) and persist it. Merge never drops `fee_cap` or blanks an existing leg.
 3. `wallet_core::reconcile(journal, executor).await` — re-drive **`pending()` only**
    (Pending|Executing); `Failed`/`Permanent` intents stay terminal (not auto-re-driven, §2);
    `perform` sees backfilled MoveRecords + reattaches via deterministic op-ids.
@@ -227,8 +268,10 @@ within our state). `pending()`/`failed()` are typed prefix scans.
   prevents a second invoice; (c) crash after send-commit-before-MoveRecord → no double-pay;
   (d) restore-from-seed mid-move (client DB gone): backfill CANNOT repair (no op-log) — assert
   the bounded hazard, i.e. backed-up move state (ADR-0003) detects/avoids the resend, else the
-  loss is bounded by the v1 balance cap (ADR-0018); (e) misbehaving-gateway double (T4). Fed
-  bootstrapped once per session (runbook §6).
+  loss is bounded by the v1 balance cap (ADR-0018); (e) misbehaving-gateway double (T4);
+  (f) **`apply(DirectInflow to=B)`** generates a receive on B, claims, and B nets exactly
+  `amount` (grossed-up invoice — the cheap-lever gate, ADR-0022). Fed bootstrapped once per
+  session (runbook §6).
 
 ## 11. Build order
 0. **Foundational `wallet-core` refactor (behavior-preserving):** async `Executor`/`Journal`
@@ -237,9 +280,10 @@ within our state). `pending()`/`failed()` are typed prefix scans.
    guardian identity → `Vec<GuardianId>`, idempotency-key formatting. (No `move_sm`.)
 1. `move_protocol.rs` (`MoveRecord`, `next_step`, the op-log→MoveRecord mapping) + pure tests.
 2. `FedimintJournal` over an in-memory fedimint `Database` + tests.
-3. `MultiClient` (join/open/balance/receive/pay with `custom_meta`, backfill) + devimint single-fed smoke.
-4. `FedimintExecutor` + fee preflight → real ecash + devimint single-fed self-move.
-5. Two-fed harness + the crash-window/reconcile gate tests.
+3. `MultiClient` (join/open/balance/receive/pay with `custom_meta`, `backfill_ops`) + devimint single-fed smoke.
+4. `FedimintExecutor` + `quote`/fee preflight + `assemble_record` merge → real ecash:
+   `DirectInflow` (receive on a chosen fed, B nets `amount`) then `Move` (single-fed self-move).
+5. Two-fed harness + the crash-window/reconcile/backfill-merge gate tests.
 
 ## 12. Decisions (settled)
 - ⟦D1⟧ crate `wallet-fedimint`. ⟦D2⟧ 100% async, `&self` + interior mutability, no block_on.
