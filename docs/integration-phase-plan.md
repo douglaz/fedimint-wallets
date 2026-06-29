@@ -80,11 +80,20 @@ manages a small active set + ephemeral probe-joins, not an N-client registry.
 > *deliverable*, not overhead.
 
 ## Phasing
-- **Phase 1 — prove the money path.** `MultiClient`/`FedimintRuntime` (join/balance/receive/
-  pay) + `FedimintExecutor` (the 4 actions) + `SqliteJournal` + the **devimint harness**.
-  Exit: a devimint test moves ecash between two federations via `apply()` and survives
-  `reconcile()` with no double-pay. Candidate set = a bundled invite list (no scorer/
-  discovery yet).
+- **Phase 1 — prove the money path. Spike-first (codex state review).**
+  - **1a SPIKE (learn).** devimint up; by hand, drive ONE cross-fed move (B creates invoice
+    → A pays via a shared gateway → B claims), killing the process at every step. Output =
+    a documented operation state machine + the exact durable artifacts (Fedimint operation
+    IDs, invoice, payment hash, gateway pubkey, claim/refund state) needed to RESUME without
+    double-pay. Throwaway code; the deliverable is knowledge.
+  - **1b MODEL (from reality).** Redesign `Action`/`Intent` (see "Model corrections"), the
+    balance snapshot, the real `FederationId`/guardian identity, and the `SqliteJournal`
+    schema around durable operation artifacts + the occurrence/epoch key (T10). Sketch the
+    key/seed/storage shape (ADR-0003/0011) before the layout hardens.
+  - **1c BUILD + GATE.** Concrete `MultiClient`/`FedimintRuntime` + `FedimintExecutor` over
+    the learned state machine + `SqliteJournal`. Exit gate: a devimint test moves ecash
+    A→B via `apply()` AND survives `reconcile()` (crash-at-every-step) with no double-pay,
+    plus the misbehaving-gateway double (T4). Candidate set = a bundled invite list.
 - **Phase 2 — sense + decide.** `FedimintProbeRunner` (config-fetch + round-trip + peg-out)
   + the facts assembler → real `FederationFacts` → `score()` → snapshot → `decide()` →
   `apply()`. Recorded-fixture parser tests in the fast layer. Exit: full tick vs devimint.
@@ -117,3 +126,37 @@ VERDICT: architecture LOCKED (CODEX absorbed). Build Phase 1: MultiClient + Fedi
 via apply() and survives reconcile() with no double-pay.
 
 NO UNRESOLVED DECISIONS
+
+## Model corrections (codex state review, 2026-06-29)
+
+A second codex pass (current state + next steps) found the architecture sound but the
+data model written pre-SDK. Corrections, to land in Phase 1b (model-from-reality):
+
+- **Split the `Action` set into executable money-moves vs advisory policy.**
+  - Executable (executor intents): `DirectInflow { to }` (cheap: route the next incoming
+    payment to `to`, no swap — the PRIMARY lever), `Move { from, to, amount, fee_limit,
+    occurrence }` (expensive: swap existing balance A→B), `Evacuate { from, to, amount,
+    fee_limit, occurrence }` (a Move triggered by shutdown; carries target + amount).
+  - Advisory (NOT executor intents): `RefuseInflow` / `Cap { .. }` — mutates receive
+    routing policy, moves no money. `RefuseAllocation` is this, not one of "the 4 actions".
+- **Inflow-direction is the cheap primary lever** and must not be deferred: directing the
+  next receive is ~free; swapping balance costs gateway fees. Prove the receive +
+  DirectInflow path before/with the swap, so the first allocator proves cheap allocation,
+  not just expensive rebalance.
+- **Idempotency at the right granularity.** The per-Action key cannot drive
+  create-invoice→pay→preimage→claim→refund across crashes. The journal stores durable
+  operation artifacts and RESUMES the same invoice/payment; it never restarts. T10's
+  occurrence/epoch must land before the `SqliteJournal` schema hardens.
+- **Real identities.** `FederationId` → the 32-byte consensus hash; guardian-independence
+  (ADR-0010) keys on real guardian identity (pubkeys/URLs), NOT local peer indices.
+- **Structured balance.** Replace `balance: Sats` with `{ spendable, in_flight, claimable,
+  reserved_fee }` at msat granularity (T3); the allocator can't decide fees/caps/retries
+  from one flat number.
+- **Scorer:** require the LN/LNv2 module in the default policy (a fed with no LN can't
+  send/receive); carry gateway-availability + consensus_version in `FederationFacts`.
+- **Key management shapes storage from day one** — sketch seed/Keystore/Block Store/
+  recovery (incl. recovery of PENDING operations, not just ecash) before client DBs land.
+
+Honesty note (codex): after ADR-0006, v1 holds ~2 active federations; "automatically
+allocates across many federations" is the candidate/discovery universe + a v2 promise, not
+the v1 active set. Keep product copy honest about this (ties to T5).
