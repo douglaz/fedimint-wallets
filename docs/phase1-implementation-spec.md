@@ -3,201 +3,199 @@
 Detailed design for Phase 1 of the integration phase
 ([integration-phase-plan.md](./integration-phase-plan.md)). Grounded in the validated
 mechanics ([fedimint-mechanics.md](./fedimint-mechanics.md)) and the devimint runbook.
-**Status: DRAFT — iterating.** Open decisions are marked `⟦Dn⟧` and collected in §10.
+**Status: iterating.** Decisions settled in §10.
 
 ## 0. Goal + scope
-Build the smallest thing that proves a cross-federation ecash move works and survives a
-crash. Exit gate: a devimint test moves ecash A→B via `apply()`, survives `reconcile()`
-(killed mid-move), with no double-pay.
+Smallest thing that proves a cross-federation ecash move works and survives a crash. Exit
+gate: a devimint test moves ecash A→B via `apply()`, survives `reconcile()` (killed
+mid-move), with no double-pay.
 
-**In scope:** `MultiClient` (join / open / balance / receive / pay), `FedimintExecutor`
-(executes the `Move` action), `MoveRecord` coordination + `SqliteJournal`, the resume loop,
-the devimint test harness.
+**In scope:** async refactor of the `wallet-core` executor; `MultiClient` (join / open /
+balance / receive / pay); `FedimintExecutor` (executes `Move`); `MoveRecord` + the
+fedimint-`Database`-backed journal; the resume loop; the devimint harness.
 
-**Out of scope (Phase 2/3, but types are shaped now):** scorer/allocator wiring, discovery
-(Nostr/Observer), the orchestrator tick + triggers, executing `DirectInflow`/`Evacuate`,
-the scorer's gateway probing, UI. We *define* the full `Action`/balance types but Phase 1
-only *executes* `Move`.
+**Out of scope (Phase 2/3; types shaped now, not executed):** scorer/allocator wiring,
+discovery, the orchestrator tick, executing `DirectInflow`/`Evacuate`, UI.
 
 ## 1. Crate layout
 ```
-wallet-core/        (exists; PURE, no fedimint dep)  scorer, allocator, executor(traits+logic), types
+wallet-core/        (exists; no fedimint/network/db dep; async traits + sync pure logic)
+    scorer.rs, allocator.rs        pure sync fns (decide/score) — unchanged
+    executor.rs                    Executor + Journal traits NOW ASYNC; apply/reconcile async
+    types.rs                       newtypes (see §3)
 wallet-fedimint/    (NEW; depends on fedimint-client + wallet-core)
-    multi_client.rs    MultiClient: the per-fed fedimint_client::Client registry
-    executor.rs        FedimintExecutor: impl wallet_core::Executor over MultiClient
-    journal.rs         SqliteJournal: impl wallet_core::Journal + the MoveRecord store
-    move_protocol.rs   MoveRecord + the pure phase/next-step logic (testable without fedimint)
-    runtime.rs         wiring: open-all + reconcile on startup
+    multi_client.rs    MultiClient over fedimint_client::Client per fed
+    executor.rs        FedimintExecutor: impl async wallet_core::Executor
+    journal.rs         FedimintJournal: impl async wallet_core::Journal over fedimint Database (prefix 0)
+    move_protocol.rs   MoveRecord + pure sync next_step (testable without fedimint)
+    runtime.rs         open-all + reconcile on startup
 ```
-Rationale: `wallet-core` stays pure and mock-tested; all fedimint/async/I-O lives in
-`wallet-fedimint`. Only `wallet-fedimint` needs devimint to test. ⟦D1⟧ confirm crate name
-(`wallet-fedimint` vs `wallet-runtime`).
+`wallet-core` stays free of fedimint/network/db; all I/O lives behind its async traits and
+is implemented in `wallet-fedimint`.
 
-## 2. Async boundary  ⟦D2⟧
-`fedimint-client` is async (tokio); `wallet-core::Executor::perform` is currently sync.
-Two options:
-- **(A, recommended) Adapter blocks.** Keep `wallet-core` 100% sync (its tested
-  apply/reconcile/drive untouched). `FedimintExecutor::perform` holds a `tokio::runtime::Handle`
-  and `handle.block_on(async { ... })` the fedimint calls. The orchestrator owns the runtime.
-- (B) Make `Executor::perform` (and apply/reconcile) `async` via `async-trait`. Cleaner call
-  graph, but churns the tested pure executor and makes the pure core depend on an async shape.
-Recommend **A**: the pure core's value is being sync + deterministic; don't infect it.
+## 2. Async model (settled: 100% async, never `block_on`)
+- The `wallet-core` **`Executor` and `Journal` traits become `async`** (via `async-trait`),
+  and **`apply`/`reconcile`/`drive` become `async fn`** that `.await` them. `MockExecutor`
+  /`MemJournal` become async impls; their tests run under `#[tokio::test]`. This is a
+  refactor of already-tested code (build-order step 0) — behavior identical, signatures async.
+- **Pure CPU functions stay sync:** `allocator::decide`, `scorer::score`,
+  `move_protocol::next_step`. They never block on I/O, so they are async-compatible as-is
+  (you just call them inside async code). Do NOT make them async for its own sake.
+- `MultiClient`, `FedimintExecutor`, `FedimintJournal`, `runtime` are all async. **No
+  `block_on`, no `spawn_blocking` for our own code** — the storage engine (fedimint
+  `Database`) is itself async, so nothing forces a sync bridge.
 
-## 3. Types
+## 3. Types — newtypes throughout ("when in doubt, a newtype")
+```rust
+// wallet-core/types.rs
+pub struct FederationId(pub [u8; 32]);   // was u32 placeholder (T14)
+pub struct Msat(pub u64);                // amounts AND fees, msat granularity
+pub struct Occurrence(pub u64);          // T10 epoch
+pub struct IdempotencyKey(pub String);   // the intent key; carries occurrence
+// wallet-fedimint
+pub struct OperationId(pub [u8; 32]);    // mirror fedimint OperationId
+pub struct Preimage(pub [u8; 32]);
+pub struct DbPrefix(pub u64);
+pub struct GatewayUrl(pub String);       // SafeUrl under the hood
+pub struct Invoice(pub String);          // Bolt11 string
+```
 
-### 3.1 Identity — real `FederationId`  ⟦D3⟧
-`wallet-core` currently has `FederationId(pub u32)` (placeholder). Real id is
-`fedimint_core::config::FederationId` (32-byte hash). Options:
-- (A, recommended) `wallet-fedimint` uses the real `fedimint_core::config::FederationId`
-  everywhere; the pure `wallet-core` snapshot/decisions keep a stable opaque id (a newtype
-  over `[u8;32]`) and the adapter maps 1:1. Keep wallet-core dependency-free by making its
-  `FederationId` a `[u8;32]` newtype (small change to the placeholder, no fedimint dep).
-- (B) wallet-core depends on fedimint-core for the id type (breaks purity).
-Recommend **A** — change wallet-core `FederationId(u32)` → `FederationId([u8;32])` (T14).
-
-### 3.2 Action (wallet-core, T12) — define all, execute Move
+### 3.1 Action (wallet-core, T12) — define all, execute only `Move` in Phase 1
 ```rust
 pub enum Action {
-    // executable money-moves (Phase 1 executes only Move):
-    Move { from: FederationId, to: FederationId, amount_msat: u64, fee_cap_msat: u64, occurrence: u64 },
-    DirectInflow { to: FederationId },                 // Phase 2
-    Evacuate { from: FederationId, to: FederationId, amount_msat: u64, fee_cap_msat: u64, occurrence: u64 }, // Phase 2
-    // advisory policy (NOT executed; emitted to the app):
-    RefuseInflow,  Cap { fed: FederationId, limit_msat: u64 },
+    Move { from: FederationId, to: FederationId, amount: Msat, fee_cap: Msat, occurrence: Occurrence },
+    DirectInflow { to: FederationId },                                            // Phase 2
+    Evacuate { from: FederationId, to: FederationId, amount: Msat, fee_cap: Msat, occurrence: Occurrence }, // Phase 2
+    RefuseInflow,  Cap { fed: FederationId, limit: Msat },                        // advisory; not executed
 }
 ```
 
-### 3.3 Balance (T13) — structured, msat
+### 3.2 Balance (T13) — structured
 ```rust
-pub struct FederationBalance { pub spendable_msat: u64, pub in_flight_msat: u64, pub claimable_msat: u64, pub reserved_fee_msat: u64 }
+pub struct FederationBalance { pub spendable: Msat, pub in_flight: Msat, pub claimable: Msat, pub reserved_fee: Msat }
 ```
-Phase 1 populates `spendable_msat` from `client.get_balance()` (the only number the SDK
-gives, §6 mechanics); the rest are computed by the app from MoveRecords (`in_flight`,
-`reserved_fee`) and pending receives (`claimable`). Phase 1 may leave the latter three at 0
-until Phase 2 needs them, but the struct ships now (no v2 rewrite).
+Phase 1 fills `spendable` from `client.get_balance()`; the rest computed from MoveRecords
+/pending receives (may stay 0 until Phase 2). Ships now to avoid a v2 rewrite.
 
-### 3.4 MoveRecord (wallet-fedimint) — the coordination state
+### 3.3 MoveRecord (wallet-fedimint) — the coordination state
 ```rust
 pub struct MoveRecord {
-    pub idempotency_key: String,   // == the wallet-core Intent key; includes `occurrence`
+    pub key: IdempotencyKey,             // == the wallet-core Intent key
     pub from: FederationId, pub to: FederationId,
-    pub amount_msat: u64, pub fee_cap_msat: u64,
-    pub gateway: String,                 // the shared gateway URL (pinned)
-    pub invoice: Option<String>,         // persisted when B.receive returns (NOT idempotent)
-    pub recv_op_id: Option<[u8;32]>,     // B side
-    pub send_op_id: Option<[u8;32]>,     // A side
-    pub phase: MovePhase,                // Created|Invoiced|Sending|Settled|Refunded|Failed (derivable, stored for clarity)
+    pub amount: Msat, pub fee_cap: Msat,
+    pub gateway: GatewayUrl,             // shared gateway, pinned
+    pub invoice: Option<Invoice>,        // persisted when B.receive returns (NOT idempotent)
+    pub recv_op: Option<OperationId>,    // B side
+    pub send_op: Option<OperationId>,    // A side
+    pub phase: MovePhase,                // Created|Invoiced|Sending|Settled|Refunded|Failed
     pub outcome: Option<String>,
 }
+pub enum MoveStep { CreateInvoice, Pay, AwaitBoth, Done, Failed }
+pub fn next_step(rec: &MoveRecord) -> MoveStep;   // PURE sync; RESUME not restart
 ```
-`move_protocol.rs::next_step(&MoveRecord) -> MoveStep` is pure (testable without fedimint),
-returning `CreateInvoice | Pay | AwaitBoth | Done | Failed`. RESUME, never restart: if
-`invoice.is_some()` never re-`CreateInvoice`; if `send_op_id.is_some()` never re-`Pay`.
+Invariant: `invoice.is_some()` ⇒ never `CreateInvoice`; `send_op.is_some()` ⇒ never `Pay`.
 
-## 4. MultiClient (wallet-fedimint)
+## 4. MultiClient (wallet-fedimint) — all async
 ```rust
-pub struct MultiClient { clients: BTreeMap<FederationId, ClientHandleArc>, db: Database, mnemonic: Mnemonic }
+pub struct MultiClient { clients: BTreeMap<FederationId, ClientHandleArc>, db: fedimint_core::db::Database, mnemonic: Mnemonic }
 impl MultiClient {
-    async fn join(&mut self, invite: InviteCode) -> Result<FederationId>;       // build+join, persist invite + db-prefix
-    async fn open_all(&mut self, feds: &[(FederationId, DbPrefix, InviteCode)]) -> Result<()>; // startup
+    async fn join(&mut self, invite: InviteCode) -> Result<FederationId>;     // build+join at next DbPrefix; record in journal
+    async fn open_all(&mut self, feds: &[(FederationId, DbPrefix)]) -> Result<()>;
     fn client(&self, id: &FederationId) -> Option<&ClientHandleArc>;
-    async fn balance(&self, id: &FederationId) -> Result<u64>;                   // get_balance().msats
-    async fn receive(&self, id: &FederationId, amount_msat: u64, gw: &str) -> Result<(String /*invoice*/, [u8;32] /*op*/)>;
-    async fn pay(&self, id: &FederationId, invoice: &str, gw: &str) -> Result<[u8;32] /*op*/>;
-    async fn await_send(&self, id: &FederationId, op: [u8;32]) -> Result<SendOutcome>;   // Success(preimage)|Refunded|Failed
-    async fn await_receive(&self, id: &FederationId, op: [u8;32]) -> Result<RecvOutcome>; // Claimed|Expired
+    async fn balance(&self, id: &FederationId) -> Result<Msat>;               // get_balance()
+    async fn receive(&self, id: &FederationId, amount: Msat, gw: &GatewayUrl) -> Result<(Invoice, OperationId)>;
+    async fn pay(&self, id: &FederationId, invoice: &Invoice, gw: &GatewayUrl) -> Result<OperationId>;
+    async fn await_send(&self, id: &FederationId, op: OperationId) -> Result<SendOutcome>;   // Success(Preimage)|Refunded|Failed
+    async fn await_receive(&self, id: &FederationId, op: OperationId) -> Result<RecvOutcome>; // Claimed|Expired
 }
 ```
-Concrete fedimint calls (validated / from harbor): build via `Client::builder(db).with_module(..)`,
+Concrete fedimint calls (validated / from harbor): `Client::builder(db).with_module(..)`,
 `get_default_client_secret(root, fed_id, 0)`, `preview(connectors, invite).join/.open`;
-receive/pay via `client.get_first_module::<LightningClientModule /*lnv2*/>().receive(amount, 3600,
-desc, Some(gw), Null)` and `.send(invoice, Some(gw), Null)`; balance via `client.get_balance()`;
-await via `subscribe_*_operation_state_updates(op)`. **Gateway is explicit in Phase 1**
-(`--gateway` required, per validation) ⟦D4⟧.
+`client.get_first_module::<LightningClientModule>().receive(amount, 3600, desc, Some(gw),
+Null)` / `.send(invoice, Some(gw), Null)`; `client.get_balance()`;
+`subscribe_*_operation_state_updates(op)`. **Gateway explicit in Phase 1** (validation showed
+the LDK gateway isn't auto-vetted; supply `--gateway`/`Some(gw)`).
 
-### Storage ⟦D5⟧
-- (A, recommended, Fedi pattern) One `Database` (RocksDB on device), each client opened on a
-  **key-prefix slice** (`db.with_prefix(n)`); prefix 0 = our app tables, 1.. = each fed. One
-  fsync domain. Our `SqliteJournal`... but RocksDB + SQLite is two engines. Reconcile: either
-  (A1) RocksDB for fedimint + a separate SQLite for our app state (two files), or (A2) one
-  store. Lean A1: RocksDB per-fed-prefix for fedimint clients (native, fast), SQLite for our
-  coordination/journal (queryable `status`).
-- (B, harbor pattern) wrap fedimint's mem-db into our SQLite as a BLOB. Simpler one-file, but
-  full-state write amplification per commit.
-Recommend **A1** (RocksDB for clients, SQLite for our journal).
+### Storage (settled: RocksDB, single async Database)
+One fedimint `Database` (RocksDB on device). Each client opens on a **key-prefix slice**
+`db.with_prefix(prefix)`; `DbPrefix(0)` = our app state (§6), `DbPrefix(1..)` = each fed
+(Fedi's pattern). One async engine, one fsync domain, no sync driver. The per-fed secret is
+derived `get_default_client_secret(root, fed_id, device_index=0)`.
 
-## 5. FedimintExecutor (impl wallet_core::Executor)
+## 5. FedimintExecutor (impl async `wallet_core::Executor`)
 ```rust
+#[async_trait]
 impl Executor for FedimintExecutor {
-    fn perform(&mut self, intent: &Intent) -> Result<(), ExecError> {
-        self.rt.block_on(async {
-            match &intent.action {
-                Action::Move { from, to, amount_msat, fee_cap_msat, .. } => {
-                    let mut rec = self.journal.get_move(&intent.idempotency_key)
-                        .unwrap_or_else(|| MoveRecord::new(intent));   // resume or create
-                    loop { match next_step(&rec) {
-                        CreateInvoice => { let (inv, op) = self.mc.receive(to, *amount_msat, &rec.gateway).await?;
-                                           rec.invoice = Some(inv); rec.recv_op_id = Some(op); self.journal.put_move(&rec)?; }
-                        Pay           => { let op = self.mc.pay(from, rec.invoice.as_ref().unwrap(), &rec.gateway).await?;
-                                           rec.send_op_id = Some(op); self.journal.put_move(&rec)?; }
-                        AwaitBoth     => { let s = self.mc.await_send(from, rec.send_op_id.unwrap()).await?;
-                                           let r = self.mc.await_receive(to, rec.recv_op_id.unwrap()).await?;
-                                           rec.phase = settle(s, r); self.journal.put_move(&rec)?; }
-                        Done   => return Ok(()),
-                        Failed => return Err(ExecError::Permanent),
-                    }}
-                }
-                _ => Err(ExecError::Unsupported),   // Phase 1 executes only Move
+    async fn perform(&self, intent: &Intent) -> Result<(), ExecError> {
+        match &intent.action {
+            Action::Move { from, to, amount, fee_cap, .. } => {
+                let mut rec = self.journal.get_move(&intent.key).await?
+                    .unwrap_or_else(|| MoveRecord::new(intent));            // resume or create
+                loop { match next_step(&rec) {
+                    CreateInvoice => { let (inv, op) = self.mc.receive(to, *amount, &rec.gateway).await?;
+                                       rec.invoice = Some(inv); rec.recv_op = Some(op); self.journal.put_move(&rec).await?; }
+                    Pay           => { let op = self.mc.pay(from, rec.invoice.as_ref().unwrap(), &rec.gateway).await?;
+                                       rec.send_op = Some(op); self.journal.put_move(&rec).await?; }
+                    AwaitBoth     => { let s = self.mc.await_send(from, rec.send_op.unwrap()).await?;
+                                       let r = self.mc.await_receive(to, rec.recv_op.unwrap()).await?;
+                                       rec.phase = settle(s, r); self.journal.put_move(&rec).await?; }
+                    Done   => return Ok(()),
+                    Failed => return Err(ExecError::Permanent),
+                }}
             }
-        })
+            _ => Err(ExecError::Unsupported),    // Phase 1 executes only Move
+        }
     }
 }
 ```
-Idempotency: keyed by `intent.idempotency_key` (carries `occurrence`, T10). The MoveRecord
-persists op-ids BEFORE awaiting, so a crash mid-`perform` resumes via `next_step` and the
-client's own dedup (re-`pay` → `InvoiceAlreadyPaid`, validated). **Persist-before-act** is
-the invariant: write the MoveRecord row before/with each fedimint call.
+**Persist-before-act:** write the MoveRecord (op-id/invoice) before/with each fedimint call,
+so a crash mid-`perform` resumes via `next_step` + the client's own dedup (re-`pay` →
+`InvoiceAlreadyPaid`, validated). Idempotency keyed by `IdempotencyKey` (carries `Occurrence`).
 
-## 6. SqliteJournal + tables
-```sql
-CREATE TABLE intents(   idempotency_key TEXT PRIMARY KEY, action_json TEXT, status TEXT, updated_at INTEGER);
-CREATE TABLE moves(     idempotency_key TEXT PRIMARY KEY, from_fed BLOB, to_fed BLOB, amount_msat INTEGER,
-                        fee_cap_msat INTEGER, gateway TEXT, invoice TEXT, recv_op_id BLOB, send_op_id BLOB,
-                        phase TEXT, outcome TEXT);
-CREATE TABLE federations(fed_id BLOB PRIMARY KEY, invite_code TEXT, db_prefix INTEGER, joined_at INTEGER);
+## 6. Journal storage — fedimint `Database`, prefix 0 (async)
+`FedimintJournal` implements the async `wallet_core::Journal` over `db.with_prefix(0)`. No
+SQL, no SQLite — typed `Encodable` rows (Fedi stores app data this way). Key spaces:
 ```
-`SqliteJournal` implements `wallet_core::Journal` (`upsert/get/set_status/pending/failed`)
-over `intents`, plus `get_move/put_move` over `moves`, plus the `federations` registry
-(backed up per ADR-0003). rusqlite (sync) — fits the sync executor. ⟦D6⟧ rusqlite vs sqlx.
+IntentKey(IdempotencyKey)      -> Intent { action, status }           // the wallet-core intent log
+MoveKey(IdempotencyKey)        -> MoveRecord                          // §3.3
+FederationKey(FederationId)    -> FederationInfo { invite, db_prefix, joined_at }   // backed up, ADR-0003
+PendingIndexKey(status, key)   -> ()                                  // index for `pending()`/`failed()` scans
+```
+`pending()`/`failed()` are prefix scans over `PendingIndexKey`. All methods `async`.
 
-## 7. Resume loop (runtime.rs)
-On startup: read `federations` → `MultiClient::open_all(...)` (each client's executor
-self-resumes its own state machines). Then `wallet_core::reconcile(journal, executor)`:
-re-drive `pending`+`failed` intents; the `FedimintExecutor` re-attaches to the persisted
-op-ids via the MoveRecord and `next_step` (no restart). This is the crash-safety path the
-gate test exercises.
+## 7. Resume loop (runtime.rs, async)
+Startup: read `FederationKey` rows → `MultiClient::open_all(...)` (each client's executor
+self-resumes its own state machines). Then `wallet_core::reconcile(journal, executor).await`:
+re-drive `pending`+`failed` intents; `FedimintExecutor` re-attaches to persisted op-ids via
+the MoveRecord + `next_step` (no restart). This is the crash-safety path the gate exercises.
 
 ## 8. Test plan
-- **Pure unit (no fedimint, every `cargo test`):** `move_protocol::next_step` resume-from-every-phase
-  (no double-invoice / no double-pay); `SqliteJournal` contract tests against a tempfile;
-  `wallet_core::apply/reconcile` with the existing `MockExecutor`.
-- **devimint e2e (`--features devimint-e2e`, gated):** the gate — `apply(Move A→B)` moves
-  ecash and `reconcile()` after a kill-at-each-step yields exactly-once (assert balances +
-  no double-pay); plus the misbehaving-gateway double (T4). Bootstrap the fed once per
-  session (runbook §6). ⟦D7⟧ two-fed harness: needs fed-1 join + a gateway connected to both.
+- **Pure unit (no fedimint, `cargo test`):** `move_protocol::next_step` resume-from-every-phase
+  (no double-invoice/double-pay); the async executor `apply`/`reconcile` with async
+  `MockExecutor`/`MemJournal` under `#[tokio::test]`.
+- **devimint e2e (`--features devimint-e2e`):** the gate — `apply(Move A→B)` moves ecash;
+  `reconcile()` after a kill-at-each-step is exactly-once (assert balances + no double-pay);
+  misbehaving-gateway double (T4). Fed bootstrapped once per session (runbook §6).
 
-## 9. Build order within Phase 1
-1. `move_protocol.rs` + its pure tests (no deps) — the resume state machine.
-2. `SqliteJournal` + tests (tempfile).
-3. `MultiClient` (join/open/balance/receive/pay) — devimint smoke (single fed: receive→send).
-4. `FedimintExecutor` wiring `apply` → real ecash — devimint single-fed self-move.
+## 9. Build order
+0. **Foundational `wallet-core` refactor (behavior-preserving), land first:**
+   (a) async `Executor`/`Journal` traits + async `apply`/`reconcile`/`drive` + async
+   `MockExecutor`/`MemJournal` + `#[tokio::test]`; (b) newtypes in `types.rs` —
+   `FederationId([u8;32])`, `Msat`, `Occurrence`, `IdempotencyKey` — which ripples into the
+   allocator/scorer signatures + their golden-test fixtures. Everything below depends on it.
+1. `move_protocol.rs` + pure tests (the resume state machine).
+2. `FedimintJournal` over a fedimint `Database` + tests (in-memory `Database`).
+3. `MultiClient` (join/open/balance/receive/pay) + devimint single-fed smoke (receive→send).
+4. `FedimintExecutor` wiring `apply` → real ecash + devimint single-fed self-move.
 5. Two-fed harness + the crash/reconcile gate test.
 
-## 10. Open decisions (iterate here)
-- ⟦D1⟧ crate name: `wallet-fedimint` (rec) vs `wallet-runtime`.
-- ⟦D2⟧ async boundary: adapter `block_on` keeping core sync (rec) vs make core async.
-- ⟦D3⟧ `FederationId`: change wallet-core to `[u8;32]` newtype + map (rec) vs fedimint dep.
-- ⟦D4⟧ gateway: explicit `--gateway` in Phase 1 (rec, matches validation) vs auto-select now.
-- ⟦D5⟧ storage: RocksDB(clients)+SQLite(journal) two files (rec) vs single-DB BLOB (harbor).
-- ⟦D6⟧ sqlite driver: rusqlite sync (rec, fits sync executor) vs sqlx async.
-- ⟦D7⟧ scope of the gate: single-fed self-move first, then two-fed (rec) vs two-fed immediately.
+## 10. Decisions (settled)
+- ⟦D1⟧ crate name **`wallet-fedimint`**.
+- ⟦D2⟧ **100% async**, `Executor`/`Journal`/`apply`/`reconcile` async; pure fns stay sync;
+  **no `block_on`/`spawn_blocking`** for our code.
+- ⟦D3⟧ **newtypes throughout**; `FederationId([u8;32])` replaces the `u32` placeholder.
+- ⟦D4⟧ gateway **explicit** in Phase 1 (matches validation).
+- ⟦D5⟧ storage: **single fedimint `Database` (RocksDB)**, prefix 0 = app/journal, 1.. =
+  clients. No SQLite.
+- ⟦D6⟧ ~~sqlite driver~~ **moot** — no SQLite; journal is the async fedimint `Database`.
+- ⟦D7⟧ gate: **single-fed self-move first, then two-fed**.
