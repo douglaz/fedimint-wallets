@@ -4,9 +4,16 @@ version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 
-# Phase 1 step 1 holds ONLY the pure, deterministic core of the cross-federation
-# move (`move_protocol`) plus the identity newtypes. The fedimint SDK, the journal,
-# `MultiClient`, and the executor arrive in steps 2-4 — there are intentionally NO
-# fedimint / network / db / async dependencies here yet.
+# Phase 1: the pure `move_protocol` (step 1) plus the fedimint SDK integration
+# (steps 2-4). The fedimint dependency is pinned to douglaz/fedimint (the project
+# owner's fork) at the exact 0.12-alpha commit we built + validated against live
+# (= PR fedimint/fedimint#8774). Revisit this pin before any production ship.
+# NOTE: from here the crate needs the nix build env for fedimint's native deps —
+# build/test with: nix develop /home/master/p/fedimint -c cargo <cmd>
 [dependencies]
 wallet-core = { path = "../wallet-core" }
+fedimint-core = { git = "https://github.com/douglaz/fedimint.git", rev = "ade83765a7eef97a6f6d990d7ec0a9664226b7c3" }
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "sync"] }
