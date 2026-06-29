@@ -40,9 +40,14 @@ wallet-fedimint/    (NEW; depends on fedimint-client + wallet-core)
 - `wallet-core` **`Executor`/`Journal` traits become `#[async_trait]`**, and
   **`apply`/`reconcile`/`drive` become `async fn`**. Pure CPU fns stay sync
   (`allocator::decide`, `scorer::score`, `move_protocol::next_step`).
-- **`Executor::perform(&self, ..)`** (was `&mut self`): the executor holds `Arc<MultiClient>`
-  + `Arc<FedimintJournal>`; shared, `Send + Sync`. Mock impls use interior mutability
-  (`Mutex<…>`) to record. `Journal` methods are `&self` too.
+- **`Executor::perform(&self, ..) -> Result<PerformOutcome, ExecError>`** (was `&mut self`,
+  unit Ok): the executor holds `Arc<MultiClient>` + `Arc<FedimintJournal>`; shared, `Send +
+  Sync`. Mock impls use interior mutability (`Mutex<…>`). `Journal` methods are `&self` too.
+- **`PerformOutcome { Done, Awaiting }`** + a new **`IntentStatus::Awaiting`**: `Done` → mark
+  the intent `Done`. `Awaiting` (a `DirectInflow` whose EXTERNAL payer hasn't paid yet) → mark
+  `Awaiting`, which `reconcile` does **NOT** re-drive — it is owned by the `recv_op`
+  subscription, which marks the intent `Done` on `Claimed` / `Failed` on expiry (§9.4). This
+  prevents an unpaid inflow from being marked complete or its receive from being skipped.
 - `ExecError` gets explicit variants (was unit-like): `Retryable(String)` (leave the intent
   `Pending` so the next `reconcile` retries it), `Permanent(String)` (mark `Failed` —
   **terminal; NOT auto-re-driven**), `Unsupported` (`Evacuate` or advisory actions only —
@@ -216,29 +221,28 @@ point). A funds `invoice_amount + send_quote`; B nets exactly `amount`.
 
 ## 7. FedimintExecutor::perform (async; op-log-aware)
 ```rust
-async fn perform(&self, intent: &Intent) -> Result<(), ExecError> {
-    // MovePlan unifies Move (has_send=true, from=Some) and DirectInflow (has_send=false, from=None);
-    // None => Evacuate/advisory => Unsupported.
+async fn perform(&self, intent: &Intent) -> Result<PerformOutcome, ExecError> {  // Done | Awaiting (§2)
     let Some(p) = MovePlan::from_action(&intent.action) else { return Err(Unsupported) };
     let mut rec = self.assemble_record(intent, &p).await?;        // FIRST: intent + backfilled artifacts, so a replayed
                                                                   // move reattaches (no re-quote, no spurious over-cap fail).
     loop { match next_step(&rec) {                                 // respects rec.send_required
         CreateInvoice => { // size the invoice (fixed point, §6) + cap-check the receive side ONCE here
-                           let inv_amt = self.gross_up(&p).await?;                    // §6 fixed-point; receive cap-check
+                           let (inv_amt, recv_q) = self.gross_up(&p).await?;          // §6 fixed-point; receive cap-check
+                           rec.receive_quote = recv_q;                               // PERSIST it — the Pay re-check needs it on resume
                            let (inv, op) = self.mc.receive(&p.to, inv_amt, &p.gateway, &intent.key).await?;
                            rec.invoice = Some(inv); rec.recv_op = Some(op); self.journal.put_move(&rec).await?;
                            if !rec.send_required {                                    // DirectInflow: payer is EXTERNAL —
-                               return Ok(());                                         // surface the invoice + return; do NOT
-                           } }                                                        // block on await (claim finalized async, §9)
+                               return Ok(PerformOutcome::Awaiting);                   // surface invoice; intent stays AWAITING,
+                           } }                                                        // claim finalized by the recv_op subscription (§9.4)
         Pay           => { // re-quote the send leg NOW (gateway may have changed fees since CreateInvoice); invoice stays fixed
                            if self.send_quote(&p).await? + rec.receive_quote > p.fee_cap { return Err(Permanent("fee over cap".into())); }
                            match self.mc.pay(p.from.as_ref().unwrap(), rec.invoice.as_ref().unwrap(), &p.gateway, &intent.key).await? {
                                Started(op)|AlreadyInFlight(op)|AlreadyPaid(op) => rec.send_op = Some(op), }
                            self.journal.put_move(&rec).await?; }
-        AwaitSettle   => { let recv = self.mc.await_receive(&p.to, rec.recv_op.unwrap()).await?;  // Move: A paid, claim is fast
-                           let send = Some(self.mc.await_send(p.from.as_ref().unwrap(), rec.send_op.unwrap()).await?);
-                           rec.phase = settle(send, recv); self.journal.put_move(&rec).await?; }
-        Done => return Ok(()), Failed => return Err(Permanent("move failed".into())),
+        AwaitSettle   => { let recv = self.mc.await_receive(&p.to, rec.recv_op.unwrap()).await?;
+                           let send = if rec.send_required { Some(self.mc.await_send(p.from.as_ref().unwrap(), rec.send_op.unwrap()).await?) } else { None };
+                           rec.phase = settle(send, recv); self.journal.put_move(&rec).await?; }   // guard: DirectInflow has no send leg
+        Done => return Ok(PerformOutcome::Done), Failed => return Err(Permanent("move failed".into())),
     }}
 }
 ```
@@ -266,8 +270,8 @@ within our state). `pending()`/`failed()` are typed prefix scans.
    `move_id`; for each pending Intent, assemble `MoveRecord` = Intent params + merged artifacts
    (+ cached record) and persist it. Merge never drops `fee_cap` or blanks an existing leg.
 3. `wallet_core::reconcile(journal, executor).await` — re-drive **`pending()` only**
-   (Pending|Executing); `Failed`/`Permanent` intents stay terminal (not auto-re-driven, §2);
-   `perform` sees backfilled MoveRecords + reattaches via deterministic op-ids.
+   (Pending|Executing); `Failed`/`Permanent` stay terminal and **`Awaiting` is skipped**
+   (subscription-owned, §2/§9.4); `perform` sees backfilled MoveRecords + reattaches via op-ids.
 4. **DirectInflow claims are finalized asynchronously:** `perform` returns once the invoice
    exists (the payer is external), so a subscription on `recv_op` (re-attached on startup, like
    harbor/Fedi) observes `Claimed` and marks the intent Done + updates balance — `apply` never
@@ -289,7 +293,8 @@ within our state). `pending()`/`failed()` are typed prefix scans.
 
 ## 11. Build order
 0. **Foundational `wallet-core` refactor (behavior-preserving):** async `Executor`/`Journal`
-   + async `apply`/`reconcile`/`drive` + async mocks/`#[tokio::test]`; `ExecError` variants;
+   + async `apply`/`reconcile`/`drive` + async mocks/`#[tokio::test]`; `ExecError` variants +
+   `PerformOutcome { Done, Awaiting }` + `IntentStatus::Awaiting`;
    newtypes (`FederationId([u8;32])`, `GuardianId`, `Msat`, `Occurrence`, `IdempotencyKey`),
    guardian identity → `Vec<GuardianId>`, idempotency-key formatting. (No `move_sm`.)
 1. `move_protocol.rs` (`MoveRecord`, `next_step`, the op-log→MoveRecord mapping) + pure tests.
