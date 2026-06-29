@@ -46,8 +46,10 @@ wallet-fedimint/    (NEW; depends on fedimint-client + wallet-core)
 - **`PerformOutcome { Done, Awaiting }`** + a new **`IntentStatus::Awaiting`**: `Done` → mark
   the intent `Done`. `Awaiting` (a `DirectInflow` whose EXTERNAL payer hasn't paid yet) → mark
   `Awaiting`, which `reconcile` does **NOT** re-drive — it is owned by the `recv_op`
-  subscription, which marks the intent `Done` on `Claimed` / `Failed` on expiry (§9.5). This
-  prevents an unpaid inflow from being marked complete or its receive from being skipped.
+  subscription, which marks the intent `Done` on `Claimed` / `Failed` on expiry (§9.5). **The
+  runtime starts that subscription the moment the intent transitions to `Awaiting`** (not only
+  on boot, where §9.3 rehydrates it) — else a payment that arrives before any restart is never
+  observed. This prevents an unpaid inflow from being marked complete or stuck forever.
 - `ExecError` gets explicit variants (was unit-like): `Retryable(String)` (leave the intent
   `Pending` so the next `reconcile` retries it), `Permanent(String)` (mark `Failed` —
   **terminal; NOT auto-re-driven**), `Unsupported` (`Evacuate` or advisory actions only —
@@ -283,8 +285,10 @@ within our state). `pending()`/`failed()` are typed prefix scans.
 ## 9. Resume loop (runtime.rs, async)
 1. read `FederationKey` rows → `MultiClient::open_all(...)` (each client self-resumes its SMs).
 2. **op-log backfill + merge:** for each client, `mc.backfill_ops(id)` → group `OpArtifact`s by
-   `move_id`; for each **`Pending` AND `Awaiting`** Intent, assemble `MoveRecord` = Intent params
-   + merged artifacts (+ cached record) and persist it. Merge never drops `fee_cap` or blanks a leg.
+   `move_id`; for each **`pending()` (Pending|Executing) AND `Awaiting`** Intent, assemble
+   `MoveRecord` = Intent params + merged artifacts (+ cached record) and persist it — backfilling
+   `Executing` too is required, else a crash in the receive-commit-before-MoveRecord window
+   re-drives without the op artifact and mints a second invoice. Merge never drops `fee_cap`.
 3. **Rehydrate `Awaiting` subscriptions:** for each `Awaiting` intent (a `DirectInflow` whose
    external payer hasn't settled), re-`subscribe` to its `recv_op` so the claim is still observed
    after a restart — otherwise the intent stays `Awaiting` forever. (`Awaiting` is NOT re-driven
