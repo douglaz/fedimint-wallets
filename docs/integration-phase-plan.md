@@ -80,20 +80,25 @@ manages a small active set + ephemeral probe-joins, not an N-client registry.
 > *deliverable*, not overhead.
 
 ## Phasing
-- **Phase 1 — prove the money path. Spike-first (codex state review).**
-  - **1a SPIKE (learn).** devimint up; by hand, drive ONE cross-fed move (B creates invoice
-    → A pays via a shared gateway → B claims), killing the process at every step. Output =
-    a documented operation state machine + the exact durable artifacts (Fedimint operation
-    IDs, invoice, payment hash, gateway pubkey, claim/refund state) needed to RESUME without
-    double-pay. Throwaway code; the deliverable is knowledge.
-  - **1b MODEL (from reality).** Redesign `Action`/`Intent` (see "Model corrections"), the
-    balance snapshot, the real `FederationId`/guardian identity, and the `SqliteJournal`
-    schema around durable operation artifacts + the occurrence/epoch key (T10). Sketch the
-    key/seed/storage shape (ADR-0003/0011) before the layout hardens.
-  - **1c BUILD + GATE.** Concrete `MultiClient`/`FedimintRuntime` + `FedimintExecutor` over
-    the learned state machine + `SqliteJournal`. Exit gate: a devimint test moves ecash
-    A→B via `apply()` AND survives `reconcile()` (crash-at-every-step) with no double-pay,
-    plus the misbehaving-gateway double (T4). Candidate set = a bundled invite list.
+- **Phase 1 — prove the money path. The model is now GROUNDED** in
+  [fedimint-mechanics.md](./fedimint-mechanics.md) (a five-way read of the fedimint SDK +
+  harbor + Fedi), so this is implement + validate, not learn-from-scratch.
+  - **1a HARNESS + LIVE VALIDATION.** Stand up devimint + the test harness (T4). By hand,
+    run the grounded recipe live — `B.receive(gateway=G)` → `A.send(invoice, gateway=G)` →
+    shared-gateway internal swap → B claims — and confirm the real op ids / artifacts match
+    fedimint-mechanics.md (esp. that re-`send` returns `InvoiceAlreadyPaid`). Validates the
+    model against reality.
+  - **1b IMPLEMENT (the grounded model).** Lift the per-fed plumbing from harbor/Fedi:
+    `MultiClient` = `Map<FederationId, Client>`, one global DB with per-fed key prefixes,
+    per-fed secret via `get_default_client_secret`. Build the **thin `MoveRecord`
+    coordination** (two op ids + invoice + gateway + occurrence) + the resume loop
+    (re-`subscribe` on boot; the clients self-resume their own SMs — we do NOT re-implement
+    them). Split `Action`/`Intent` (DirectInflow/Move/Evacuate vs advisory), the structured
+    msat balance, real `FederationId`. Sketch key/seed/storage + back up the federation list
+    (ADR-0003) before the layout hardens.
+  - **1c GATE.** Exit: a devimint test moves ecash A→B via `apply()` AND survives
+    `reconcile()` (crash-at-every-step) with no double-pay, plus the misbehaving-gateway
+    double + the restore-from-seed-mid-move hazard (T4). Candidate set = a bundled invite list.
 - **Phase 2 — sense + decide.** `FedimintProbeRunner` (config-fetch + round-trip + peg-out)
   + the facts assembler → real `FederationFacts` → `score()` → snapshot → `decide()` →
   `apply()`. Recorded-fixture parser tests in the fast layer. Exit: full tick vs devimint.
