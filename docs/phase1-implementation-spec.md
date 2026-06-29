@@ -46,7 +46,7 @@ wallet-fedimint/    (NEW; depends on fedimint-client + wallet-core)
 - **`PerformOutcome { Done, Awaiting }`** + a new **`IntentStatus::Awaiting`**: `Done` → mark
   the intent `Done`. `Awaiting` (a `DirectInflow` whose EXTERNAL payer hasn't paid yet) → mark
   `Awaiting`, which `reconcile` does **NOT** re-drive — it is owned by the `recv_op`
-  subscription, which marks the intent `Done` on `Claimed` / `Failed` on expiry (§9.4). This
+  subscription, which marks the intent `Done` on `Claimed` / `Failed` on expiry (§9.5). This
   prevents an unpaid inflow from being marked complete or its receive from being skipped.
 - `ExecError` gets explicit variants (was unit-like): `Retryable(String)` (leave the intent
   `Pending` so the next `reconcile` retries it), `Permanent(String)` (mark `Failed` —
@@ -55,7 +55,10 @@ wallet-fedimint/    (NEW; depends on fedimint-client + wallet-core)
   `drive` branches on these. **This changes the executor's prior reconcile semantics**
   (which re-drove `pending`+`failed`): `reconcile` now re-drives **`pending()` only**; a
   `Failed`/`Permanent` intent stays failed until an explicit manual retry resets it to
-  `Pending` (so fee-over-cap / unsupported don't re-run every launch).
+  `Pending` (so fee-over-cap / unsupported don't re-run every launch). **`apply` must also
+  treat `Failed` as terminal** — a repeated allocator tick with the same idempotency key must
+  NOT refresh a `Failed` intent back to `Pending` (only a manual retry does), or fee-over-cap/
+  unsupported failures would re-run every tick.
 - The storage engine (fedimint `Database`) is itself async, so nothing forces a sync bridge.
 
 ## 3. Identity + types — newtypes throughout
@@ -207,12 +210,14 @@ the gateway fee):
 3. `receive_quote = recv_tx_fee + recv_gateway_fee`; `send_quote = send_tx_fee + send_gateway_fee`;
    `total = send_quote + receive_quote`. If `total > fee_cap` → `ExecError::Permanent("fee over cap")`,
    abort. (`quote()` in §7 returns these sums.)
-**`amount` is the NET credit the destination must end up with.** lnv2 subtracts the receive
-fee from the GROSS invoice amount, and the gateway `receive_fee` has a ppm component, so the
-gross-up is a **fixed point**, not a single add: find `invoice_amount` s.t. `invoice_amount −
-recv_gateway_fee(invoice_amount) − recv_tx_fee = amount`. For `recv_fee = base + ppm·x`:
-`invoice_amount = (amount + recv_base + recv_tx_fee) / (1 − recv_ppm)` (or iterate to a fixed
-point). A funds `invoice_amount + send_quote`; B nets exactly `amount`.
+**`amount` is the NET credit the destination must end up with.** BOTH fee parts scale with the
+GROSS invoice amount — the gateway `receive_fee` has a ppm, AND `receive_fee_quote` (the
+federation tx fee) depends on the received/gross amount — so the gross-up is a **fixed point**
+evaluated on the *candidate gross*, not on `amount`: find `invoice_amount` s.t. `invoice_amount
+− recv_gateway_fee(invoice_amount) − receive_fee_quote(invoice_amount) = amount`. Iterate to
+convergence (or, treating both as `base + ppm·x`, solve closed-form). **Quote both receive
+parts on `invoice_amount`, never on the net `amount`.** A funds `invoice_amount + send_quote`;
+B nets exactly `amount`.
 - **Receive side** (the invoice size + cap-relevant receive cost) is computed once **at the
   `CreateInvoice` step** and the invoice amount is then **fixed** (never re-quoted on resume).
 - **Send side**: the gateway can change its send fee after the invoice exists, and lnv2
@@ -234,7 +239,7 @@ async fn perform(&self, intent: &Intent) -> Result<PerformOutcome, ExecError> { 
                            rec.invoice = Some(inv); rec.recv_op = Some(op); self.journal.put_move(&rec).await?;
                            if !rec.send_required {                                    // DirectInflow: payer is EXTERNAL —
                                return Ok(PerformOutcome::Awaiting);                   // surface invoice; intent stays AWAITING,
-                           } }                                                        // claim finalized by the recv_op subscription (§9.4)
+                           } }                                                        // claim finalized by the recv_op subscription (§9.5)
         Pay           => { // re-check the cap NOW. receive cost is recomputed crash-safely from the (op-log-recoverable)
                            // invoice: receive_quote = invoice_amount − amount. send fee is quoted FROM the invoice.
                            let inv = rec.invoice.as_ref().unwrap();
@@ -258,7 +263,7 @@ async fn perform(&self, intent: &Intent) -> Result<PerformOutcome, ExecError> { 
 so a replayed move reattaches to its existing ops. `gross_up` (§6) sizes the invoice via the
 fixed point + cap-checks the receive side, **once at `CreateInvoice`** (invoice then fixed);
 the **send side is re-quoted at each `Pay`** (the gateway may have changed fees). `DirectInflow`
-returns after `CreateInvoice` — its payer is external, so the claim is finalized async (§9.4).
+returns after `CreateInvoice` — its payer is external, so the claim is finalized async (§9.5).
 `PerformOutcome::Awaiting` is a marker (wallet-core is pure and can't carry a BOLT11 type); the
 **invoice is surfaced via a runtime read API** `Runtime::invoice_for(&intent.key) -> Option<Invoice>`
 (reads the journal's `MoveRecord.invoice`), which the UI displays and the §10 test pays.
@@ -278,15 +283,18 @@ within our state). `pending()`/`failed()` are typed prefix scans.
 ## 9. Resume loop (runtime.rs, async)
 1. read `FederationKey` rows → `MultiClient::open_all(...)` (each client self-resumes its SMs).
 2. **op-log backfill + merge:** for each client, `mc.backfill_ops(id)` → group `OpArtifact`s by
-   `move_id`; for each pending Intent, assemble `MoveRecord` = Intent params + merged artifacts
-   (+ cached record) and persist it. Merge never drops `fee_cap` or blanks an existing leg.
-3. `wallet_core::reconcile(journal, executor).await` — re-drive **`pending()` only**
+   `move_id`; for each **`Pending` AND `Awaiting`** Intent, assemble `MoveRecord` = Intent params
+   + merged artifacts (+ cached record) and persist it. Merge never drops `fee_cap` or blanks a leg.
+3. **Rehydrate `Awaiting` subscriptions:** for each `Awaiting` intent (a `DirectInflow` whose
+   external payer hasn't settled), re-`subscribe` to its `recv_op` so the claim is still observed
+   after a restart — otherwise the intent stays `Awaiting` forever. (`Awaiting` is NOT re-driven
+   through `perform`; only its subscription is reattached.)
+4. `wallet_core::reconcile(journal, executor).await` — re-drive **`pending()` only**
    (Pending|Executing); `Failed`/`Permanent` stay terminal and **`Awaiting` is skipped**
-   (subscription-owned, §2/§9.4); `perform` sees backfilled MoveRecords + reattaches via op-ids.
-4. **DirectInflow claims are finalized asynchronously:** `perform` returns once the invoice
-   exists (the payer is external), so a subscription on `recv_op` (re-attached on startup, like
-   harbor/Fedi) observes `Claimed` and marks the intent Done + updates balance — `apply` never
-   blocks waiting for an external payment.
+   (subscription-owned, §2/§9.5); `perform` sees backfilled MoveRecords + reattaches via op-ids.
+5. **DirectInflow claims are finalized asynchronously:** `perform` returns once the invoice
+   exists (the payer is external), so the `recv_op` subscription (step 3) observes `Claimed`,
+   marks the intent `Done`, and updates balance — `apply` never blocks on an external payment.
 
 ## 10. Test plan
 - **Pure unit (`cargo test`):** `next_step` resume-from-every-phase; async `apply`/`reconcile`
