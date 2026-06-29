@@ -192,5 +192,6 @@ Not yet validated (follow-ups, none expected to contradict the model):
   land on different clients/feds.
 - Crash/self-resume (kill mid-operation, reopen client, operation completes) — not scripted.
 
-Reproduce: `nix develop -c` then `devimint dev-fed` with the scripts under the session
-scratchpad (`tv3.sh`). Binaries build to `target-nix/debug`.
+Reproduce: see [devimint-runbook.md](./devimint-runbook.md) for the full build/run recipe,
+the fedimint-cli cheatsheet, and the gateway/CLI gotchas (each of which cost a bring-up to
+learn).
