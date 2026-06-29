@@ -4,7 +4,7 @@ Detailed design for Phase 1 of the integration phase
 ([integration-phase-plan.md](./integration-phase-plan.md)). Grounded in the validated
 mechanics ([fedimint-mechanics.md](./fedimint-mechanics.md)) and the devimint runbook.
 API claims verified against `~/p/fedimint` (branch `docs/custodial-receive-spec`).
-**Status: iterating (codex round 1 absorbed).** Decisions settled in §11.
+**Status: hardened through 12 codex passes (gpt-5.5 / xhigh).** Decisions settled in §11.
 
 ## 0. Goal + scope
 Smallest thing that proves a cross-federation ecash move works and survives a crash. Exit
@@ -81,7 +81,7 @@ pub struct Invoice(pub String);     // parse to Bolt11Invoice via FromStr
 local `u32` peer indices are meaningless across feds. The allocator's idempotency-key
 formatting (currently `u32`) formats `hex(FederationId)` + `Occurrence`.
 
-### 3.1 Action (T12) — define all, execute only `Move`
+### 3.1 Action (T12) — define all; Phase 1 executes `Move` + `DirectInflow`
 ```rust
 pub enum Action {
     Move { from: FederationId, to: FederationId, amount: Msat, fee_cap: Msat, gateway: GatewayUrl, occurrence: Occurrence },
@@ -215,11 +215,12 @@ the gateway fee):
 **`amount` is the NET credit the destination must end up with.** BOTH fee parts scale with the
 GROSS invoice amount — the gateway `receive_fee` has a ppm, AND `receive_fee_quote` (the
 federation tx fee) depends on the received/gross amount — so the gross-up is a **fixed point**
-evaluated on the *candidate gross*, not on `amount`: find `invoice_amount` s.t. `invoice_amount
-− recv_gateway_fee(invoice_amount) − receive_fee_quote(invoice_amount) = amount`. Iterate to
-convergence (or, treating both as `base + ppm·x`, solve closed-form). **Quote both receive
-parts on `invoice_amount`, never on the net `amount`.** A funds `invoice_amount + send_quote`;
-B nets exactly `amount`.
+evaluated on the right base, not on `amount`. The gateway takes its fee FIRST (invoice →
+on-federation `contract_amount`), then the federation fee applies to the contract, so:
+`contract_amount = invoice_amount − recv_gateway_fee(invoice_amount)`, and find `invoice_amount`
+s.t. `contract_amount − receive_fee_quote(contract_amount) = amount`. **Quote the gateway fee on
+`invoice_amount` and the federation fee on `contract_amount` (never on the net `amount`)**;
+iterate to convergence. A funds `invoice_amount + send_quote`; B nets exactly `amount`.
 - **Receive side** (the invoice size + cap-relevant receive cost) is computed once **at the
   `CreateInvoice` step** and the invoice amount is then **fixed** (never re-quoted on resume).
 - **Send side**: the gateway can change its send fee after the invoice exists, and lnv2
