@@ -75,7 +75,7 @@ formatting (currently `u32`) formats `hex(FederationId)` + `Occurrence`.
 ```rust
 pub enum Action {
     Move { from: FederationId, to: FederationId, amount: Msat, fee_cap: Msat, gateway: GatewayUrl, occurrence: Occurrence },
-    DirectInflow { to: FederationId, amount: Msat, gateway: GatewayUrl, occurrence: Occurrence }, // Phase 1: receive on `to`
+    DirectInflow { to: FederationId, amount: Msat, fee_cap: Msat, gateway: GatewayUrl, occurrence: Occurrence }, // Phase 1: receive on `to`
     Evacuate { from: FederationId, to: FederationId, amount: Msat, fee_cap: Msat, gateway: GatewayUrl, occurrence: Occurrence }, // Phase 2
     RefuseInflow,  Cap { fed: FederationId, limit: Msat },                                      // advisory; not executed
 }
@@ -189,19 +189,20 @@ rely on "persist-before-act". Instead:
 `send()` does NOT enforce our `fee_cap`; it only enforces lnv2's high built-in cap (100 sat +
 1.5% send). `fee_cap` bounds the **total cost of moving `amount`**, so the preflight must sum
 BOTH legs, before the irreversible `Pay`:
-1. From the pinned gateway's `routing_info`: the **`send_fee`** (A side) AND the **`receive_fee`**
-   (B side — it reduces B's incoming contract, so it's a real cost of the move).
-2. Both federations' tx fees (contract/mint fees from each `ClientConfig`): `tx_fee_A` + `tx_fee_B`.
-3. `total = send_fee + receive_fee + tx_fee_A + tx_fee_B`. If `total > fee_cap` →
-   `ExecError::Permanent("fee over cap")`, do not send.
+1. Use the **client's own fee-quote APIs**, not static `ClientConfig` fee constants — the tx
+   fee depends on note selection/change/dust, so config fees under-quote. lnv2 exposes
+   `receive_fee_quote(amount)` (B side: gateway `receive_fee` + B's tx fee) and
+   `send_fee_quote(..)` (A side: gateway `send_fee` + A's tx fee).
+2. `total = send_quote + receive_quote` (the receive quote is a real cost — it reduces B's
+   incoming contract). If `total > fee_cap` → `ExecError::Permanent("fee over cap")`, abort.
 **`amount` is the NET credit the destination must end up with** (the allocator's target
-transfer/top-up). lnv2 subtracts `receive_fee` + the B-side claim tx fee, so we **gross up**
-the invoice: `invoice_amount = amount + receive_fee + tx_fee_B`; A funds `invoice_amount +
-send_fee`; B nets exactly `amount`. The fee quote therefore runs **up front, before
-`CreateInvoice`** (the grossed-up size needs `receive_fee`), not only before `Pay`; if
-`total > fee_cap` → `Permanent` before any operation starts. `reserved_fee` tracks `total`.
-(Fetch both the A-side and B-side gateway `routing_info` up front; for `DirectInflow` only
-the receive side applies: `invoice_amount = amount + receive_fee + tx_fee`.)
+transfer/top-up). lnv2 subtracts the receive quote, so we **gross up** the invoice:
+`invoice_amount = amount + receive_quote`; A funds `invoice_amount + send_quote`; B nets
+exactly `amount`. The quote + cap check + gross-up run **at the `CreateInvoice` step** (which
+sizes the invoice) — the *first* time only, so a move resumed past that step **never
+re-quotes** and a later gateway-fee change can't spuriously fail an in-flight move.
+`reserved_fee` tracks `total`. For `DirectInflow` only the receive side applies:
+`invoice_amount = amount + receive_quote` (`send_quote = 0`).
 
 ## 7. FedimintExecutor::perform (async; op-log-aware)
 ```rust
@@ -209,12 +210,14 @@ async fn perform(&self, intent: &Intent) -> Result<(), ExecError> {
     // MovePlan unifies Move (has_send=true, from=Some) and DirectInflow (has_send=false, from=None);
     // None => Evacuate/advisory => Unsupported.
     let Some(p) = MovePlan::from_action(&intent.action) else { return Err(Unsupported) };
-    let q = self.quote(&p, p.amount).await?;                       // §6, amount-aware (ppm + tx fees); both legs or receive-only
-    if q.total > p.fee_cap { return Err(Permanent("fee over cap".into())); }
-    let inv_amt = p.amount + q.receive_fee + q.tx_fee_to;          // gross up: destination nets exactly `amount`
-    let mut rec = self.assemble_record(intent, &p).await?;        // intent params + backfilled artifacts; rec.send_required = p.has_send
+    let mut rec = self.assemble_record(intent, &p).await?;        // FIRST: intent + backfilled artifacts, so a replayed
+                                                                  // move reattaches (no re-quote, no spurious over-cap fail).
     loop { match next_step(&rec) {                                 // respects rec.send_required
-        CreateInvoice => { let (inv, op) = self.mc.receive(&p.to, inv_amt, &p.gateway, &intent.key).await?;
+        CreateInvoice => { // fee gate lives HERE — only when starting a NEW invoice, never on resume past this step
+                           let q = self.quote(&p, p.amount).await?;                  // §6, via client *_fee_quote APIs
+                           if q.total > p.fee_cap { return Err(Permanent("fee over cap".into())); }
+                           let inv_amt = p.amount + q.receive_quote;                 // gross up: destination nets `amount`
+                           let (inv, op) = self.mc.receive(&p.to, inv_amt, &p.gateway, &intent.key).await?;
                            rec.invoice = Some(inv); rec.recv_op = Some(op); self.journal.put_move(&rec).await?; }
         Pay           => { match self.mc.pay(p.from.as_ref().unwrap(), rec.invoice.as_ref().unwrap(), &p.gateway, &intent.key).await? {
                                Started(op)|AlreadyInFlight(op)|AlreadyPaid(op) => rec.send_op = Some(op), }
@@ -226,9 +229,11 @@ async fn perform(&self, intent: &Intent) -> Result<(), ExecError> {
     }}
 }
 ```
-`quote` fetches the up-front fee preflight (§6); `assemble_record` merges the Intent with the
-op-log artifacts (§4). The fee gate runs **before** `CreateInvoice` so the invoice is sized
-grossed-up and no irreversible op starts over-cap.
+`assemble_record` (called FIRST) merges the Intent with the backfilled op-log artifacts (§4),
+so a replayed move reattaches to its existing ops. `quote` (§6, via the client `*_fee_quote`
+APIs) runs **inside the `CreateInvoice` step** — only when minting a new invoice, never on
+resume — so the invoice is sized grossed-up, no irreversible op starts over-cap, and a fee
+change can't fail an already-started move.
 
 ## 8. Journal storage — fedimint `Database`, prefix `[0x00]` (async)
 `FedimintJournal` implements async `wallet_core::Journal` over `db.with_prefix(vec![0x00])`.
