@@ -27,6 +27,10 @@ fedimint-mint-client = { git = "https://github.com/douglaz/fedimint.git", rev = 
 fedimint-wallet-client = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
 fedimint-ln-client = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
 fedimint-lnv2-client = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
+# `Bolt11Invoice` (the type lnv2 `send`/`receive` speak) — pinned to the SAME version
+# fedimint's workspace uses (0.33), so it resolves to the one copy already in the lockfile;
+# depending on it directly adds no new version and guarantees the exact same type.
+lightning-invoice = "0.33"
 anyhow = "1"
 async-trait = "0.1"
 futures = "0.3"

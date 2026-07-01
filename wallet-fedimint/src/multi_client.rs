@@ -1,19 +1,31 @@
 //! `MultiClient` — one `fedimint_client::Client` per joined federation, all sharing a
-//! single async fedimint `Database` (spec §1/§4). Owns the client LIFECYCLE for Phase 1
-//! step 3: join / open_all / balance / federations. Receive/pay/await/backfill (the
-//! money-moving calls) land with the `FedimintExecutor` in step 4.
+//! single async fedimint `Database` (spec §1/§4). Owns the client LIFECYCLE (step 3:
+//! join / open_all / balance / federations) and the raw lnv2 money PRIMITIVES (step 4a:
+//! gateways / receive / pay / await_receive / await_send). The `FedimintExecutor` — fee
+//! gross-up, `MoveRecord`/`Action` wiring, op-log backfill — lands on top in step 4b.
 
 use crate::journal::{FederationInfo, FedimintJournal};
+use crate::types::{GatewayUrl, Invoice, OperationId, Preimage};
 use fedimint_bip39::{Bip39RootSecretStrategy, Mnemonic};
 use fedimint_client::secret::RootSecretStrategy as _;
 use fedimint_client::{Client, ClientBuilder, ClientHandleArc, RootSecret};
 use fedimint_connectors::ConnectorRegistry;
+use fedimint_core::core::OperationId as FedimintOperationId;
 use fedimint_core::db::{Database, IDatabaseTransactionOpsCore};
 use fedimint_core::invite_code::InviteCode;
+use fedimint_core::util::SafeUrl;
+use fedimint_core::Amount;
 use fedimint_core::BitcoinHash as _;
+use fedimint_lnv2_client::common::Bolt11InvoiceDescription;
+use fedimint_lnv2_client::{
+    FinalReceiveOperationState, FinalSendOperationState, LightningClientModule,
+    LightningOperationMeta, SendPaymentError,
+};
 use futures::lock::Mutex;
 use futures::StreamExt;
+use lightning_invoice::Bolt11Invoice;
 use std::collections::BTreeMap;
+use std::str::FromStr as _;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wallet_core::{FederationId, Msat};
@@ -246,6 +258,299 @@ impl MultiClient {
         builder.with_module(fedimint_lnv2_client::LightningClientInit::default());
         Ok(builder)
     }
+
+    // ---- lnv2 money primitives (spec §4, step 4a) ----------------------------------
+    //
+    // Thin wrappers over `fedimint_lnv2_client::LightningClientModule` (the shared-gateway
+    // internal-swap path validated live in docs/fedimint-mechanics.md §5). NO fee gross-up,
+    // no MoveRecord/Action wiring, no op-log backfill — those are step 4b.
+
+    /// This federation's registered lnv2 gateways (its guardian-vetted list) so the caller
+    /// can pin one explicitly. NOTE: devimint does NOT auto-register its LDK gateway here,
+    /// so this list can be empty even when a usable gateway exists — in that case the caller
+    /// passes the gateway URL directly to [`Self::receive`]/[`Self::pay`] (runbook §4).
+    pub async fn gateways(&self, id: &FederationId) -> anyhow::Result<Vec<GatewayUrl>> {
+        let client = self.client(id)?;
+        let lnv2 = client.get_first_module::<LightningClientModule>()?;
+        let urls = lnv2
+            .list_gateways(None)
+            .await
+            .map_err(|e| anyhow::anyhow!("listing lnv2 gateways for {}: {e}", id.to_hex()))?;
+        Ok(urls.into_iter().map(bridge_gateway_url).collect())
+    }
+
+    /// Generate a BOLT11 invoice to receive `amount` into `id` via lnv2. NOT idempotent —
+    /// each call mints a FRESH invoice/op-id (spec §3), so the caller must persist the
+    /// returned pair. `gateway` is passed straight through (`None` → lnv2 auto-selects);
+    /// `custom_meta` is committed into the operation meta by fedimint (the move-coordination
+    /// hook lands in step 4b).
+    pub async fn receive(
+        &self,
+        id: &FederationId,
+        amount: Msat,
+        gateway: Option<GatewayUrl>,
+        custom_meta: serde_json::Value,
+    ) -> anyhow::Result<(Invoice, OperationId)> {
+        let client = self.client(id)?;
+        let lnv2 = client.get_first_module::<LightningClientModule>()?;
+        let (invoice, op) = lnv2
+            .receive(
+                Amount::from_msats(amount.0),
+                RECEIVE_EXPIRY_SECS,
+                Bolt11InvoiceDescription::Direct(String::new()),
+                parse_gateway(gateway)?,
+                custom_meta,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("lnv2 receive on {}: {e}", id.to_hex()))?;
+        Ok((bridge_invoice(&invoice), bridge_op_id(op)))
+    }
+
+    /// Pay a BOLT11 invoice from `id` via lnv2. The lnv2 client is the dedup AUTHORITY
+    /// (deterministic op-id): re-paying an in-flight or already-settled invoice returns
+    /// [`SendOutcome::AlreadyInFlight`]/[`SendOutcome::AlreadyPaid`] carrying the ORIGINAL
+    /// op-id — never an `Err`, never a double-pay (spec §4). `custom_meta` is committed into
+    /// the operation meta.
+    pub async fn pay(
+        &self,
+        id: &FederationId,
+        invoice: Invoice,
+        gateway: Option<GatewayUrl>,
+        custom_meta: serde_json::Value,
+    ) -> anyhow::Result<SendOutcome> {
+        let client = self.client(id)?;
+        let lnv2 = client.get_first_module::<LightningClientModule>()?;
+        let bolt11 = Bolt11Invoice::from_str(&invoice.0)
+            .map_err(|e| anyhow::anyhow!("parsing invoice: {e}"))?;
+        map_send_result(
+            lnv2.send(bolt11, parse_gateway(gateway)?, custom_meta)
+                .await,
+        )
+    }
+
+    /// Block until `op`'s receive leg on `id` reaches a final state (spec §3's 3-state SM
+    /// claims the ecash automatically; we just await).
+    pub async fn await_receive(
+        &self,
+        id: &FederationId,
+        op: OperationId,
+    ) -> anyhow::Result<ReceiveState> {
+        let client = self.client(id)?;
+        // Guard the typed await against a swapped op-id (a send op handed to the receive
+        // await): the lnv2 helper would panic decoding the other leg's cached outcome, or
+        // hang on an in-flight op whose state machine never yields a receive state.
+        ensure_lnv2_op_kind(&client, op, Lnv2OpKind::Receive).await?;
+        let lnv2 = client.get_first_module::<LightningClientModule>()?;
+        let state = lnv2
+            .await_final_receive_operation_state(unbridge_op_id(op))
+            .await?;
+        Ok(map_receive_state(state))
+    }
+
+    /// Block until `op`'s send leg on `id` reaches a final state (the SM self-refunds on
+    /// gateway forfeit/expiry, spec §4).
+    pub async fn await_send(
+        &self,
+        id: &FederationId,
+        op: OperationId,
+    ) -> anyhow::Result<SendState> {
+        let client = self.client(id)?;
+        // Symmetric guard to `await_receive`: a receive op-id handed to the send await would
+        // panic/hang inside the lnv2 helper; fail cleanly on the mismatch instead.
+        ensure_lnv2_op_kind(&client, op, Lnv2OpKind::Send).await?;
+        let lnv2 = client.get_first_module::<LightningClientModule>()?;
+        let state = lnv2
+            .await_final_send_operation_state(unbridge_op_id(op))
+            .await?;
+        Ok(map_send_state(state))
+    }
+
+    /// Clone out the open client for `id`, or error if the federation isn't joined/opened.
+    /// Cloning the `Arc` under the (sync) map lock keeps the guard from crossing an await
+    /// point in the money methods above.
+    fn client(&self, id: &FederationId) -> anyhow::Result<ClientHandleArc> {
+        self.clients
+            .read()
+            .expect("client map lock poisoned")
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("federation {} not joined/opened", id.to_hex()))
+    }
+}
+
+/// Invoice expiry (seconds) passed to lnv2 `receive`. Spec §4 fixes this at one hour; the
+/// executor may size it per-move in step 4b.
+const RECEIVE_EXPIRY_SECS: u32 = 3600;
+
+/// The outcome of an lnv2 `send` (see [`MultiClient::pay`]). The dedup variants are
+/// OUTCOMES, not errors: the client recognised an existing operation for this invoice and
+/// hands back its op-id so the caller re-attaches instead of paying twice (spec §4 — the
+/// client is the dedup authority).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// A fresh payment was submitted; carries its new op-id.
+    Started(OperationId),
+    /// A payment for this invoice is already in progress; carries its existing op-id.
+    AlreadyInFlight(OperationId),
+    /// This invoice was already paid; carries the settled op-id.
+    AlreadyPaid(OperationId),
+}
+
+/// The final state of a receive leg (`await_final_receive_operation_state`).
+///
+/// NOTE: `Claimed` carries no amount. The underlying `FinalReceiveOperationState::Claimed`
+/// has none, and reading the claimed value back would mean decoding the operation meta —
+/// that belongs to the step-4b op-log work, not these raw primitives. The receiver already
+/// knows the requested amount at `receive`-time and reads the settled figure via `balance`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReceiveState {
+    /// The incoming payment was confirmed and the ecash was minted.
+    Claimed,
+    /// The invoice expired before it was paid.
+    Expired,
+    /// The receive failed (programming error or malicious federation).
+    Failed(String),
+}
+
+/// The final state of a send leg (`await_final_send_operation_state`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SendState {
+    /// The payment settled; carries the preimage proving the gateway paid the invoice.
+    Success(Preimage),
+    /// The payment failed and the outgoing contract was refunded to us.
+    Refunded,
+    /// The send failed (programming error or malicious federation).
+    Failed(String),
+}
+
+/// Map lnv2 `send`'s result to a [`SendOutcome`]: the two dedup errors become non-failure
+/// outcomes carrying the existing op-id; every other error is a real failure. Pure, so the
+/// dedup mapping is unit-tested without a live federation.
+fn map_send_result(
+    result: Result<FedimintOperationId, SendPaymentError>,
+) -> anyhow::Result<SendOutcome> {
+    match result {
+        Ok(op) => Ok(SendOutcome::Started(bridge_op_id(op))),
+        Err(SendPaymentError::PaymentInProgress(op)) => {
+            Ok(SendOutcome::AlreadyInFlight(bridge_op_id(op)))
+        }
+        Err(SendPaymentError::InvoiceAlreadyPaid(op)) => {
+            Ok(SendOutcome::AlreadyPaid(bridge_op_id(op)))
+        }
+        Err(e) => Err(anyhow::anyhow!("lnv2 send: {e}")),
+    }
+}
+
+fn map_receive_state(state: FinalReceiveOperationState) -> ReceiveState {
+    match state {
+        FinalReceiveOperationState::Claimed => ReceiveState::Claimed,
+        FinalReceiveOperationState::Expired => ReceiveState::Expired,
+        FinalReceiveOperationState::Failure => ReceiveState::Failed(
+            "receive failed (programming error or malicious federation)".into(),
+        ),
+    }
+}
+
+fn map_send_state(state: FinalSendOperationState) -> SendState {
+    match state {
+        FinalSendOperationState::Success(preimage) => SendState::Success(Preimage(preimage)),
+        FinalSendOperationState::Refunded => SendState::Refunded,
+        FinalSendOperationState::Failure => {
+            SendState::Failed("send failed (programming error or malicious federation)".into())
+        }
+    }
+}
+
+/// Which lnv2 leg an operation is. `await_final_{receive,send}_operation_state` each dispatch
+/// on ONE state-machine variant, so handing the wrong kind of op-id to a typed await is a
+/// latent panic (decoding the other leg's cached final outcome) or hang (an in-flight op whose
+/// state machine never yields the awaited variant) — [`ensure_lnv2_op_kind`] turns that into a
+/// clean error, since the CLI accepts any 32-byte op-id.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lnv2OpKind {
+    Send,
+    Receive,
+}
+
+impl Lnv2OpKind {
+    /// The `await-<label>` command / method name this kind belongs to (also the error vocab).
+    fn label(self) -> &'static str {
+        match self {
+            Lnv2OpKind::Send => "send",
+            Lnv2OpKind::Receive => "receive",
+        }
+    }
+
+    /// The kind an lnv2 operation's meta represents. `LnurlReceive` is a receive-side leg
+    /// (`await_final_receive_operation_state` handles it), so it maps to `Receive`.
+    fn of(meta: &LightningOperationMeta) -> Self {
+        match meta {
+            LightningOperationMeta::Send(_) => Lnv2OpKind::Send,
+            LightningOperationMeta::Receive(_) | LightningOperationMeta::LnurlReceive(_) => {
+                Lnv2OpKind::Receive
+            }
+        }
+    }
+}
+
+/// Fail unless `op` on `client` is an lnv2 lightning operation of the `expected` kind, so a
+/// swapped op-id fails cleanly instead of panicking/hanging inside the typed await (see
+/// [`Lnv2OpKind`]). Reads only the client's local op-log (no network); a valid op-id from
+/// `receive`/`pay` is always present by the time its await is called.
+async fn ensure_lnv2_op_kind(
+    client: &ClientHandleArc,
+    op: OperationId,
+    expected: Lnv2OpKind,
+) -> anyhow::Result<()> {
+    let fed_op = unbridge_op_id(op);
+    let entry = client
+        .operation_log()
+        .get_operation(fed_op)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("no operation found for id {}", fed_op.fmt_full()))?;
+    let meta = entry.try_meta::<LightningOperationMeta>().map_err(|e| {
+        anyhow::anyhow!(
+            "operation {} is not an lnv2 lightning operation: {e}",
+            fed_op.fmt_full()
+        )
+    })?;
+    let actual = Lnv2OpKind::of(&meta);
+    anyhow::ensure!(
+        actual == expected,
+        "operation {} is a {} operation, not a {} — await it with `await-{}` instead",
+        fed_op.fmt_full(),
+        actual.label(),
+        expected.label(),
+        actual.label(),
+    );
+    Ok(())
+}
+
+/// Parse an optional [`GatewayUrl`] into fedimint's `SafeUrl` via the public constructor
+/// (`SafeUrl`'s field is private). `None` stays `None`, letting lnv2 auto-select.
+fn parse_gateway(gateway: Option<GatewayUrl>) -> anyhow::Result<Option<SafeUrl>> {
+    gateway
+        .map(|g| {
+            SafeUrl::parse(&g.0).map_err(|e| anyhow::anyhow!("invalid gateway url {:?}: {e}", g.0))
+        })
+        .transpose()
+}
+
+fn bridge_gateway_url(url: SafeUrl) -> GatewayUrl {
+    GatewayUrl(url.to_string())
+}
+
+fn bridge_invoice(invoice: &Bolt11Invoice) -> Invoice {
+    Invoice(invoice.to_string())
+}
+
+/// Bridge fedimint's `OperationId([u8; 32])` to ours (both are the same 32 bytes, spec §3).
+fn bridge_op_id(op: FedimintOperationId) -> OperationId {
+    OperationId(op.0)
+}
+
+fn unbridge_op_id(op: OperationId) -> FedimintOperationId {
+    FedimintOperationId(op.0)
 }
 
 /// `[CLIENT_PREFIX_TAG] ++ u32_le(db_prefix)` — exactly 5 bytes (spec §4).
@@ -273,7 +578,8 @@ mod tests {
     use super::*;
     use fedimint_core::db::mem_impl::MemDatabase;
     use fedimint_core::db::IRawDatabaseExt as _;
-    use std::str::FromStr as _;
+    // `FromStr` (for `FederationId::from_str` / `Bolt11Invoice::from_str`) comes in via
+    // `use super::*` — the module already imports it for `pay`.
 
     #[test]
     fn client_prefix_is_fixed_length_and_tagged() {
@@ -349,6 +655,102 @@ mod tests {
         assert_eq!(bytes_a, bytes_a_again);
         // Different mnemonic -> different root secret (two wallets must never collide).
         assert_ne!(bytes_a, bytes_b);
+    }
+
+    #[test]
+    fn send_result_maps_dedup_errors_to_outcomes_not_failures() {
+        let op = FedimintOperationId::new_random();
+        // A fresh submission -> Started, carrying the new op-id.
+        assert_eq!(
+            map_send_result(Ok(op)).expect("Ok maps to an outcome"),
+            SendOutcome::Started(OperationId(op.0))
+        );
+        // The two dedup errors are OUTCOMES (not failures), each carrying the EXISTING
+        // op-id so the caller re-attaches rather than double-paying.
+        assert_eq!(
+            map_send_result(Err(SendPaymentError::PaymentInProgress(op)))
+                .expect("PaymentInProgress maps to an outcome"),
+            SendOutcome::AlreadyInFlight(OperationId(op.0))
+        );
+        assert_eq!(
+            map_send_result(Err(SendPaymentError::InvoiceAlreadyPaid(op)))
+                .expect("InvoiceAlreadyPaid maps to an outcome"),
+            SendOutcome::AlreadyPaid(OperationId(op.0))
+        );
+        // Any other send error stays a real failure (never a silent success).
+        assert!(map_send_result(Err(SendPaymentError::InvoiceExpired)).is_err());
+        assert!(map_send_result(Err(SendPaymentError::FederationNotSupported)).is_err());
+    }
+
+    #[test]
+    fn lnv2_op_kinds_are_distinct_and_labelled_for_the_cli() {
+        // The send/receive await guards compare kinds, so the two must be distinguishable...
+        assert_ne!(Lnv2OpKind::Send, Lnv2OpKind::Receive);
+        // ...and the labels must match the `await-<label>` CLI subcommands, so the mismatch
+        // error tells the operator exactly which await to use instead.
+        assert_eq!(Lnv2OpKind::Send.label(), "send");
+        assert_eq!(Lnv2OpKind::Receive.label(), "receive");
+    }
+
+    #[test]
+    fn receive_state_maps_every_final_state() {
+        assert_eq!(
+            map_receive_state(FinalReceiveOperationState::Claimed),
+            ReceiveState::Claimed
+        );
+        assert_eq!(
+            map_receive_state(FinalReceiveOperationState::Expired),
+            ReceiveState::Expired
+        );
+        assert!(matches!(
+            map_receive_state(FinalReceiveOperationState::Failure),
+            ReceiveState::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn send_state_maps_every_final_state_and_preserves_the_preimage() {
+        let preimage = [7u8; 32];
+        assert_eq!(
+            map_send_state(FinalSendOperationState::Success(preimage)),
+            SendState::Success(Preimage(preimage))
+        );
+        assert_eq!(
+            map_send_state(FinalSendOperationState::Refunded),
+            SendState::Refunded
+        );
+        assert!(matches!(
+            map_send_state(FinalSendOperationState::Failure),
+            SendState::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn op_id_bridge_round_trips() {
+        let op = FedimintOperationId::new_random();
+        let ours = bridge_op_id(op);
+        assert_eq!(ours.0, op.0);
+        assert_eq!(unbridge_op_id(ours), op);
+    }
+
+    #[test]
+    fn gateway_url_bridges_through_safe_url() -> anyhow::Result<()> {
+        // A present gateway parses to a SafeUrl and round-trips back to the same GatewayUrl.
+        let parsed = parse_gateway(Some(GatewayUrl("http://127.0.0.1:8175/".into())))?;
+        let safe = parsed.expect("Some gateway -> Some SafeUrl");
+        assert_eq!(bridge_gateway_url(safe).0, "http://127.0.0.1:8175/");
+        // No gateway stays None (lnv2 auto-selects).
+        assert!(parse_gateway(None)?.is_none());
+        // A malformed gateway url is a clean error, not a panic.
+        assert!(parse_gateway(Some(GatewayUrl("not a url".into()))).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_invoice_string_is_a_clean_error() {
+        // `pay` parses the invoice via `Bolt11Invoice::from_str`; garbage must error cleanly
+        // (surfaced as an `anyhow` error), not panic.
+        assert!(Bolt11Invoice::from_str("not-a-bolt11-invoice").is_err());
     }
 
     #[tokio::test]
