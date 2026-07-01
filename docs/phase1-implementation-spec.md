@@ -14,7 +14,9 @@ code that actually **moves ecash across federations and survives crashes**. It a
 - **What gets built:** a `MultiClient` (one `fedimint_client::Client` per federation, one async
   RocksDB with per-fed key prefixes), a `FedimintExecutor` that performs **two actions** —
   `Move` (cross-fed transfer A→B) and `DirectInflow` (route a receive to a chosen fed, the
-  cheap primary lever) — plus the op-log-backed journal, the resume loop, and the devimint harness.
+  cheap primary lever) — plus the op-log-backed journal, the resume loop, and **`wallet-cli`**
+  (a first-class, permanent headless frontend over the engine — ADR-0023 — that is also the
+  devimint integration-test driver). The Android app is the *other* frontend, built later.
 - **The money path (validated live):** a cross-fed move is **two ordinary fedimint operations**
   — `B.receive` then `A.send` through a shared gateway's internal swap. The fedimint clients
   self-resume their own state machines, so we don't re-implement them; we own only a thin
@@ -34,8 +36,10 @@ code that actually **moves ecash across federations and survives crashes**. It a
   at every step (no double-pay, no second payable invoice), plus a `DirectInflow` that nets
   exactly the target amount.
 - **Build order:** (0) behavior-preserving `wallet-core` async + newtype refactor → (1) the pure
-  move state machine → (2) the journal over fedimint's `Database` → (3) `MultiClient` →
-  (4) `FedimintExecutor` + fees → (5) two-fed crash/reconcile gate.
+  move state machine → (2) the journal over fedimint's `Database` → (3) `MultiClient` +
+  `wallet-cli` join/balance → (4) `FedimintExecutor` + fees + `wallet-cli` move/reconcile →
+  (5) two-fed crash/reconcile gate via real `wallet-cli` process kills. `wallet-cli` grows with
+  the engine, not bolted on at the end.
 
 ## 0. Goal + scope
 Smallest thing that proves a cross-federation ecash move works and survives a crash. Exit
@@ -56,14 +60,21 @@ devimint harness.
 discovery, the orchestrator tick, executing `Evacuate`, UI.
 
 ## 1. Crate layout
+The wallet is an **engine** with **two co-equal frontends** over its public API — `wallet-cli`
+(headless, permanent) and, later, the Android app (Slint UI). Neither reaches around the engine
+API; the engine assumes no UI (ADR-0023).
 ```
 wallet-core/        (no fedimint/network/db dep; async I/O traits + sync pure logic)
-wallet-fedimint/    (NEW; depends on fedimint-client + wallet-core)
+wallet-fedimint/    (the ENGINE; depends on fedimint-client + wallet-core)
     multi_client.rs  MultiClient over fedimint_client::Client per fed
     executor.rs      FedimintExecutor: impl async wallet_core::Executor
     journal.rs       FedimintJournal: impl async wallet_core::Journal over fedimint Database (prefix [0x00])
     move_protocol.rs MoveRecord + pure sync next_step + op-log backfill mapping
     runtime.rs       open-all + op-log backfill + reconcile on startup
+wallet-cli/         (FIRST-CLASS frontend, kept forever — ADR-0023; a clap bin over the engine:
+                     join / balance / receive / pay / move / reconcile / list-feds. The
+                     dogfooding surface AND the devimint integration-test driver.)
+# (later) the Android frontend — Slint UI + JNI — is the OTHER frontend over the same engine.
 ```
 (There is NO `move_sm.rs`; the per-leg state-machine model was retired, ADR-0022.)
 
@@ -337,7 +348,10 @@ re-check each referenced Intent before returning it.
 ## 10. Test plan
 - **Pure unit (`cargo test`):** `next_step` resume-from-every-phase; async `apply`/`reconcile`
   with async `MockExecutor`/`MemJournal` (`#[tokio::test]`); `ExecError` retry vs terminal.
-- **devimint e2e (`--features devimint-e2e`):** the gate + the explicit crash-window cases —
+- **devimint e2e — CLI-driven (ADR-0023):** the money-path + crash gates drive the **`wallet-cli`
+  binary** against a devimint federation (as devimint drives `fedimint-cli`), NOT the Rust API
+  in-process. This makes the crash cases real: run `wallet-cli move …`, **`kill -9` the process
+  mid-move**, then `wallet-cli reconcile`, and assert balances. The cases —
   (a) `apply(Move A→B)` moves ecash; (b) crash after receive-commit-before-MoveRecord → backfill
   prevents a second invoice; (c) crash after send-commit-before-MoveRecord → no double-pay;
   (d) restore-from-seed mid-move (client DB gone): backfill CANNOT repair (no op-log) — assert
@@ -357,10 +371,14 @@ re-check each referenced Intent before returning it.
    guardian identity → `Vec<GuardianId>`, idempotency-key formatting. (No `move_sm`.)
 1. `move_protocol.rs` (`MoveRecord`, `next_step`, the op-log→MoveRecord mapping) + pure tests.
 2. `FedimintJournal` over an in-memory fedimint `Database` using raw byte/serde rows + tests.
-3. `MultiClient` (join/open/balance/receive/pay with `custom_meta`, `backfill_ops`) + devimint single-fed smoke.
-4. `FedimintExecutor` + `quote`/fee preflight + `assemble_record` merge → real ecash:
-   `DirectInflow` (receive on a chosen fed, B nets `amount`) then `Move` (single-fed self-move).
-5. Two-fed harness + the crash-window/reconcile/backfill-merge gate tests.
+3. `MultiClient` (join/open/balance) **+ the `wallet-cli` crate with `join`/`balance`/`list-feds`**
+   (ADR-0023) + a devimint smoke that drives `wallet-cli` (join a devimint fed, assert balance).
+   Then `MultiClient` receive/pay/await/`backfill_ops` with `custom_meta`.
+4. `FedimintExecutor` + `quote`/fee preflight + `assemble_record` merge → real ecash, exposed as
+   `wallet-cli move`/`receive`/`reconcile`: `DirectInflow` (receive on a chosen fed, B nets
+   `amount`) then `Move` (single-fed self-move), driven + asserted via `wallet-cli`.
+5. Two-fed harness + the crash/reconcile/backfill gate via **real `wallet-cli` process kills**
+   (`kill -9` mid-move → `wallet-cli reconcile` → no double-pay/double-invoice).
 
 ## 12. Decisions (settled)
 - ⟦D1⟧ crate `wallet-fedimint`. ⟦D2⟧ 100% async, `&self` + interior mutability, no block_on.
