@@ -20,10 +20,14 @@ fedimint-core = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec
 fedimint-client = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
 fedimint-bip39 = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
 fedimint-rocksdb = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
+# `ConnectorRegistry` (join/open need it) is already resolved transitively via
+# fedimint-client, so pinning it directly adds no new version to the lockfile.
+fedimint-connectors = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
 fedimint-mint-client = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
 fedimint-wallet-client = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
 fedimint-ln-client = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
 fedimint-lnv2-client = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
+anyhow = "1"
 async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

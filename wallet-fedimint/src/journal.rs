@@ -1,6 +1,7 @@
 //! [`FedimintJournal`] — the durable, async [`wallet_core::Journal`] backed by a fedimint
 //! [`Database`] (spec §8). All journal rows live under the **app prefix `[0x00]`**
-//! (`db.with_prefix(vec![0x00])`); the per-federation clients use `[0x01, ..]` (a later step).
+//! (`db.with_prefix(vec![0x00])`); the per-federation clients use `[0x01, ..]` (see
+//! [`crate::multi_client::MultiClient`]).
 //!
 //! # Encoding (settled): serde over the RAW byte API, NOT fedimint `Encodable`
 //! Our row values are versioned `serde_json` envelopes containing plain types ([`Intent`],
@@ -47,7 +48,8 @@ use std::sync::Arc;
 use wallet_core::FederationId;
 use wallet_core::{ExecError, IdempotencyKey, Intent, IntentStatus, Journal};
 
-/// The app-state partition prefix (spec §4/§8). Clients live at `[0x01, ..]` (a later step).
+/// The app-state partition prefix (spec §4/§8). Clients live at `[0x01, ..]`, see
+/// [`crate::multi_client::MultiClient`].
 const APP_PREFIX: u8 = 0x00;
 
 // Type tags within the app prefix.

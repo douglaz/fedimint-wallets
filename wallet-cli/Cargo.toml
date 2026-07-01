@@ -1,0 +1,24 @@
+[package]
+name = "wallet-cli"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+# The first-class, permanent headless frontend over the wallet engine (ADR-0023). Thin:
+# all logic lives in wallet-fedimint/wallet-core; this crate only parses arguments, drives
+# the engine, and formats output.
+# NOTE: needs the nix build env for fedimint's native deps, same as wallet-fedimint —
+# build/test with: nix develop /home/master/p/fedimint -c cargo <cmd>
+[dependencies]
+wallet-core = { path = "../wallet-core" }
+wallet-fedimint = { path = "../wallet-fedimint" }
+# Same git source + rev as wallet-fedimint (see its Cargo.toml note); do not change the pin.
+fedimint-core = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
+fedimint-client = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
+fedimint-bip39 = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
+fedimint-rocksdb = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"
+rand = "0.8"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
