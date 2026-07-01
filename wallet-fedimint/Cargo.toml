@@ -15,7 +15,15 @@ license = "AGPL-3.0-or-later"
 # build/test with: nix develop /home/master/p/fedimint -c cargo <cmd>
 [dependencies]
 wallet-core = { path = "../wallet-core" }
+# All fedimint crates share ONE git source + rev (douglaz/fedimint @ b108ec6, see note above).
 fedimint-core = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
+fedimint-client = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
+fedimint-bip39 = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
+fedimint-rocksdb = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
+fedimint-mint-client = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
+fedimint-wallet-client = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
+fedimint-ln-client = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
+fedimint-lnv2-client = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
 async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
