@@ -1,5 +1,6 @@
 use async_trait::async_trait;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use tokio::sync::Barrier;
 use wallet_core::*;
 
 fn ikey(key: &str) -> IdempotencyKey {
@@ -72,12 +73,167 @@ impl Journal for GetFailsJournal {
         unreachable!("apply must not drive when get fails")
     }
 
+    async fn set_status_if(
+        &self,
+        _key: &IdempotencyKey,
+        _expected: IntentStatus,
+        _new: IntentStatus,
+    ) -> Result<bool, ExecError> {
+        unreachable!("apply must not drive when get fails")
+    }
+
     async fn pending(&self) -> Vec<Intent> {
         Vec::new()
     }
 
     async fn failed(&self) -> Vec<Intent> {
         Vec::new()
+    }
+}
+
+/// A [`Journal`] wrapping a [`MemJournal`] whose `set_status_if` rendezvouses at a
+/// [`Barrier`] before delegating. Used by `concurrent_drive_performs_once` to force two
+/// concurrent `drive`s to both reach their CAS claim together, so the race it exercises is
+/// real rather than accidentally serialized by the runtime running one `reconcile` to
+/// completion before the other starts.
+struct BarrierJournal {
+    inner: MemJournal,
+    barrier: Barrier,
+}
+
+#[async_trait]
+impl Journal for BarrierJournal {
+    async fn upsert(&self, intent: &Intent) -> Result<(), ExecError> {
+        self.inner.upsert(intent).await
+    }
+
+    async fn get(&self, key: &IdempotencyKey) -> Result<Option<Intent>, ExecError> {
+        self.inner.get(key).await
+    }
+
+    async fn set_status(
+        &self,
+        key: &IdempotencyKey,
+        status: IntentStatus,
+    ) -> Result<(), ExecError> {
+        self.inner.set_status(key, status).await
+    }
+
+    async fn set_status_if(
+        &self,
+        key: &IdempotencyKey,
+        expected: IntentStatus,
+        new: IntentStatus,
+    ) -> Result<bool, ExecError> {
+        self.barrier.wait().await;
+        self.inner.set_status_if(key, expected, new).await
+    }
+
+    async fn pending(&self) -> Vec<Intent> {
+        self.inner.pending().await
+    }
+
+    async fn failed(&self) -> Vec<Intent> {
+        self.inner.failed().await
+    }
+}
+
+/// A [`Journal`] wrapper whose `pending()` captures a snapshot immediately, then waits
+/// before returning it. This lets a test hold a stale `Executing` snapshot until after the
+/// first driver has already completed the intent.
+struct DelayedPendingJournal {
+    inner: Arc<MemJournal>,
+    snapshot_taken: Barrier,
+    release_snapshot: Barrier,
+}
+
+#[async_trait]
+impl Journal for DelayedPendingJournal {
+    async fn upsert(&self, intent: &Intent) -> Result<(), ExecError> {
+        self.inner.upsert(intent).await
+    }
+
+    async fn get(&self, key: &IdempotencyKey) -> Result<Option<Intent>, ExecError> {
+        self.inner.get(key).await
+    }
+
+    async fn set_status(
+        &self,
+        key: &IdempotencyKey,
+        status: IntentStatus,
+    ) -> Result<(), ExecError> {
+        self.inner.set_status(key, status).await
+    }
+
+    async fn set_status_if(
+        &self,
+        key: &IdempotencyKey,
+        expected: IntentStatus,
+        new: IntentStatus,
+    ) -> Result<bool, ExecError> {
+        self.inner.set_status_if(key, expected, new).await
+    }
+
+    async fn pending(&self) -> Vec<Intent> {
+        let snapshot = self.inner.pending().await;
+        self.snapshot_taken.wait().await;
+        self.release_snapshot.wait().await;
+        snapshot
+    }
+
+    async fn failed(&self) -> Vec<Intent> {
+        self.inner.failed().await
+    }
+
+    fn store_id(&self) -> usize {
+        Arc::as_ptr(&self.inner) as *const () as usize
+    }
+}
+
+/// An executor that holds the first `perform` open. A second `perform` call records a
+/// duplicate key and returns immediately, making the in-flight `Executing` race observable
+/// without hanging the test.
+struct BlockingExecutor {
+    performed_keys: Mutex<Vec<IdempotencyKey>>,
+    first_entered: Barrier,
+    release_first: Barrier,
+}
+
+impl BlockingExecutor {
+    fn new() -> Self {
+        Self {
+            performed_keys: Mutex::new(Vec::new()),
+            first_entered: Barrier::new(2),
+            release_first: Barrier::new(2),
+        }
+    }
+
+    fn performed_keys(&self) -> Vec<IdempotencyKey> {
+        self.performed_keys
+            .lock()
+            .expect("blocking executor mutex poisoned")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl Executor for BlockingExecutor {
+    async fn perform(&self, intent: &Intent) -> Result<PerformOutcome, ExecError> {
+        let call = {
+            let mut performed_keys = self
+                .performed_keys
+                .lock()
+                .expect("blocking executor mutex poisoned");
+            performed_keys.push(intent.idempotency_key.clone());
+            performed_keys.len()
+        };
+
+        if call == 1 {
+            self.first_entered.wait().await;
+            self.release_first.wait().await;
+        }
+
+        Ok(PerformOutcome::Done)
     }
 }
 
@@ -463,5 +619,170 @@ async fn awaiting_replay_after_crash_preserves_awaiting_status() {
     assert_eq!(
         journal.get(&ikey(key)).await.expect("get").unwrap().status,
         IntentStatus::Awaiting
+    );
+}
+
+/// The single-writer CAS claim: two concurrent `drive`s of the same `Pending` intent must
+/// yield exactly one `perform`. `BarrierJournal` forces both `reconcile` calls to reach their
+/// CAS claim together (both have already fetched the `Pending` intent via `pending()` before
+/// either attempts the claim), so this exercises the real race, not two serialized passes.
+#[tokio::test]
+async fn concurrent_drive_performs_once() {
+    let key = "move:1:2:42";
+    let intent = Intent::from_decision(&move_decision(key, 42));
+    let inner = MemJournal::new();
+    inner.upsert(&intent).await.unwrap();
+    let journal = Arc::new(BarrierJournal {
+        inner,
+        barrier: Barrier::new(2),
+    });
+    let executor = Arc::new(MockExecutor::new());
+
+    let (j1, e1) = (Arc::clone(&journal), Arc::clone(&executor));
+    let (j2, e2) = (Arc::clone(&journal), Arc::clone(&executor));
+    let task1 = tokio::spawn(async move { reconcile(j1.as_ref(), e1.as_ref()).await });
+    let task2 = tokio::spawn(async move { reconcile(j2.as_ref(), e2.as_ref()).await });
+    let (a, b) = tokio::join!(task1, task2);
+    let (a, b) = (a.expect("task1 join"), b.expect("task2 join"));
+
+    let combined = ExecutionSummary {
+        performed: a.performed + b.performed,
+        skipped: a.skipped + b.skipped,
+        failed: a.failed + b.failed,
+    };
+    assert_eq!(
+        combined,
+        counts(1, 1, 0),
+        "exactly one of the two concurrent drives performs; the other loses the CAS and skips"
+    );
+    assert_eq!(executor.performed_keys(), vec![ikey(key)]);
+    assert_eq!(
+        journal.get(&ikey(key)).await.expect("get").unwrap().status,
+        IntentStatus::Done
+    );
+}
+
+/// Once a first driver has claimed `Pending -> Executing`, ordinary `apply`/`reconcile`
+/// can observe that `Executing` row before the first `perform` stores a terminal status.
+/// That second driver must skip the live in-process operation, while a later crash-recovery
+/// pass with no in-flight guard still resumes `Executing`.
+#[tokio::test]
+async fn concurrent_executing_drive_skips_in_flight_perform() {
+    let key = "executing-race:1";
+    let mut intent = Intent::from_decision(&move_decision(key, 42));
+    intent.status = IntentStatus::Executing;
+
+    let journal = Arc::new(MemJournal::new());
+    journal.upsert(&intent).await.unwrap();
+    let executor = Arc::new(BlockingExecutor::new());
+
+    let (j1, e1) = (Arc::clone(&journal), Arc::clone(&executor));
+    let task1 = tokio::spawn(async move { reconcile(j1.as_ref(), e1.as_ref()).await });
+
+    executor.first_entered.wait().await;
+
+    let second = reconcile(journal.as_ref(), executor.as_ref()).await;
+    assert_eq!(
+        second,
+        counts(0, 1, 0),
+        "a concurrent Executing driver must skip the in-flight perform"
+    );
+    assert_eq!(executor.performed_keys(), vec![ikey(key)]);
+
+    executor.release_first.wait().await;
+    let first = task1.await.expect("task1 join");
+    assert_eq!(first, counts(1, 0, 0));
+    assert_eq!(executor.performed_keys(), vec![ikey(key)]);
+    assert_eq!(
+        journal.get(&ikey(key)).await.expect("get").unwrap().status,
+        IntentStatus::Done
+    );
+}
+
+/// A stale `Executing` snapshot captured while another driver is in `perform` must not run
+/// after that first driver completes and releases the process-local in-flight guard.
+#[tokio::test]
+async fn concurrent_executing_stale_snapshot_skips_after_completion() {
+    let key = "executing-stale:1";
+    let mut intent = Intent::from_decision(&move_decision(key, 42));
+    intent.status = IntentStatus::Executing;
+
+    let journal = Arc::new(MemJournal::new());
+    journal.upsert(&intent).await.unwrap();
+    let executor = Arc::new(BlockingExecutor::new());
+
+    let (j1, e1) = (Arc::clone(&journal), Arc::clone(&executor));
+    let task1 = tokio::spawn(async move { reconcile(j1.as_ref(), e1.as_ref()).await });
+
+    executor.first_entered.wait().await;
+
+    let delayed = Arc::new(DelayedPendingJournal {
+        inner: Arc::clone(&journal),
+        snapshot_taken: Barrier::new(2),
+        release_snapshot: Barrier::new(2),
+    });
+    let (j2, e2) = (Arc::clone(&delayed), Arc::clone(&executor));
+    let task2 = tokio::spawn(async move { reconcile(j2.as_ref(), e2.as_ref()).await });
+
+    delayed.snapshot_taken.wait().await;
+
+    executor.release_first.wait().await;
+    let first = task1.await.expect("task1 join");
+    assert_eq!(first, counts(1, 0, 0));
+    assert_eq!(
+        journal.get(&ikey(key)).await.expect("get").unwrap().status,
+        IntentStatus::Done
+    );
+
+    delayed.release_snapshot.wait().await;
+    let second = task2.await.expect("task2 join");
+    assert_eq!(
+        second,
+        counts(0, 1, 0),
+        "a stale Executing snapshot must skip after the row is already terminal"
+    );
+    assert_eq!(executor.performed_keys(), vec![ikey(key)]);
+}
+
+/// `set_status_if` itself: wins on a matching `expected`, moving the status (and, for a
+/// durable journal, the pending index); loses (no change) on a mismatch, including on an
+/// intent that has already moved past `expected`; and returns `Ok(false)` for an absent key.
+#[tokio::test]
+async fn set_status_if_cas() {
+    let key = ikey("move:1:2:42");
+    let intent = Intent::from_decision(&move_decision("move:1:2:42", 42));
+    let journal = MemJournal::new();
+    journal.upsert(&intent).await.unwrap();
+
+    assert_eq!(
+        journal
+            .set_status_if(&key, IntentStatus::Pending, IntentStatus::Executing)
+            .await,
+        Ok(true)
+    );
+    assert_eq!(
+        journal.get(&key).await.expect("get").unwrap().status,
+        IntentStatus::Executing
+    );
+
+    // Already Executing: a second claim against the stale `expected` (Pending) must not win.
+    assert_eq!(
+        journal
+            .set_status_if(&key, IntentStatus::Pending, IntentStatus::Executing)
+            .await,
+        Ok(false)
+    );
+    assert_eq!(
+        journal.get(&key).await.expect("get").unwrap().status,
+        IntentStatus::Executing
+    );
+
+    // An absent key never matches any `expected`.
+    let missing = ikey("no-such-key");
+    assert_eq!(
+        journal
+            .set_status_if(&missing, IntentStatus::Pending, IntentStatus::Executing)
+            .await,
+        Ok(false)
     );
 }

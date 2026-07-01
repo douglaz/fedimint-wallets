@@ -39,10 +39,11 @@
 
 use crate::move_protocol::MoveRecord;
 use async_trait::async_trait;
-use fedimint_core::db::{Database, DatabaseError, IDatabaseTransactionOpsCore};
+use fedimint_core::db::{AutocommitError, Database, DatabaseError, IDatabaseTransactionOpsCore};
 use futures::StreamExt;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use wallet_core::FederationId;
 use wallet_core::{ExecError, IdempotencyKey, Intent, IntentStatus, Journal};
 
@@ -93,6 +94,10 @@ pub struct FederationListReport {
 pub struct FedimintJournal {
     /// Already `with_prefix(vec![0x00])`; all raw keys here are relative to that partition.
     db: Database,
+    /// [`Journal::store_id`]: identity of `db`'s underlying storage, captured in [`Self::new`]
+    /// from the pre-`with_prefix` handle (see there for why `with_prefix` itself can't supply
+    /// it).
+    store_id: usize,
 }
 
 impl FedimintJournal {
@@ -100,9 +105,19 @@ impl FedimintJournal {
     ///
     /// Two `FedimintJournal`s built from the SAME underlying `Database` share storage (the
     /// `[0x00]` partition over one inner `Arc`): a row written by one is visible to the other.
+    ///
+    /// [`Self::store_id`] (spec §2, the in-process single-writer guard) is captured HERE, from
+    /// `db` itself, before `with_prefix` wraps it: `with_prefix` always allocates a fresh
+    /// adapter `Arc`, so two `FedimintJournal`s built from clones of the same `db` would
+    /// otherwise get different post-prefix pointers even though they share the same backing
+    /// store. `Database::clone` shares its inner `Arc` unchanged, so reading the identity off
+    /// a clone of the ORIGINAL `db` (via the public `into_inner`) gives two such calls the
+    /// SAME id, while an unrelated `Database` gets a different one.
     pub fn new(db: Database) -> Self {
+        let store_id = Arc::as_ptr(&db.clone().into_inner()) as *const () as usize;
         Self {
             db: db.with_prefix(vec![APP_PREFIX]),
+            store_id,
         }
     }
 
@@ -116,9 +131,9 @@ impl FedimintJournal {
             return Ok(None);
         };
         let intent: Intent = decode_row_result("intent", &raw_key, &bytes)?;
-        // Integrity guard (round-8 review): the row's own key MUST match the one we looked up.
-        // A mismatch means a corrupt row or a key-encoding collision, not a real hit — reject it
-        // (a targeted `get` returning the wrong intent would be worse than an error).
+        // The row's own key MUST match the one we looked up. A mismatch means a corrupt row
+        // or a key-encoding collision, not a real hit; a targeted `get` returning the wrong
+        // intent would be worse than an error.
         if intent.idempotency_key != *key {
             return Err(ExecError::Permanent(format!(
                 "journal: intent row under {key:?} carries mismatched key {:?}",
@@ -379,22 +394,48 @@ impl Journal for FedimintJournal {
         let old_status = intent.status;
         intent.status = status;
 
-        // Move the index entry atomically with the Intent rewrite (old removed, new inserted),
-        // touching the index only for the scanned statuses (see module docs).
-        if old_status != status && is_indexed(old_status) {
-            dbtx.raw_remove_entry(&pending_index_key(old_status, key))
-                .await
-                .map_err(db_err)?;
-        }
-        if is_indexed(status) {
-            dbtx.raw_insert_bytes(&pending_index_key(status, key), &[])
-                .await
-                .map_err(db_err)?;
-        }
-        let value = encode_row(&intent)?;
-        dbtx.raw_insert_bytes(&ikey, &value).await.map_err(db_err)?;
+        write_intent_and_index(&mut dbtx, &ikey, key, old_status, &intent).await?;
         dbtx.commit_tx_result().await.map_err(db_err)?;
         Ok(())
+    }
+
+    /// The single-writer claim: read the intent row; if absent or its status != `expected`,
+    /// make no change and return `Ok(false)`; otherwise set `status = new`, rewrite the
+    /// intent row, and move the `PendingIndexKey` in the SAME dbtx as the read and the status
+    /// check. The autocommit wrapper retries write conflicts: a loser re-reads the winner's
+    /// status and returns `Ok(false)`, so at most one caller observes `Ok(true)` for a given
+    /// `expected -> new` transition.
+    async fn set_status_if(
+        &self,
+        key: &IdempotencyKey,
+        expected: IntentStatus,
+        new: IntentStatus,
+    ) -> Result<bool, ExecError> {
+        self.db
+            .autocommit(
+                |dbtx, _| {
+                    Box::pin(async move {
+                        let ikey = intent_key(key);
+                        let Some(bytes) = dbtx.raw_get_bytes(&ikey).await.map_err(db_err)? else {
+                            return Ok(false);
+                        };
+                        let mut intent = decode_row_result::<Intent>("intent", &ikey, &bytes)?;
+                        if intent.status != expected {
+                            return Ok(false);
+                        }
+                        intent.status = new;
+
+                        write_intent_and_index(dbtx, &ikey, key, expected, &intent).await?;
+                        Ok(true)
+                    })
+                },
+                None,
+            )
+            .await
+            .map_err(|e| match e {
+                AutocommitError::CommitFailed { last_error, .. } => db_err(last_error),
+                AutocommitError::ClosureError { error, .. } => error,
+            })
     }
 
     async fn pending(&self) -> Vec<Intent> {
@@ -416,6 +457,35 @@ impl Journal for FedimintJournal {
                 Vec::new()
             })
     }
+
+    fn store_id(&self) -> usize {
+        self.store_id
+    }
+}
+
+/// Rewrite the Intent row and move its `PendingIndexKey` entry from `old_status` to
+/// `new_intent.status`, in the caller's already-open `dbtx` — the one-dbtx atomicity contract
+/// (spec §8) shared by [`Journal::set_status`] and [`Journal::set_status_if`].
+async fn write_intent_and_index(
+    dbtx: &mut impl IDatabaseTransactionOpsCore,
+    ikey: &[u8],
+    key: &IdempotencyKey,
+    old_status: IntentStatus,
+    new_intent: &Intent,
+) -> Result<(), ExecError> {
+    if old_status != new_intent.status && is_indexed(old_status) {
+        dbtx.raw_remove_entry(&pending_index_key(old_status, key))
+            .await
+            .map_err(db_err)?;
+    }
+    if is_indexed(new_intent.status) {
+        dbtx.raw_insert_bytes(&pending_index_key(new_intent.status, key), &[])
+            .await
+            .map_err(db_err)?;
+    }
+    let value = encode_row(new_intent)?;
+    dbtx.raw_insert_bytes(ikey, &value).await.map_err(db_err)?;
+    Ok(())
 }
 
 // --- key encoding ---

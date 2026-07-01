@@ -3,12 +3,16 @@
 //! round-trips, the atomic Intent + `PendingIndexKey` write, the index moving on a status
 //! change, the `MoveRecord` cache, the federation registry, and cross-handle persistence.
 
+use async_trait::async_trait;
 use fedimint_core::db::mem_impl::MemDatabase;
 use fedimint_core::db::IDatabaseTransactionOpsCore;
 use fedimint_core::db::IRawDatabaseExt;
 use futures::StreamExt;
+use std::sync::{Arc, Mutex};
+use tokio::sync::Barrier;
 use wallet_core::{
-    Action, ExecError, FederationId, IdempotencyKey, Intent, IntentStatus, Journal, Msat,
+    reconcile, Action, ExecError, Executor, FederationId, IdempotencyKey, Intent, IntentStatus,
+    Journal, MockExecutor, Msat, PerformOutcome,
 };
 use wallet_fedimint::{
     FederationInfo, FedimintJournal, GatewayUrl, Invoice, MovePhase, MoveRecord, OperationId,
@@ -122,6 +126,74 @@ async fn set_status_moves_between_indexes() {
     );
 }
 
+/// The single-writer CAS claim: `set_status_if` wins when the stored status matches
+/// `expected`, moving BOTH the intent row and the `PendingIndexKey` in the same dbtx; it
+/// loses (no write at all) on a status mismatch, including once the intent has already moved
+/// past `expected`; and it returns `Ok(false)` for a key with no stored intent.
+#[tokio::test]
+async fn set_status_if_cas() {
+    let journal = mem_journal();
+    let i = intent("cas", IntentStatus::Pending);
+    journal.upsert(&i).await.expect("upsert");
+
+    assert!(journal
+        .set_status_if(
+            &i.idempotency_key,
+            IntentStatus::Pending,
+            IntentStatus::Executing,
+        )
+        .await
+        .expect("set_status_if"));
+    assert_eq!(
+        journal
+            .get(&i.idempotency_key)
+            .await
+            .expect("get")
+            .map(|i| i.status),
+        Some(IntentStatus::Executing)
+    );
+    assert!(has_key(&journal.pending().await, "cas"));
+
+    // A second claim against the now-stale `expected` (Pending) must not win: no change to
+    // the intent row or either index.
+    assert!(!journal
+        .set_status_if(
+            &i.idempotency_key,
+            IntentStatus::Pending,
+            IntentStatus::Executing,
+        )
+        .await
+        .expect("set_status_if"));
+    assert_eq!(
+        journal
+            .get(&i.idempotency_key)
+            .await
+            .expect("get")
+            .map(|i| i.status),
+        Some(IntentStatus::Executing)
+    );
+
+    // Winning claim moves the index too: Executing -> Failed via CAS leaves `pending()` and
+    // enters `failed()`.
+    assert!(journal
+        .set_status_if(
+            &i.idempotency_key,
+            IntentStatus::Executing,
+            IntentStatus::Failed,
+        )
+        .await
+        .expect("set_status_if"));
+    assert!(!has_key(&journal.pending().await, "cas"));
+    assert!(has_key(&journal.failed().await, "cas"));
+
+    // An absent key never matches any `expected`.
+    let missing = IdempotencyKey("no-such-key".to_string());
+    assert!(!journal
+        .set_status_if(&missing, IntentStatus::Pending, IntentStatus::Executing)
+        .await
+        .expect("set_status_if"));
+}
+
 /// Test 3: `pending()` returns Pending|Executing only — Done and Failed are excluded.
 #[tokio::test]
 async fn pending_excludes_done_and_failed() {
@@ -222,6 +294,211 @@ async fn shared_database_handle_persists() {
     assert_eq!(
         reader.get_move(&rec.key).await.expect("get_move"),
         Some(rec)
+    );
+}
+
+/// `Journal::store_id` (the identity `drive`'s process-local in-flight-performs guard uses
+/// to recognize "same store") must match for two INDEPENDENTLY-CONSTRUCTED
+/// `FedimintJournal`s over the SAME `Database` — the cross-handle sharing
+/// `shared_database_handle_persists` already proves for reads/writes — and must NOT match
+/// for two unrelated `Database`s, or the guard would wrongly conflate unrelated stores.
+#[tokio::test]
+async fn store_id_matches_only_for_the_same_database() {
+    let db = MemDatabase::new().into_database();
+    let a = FedimintJournal::new(db.clone());
+    let b = FedimintJournal::new(db);
+    assert_eq!(
+        a.store_id(),
+        b.store_id(),
+        "two handles over the same Database must share one store_id"
+    );
+
+    let unrelated = FedimintJournal::new(MemDatabase::new().into_database());
+    assert_ne!(
+        a.store_id(),
+        unrelated.store_id(),
+        "handles over unrelated Databases must not collide"
+    );
+}
+
+/// A `Journal` wrapper that forces its `set_status_if` (the CAS claim point) to rendezvous at
+/// a `Barrier` before delegating — see `wallet-core`'s `concurrent_drive_performs_once`, which
+/// uses the identical technique so the race under test is real rather than accidentally
+/// serialized by the runtime finishing one `reconcile` before the other starts.
+struct BarrierJournal {
+    inner: FedimintJournal,
+    barrier: Arc<Barrier>,
+}
+
+#[async_trait]
+impl Journal for BarrierJournal {
+    async fn upsert(&self, intent: &Intent) -> Result<(), ExecError> {
+        self.inner.upsert(intent).await
+    }
+
+    async fn get(&self, key: &IdempotencyKey) -> Result<Option<Intent>, ExecError> {
+        self.inner.get(key).await
+    }
+
+    async fn set_status(
+        &self,
+        key: &IdempotencyKey,
+        status: IntentStatus,
+    ) -> Result<(), ExecError> {
+        self.inner.set_status(key, status).await
+    }
+
+    async fn set_status_if(
+        &self,
+        key: &IdempotencyKey,
+        expected: IntentStatus,
+        new: IntentStatus,
+    ) -> Result<bool, ExecError> {
+        self.barrier.wait().await;
+        self.inner.set_status_if(key, expected, new).await
+    }
+
+    async fn pending(&self) -> Vec<Intent> {
+        self.inner.pending().await
+    }
+
+    async fn failed(&self) -> Vec<Intent> {
+        self.inner.failed().await
+    }
+
+    fn store_id(&self) -> usize {
+        self.inner.store_id()
+    }
+}
+
+/// Without `store_id` correctly identifying shared storage, `drive`'s in-flight guard keys on
+/// each `FedimintJournal` wrapper's OWN address, so two independently-constructed handles
+/// over the SAME `Database` (a documented, supported pattern — see
+/// `shared_database_handle_persists`) would each think they hold an unclaimed store and both
+/// call `perform`. This exercises `reconcile` through exactly that two-handle setup and
+/// asserts exactly one performs.
+#[tokio::test]
+async fn shared_database_handle_dedupes_concurrent_perform() {
+    let db = MemDatabase::new().into_database();
+    let barrier = Arc::new(Barrier::new(2));
+    let a = Arc::new(BarrierJournal {
+        inner: FedimintJournal::new(db.clone()),
+        barrier: Arc::clone(&barrier),
+    });
+    let b = Arc::new(BarrierJournal {
+        inner: FedimintJournal::new(db),
+        barrier,
+    });
+    assert_eq!(a.store_id(), b.store_id(), "both wrap the same Database");
+
+    let i = intent("shared-perform", IntentStatus::Pending);
+    a.upsert(&i).await.expect("upsert");
+
+    let executor = Arc::new(MockExecutor::new());
+    let (ea, eb) = (Arc::clone(&executor), Arc::clone(&executor));
+    let task_a = tokio::spawn(async move { reconcile(a.as_ref(), ea.as_ref()).await });
+    let task_b = tokio::spawn(async move { reconcile(b.as_ref(), eb.as_ref()).await });
+    let (ra, rb) = tokio::join!(task_a, task_b);
+    let (ra, rb) = (ra.expect("task a join"), rb.expect("task b join"));
+
+    assert_eq!(
+        ra.performed + rb.performed,
+        1,
+        "exactly one of the two concurrent reconciles performs the shared intent"
+    );
+    assert_eq!(executor.performed_keys().len(), 1);
+}
+
+/// An executor that holds its first `perform` open until released, so a second concurrent
+/// `drive` for the same (already `Executing`) intent is observable without hanging the test.
+/// Mirrors `wallet-core`'s test double of the same name.
+struct BlockingExecutor {
+    performed_keys: Mutex<Vec<IdempotencyKey>>,
+    first_entered: Barrier,
+    release_first: Barrier,
+}
+
+impl BlockingExecutor {
+    fn new() -> Self {
+        Self {
+            performed_keys: Mutex::new(Vec::new()),
+            first_entered: Barrier::new(2),
+            release_first: Barrier::new(2),
+        }
+    }
+
+    fn performed_keys(&self) -> Vec<IdempotencyKey> {
+        self.performed_keys
+            .lock()
+            .expect("blocking executor mutex poisoned")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl Executor for BlockingExecutor {
+    async fn perform(&self, intent: &Intent) -> Result<PerformOutcome, ExecError> {
+        let call = {
+            let mut performed_keys = self
+                .performed_keys
+                .lock()
+                .expect("blocking executor mutex poisoned");
+            performed_keys.push(intent.idempotency_key.clone());
+            performed_keys.len()
+        };
+
+        if call == 1 {
+            self.first_entered.wait().await;
+            self.release_first.wait().await;
+        }
+
+        Ok(PerformOutcome::Done)
+    }
+}
+
+/// The CAS itself cannot cover an intent that is ALREADY `Executing` (past the CAS claim,
+/// e.g. a resumed crash-recovery drive still mid-`perform`), so a second `reconcile` skips
+/// `set_status_if` entirely (see `drive`) and its only defense against a duplicate `perform`
+/// is the process-local in-flight guard keyed by `store_id`.
+/// `shared_database_handle_dedupes_concurrent_perform` above races the CAS (a `Pending`
+/// intent), which the durable dbtx already serializes on its own; this test instead starts
+/// `Executing` and uses a blocking executor so the in-flight guard is the ONLY thing that can
+/// prevent the second, independently-constructed handle from calling `perform` again.
+#[tokio::test]
+async fn shared_database_handle_dedupes_concurrent_executing_perform() {
+    let db = MemDatabase::new().into_database();
+    let a = FedimintJournal::new(db.clone());
+    let b = FedimintJournal::new(db);
+    assert_eq!(a.store_id(), b.store_id(), "both wrap the same Database");
+
+    let i = intent("shared-executing", IntentStatus::Executing);
+    a.upsert(&i).await.expect("upsert");
+
+    let executor = Arc::new(BlockingExecutor::new());
+    let (a, ea) = (Arc::new(a), Arc::clone(&executor));
+    let task_a = tokio::spawn(async move { reconcile(a.as_ref(), ea.as_ref()).await });
+
+    executor.first_entered.wait().await;
+
+    let result_b = reconcile(&b, executor.as_ref()).await;
+    assert_eq!(
+        (result_b.performed, result_b.skipped),
+        (0, 1),
+        "the second handle must skip the in-flight perform, not repeat it"
+    );
+    assert_eq!(executor.performed_keys().len(), 1);
+
+    executor.release_first.wait().await;
+    let result_a = task_a.await.expect("task a join");
+    assert_eq!(result_a.performed, 1);
+    assert_eq!(executor.performed_keys().len(), 1);
+    assert_eq!(
+        b.get(&i.idempotency_key)
+            .await
+            .expect("get")
+            .unwrap()
+            .status,
+        IntentStatus::Done
     );
 }
 

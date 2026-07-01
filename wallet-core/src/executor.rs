@@ -1,7 +1,7 @@
 use crate::types::{Action, AllocatorDecision, IdempotencyKey, Msat};
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum IntentStatus {
@@ -83,15 +83,84 @@ pub trait Journal: Send + Sync {
     async fn get(&self, key: &IdempotencyKey) -> Result<Option<Intent>, ExecError>;
     async fn set_status(&self, key: &IdempotencyKey, status: IntentStatus)
         -> Result<(), ExecError>;
+    /// The single-writer claim (spec §2): atomically, if the stored intent's status ==
+    /// `expected`, set it to `new` (moving the pending index in the same transaction for
+    /// durable impls) and return `Ok(true)`; otherwise make no change and return `Ok(false)`.
+    /// `Ok(false)` also covers an absent key. `drive` uses this to claim a `Pending` intent
+    /// before performing it, so two concurrent drivers of the same intent can never both win
+    /// the claim.
+    async fn set_status_if(
+        &self,
+        key: &IdempotencyKey,
+        expected: IntentStatus,
+        new: IntentStatus,
+    ) -> Result<bool, ExecError>;
     /// Intents to re-drive on the next pass: `Pending | Executing` ONLY (never
     /// `Awaiting`/`Failed`, which are terminal-or-subscription-owned).
     async fn pending(&self) -> Vec<Intent>;
     async fn failed(&self) -> Vec<Intent>;
+    /// A stable identity for this journal's underlying durable store — used ONLY to scope
+    /// `drive`'s process-local in-flight-performs guard (a belt-and-suspenders duplicate-perform
+    /// guard alongside the CAS above; an `Executing -> Executing` CAS can't provide mutual
+    /// exclusion by itself, since re-reading unchanged state can't tell "my own resume" apart
+    /// from "a different concurrent claimant"). Two `Journal` VALUES over the SAME underlying
+    /// store (e.g. two `FedimintJournal`s built from clones of the same `Database`, which is
+    /// documented to share storage) MUST return the same id, or the guard silently fails to
+    /// serialize them; two unrelated journals (e.g. independent test fixtures) must not
+    /// collide. The default (this value's own address) is correct for any impl that is never
+    /// constructed twice over the same shared storage — true of `MemJournal` and the trait's
+    /// test doubles; `FedimintJournal` overrides it (its storage CAN be shared across
+    /// independently-constructed handles).
+    fn store_id(&self) -> usize {
+        (self as *const Self).cast::<()>() as usize
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct MemJournal {
     intents: Mutex<BTreeMap<IdempotencyKey, Intent>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct InFlightPerformKey {
+    store: usize,
+    key: IdempotencyKey,
+}
+
+static IN_FLIGHT_PERFORMS: OnceLock<Mutex<BTreeSet<InFlightPerformKey>>> = OnceLock::new();
+
+fn in_flight_performs() -> &'static Mutex<BTreeSet<InFlightPerformKey>> {
+    IN_FLIGHT_PERFORMS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+struct InFlightPerform {
+    key: InFlightPerformKey,
+}
+
+impl InFlightPerform {
+    fn claim<J: Journal>(journal: &J, key: &IdempotencyKey) -> Option<Self> {
+        let key = InFlightPerformKey {
+            store: journal.store_id(),
+            key: key.clone(),
+        };
+        let mut in_flight = in_flight_performs()
+            .lock()
+            .expect("in-flight perform mutex poisoned");
+        if in_flight.insert(key.clone()) {
+            Some(Self { key })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for InFlightPerform {
+    fn drop(&mut self) {
+        in_flight_performs()
+            .lock()
+            .expect("in-flight perform mutex poisoned")
+            .remove(&self.key);
+    }
 }
 
 impl MemJournal {
@@ -140,6 +209,22 @@ impl Journal for MemJournal {
             .get_mut(key)
             .map(|intent| intent.status = status)
             .ok_or_else(|| ExecError::Permanent("journal: intent not found".into()))
+    }
+
+    async fn set_status_if(
+        &self,
+        key: &IdempotencyKey,
+        expected: IntentStatus,
+        new: IntentStatus,
+    ) -> Result<bool, ExecError> {
+        let mut intents = self.intents.lock().expect("journal mutex poisoned");
+        match intents.get_mut(key) {
+            Some(intent) if intent.status == expected => {
+                intent.status = new;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     async fn pending(&self) -> Vec<Intent> {
@@ -345,17 +430,50 @@ async fn drive<J: Journal, E: Executor>(
     intent: &Intent,
     summary: &mut ExecutionSummary,
 ) {
-    if journal
-        .set_status(&intent.idempotency_key, IntentStatus::Executing)
-        .await
-        .is_err()
-    {
-        summary.failed += 1;
-        return;
+    // `drive` only ever receives a `Pending` or `Executing` intent (see `apply`/`reconcile`).
+    // A `Pending` intent must first win the durable CAS claim. `Executing` means either
+    // crash-recovery resume or another in-process driver already won that claim; the
+    // process-local guard below lets crash recovery proceed while skipping live duplicates.
+    if intent.status == IntentStatus::Pending {
+        match journal
+            .set_status_if(
+                &intent.idempotency_key,
+                IntentStatus::Pending,
+                IntentStatus::Executing,
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                // Another driver already claimed this intent; not a failure, just lost the race.
+                summary.skipped += 1;
+                return;
+            }
+            Err(_) => {
+                summary.failed += 1;
+                return;
+            }
+        }
     }
 
-    let mut executing = intent.clone();
-    executing.status = IntentStatus::Executing;
+    let Some(_in_flight) = InFlightPerform::claim(journal, &intent.idempotency_key) else {
+        summary.skipped += 1;
+        return;
+    };
+
+    let executing = match journal.get(&intent.idempotency_key).await {
+        Ok(Some(intent)) if intent.status == IntentStatus::Executing => intent,
+        Ok(_) => {
+            // This can be a stale `Executing` snapshot from a concurrent scan after the
+            // winning driver has already written a terminal status.
+            summary.skipped += 1;
+            return;
+        }
+        Err(_) => {
+            summary.failed += 1;
+            return;
+        }
+    };
 
     match executor.perform(&executing).await {
         Ok(outcome) => {
