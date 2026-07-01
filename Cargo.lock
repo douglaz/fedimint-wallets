@@ -996,7 +996,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 [[package]]
 name = "fedimint-core"
 version = "0.12.0-alpha"
-source = "git+https://github.com/douglaz/fedimint.git?rev=ade83765a7eef97a6f6d990d7ec0a9664226b7c3#ade83765a7eef97a6f6d990d7ec0a9664226b7c3"
+source = "git+https://github.com/douglaz/fedimint.git?rev=b108ec66ab21b70e1eea35d8663d9941a665ad58#b108ec66ab21b70e1eea35d8663d9941a665ad58"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -1060,7 +1060,7 @@ dependencies = [
 [[package]]
 name = "fedimint-derive"
 version = "0.12.0-alpha"
-source = "git+https://github.com/douglaz/fedimint.git?rev=ade83765a7eef97a6f6d990d7ec0a9664226b7c3#ade83765a7eef97a6f6d990d7ec0a9664226b7c3"
+source = "git+https://github.com/douglaz/fedimint.git?rev=b108ec66ab21b70e1eea35d8663d9941a665ad58#b108ec66ab21b70e1eea35d8663d9941a665ad58"
 dependencies = [
  "itertools 0.14.0",
  "proc-macro2",
@@ -1071,7 +1071,7 @@ dependencies = [
 [[package]]
 name = "fedimint-logging"
 version = "0.12.0-alpha"
-source = "git+https://github.com/douglaz/fedimint.git?rev=ade83765a7eef97a6f6d990d7ec0a9664226b7c3#ade83765a7eef97a6f6d990d7ec0a9664226b7c3"
+source = "git+https://github.com/douglaz/fedimint.git?rev=b108ec66ab21b70e1eea35d8663d9941a665ad58#b108ec66ab21b70e1eea35d8663d9941a665ad58"
 dependencies = [
  "anyhow",
  "tracing-subscriber",
@@ -1102,7 +1102,7 @@ dependencies = [
 [[package]]
 name = "fedimint-util-error"
 version = "0.12.0-alpha"
-source = "git+https://github.com/douglaz/fedimint.git?rev=ade83765a7eef97a6f6d990d7ec0a9664226b7c3#ade83765a7eef97a6f6d990d7ec0a9664226b7c3"
+source = "git+https://github.com/douglaz/fedimint.git?rev=b108ec66ab21b70e1eea35d8663d9941a665ad58#b108ec66ab21b70e1eea35d8663d9941a665ad58"
 dependencies = [
  "anyhow",
 ]

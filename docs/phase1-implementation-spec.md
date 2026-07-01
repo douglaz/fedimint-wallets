@@ -104,12 +104,20 @@ wallet-cli/         (FIRST-CLASS frontend, kept forever — ADR-0023; a clap bin
   NOT refresh a `Failed` intent back to `Pending` (only a manual retry does), or fee-over-cap/
   unsupported failures would re-run every tick.
 - The storage engine (fedimint `Database`) is itself async, so nothing forces a sync bridge.
+- **Single-writer guard (codex):** `lnv2 receive()`/`send()` are NOT idempotent, and `wallet-cli`
+  is multi-process (ADR-0023), so two `perform`s for one intent must never run concurrently.
+  Two-layer guard: (a) RocksDB takes an exclusive per-directory lock — two `wallet-cli` processes
+  cannot open the same DB dir at once (the OS serializes them); (b) WITHIN a process, the
+  `Journal` transitions `Pending → Executing` via a **compare-and-swap** (`set_status_if`, old→new
+  in one dbtx) and `drive` calls `perform` ONLY if it won the CAS — so `apply` racing `reconcile`
+  on the same intent yields exactly one `perform`. `MemDatabase` (tests) has no dir lock, so the
+  CAS is what the concurrency test exercises.
 
 ## 3. Identity + types — newtypes throughout
 ```rust
 // wallet-core/types.rs
 pub struct FederationId(pub [u8; 32]);   // bridges fedimint_core::config::FederationId(sha256::Hash)
-pub struct GuardianId(pub Vec<u8>);      // a guardian's pubkey OR api-url bytes (NOT a local peer index)
+pub struct GuardianId(pub Vec<u8>);      // canonical guardian pubkey bytes ONLY (NOT api-url, NOT a local peer index) — code is authoritative
 pub struct Msat(pub u64);                // amounts AND fees
 pub struct Occurrence(pub u64);          // T10 epoch
 pub struct IdempotencyKey(pub String);   // the intent key; carries occurrence + hex(FederationId)s
@@ -204,9 +212,12 @@ merge never overwrites a leg with a blank or drops `fee_cap`.
 - Await: `.await_final_send_operation_state(op)` / `.await_final_receive_operation_state(op)`.
 
 ### Storage (settled: one async fedimint `Database`, RocksDB)
-`Database::with_prefix(Vec<u8>)` is the real API. Byte layout: **app state = `[0x00]`**,
-**clients = `[0x01, <fed-index u8/le-bytes>]`**. `DbPrefix` newtype wraps the `Vec<u8>`. One
-async engine, one fsync domain, no sync driver.
+`Database::with_prefix(Vec<u8>)` is the real API. Byte layout uses **FIXED-LENGTH prefixes**
+(load-bearing — variable-length prefixes could alias, e.g. `[0x01,0x00]` vs `[0x01],[0x00,..]`):
+**app state = `[0x00]`** (1 byte); **client `i` = `[0x01] ++ u32_le(db_prefix)`** (exactly 5
+bytes). `db_prefix: u32` is the client's stable per-fed index; the `[0x01] ++ u32_le` encoding
+is the load-bearing contract (never reuse an index for a different fed). `DbPrefix` newtype
+wraps the `Vec<u8>`. One async engine, one fsync domain, no sync driver.
 
 ## 5. Durability model — op-log is the source of truth (REWRITTEN per codex P0)
 The public lnv2 `receive()`/`send()` commit the fedimint operation in the **client's** DB
@@ -329,7 +340,10 @@ re-check each referenced Intent before returning it.
 
 ## 9. Resume loop (runtime.rs, async)
 1. read `FederationKey` rows → `MultiClient::open_all(...)` (each client self-resumes its SMs).
-2. **op-log backfill + merge:** for each client, `mc.backfill_ops(id)` → group `OpArtifact`s by
+2. **op-log backfill + merge:** for each client, `mc.backfill_ops(id)` **pages the op-log to
+   exhaustion** (`paginate_operations_rev` until no more, NOT a single page — a missed op
+   re-mints/re-pays) and decodes each `custom_meta` **fallibly** (skip + warn-log a malformed
+   entry, never panic); group `OpArtifact`s by
    `move_id`; for each **`pending()` (Pending|Executing) AND `Awaiting`** Intent, assemble
    `MoveRecord` = Intent params + merged artifacts (+ cached record) and persist it — backfilling
    `Executing` too is required, else a crash in the receive-commit-before-MoveRecord window
@@ -350,8 +364,12 @@ re-check each referenced Intent before returning it.
   with async `MockExecutor`/`MemJournal` (`#[tokio::test]`); `ExecError` retry vs terminal.
 - **devimint e2e — CLI-driven (ADR-0023):** the money-path + crash gates drive the **`wallet-cli`
   binary** against a devimint federation (as devimint drives `fedimint-cli`), NOT the Rust API
-  in-process. This makes the crash cases real: run `wallet-cli move …`, **`kill -9` the process
-  mid-move**, then `wallet-cli reconcile`, and assert balances. The cases —
+  in-process. This makes the crash cases real: run `wallet-cli move …`, kill the process
+  mid-move, then `wallet-cli reconcile`, and assert balances. **Crashes fire at DETERMINISTIC
+  killpoints, not timing sleeps:** `wallet-cli` reads a test-only `WALLET_CLI_CRASH_AT=<named
+  step>` (e.g. `after-receive-commit`, `after-send-commit`, `before-move-record`) and
+  `std::process::abort()`s exactly there — so each crash-window case is reproducible, not racy.
+  The cases —
   (a) `apply(Move A→B)` moves ecash; (b) crash after receive-commit-before-MoveRecord → backfill
   prevents a second invoice; (c) crash after send-commit-before-MoveRecord → no double-pay;
   (d) restore-from-seed mid-move (client DB gone): backfill CANNOT repair (no op-log) — assert
