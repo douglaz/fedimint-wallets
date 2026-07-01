@@ -14,6 +14,10 @@ license = "AGPL-3.0-or-later"
 wallet-core = { path = "../wallet-core" }
 fedimint-core = { git = "https://github.com/douglaz/fedimint.git", rev = "ade83765a7eef97a6f6d990d7ec0a9664226b7c3" }
 async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "sync"] }

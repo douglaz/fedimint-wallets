@@ -304,15 +304,17 @@ returns after `CreateInvoice` — its payer is external, so the claim is finaliz
 
 ## 8. Journal storage — fedimint `Database`, prefix `[0x00]` (async)
 `FedimintJournal` implements async `wallet_core::Journal` over `db.with_prefix(vec![0x00])`.
-Typed `Encodable` rows (no SQL):
+Rows use the fedimint `Database` RAW byte API, not typed `Encodable`: keys are type-tagged bytes
+inside the `[0x00]` prefix, and values are versioned serde JSON envelopes:
 ```
-IntentKey(IdempotencyKey)   -> Intent { action, status }
-MoveKey(IdempotencyKey)     -> MoveRecord                 // derived cache (§5); rebuilt from op-log
-FederationKey(FederationId) -> FederationInfo { invite, db_prefix, joined_at }   // backed up, ADR-0003
-PendingIndexKey(status, key)-> ()                         // for pending()/failed() scans
+0x01 ++ IdempotencyKey bytes -> v1(Intent)
+0x02 ++ IdempotencyKey bytes -> v1(MoveRecord)            // derived cache (§5); rebuilt from op-log
+0x03 ++ FederationId bytes   -> v1(FederationInfo { invite, db_prefix, joined_at }) // backed up, ADR-0003
+0x04 ++ status_byte ++ key   -> ()                        // for pending()/failed()/awaiting() scans
 ```
 The Intent write + its `PendingIndexKey` update happen in **one prefix-`[0x00]` dbtx** (atomic
-within our state). `pending()`/`failed()` are typed prefix scans.
+within our state). `pending()`/`failed()`/`awaiting()` are raw prefix scans that load and
+re-check each referenced Intent before returning it.
 
 ## 9. Resume loop (runtime.rs, async)
 1. read `FederationKey` rows → `MultiClient::open_all(...)` (each client self-resumes its SMs).
@@ -354,7 +356,7 @@ within our state). `pending()`/`failed()` are typed prefix scans.
    newtypes (`FederationId([u8;32])`, `GuardianId`, `Msat`, `Occurrence`, `IdempotencyKey`),
    guardian identity → `Vec<GuardianId>`, idempotency-key formatting. (No `move_sm`.)
 1. `move_protocol.rs` (`MoveRecord`, `next_step`, the op-log→MoveRecord mapping) + pure tests.
-2. `FedimintJournal` over an in-memory fedimint `Database` + tests.
+2. `FedimintJournal` over an in-memory fedimint `Database` using raw byte/serde rows + tests.
 3. `MultiClient` (join/open/balance/receive/pay with `custom_meta`, `backfill_ops`) + devimint single-fed smoke.
 4. `FedimintExecutor` + `quote`/fee preflight + `assemble_record` merge → real ecash:
    `DirectInflow` (receive on a chosen fed, B nets `amount`) then `Move` (single-fed self-move).

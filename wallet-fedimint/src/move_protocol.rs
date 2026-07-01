@@ -15,7 +15,7 @@ use wallet_core::{FederationId, IdempotencyKey, Msat};
 /// The terminal phases — `Settled`/`Refunded`/`Failed` — encode the SETTLEMENT outcome,
 /// which is learned by awaiting the operations, not from the presence of op-ids; they
 /// are therefore preserved across re-assembly (§5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MovePhase {
     Created,
     Invoiced,
@@ -40,7 +40,7 @@ pub enum MoveStep {
 /// fedimint op-log, §5). The PARAMS (from/to/amount/fee_cap/gateway/send_required) come
 /// from the durable Intent; the op-ids + invoice come from the op-log artifacts. It is
 /// rebuilt by [`assemble_move_record`] and consumed by [`next_step`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MoveRecord {
     /// `== Intent key == ` the `move_id` embedded in each op's `custom_meta`.
     pub key: IdempotencyKey,

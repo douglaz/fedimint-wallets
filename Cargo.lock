@@ -4392,6 +4392,7 @@ name = "wallet-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "serde",
  "tokio",
 ]
 
@@ -4401,7 +4402,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "fedimint-core",
+ "futures",
+ "serde",
+ "serde_json",
  "tokio",
+ "tracing",
  "wallet-core",
 ]
 

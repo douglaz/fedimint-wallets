@@ -1,6 +1,8 @@
 /// A federation's 32-byte identity. Bridges `fedimint_core::config::FederationId`
 /// (a `sha256::Hash`); a local `u32` peer/index is meaningless across federations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct FederationId(pub [u8; 32]);
 
 impl FederationId {
@@ -31,18 +33,22 @@ impl FederationId {
 /// funding a non-independent standby and silently defeating the insurance. The
 /// producer (wallet-fedimint, a later step) owns enforcing this single encoding when
 /// it populates guardians from real federation config.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct GuardianId(pub Vec<u8>);
 
 /// A millisatoshi amount (and fees). The arithmetic here is unit-agnostic, so the
 /// relabel from the former `Sats` keeps every numeric value as-is (no ×1000 scaling).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct Msat(pub u64);
 
 /// A monotonic allocation epoch (T10). Defined here so the identity layer is
 /// complete, but NOT yet wired into [`IdempotencyKey`] (see its note); the full
 /// design folds it into the durable intent key to distinguish recurring intents.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Occurrence(pub u64);
 
 /// The stable per-intent key: dedupes the same logical intent across evaluation
@@ -51,7 +57,9 @@ pub struct Occurrence(pub u64);
 /// params collide — once one is `Done`, the repeat is permanently skipped. Adding an
 /// occurrence to the key (to revive recurring allocations) is deferred (TODOS T10);
 /// the trailing numeric in today's key is the amount, a stand-in slot.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct IdempotencyKey(pub String);
 
 #[derive(Clone, Debug, PartialEq)]
@@ -77,7 +85,7 @@ pub struct AllocatorSnapshot {
     pub now: u64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Action {
     TopUpSpending {
         from: FederationId,
@@ -99,7 +107,7 @@ pub enum Action {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReasonCode {
     SpendingBelowTarget,
     StandbyBelowTarget,

@@ -11,3 +11,5 @@
 
 # Rust build output
 /target
+# nix-env build output (CARGO_TARGET_DIR under `nix develop`)
+/target-nix

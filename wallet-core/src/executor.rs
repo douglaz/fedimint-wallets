@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum IntentStatus {
     Pending,
     Executing,
@@ -14,7 +14,7 @@ pub enum IntentStatus {
     Failed,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Intent {
     pub idempotency_key: IdempotencyKey,
     pub action: Action,
@@ -77,7 +77,7 @@ pub enum ExecError {
 #[async_trait]
 pub trait Journal: Send + Sync {
     async fn upsert(&self, intent: &Intent) -> Result<(), ExecError>;
-    async fn get(&self, key: &IdempotencyKey) -> Option<Intent>;
+    async fn get(&self, key: &IdempotencyKey) -> Result<Option<Intent>, ExecError>;
     async fn set_status(&self, key: &IdempotencyKey, status: IntentStatus)
         -> Result<(), ExecError>;
     /// Intents to re-drive on the next pass: `Pending | Executing` ONLY (never
@@ -117,12 +117,13 @@ impl Journal for MemJournal {
         Ok(())
     }
 
-    async fn get(&self, key: &IdempotencyKey) -> Option<Intent> {
-        self.intents
+    async fn get(&self, key: &IdempotencyKey) -> Result<Option<Intent>, ExecError> {
+        Ok(self
+            .intents
             .lock()
             .expect("journal mutex poisoned")
             .get(key)
-            .cloned()
+            .cloned())
     }
 
     async fn set_status(
@@ -277,7 +278,17 @@ pub async fn apply<J: Journal, E: Executor>(
         //    must NOT resurrect a fee-over-cap/unsupported failure back to `Pending`.
         //  - `Awaiting`: a `DirectInflow` owned by its `recv_op` subscription (§9.5);
         //    re-driving through `perform` would mint a second invoice.
-        match journal.get(&decision.idempotency_key).await {
+        let existing = match journal.get(&decision.idempotency_key).await {
+            Ok(existing) => existing,
+            Err(_) => {
+                // Unknown durable state must not be treated as "missing"; doing so could
+                // re-drive a terminal or subscription-owned intent.
+                summary.failed += 1;
+                continue;
+            }
+        };
+
+        match existing {
             Some(intent)
                 if matches!(
                     intent.status,

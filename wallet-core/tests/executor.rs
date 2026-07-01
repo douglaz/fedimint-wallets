@@ -1,3 +1,5 @@
+use async_trait::async_trait;
+use std::sync::Mutex;
 use wallet_core::*;
 
 fn ikey(key: &str) -> IdempotencyKey {
@@ -34,6 +36,39 @@ fn counts(performed: usize, skipped: usize, failed: usize) -> ExecutionSummary {
     }
 }
 
+#[derive(Default)]
+struct GetFailsJournal {
+    upserts: Mutex<usize>,
+}
+
+#[async_trait]
+impl Journal for GetFailsJournal {
+    async fn upsert(&self, _intent: &Intent) -> Result<(), ExecError> {
+        *self.upserts.lock().expect("mutex poisoned") += 1;
+        Ok(())
+    }
+
+    async fn get(&self, _key: &IdempotencyKey) -> Result<Option<Intent>, ExecError> {
+        Err(ExecError::Permanent("poison intent row".to_string()))
+    }
+
+    async fn set_status(
+        &self,
+        _key: &IdempotencyKey,
+        _status: IntentStatus,
+    ) -> Result<(), ExecError> {
+        unreachable!("apply must not drive when get fails")
+    }
+
+    async fn pending(&self) -> Vec<Intent> {
+        Vec::new()
+    }
+
+    async fn failed(&self) -> Vec<Intent> {
+        Vec::new()
+    }
+}
+
 #[tokio::test]
 async fn apply_fresh_decision_journals_and_performs_once() {
     let key = "topup:1:2:42";
@@ -46,7 +81,11 @@ async fn apply_fresh_decision_journals_and_performs_once() {
         counts(1, 0, 0)
     );
     assert_eq!(executor.performed_keys(), vec![ikey(key)]);
-    let intent = journal.get(&ikey(key)).await.expect("intent is journaled");
+    let intent = journal
+        .get(&ikey(key))
+        .await
+        .expect("get")
+        .expect("intent is journaled");
     assert_eq!(intent.idempotency_key, ikey(key));
     assert_eq!(intent.action, decisions[0].action);
     assert_eq!(intent.max_fee, decisions[0].max_fee);
@@ -69,6 +108,21 @@ async fn applying_same_decisions_twice_performs_only_once() {
 }
 
 #[tokio::test]
+async fn apply_get_error_does_not_create_fresh_intent() {
+    let key = "topup:1:2:42";
+    let decisions = vec![topup(key, 42)];
+    let journal = GetFailsJournal::default();
+    let executor = MockExecutor::new();
+
+    assert_eq!(
+        apply(&journal, &executor, &decisions).await,
+        counts(0, 0, 1)
+    );
+    assert_eq!(*journal.upserts.lock().expect("mutex poisoned"), 0);
+    assert!(executor.performed_keys().is_empty());
+}
+
+#[tokio::test]
 async fn duplicate_keys_in_one_apply_are_performed_once() {
     let key = "topup:1:2:42";
     let decisions = vec![topup(key, 42), topup(key, 42)];
@@ -81,7 +135,7 @@ async fn duplicate_keys_in_one_apply_are_performed_once() {
     );
     assert_eq!(executor.performed_keys(), vec![ikey(key)]);
     assert_eq!(
-        journal.get(&ikey(key)).await.unwrap().status,
+        journal.get(&ikey(key)).await.expect("get").unwrap().status,
         IntentStatus::Done
     );
 }
@@ -99,7 +153,7 @@ async fn reconcile_redrives_executing_intent_after_crash() {
     assert_eq!(reconcile(&journal, &executor).await, counts(1, 0, 0));
     assert_eq!(executor.performed_keys(), vec![ikey(key)]);
     assert_eq!(
-        journal.get(&ikey(key)).await.unwrap().status,
+        journal.get(&ikey(key)).await.expect("get").unwrap().status,
         IntentStatus::Done
     );
 }
@@ -118,7 +172,7 @@ async fn retryable_failure_stays_pending_and_reconcile_retries() {
     );
     // A Retryable error leaves the intent Pending (NOT Failed), so reconcile retries it.
     assert_eq!(
-        journal.get(&ikey(key)).await.unwrap().status,
+        journal.get(&ikey(key)).await.expect("get").unwrap().status,
         IntentStatus::Pending
     );
     assert!(executor.performed_keys().is_empty());
@@ -127,7 +181,7 @@ async fn retryable_failure_stays_pending_and_reconcile_retries() {
     assert_eq!(reconcile(&journal, &executor).await, counts(1, 0, 0));
     assert_eq!(executor.performed_keys(), vec![ikey(key)]);
     assert_eq!(
-        journal.get(&ikey(key)).await.unwrap().status,
+        journal.get(&ikey(key)).await.expect("get").unwrap().status,
         IntentStatus::Done
     );
 }
@@ -145,7 +199,7 @@ async fn permanent_failure_is_terminal_and_reconcile_does_not_redrive() {
         counts(0, 0, 1)
     );
     assert_eq!(
-        journal.get(&ikey(key)).await.unwrap().status,
+        journal.get(&ikey(key)).await.expect("get").unwrap().status,
         IntentStatus::Failed
     );
 
@@ -155,7 +209,7 @@ async fn permanent_failure_is_terminal_and_reconcile_does_not_redrive() {
     assert_eq!(reconcile(&journal, &executor).await, counts(0, 0, 0));
     assert!(executor.performed_keys().is_empty());
     assert_eq!(
-        journal.get(&ikey(key)).await.unwrap().status,
+        journal.get(&ikey(key)).await.expect("get").unwrap().status,
         IntentStatus::Failed
     );
 }
@@ -176,7 +230,7 @@ async fn apply_skips_decision_when_key_is_already_done() {
     );
     assert!(executor.performed_keys().is_empty());
     assert_eq!(
-        journal.get(&ikey(key)).await.unwrap().status,
+        journal.get(&ikey(key)).await.expect("get").unwrap().status,
         IntentStatus::Done
     );
 }
@@ -204,6 +258,7 @@ async fn apply_does_not_resurrect_failed_intent() {
     let intent = journal
         .get(&ikey(key))
         .await
+        .expect("get")
         .expect("intent still journaled");
     assert_eq!(intent.status, IntentStatus::Failed);
     assert_eq!(intent.max_fee, Msat(1));
@@ -224,7 +279,7 @@ async fn awaiting_outcome_leaves_intent_awaiting_and_is_not_redriven() {
         counts(1, 0, 0)
     );
     assert_eq!(
-        journal.get(&ikey(key)).await.unwrap().status,
+        journal.get(&ikey(key)).await.expect("get").unwrap().status,
         IntentStatus::Awaiting
     );
     assert_eq!(executor.performed_keys(), vec![ikey(key)]);
@@ -234,7 +289,7 @@ async fn awaiting_outcome_leaves_intent_awaiting_and_is_not_redriven() {
     assert_eq!(reconcile(&journal, &executor).await, counts(0, 0, 0));
     assert_eq!(executor.performed_keys(), vec![ikey(key)]);
     assert_eq!(
-        journal.get(&ikey(key)).await.unwrap().status,
+        journal.get(&ikey(key)).await.expect("get").unwrap().status,
         IntentStatus::Awaiting
     );
 }
@@ -258,7 +313,7 @@ async fn awaiting_replay_after_crash_preserves_awaiting_status() {
     );
     assert_eq!(executor.performed_keys(), vec![ikey(key)]);
     assert_eq!(
-        journal.get(&ikey(key)).await.unwrap().status,
+        journal.get(&ikey(key)).await.expect("get").unwrap().status,
         IntentStatus::Executing
     );
 
@@ -267,7 +322,7 @@ async fn awaiting_replay_after_crash_preserves_awaiting_status() {
     assert_eq!(reconcile(&journal, &executor).await, counts(1, 0, 0));
     assert_eq!(executor.performed_keys(), vec![ikey(key)]);
     assert_eq!(
-        journal.get(&ikey(key)).await.unwrap().status,
+        journal.get(&ikey(key)).await.expect("get").unwrap().status,
         IntentStatus::Awaiting
     );
 }
