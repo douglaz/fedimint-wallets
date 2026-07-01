@@ -40,19 +40,53 @@ The ADRs in `docs/adr/` are canonical; this is the actionable task list.
 - [ ] **T10** Allocator/executor key **epoch** (cross-cutting allocator + executor): the idempotency key is per-logical-intent with no occurrence nonce, so once an intent is `Done` an identical decision that legitimately recurs later is permanently skipped (`wallet-core/src/executor.rs` apply). Add an epoch/occurrence that is stable while a condition persists but advances once the intent settles, so replay stays idempotent AND recurrence stays live.
 - [ ] **T11** Executor **auth gating**: `apply`/`drive` perform regardless of `AllocatorDecision.requires_auth` (always `false` today). When biometric-to-send / standing-instruction auth exists, hold `requires_auth` intents instead of auto-performing them.
 
-## Phase 1 model corrections (codex state review, 2026-06-29)
+## Phase 1 integration build — progress + deferred live validation (2026-07)
 
-These land in Phase 1b (model-from-reality), AFTER the 1a devimint spike teaches the real
-operation state machine. See [docs/integration-phase-plan.md](./docs/integration-phase-plan.md)
+Build order from `docs/phase1-implementation-spec.md`. All builds/tests run in nix
+(`nix develop /home/master/p/fedimint -c cargo …`); the fedimint dep is pinned to
+douglaz/fedimint @ `b108ec6`.
+
+**Done + on `main`:**
+- [x] Step 0 async executor + identity newtypes; single-writer CAS claim (codex #2).
+- [x] Step 1 pure `move_protocol` (MoveRecord/next_step/assemble).
+- [x] Step 2 `FedimintJournal` over the fedimint `Database` (raw-byte + serde rows, atomic index).
+- [x] Model rebuild T12/T10/T13/T16 (Action=Move/DirectInflow/Evacuate + advisory; occurrence in
+      key; structured `FedBalance`; scorer requires Lnv2). T14 real identities also satisfied.
+- [x] Step 3 `MultiClient` join/open/balance + first-class `wallet-cli` (ADR-0023) — **join
+      validated LIVE** on devimint.
+- [x] Step 4a lnv2 money primitives (receive/pay/await) — **receive validated LIVE** (nets exactly
+      amount − lnv2 recv fee).
+- [x] Step 4b pure core — fixed-point fee `gross_up` (§6, never under-credits) + `Action→MovePlan`
+      + `FedimintExecutor::perform` scaffold (compiles) + `MultiClient` fee-quote/backfill_ops.
+
+**Deferred to a LESS-LOADED machine (devimint validation flaked under 8-way rb-lite contention):**
+- [ ] **4a-pay** re-validate the pay direction live (receive-to-fund flaked; pay code is symmetric +
+      baseline works). Watch the `fm::client::reactor "Executor should be running"` warning seen on a
+      0-balance pay.
+- [ ] **4b-live** validate `FedimintExecutor::perform` on devimint: `DirectInflow` nets EXACTLY the
+      target amount; a single-fed `Move` (receive+pay via the shared gateway). Wire `wallet-cli
+      move`/`reconcile`.
+- [ ] **Fee-quote base discrepancy** — resolve lnv2 `receive_fee_quote` base (doc: gross) vs spec §6
+      (`contract_amount`) against the live quote API (see memory `fee-quote-base-discrepancy`).
+- [ ] **Step 5 crash gate** — `kill -9` `wallet-cli` mid-move at the deterministic `WALLET_CLI_CRASH_AT`
+      killpoints → `reconcile` → no double-pay / no second payable invoice (spec §10).
+
+## Phase 1 model corrections (codex state review, 2026-06-29) — LANDED in the model rebuild above
+
+These landed in the model rebuild (`main`), AFTER the devimint spike taught the real operation
+state machine. See [docs/integration-phase-plan.md](./docs/integration-phase-plan.md)
 "Model corrections" and [ADR-0022](./docs/adr/0022-money-move-model-and-inflow-direction.md).
 
-- [ ] **T12 (P1) Redesign `Action`/`Intent`: split executable money-moves from advisory policy.**
-  Executable: `DirectInflow { to }` (route next receive — the cheap PRIMARY lever),
-  `Move { from, to, amount, fee_limit, occurrence }`, `Evacuate { from, to, amount, fee_limit, occurrence }`.
-  Advisory (not executor intents): `RefuseInflow`/`Cap`. Carry the occurrence/epoch (T10) in the key.
-- [ ] **T13 (P1) Structured per-fed balance snapshot** (extends T3): `{ spendable, in_flight, claimable, reserved_fee }` at **msat** granularity; the allocator can't decide fees/caps/retries from one flat `Sats`.
-- [ ] **T14 (P1) Real identities:** `FederationId` → 32-byte consensus hash; guardian-independence (ADR-0010) keys on real guardian identity (pubkeys/URLs), NOT local peer indices. Replace the `u32` placeholders when the model meets the SDK.
-- [ ] **T15 (P1) Durable operation journal:** `SqliteJournal` stores operation artifacts (Fedimint operation IDs, invoice, payment hash, gateway pubkey, claim/refund state) and **resumes** the same invoice/payment on replay — never restarts. Depends on T10 occurrence landing first.
-- [ ] **T16 (P2) Scorer fit:** require LN/LNv2 in the default `ScorerPolicy`; carry gateway-availability + `consensus_version` in `FederationFacts` (a fed with no LN can't send/receive).
-- [ ] **Inflow-direction first:** prove the receive + `DirectInflow` path before/with the swap, so the first allocator proves CHEAP allocation (direct the next inflow), not just EXPENSIVE rebalance (swap existing balance).
+- [x] **T12 Redesign `Action`/`Intent`** — landed: `DirectInflow { to, amount, fee_cap }`,
+  `Move`/`Evacuate { from, to, amount, fee_cap }`, advisory `RefuseInflow`/`Cap`; occurrence (T10)
+  in the idempotency key; `apply` only intents executable actions.
+- [x] **T13 Structured per-fed balance** — landed: `FedBalance { spendable, in_flight, claimable, reserved_fee }` at msat.
+- [x] **T14 Real identities** — landed: `FederationId([u8;32])` = fedimint consensus hash (bridged in
+  `MultiClient`); `GuardianId` = canonical guardian pubkey bytes.
+- [x] **T15 Durable operation journal** — satisfied by `FedimintJournal` (over the fedimint RocksDB
+  `Database`, NOT SQLite) + `move_protocol` op-log backfill/resume. `backfill_ops` resume path is
+  scaffolded (compile); its live resume proof is part of the deferred step-5 crash gate.
+- [x] **T16 Scorer requires Lnv2** — landed in the scorer default policy.
+- [x] **Inflow-direction first** — `DirectInflow` is the cheap primary lever + built before the swap
+  (receive path validated live; `DirectInflow`-nets-amount is in the deferred 4b-live gate).
 - [ ] **Honesty (ties to T5):** after ADR-0006, v1 holds ~2 active feds; "allocates across many federations" is the candidate/discovery universe + a v2 promise. Keep product copy honest.
