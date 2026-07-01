@@ -51,6 +51,9 @@ pub struct FederationFacts {
     pub latency_ms: u32,
     // Lifecycle:
     pub shutdown_scheduled: bool,
+    // Fedimint Lightning v2 (T16): a fed with no LNv2 cannot send/receive at all, so
+    // this gates eligibility unconditionally rather than through `required_modules`.
+    pub has_lnv2: bool,
     // Untrusted prior, used only behind the gate (ADR-0020):
     pub observer: Option<ObserverPrior>,
 }
@@ -85,6 +88,7 @@ pub enum ReasonCode {
     ProbeFailed,
     ShutdownScheduled,
     LowObserverUptime,
+    NoLnv2,
 }
 
 /// The scorer's verdict for one federation.
@@ -137,6 +141,13 @@ pub fn score(facts: &FederationFacts, policy: &ScorerPolicy) -> FederationVerdic
     // Do not fund a federation that is winding down.
     if facts.shutdown_scheduled {
         reasons.push(ReasonCode::ShutdownScheduled);
+        floor_ok = false;
+    }
+
+    // A fed with no Lightning v2 cannot send or receive at all (T16): unconditional,
+    // like the guardian-count floor above, not a tunable `ScorerPolicy` toggle.
+    if !facts.has_lnv2 {
+        reasons.push(ReasonCode::NoLnv2);
         floor_ok = false;
     }
 

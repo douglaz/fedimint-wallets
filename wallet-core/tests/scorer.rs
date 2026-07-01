@@ -17,6 +17,7 @@ fn healthy() -> FederationFacts {
         peg_out_quotable: true,
         latency_ms: 100,
         shutdown_scheduled: false,
+        has_lnv2: true,
         observer: None,
     }
 }
@@ -74,6 +75,19 @@ fn reject_shutdown() {
     let verdict = score(&facts, &ScorerPolicy::default());
     assert!(!verdict.eligible_to_fund);
     assert!(verdict.reasons.contains(&ReasonCode::ShutdownScheduled));
+}
+
+#[test]
+fn reject_no_lnv2() {
+    // T16: a fed with no Lightning v2 cannot send/receive at all, so it is ineligible
+    // regardless of otherwise-perfect structural facts and probes.
+    let facts = FederationFacts {
+        has_lnv2: false,
+        ..healthy()
+    };
+    let verdict = score(&facts, &ScorerPolicy::default());
+    assert!(!verdict.eligible_to_fund);
+    assert!(verdict.reasons.contains(&ReasonCode::NoLnv2));
 }
 
 #[test]

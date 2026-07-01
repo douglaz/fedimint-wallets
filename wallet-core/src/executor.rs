@@ -18,7 +18,9 @@ pub enum IntentStatus {
 pub struct Intent {
     pub idempotency_key: IdempotencyKey,
     pub action: Action,
-    pub max_fee: Msat,
+    /// Derived from `action.fee_cap()`: `Some` for `Move`/`Evacuate`, `None` for a
+    /// `DirectInflow` (which moves no money and so has no fee budget).
+    pub max_fee: Option<Msat>,
     pub status: IntentStatus,
 }
 
@@ -27,7 +29,7 @@ impl Intent {
         Self {
             idempotency_key: decision.idempotency_key.clone(),
             action: decision.action.clone(),
-            max_fee: decision.max_fee,
+            max_fee: decision.action.fee_cap(),
             status: IntentStatus::Pending,
         }
     }
@@ -70,7 +72,8 @@ pub enum ExecError {
     Retryable(String),
     /// Terminal: mark `Failed`. NOT auto-re-driven; only a manual retry resets it.
     Permanent(String),
-    /// The action is not executable in this phase (e.g. `Evacuate`/advisory). → `Failed`.
+    /// The action is not supported by this executor implementation yet (e.g.
+    /// `Evacuate`, modeled but Phase 1 returns `Unsupported`). → `Failed`.
     Unsupported,
 }
 
@@ -264,16 +267,23 @@ pub async fn apply<J: Journal, E: Executor>(
     let mut seen = BTreeSet::new();
 
     for decision in decisions {
+        // Advisory actions (`RefuseInflow`/`Cap`) are policy signals, not work: never
+        // journal an Intent for them.
+        if !decision.action.is_executable() {
+            summary.skipped += 1;
+            continue;
+        }
+
         if !seen.insert(decision.idempotency_key.clone()) {
             summary.skipped += 1;
             continue;
         }
 
         // Terminal/owned states are NOT refreshed by a fresh allocator tick:
-        //  - `Done`: idempotent REPLAY of a completed intent (crash recovery). It also
-        //    means an identical decision that legitimately RECURS later is permanently
-        //    skipped, because the allocator key is per-logical-intent with no occurrence
-        //    nonce; reviving recurring allocations needs an epoch in the key (TODOS).
+        //  - `Done`: idempotent REPLAY of a completed intent (crash recovery). A
+        //    legitimately RECURRING decision stays live because the allocator stamps
+        //    the current `Occurrence` (T10) into the key, so the next tick's key
+        //    differs once this one has settled `Done`.
         //  - `Failed`: terminal until a MANUAL retry resets it (§2). A recurring tick
         //    must NOT resurrect a fee-over-cap/unsupported failure back to `Pending`.
         //  - `Awaiting`: a `DirectInflow` owned by its `recv_op` subscription (§9.5);
@@ -297,7 +307,13 @@ pub async fn apply<J: Journal, E: Executor>(
             {
                 summary.skipped += 1;
             }
-            _ => {
+            Some(intent) => {
+                // The key names an already-started operation. Drive the durable intent as
+                // stored instead of refreshing action fields from a later allocator tick;
+                // the real executor fixes invoices/amounts under the original key.
+                drive(journal, executor, &intent, &mut summary).await;
+            }
+            None => {
                 let intent = Intent::from_decision(decision);
                 if journal.upsert(&intent).await.is_err() {
                     summary.failed += 1;

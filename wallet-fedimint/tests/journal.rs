@@ -25,12 +25,13 @@ fn fed(n: u8) -> FederationId {
 fn intent(key: &str, status: IntentStatus) -> Intent {
     Intent {
         idempotency_key: IdempotencyKey(key.to_string()),
-        action: Action::TopUpSpending {
+        action: Action::Move {
             from: fed(1),
             to: fed(2),
             amount: Msat(100_000),
+            fee_cap: Msat(2_000),
         },
-        max_fee: Msat(2_000),
+        max_fee: Some(Msat(2_000)),
         status,
     }
 }

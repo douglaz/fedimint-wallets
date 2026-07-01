@@ -43,29 +43,39 @@ pub struct GuardianId(pub Vec<u8>);
 )]
 pub struct Msat(pub u64);
 
-/// A monotonic allocation epoch (T10). Defined here so the identity layer is
-/// complete, but NOT yet wired into [`IdempotencyKey`] (see its note); the full
-/// design folds it into the durable intent key to distinguish recurring intents.
+/// A monotonic allocation epoch (T10). Stable while a condition persists, but
+/// advances once the underlying intent settles, so recurrence stays live: the same
+/// logical decision at two different occurrences produces two different
+/// [`IdempotencyKey`]s (see `allocator::decide`), rather than being permanently
+/// skipped after the first is marked `Done`.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 pub struct Occurrence(pub u64);
 
 /// The stable per-intent key: dedupes the same logical intent across evaluation
-/// ticks and crashes. Built from `hex(FederationId)`s. NOTE: the [`Occurrence`]
-/// epoch is NOT yet folded into the key, so two recurring intents with identical
-/// params collide — once one is `Done`, the repeat is permanently skipped. Adding an
-/// occurrence to the key (to revive recurring allocations) is deferred (TODOS T10);
-/// the trailing numeric in today's key is the amount, a stand-in slot.
+/// ticks and crashes, while the embedded [`Occurrence`] lets a legitimately
+/// recurring decision produce a fresh key once the prior occurrence settles.
 #[derive(
     Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub struct IdempotencyKey(pub String);
 
+/// Structured per-federation balance (T13), at msat granularity. The allocator
+/// decides on `spendable`; the other fields exist so the model can later account for
+/// fees/caps/retries without another balance-shape rewrite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FedBalance {
+    pub spendable: Msat,
+    pub in_flight: Msat,
+    pub claimable: Msat,
+    pub reserved_fee: Msat,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FederationStatus {
     pub id: FederationId,
-    pub balance: Msat,
+    pub balance: FedBalance,
     pub probed_ok: bool,
     pub reputation: i32,
     pub guardians: Vec<GuardianId>,
@@ -85,26 +95,62 @@ pub struct AllocatorSnapshot {
     pub now: u64,
 }
 
+/// A move A→B is a protocol (ADR-0022): B creates an invoice, A pays it via a shared
+/// gateway, B claims the contract. `Action` models this split between executable
+/// money-moves and advisory policy signals (T12).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Action {
-    TopUpSpending {
+    /// Route the next receive here. The cheap PRIMARY lever: directing an inflow
+    /// costs nothing, unlike moving existing balance.
+    DirectInflow { to: FederationId },
+    /// Rebalance existing balance from one federation to another.
+    Move {
         from: FederationId,
         to: FederationId,
         amount: Msat,
+        fee_cap: Msat,
     },
-    FundStandby {
-        from: FederationId,
-        to: FederationId,
-        amount: Msat,
-    },
+    /// Move a federation's balance out ahead of a shutdown/health problem. Modeled
+    /// here; the executor returns `Unsupported` for it in Phase 1.
     Evacuate {
         from: FederationId,
-        reason: ReasonCode,
+        to: FederationId,
+        amount: Msat,
+        fee_cap: Msat,
     },
-    RefuseAllocation {
+    /// Advisory: do not route the next inflow to `fed`. Never becomes an executor
+    /// `Intent` (see `Action::is_executable`).
+    RefuseInflow {
         fed: FederationId,
         reason: ReasonCode,
     },
+    /// Advisory: cap further allocation into `fed`. Never becomes an executor
+    /// `Intent`.
+    Cap {
+        fed: FederationId,
+        reason: ReasonCode,
+    },
+}
+
+impl Action {
+    /// Whether `apply()` should create an executor `Intent` for this action.
+    /// `RefuseInflow`/`Cap` are policy signals (recorded/surfaced only), not work.
+    pub fn is_executable(&self) -> bool {
+        matches!(
+            self,
+            Action::DirectInflow { .. } | Action::Move { .. } | Action::Evacuate { .. }
+        )
+    }
+
+    /// The fee budget authoritative for this action, if it has one. `Move`/`Evacuate`
+    /// carry a `fee_cap`; `DirectInflow` moves no money and advisory actions are
+    /// never executed, so both have none.
+    pub fn fee_cap(&self) -> Option<Msat> {
+        match self {
+            Action::Move { fee_cap, .. } | Action::Evacuate { fee_cap, .. } => Some(*fee_cap),
+            Action::DirectInflow { .. } | Action::RefuseInflow { .. } | Action::Cap { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -123,7 +169,8 @@ pub enum ReasonCode {
 pub struct AllocatorDecision {
     pub action: Action,
     pub reason: ReasonCode,
-    pub max_fee: Msat,
+    /// The epoch stamped into `idempotency_key` (T10): see `allocator::decide`.
+    pub occurrence: Occurrence,
     pub idempotency_key: IdempotencyKey,
     pub requires_auth: bool,
 }
