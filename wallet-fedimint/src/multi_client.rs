@@ -4,9 +4,12 @@
 //! gateways / receive / pay / await_receive / await_send). The `FedimintExecutor` — fee
 //! gross-up, `MoveRecord`/`Action` wiring, op-log backfill — lands on top in step 4b.
 
+use crate::fee::GatewayFee;
 use crate::journal::{FederationInfo, FedimintJournal};
+use crate::move_protocol::{Leg, MoveMeta, OpArtifact};
 use crate::types::{GatewayUrl, Invoice, OperationId, Preimage};
 use fedimint_bip39::{Bip39RootSecretStrategy, Mnemonic};
+use fedimint_client::db::ChronologicalOperationLogKey;
 use fedimint_client::secret::RootSecretStrategy as _;
 use fedimint_client::{Client, ClientBuilder, ClientHandleArc, RootSecret};
 use fedimint_connectors::ConnectorRegistry;
@@ -16,7 +19,8 @@ use fedimint_core::invite_code::InviteCode;
 use fedimint_core::util::SafeUrl;
 use fedimint_core::Amount;
 use fedimint_core::BitcoinHash as _;
-use fedimint_lnv2_client::common::Bolt11InvoiceDescription;
+use fedimint_lnv2_client::common::gateway_api::{PaymentFee, RoutingInfo};
+use fedimint_lnv2_client::common::{Bolt11InvoiceDescription, LightningInvoice};
 use fedimint_lnv2_client::{
     FinalReceiveOperationState, FinalSendOperationState, LightningClientModule,
     LightningOperationMeta, SendPaymentError,
@@ -365,6 +369,146 @@ impl MultiClient {
         Ok(map_send_state(state))
     }
 
+    // ---- fee quotes + op-log backfill (spec §6/§9, step 4b glue) -------------------
+    //
+    // These are the I/O the `FedimintExecutor` needs to size + cap a move and to reattach
+    // to in-flight ops after a crash. They are scaffolded here (compile + verified against
+    // the pinned lnv2/client source); the executor's live validation lands on a quiet
+    // machine. Every fee here is the FEDERATION tx fee OR the gateway fee — combined by the
+    // executor's `gross_up`/cap-check (the `*_fee_quote` client APIs exclude the gateway fee).
+
+    /// The FEDERATION receive-tx fee for receiving `amount` into `id` (spec §6.1), in msat.
+    /// This is only the on-federation cost (note selection / change / dust); the gateway's
+    /// receive fee is quoted separately via [`Self::receive_gateway_fee`].
+    pub async fn receive_fee_quote(&self, id: &FederationId, amount: Msat) -> anyhow::Result<Msat> {
+        let client = self.client(id)?;
+        let lnv2 = client.get_first_module::<LightningClientModule>()?;
+        let quote = lnv2.receive_fee_quote(Amount::from_msats(amount.0)).await?;
+        Ok(Msat(quote.total().get_bitcoin().msats))
+    }
+
+    /// The FEDERATION send-tx fee for paying `invoice` from `id` (spec §6.1), in msat. Only
+    /// the on-federation cost; the gateway's send fee is quoted via [`Self::send_gateway_fee`].
+    ///
+    /// lnv2 quotes the send fee on the full outgoing-contract value (`send_fee.add_to(amount)`);
+    /// quoting on the invoice amount here is the floor. The exact contract-amount refinement
+    /// is a live-validation detail (the gateway send fee is added separately, spec §6).
+    pub async fn send_fee_quote(
+        &self,
+        id: &FederationId,
+        invoice: &Invoice,
+    ) -> anyhow::Result<Msat> {
+        let client = self.client(id)?;
+        let lnv2 = client.get_first_module::<LightningClientModule>()?;
+        let bolt11 = Bolt11Invoice::from_str(&invoice.0)
+            .map_err(|e| anyhow::anyhow!("parsing invoice: {e}"))?;
+        let invoice_msat = bolt11
+            .amount_milli_satoshis()
+            .ok_or_else(|| anyhow::anyhow!("invoice carries no amount"))?;
+        let quote = lnv2
+            .send_fee_quote(Amount::from_msats(invoice_msat))
+            .await?;
+        Ok(Msat(quote.total().get_bitcoin().msats))
+    }
+
+    /// The pinned gateway's RECEIVE fee for `id` as a pure [`GatewayFee`] (spec §6.2), read
+    /// from its `routing_info`. Feeds the executor's receive-side `gross_up`.
+    pub async fn receive_gateway_fee(
+        &self,
+        id: &FederationId,
+        gateway: &GatewayUrl,
+    ) -> anyhow::Result<GatewayFee> {
+        let routing_info = self.routing_info_for(id, gateway).await?;
+        Ok(payment_fee_to_gateway_fee(routing_info.receive_fee))
+    }
+
+    /// The pinned gateway's SEND fee for paying `invoice` from `id` (spec §6.2), read from
+    /// its `routing_info` via `send_parameters` (which picks the direct-swap vs lightning-swap
+    /// fee by whether the invoice's payee is the gateway). Feeds the send-leg cap re-quote.
+    pub async fn send_gateway_fee(
+        &self,
+        id: &FederationId,
+        gateway: &GatewayUrl,
+        invoice: &Invoice,
+    ) -> anyhow::Result<GatewayFee> {
+        let routing_info = self.routing_info_for(id, gateway).await?;
+        let bolt11 = Bolt11Invoice::from_str(&invoice.0)
+            .map_err(|e| anyhow::anyhow!("parsing invoice: {e}"))?;
+        let (send_fee, _expiration_delta) = routing_info.send_parameters(&bolt11);
+        Ok(payment_fee_to_gateway_fee(send_fee))
+    }
+
+    /// Page `id`'s op-log to EXHAUSTION (spec §5/§9.2) and recover one [`OpArtifact`] per
+    /// operation tagged with a move `custom_meta`. This is how a lost/derived `MoveRecord`
+    /// is repaired: the op-log is the source of truth, and each op ties an op-id (+ the
+    /// receive leg's invoice) back to its `move_id`.
+    ///
+    /// Paging runs newest-first via `paginate_operations_rev` until a short page ends it — a
+    /// single page would miss older ops and risk re-minting/re-paying. `custom_meta` is
+    /// decoded FALLIBLY: a non-lnv2 op or a non-move lnv2 op is skipped silently; an op that
+    /// looks like a move (`move_id` present) but fails to decode is warn-logged and skipped,
+    /// never panicking.
+    pub async fn backfill_ops(&self, id: &FederationId) -> anyhow::Result<Vec<OpArtifact>> {
+        let client = self.client(id)?;
+        let log = client.operation_log();
+        let mut last_seen: Option<ChronologicalOperationLogKey> = None;
+        let mut artifacts = Vec::new();
+        loop {
+            let page = log
+                .paginate_operations_rev(BACKFILL_PAGE_SIZE, last_seen)
+                .await;
+            let page_len = page.len();
+            if let Some((key, _)) = page.last() {
+                last_seen = Some(*key);
+            }
+            for (key, entry) in page {
+                let op_id = bridge_op_id(key.operation_id);
+                // Only lnv2 lightning ops can carry our move meta; mint/wallet/ln ops don't.
+                let Ok(meta) = entry.try_meta::<LightningOperationMeta>() else {
+                    continue;
+                };
+                match op_artifact_from_meta(op_id, meta) {
+                    Ok(Some(artifact)) => artifacts.push(artifact),
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(
+                        op = %key.operation_id.fmt_full(),
+                        error = ?e,
+                        "backfill: skipping op with malformed move meta"
+                    ),
+                }
+            }
+            // A short (or empty) page is the last: `paginate_operations_rev` returns up to
+            // `limit` newest-first, so fewer than `limit` means the log is exhausted.
+            if page_len < BACKFILL_PAGE_SIZE {
+                break;
+            }
+        }
+        Ok(artifacts)
+    }
+
+    /// Fetch the pinned gateway's `RoutingInfo` for `id`, erroring if the gateway is
+    /// unreachable or does not serve this federation. Shared by the two gateway-fee getters.
+    async fn routing_info_for(
+        &self,
+        id: &FederationId,
+        gateway: &GatewayUrl,
+    ) -> anyhow::Result<RoutingInfo> {
+        let client = self.client(id)?;
+        let lnv2 = client.get_first_module::<LightningClientModule>()?;
+        let url = SafeUrl::parse(&gateway.0)
+            .map_err(|e| anyhow::anyhow!("invalid gateway url {:?}: {e}", gateway.0))?;
+        lnv2.routing_info(&url)
+            .await
+            .map_err(|e| anyhow::anyhow!("fetching routing info from gateway {}: {e}", gateway.0))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "gateway {} does not serve federation {}",
+                    gateway.0,
+                    id.to_hex()
+                )
+            })
+    }
+
     /// Clone out the open client for `id`, or error if the federation isn't joined/opened.
     /// Cloning the `Arc` under the (sync) map lock keeps the guard from crossing an await
     /// point in the money methods above.
@@ -381,6 +525,59 @@ impl MultiClient {
 /// Invoice expiry (seconds) passed to lnv2 `receive`. Spec §4 fixes this at one hour; the
 /// executor may size it per-move in step 4b.
 const RECEIVE_EXPIRY_SECS: u32 = 3600;
+
+/// Op-log page size for [`MultiClient::backfill_ops`]. Backfill pages to EXHAUSTION (spec
+/// §9.2), so this only trades round-trips against per-page memory; it is not a coverage cap.
+const BACKFILL_PAGE_SIZE: usize = 100;
+
+/// Bridge fedimint's `PaymentFee { base, parts_per_million }` to our pure [`GatewayFee`]
+/// (spec §6.2). `base` is an `Amount`, so its msat value is `base.msats`.
+fn payment_fee_to_gateway_fee(fee: PaymentFee) -> GatewayFee {
+    GatewayFee {
+        base_msat: Msat(fee.base.msats),
+        ppm: fee.parts_per_million,
+    }
+}
+
+/// Recover the [`OpArtifact`] a single lnv2 operation contributes to a move, or `None` when
+/// the op is not part of a move (spec §4/§5). The leg is decided by the op meta VARIANT
+/// (`Send`/`Receive`), authoritative over the redundant `role` in `custom_meta`; the receive
+/// leg carries its invoice, the send leg leaves it `None` (the [`OpArtifact`] contract).
+fn op_artifact_from_meta(
+    op_id: OperationId,
+    meta: LightningOperationMeta,
+) -> anyhow::Result<Option<OpArtifact>> {
+    let (leg, custom_meta, invoice) = match meta {
+        LightningOperationMeta::Send(send) => (Leg::Send, send.custom_meta, None),
+        LightningOperationMeta::Receive(receive) => {
+            let LightningInvoice::Bolt11(bolt11) = receive.invoice;
+            (
+                Leg::Receive,
+                receive.custom_meta,
+                Some(bridge_invoice(&bolt11)),
+            )
+        }
+        // A gateway-minted LNURL receive is not part of our two-leg move protocol.
+        LightningOperationMeta::LnurlReceive(_) => return Ok(None),
+    };
+
+    // A move op tags `custom_meta` with a `move_id`; anything else (e.g. a bare wallet-cli
+    // receive/pay carrying only a `role`) is not part of a move — skip it silently.
+    if custom_meta.get("move_id").is_none() {
+        return Ok(None);
+    }
+    // It claims to be a move op: a decode failure now is genuine corruption (spec §9.2) —
+    // surface it (the caller warns + skips) rather than silently dropping a real leg.
+    let move_meta = MoveMeta::from_value(&custom_meta).ok_or_else(|| {
+        anyhow::anyhow!("op has a move_id but its custom_meta is not a valid MoveMeta")
+    })?;
+    Ok(Some(OpArtifact {
+        move_id: move_meta.move_id,
+        leg,
+        op_id,
+        invoice,
+    }))
+}
 
 /// The outcome of an lnv2 `send` (see [`MultiClient::pay`]). The dedup variants are
 /// OUTCOMES, not errors: the client recognised an existing operation for this invoice and

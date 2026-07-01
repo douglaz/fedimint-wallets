@@ -101,8 +101,15 @@ pub struct AllocatorSnapshot {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Action {
     /// Route the next receive here. The cheap PRIMARY lever: directing an inflow
-    /// costs nothing, unlike moving existing balance.
-    DirectInflow { to: FederationId },
+    /// costs nothing to *move* (no source balance is spent), but the receive
+    /// itself still has a fee — the gateway + federation receive-side cost that
+    /// grosses up the invoice (spec §6). `amount` is the NET credit the
+    /// destination must end up with; `fee_cap` bounds that receive-side cost.
+    DirectInflow {
+        to: FederationId,
+        amount: Msat,
+        fee_cap: Msat,
+    },
     /// Rebalance existing balance from one federation to another.
     Move {
         from: FederationId,
@@ -142,13 +149,16 @@ impl Action {
         )
     }
 
-    /// The fee budget authoritative for this action, if it has one. `Move`/`Evacuate`
-    /// carry a `fee_cap`; `DirectInflow` moves no money and advisory actions are
-    /// never executed, so both have none.
+    /// The fee budget authoritative for this action, if it has one.
+    /// `Move`/`Evacuate` carry a `fee_cap` bounding the total move cost;
+    /// `DirectInflow` carries one bounding its receive-side gross-up (spec §6).
+    /// Advisory actions are never executed, so they have none.
     pub fn fee_cap(&self) -> Option<Msat> {
         match self {
-            Action::Move { fee_cap, .. } | Action::Evacuate { fee_cap, .. } => Some(*fee_cap),
-            Action::DirectInflow { .. } | Action::RefuseInflow { .. } | Action::Cap { .. } => None,
+            Action::Move { fee_cap, .. }
+            | Action::Evacuate { fee_cap, .. }
+            | Action::DirectInflow { fee_cap, .. } => Some(*fee_cap),
+            Action::RefuseInflow { .. } | Action::Cap { .. } => None,
         }
     }
 }

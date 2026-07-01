@@ -18,8 +18,9 @@ pub enum IntentStatus {
 pub struct Intent {
     pub idempotency_key: IdempotencyKey,
     pub action: Action,
-    /// Derived from `action.fee_cap()`: `Some` for `Move`/`Evacuate`, `None` for a
-    /// `DirectInflow` (which moves no money and so has no fee budget).
+    /// Derived from `action.fee_cap()`: `Some` for `Move`/`Evacuate` (total move
+    /// cost) and `DirectInflow` (its receive-side gross-up cost, spec §6); `None`
+    /// only for advisory actions, which are never executed.
     pub max_fee: Option<Msat>,
     pub status: IntentStatus,
 }

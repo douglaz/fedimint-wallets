@@ -14,18 +14,28 @@
 //!   await_receive / await_send) with the [`SendOutcome`]/[`ReceiveState`]/[`SendState`]
 //!   outcome enums, exposed through `wallet-cli`.
 //!
-//! The remaining fedimint-SDK pieces — the `FedimintExecutor` (fee gross-up,
-//! `MoveRecord`/`Action` wiring), op-log backfill, the runtime/reconcile loop — arrive in
-//! step 4b.
+//! Step 4b (this step) adds:
+//! - the PURE fee model [`fee`] (the fixed-point gross-up + cap check) and the pure
+//!   [`MovePlan`]/[`MoveMeta`] mapping — golden-tested;
+//! - the [`FedimintExecutor`] (impl [`wallet_core::Executor`]) plus the `MultiClient` fee-quote
+//!   / `backfill_ops` I/O — scaffolded (compile + source-verified), validated live later.
+//!
+//! The runtime/reconcile loop (op-log backfill on boot, subscription rehydration) arrives with
+//! the live-validation step.
 
+pub mod executor;
+pub mod fee;
 pub mod journal;
 pub mod move_protocol;
 pub mod multi_client;
 pub mod types;
 
+pub use executor::FedimintExecutor;
+pub use fee::{gross_up, total_within_cap, GatewayFee, GrossUp};
 pub use journal::{FederationInfo, FederationListReport, FedimintJournal};
 pub use move_protocol::{
-    assemble_move_record, next_step, Leg, MoveParams, MovePhase, MoveRecord, MoveStep, OpArtifact,
+    assemble_move_record, next_step, Leg, MoveMeta, MoveParams, MovePhase, MovePlan, MoveRecord,
+    MoveRole, MoveStep, OpArtifact,
 };
 pub use multi_client::{MultiClient, ReceiveState, SendOutcome, SendState};
 pub use types::{GatewayUrl, Invoice, OperationId, Preimage};

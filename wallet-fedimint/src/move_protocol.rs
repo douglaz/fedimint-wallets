@@ -7,7 +7,7 @@
 //! [`assemble_move_record`] (rebuild the derived record from its durable sources).
 
 use crate::types::{GatewayUrl, Invoice, OperationId};
-use wallet_core::{FederationId, IdempotencyKey, Msat};
+use wallet_core::{Action, FederationId, IdempotencyKey, Msat};
 
 /// Where a move currently sits in its lifecycle (spec §3.3).
 ///
@@ -92,6 +92,112 @@ pub struct MoveParams {
     pub fee_cap: Msat,
     pub gateway: GatewayUrl,
     pub send_required: bool,
+}
+
+/// The gateway-free, pure projection of an executable [`Action`] into the parameters a
+/// move needs (spec §7). It carries ONLY what is derivable from the `Action` itself; the
+/// gateway is resolved by the executor at run time (from `mc.gateways`, then pinned in the
+/// durable [`MoveRecord`]), and the idempotency key comes from the `Intent`, so neither
+/// lives here — keeping [`MovePlan::from_action`] a pure, gateway-free mapping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MovePlan {
+    /// Source federation: `Some` for a `Move` (a send leg is required), `None` for a
+    /// `DirectInflow` (receive-only).
+    pub from: Option<FederationId>,
+    pub to: FederationId,
+    /// The NET credit the destination must end up with (spec §6).
+    pub amount: Msat,
+    pub fee_cap: Msat,
+    /// `Move` = true (pay a send leg), `DirectInflow` = false (receive-only). Always agrees
+    /// with `from.is_some()`.
+    pub send_required: bool,
+}
+
+impl MovePlan {
+    /// Map an [`Action`] to a [`MovePlan`], or `None` for anything Phase 1's executor does
+    /// not perform as a move (spec §3.1/§7):
+    ///
+    /// - `Move` → `Some` with `from = Some`, `send_required = true`.
+    /// - `DirectInflow` → `Some` with `from = None`, `send_required = false` (receive-only).
+    /// - `Evacuate` → `None` (modeled but Phase 1 returns `Unsupported`).
+    /// - `RefuseInflow` / `Cap` → `None` (advisory policy signals, never executed).
+    pub fn from_action(a: &Action) -> Option<MovePlan> {
+        match a {
+            Action::Move {
+                from,
+                to,
+                amount,
+                fee_cap,
+            } => Some(MovePlan {
+                from: Some(*from),
+                to: *to,
+                amount: *amount,
+                fee_cap: *fee_cap,
+                send_required: true,
+            }),
+            Action::DirectInflow {
+                to,
+                amount,
+                fee_cap,
+            } => Some(MovePlan {
+                from: None,
+                to: *to,
+                amount: *amount,
+                fee_cap: *fee_cap,
+                send_required: false,
+            }),
+            // `Evacuate` is Phase 2 (executor → `Unsupported`); advisory actions are never
+            // executed. Both are absent from the money path here.
+            Action::Evacuate { .. } | Action::RefuseInflow { .. } | Action::Cap { .. } => None,
+        }
+    }
+}
+
+/// Which leg of a move an operation's `custom_meta` tags (spec §4). Serialized as
+/// `"send"`/`"receive"` inside [`MoveMeta`]. This mirrors [`Leg`], but is the durable,
+/// serde-tagged form embedded in the fedimint op meta (whereas [`Leg`] is the in-memory
+/// backfill artifact); the two are kept separate so the on-the-wire vocabulary is explicit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MoveRole {
+    Send,
+    Receive,
+}
+
+/// The move-coordination metadata embedded in EVERY receive/send operation's `custom_meta`
+/// (spec §4/§5). Fedimint commits it atomically with the operation, so it is how a lost
+/// [`MoveRecord`] is repaired on backfill: the op-log is the source of truth, this ties an
+/// op-id back to its `move_id` and leg.
+///
+/// Pure serde over `wallet_core` types (no fedimint SDK); the executor builds one when it
+/// calls `receive`/`send`, and `MultiClient::backfill_ops` decodes it back. The move's
+/// occurrence (spec §4) is NOT a separate field: it is already embedded in `move_id` (the
+/// allocator stamps it into the idempotency key), and backfill keys purely on `move_id`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MoveMeta {
+    /// `== MoveRecord.key == Intent key` — the join key across both legs (embeds occurrence).
+    pub move_id: IdempotencyKey,
+    pub role: MoveRole,
+    /// The move's source federation (`None` for a `DirectInflow`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<FederationId>,
+    pub to: FederationId,
+}
+
+impl MoveMeta {
+    /// Serialize to the `serde_json::Value` that lnv2 `receive`/`send` commit as
+    /// `custom_meta`. Infallible in practice (all fields are plain serde types).
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("MoveMeta is always serializable")
+    }
+
+    /// Recover a [`MoveMeta`] from an operation's `custom_meta`, or `None` when the value is
+    /// not a move meta (a bare receive/pay tagged only with a `role`, say). Backfill treats
+    /// a value that DOES look like a move (`move_id` present) but fails to decode as
+    /// malformed and warns; that discrimination lives at the `backfill_ops` call site.
+    pub fn from_value(value: &serde_json::Value) -> Option<MoveMeta> {
+        serde_json::from_value(value.clone()).ok()
+    }
 }
 
 /// The next step for a move, computed purely (spec §3.3):

@@ -241,9 +241,13 @@ impl Executor for BlockingExecutor {
 fn direct_inflow_is_executable() {
     let action = Action::DirectInflow {
         to: FederationId([2; 32]),
+        amount: Msat(50_000),
+        fee_cap: Msat(500),
     };
     assert!(action.is_executable());
-    assert_eq!(action.fee_cap(), None);
+    // A `DirectInflow` now carries a receive-side fee budget (spec §6), so it
+    // surfaces a `fee_cap` like `Move`/`Evacuate`.
+    assert_eq!(action.fee_cap(), Some(Msat(500)));
 }
 
 #[test]
@@ -284,14 +288,16 @@ async fn apply_fresh_decision_journals_and_performs_once() {
 }
 
 #[tokio::test]
-async fn apply_direct_inflow_journals_with_no_fee_cap() {
+async fn apply_direct_inflow_journals_with_its_fee_cap() {
     // A construct-a-DirectInflow smoke test: it is executable, gets an Intent, and
-    // (having no fee_cap of its own) journals with `max_fee: None`.
+    // journals with its receive-side `fee_cap` as `max_fee` (spec §6).
     let key = "inflow:2:1";
     let decisions = vec![decision(
         key,
         Action::DirectInflow {
             to: FederationId([2; 32]),
+            amount: Msat(50_000),
+            fee_cap: Msat(500),
         },
         ReasonCode::SpendingBelowTarget,
     )];
@@ -307,7 +313,7 @@ async fn apply_direct_inflow_journals_with_no_fee_cap() {
         .await
         .expect("get")
         .expect("intent is journaled");
-    assert_eq!(intent.max_fee, None);
+    assert_eq!(intent.max_fee, Some(Msat(500)));
     assert_eq!(intent.status, IntentStatus::Done);
 }
 
