@@ -61,12 +61,9 @@ pub enum PerformOutcome {
 /// A typed execution failure (was information-free). The variant decides how
 /// [`drive`] updates the intent's status.
 ///
-/// The `Retryable`/`Permanent` payloads are diagnostic context for the real
-/// `Executor` impl (wallet-fedimint, a later step) to log when it surfaces a failure.
-/// `drive` dispatches on the VARIANT alone in this phase — dependency-light
-/// `wallet-core` has no log seam yet and `ExecutionSummary` only carries counts — so
-/// the strings are carried, not yet emitted. (Kept per spec §2, which mandates the
-/// `String` payloads.)
+/// The `Retryable`/`Permanent` payloads are diagnostic context from the real
+/// `Executor` impl. `drive` dispatches on the variant and logs the payload before
+/// collapsing the result into [`ExecutionSummary`]'s counts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecError {
     /// Transient: leave the intent `Pending` so the next [`reconcile`] retries it.
@@ -492,14 +489,34 @@ async fn drive<J: Journal, E: Executor>(
                 summary.failed += 1;
             }
         }
-        Err(ExecError::Retryable(_)) => {
+        Err(ExecError::Retryable(reason)) => {
+            tracing::warn!(
+                key = %intent.idempotency_key.0,
+                reason = %reason,
+                "executor perform failed retryably"
+            );
             // Leave the intent Pending so the next reconcile retries it (NOT Failed).
             let _ = journal
                 .set_status(&intent.idempotency_key, IntentStatus::Pending)
                 .await;
             summary.failed += 1;
         }
-        Err(ExecError::Permanent(_)) | Err(ExecError::Unsupported) => {
+        Err(ExecError::Permanent(reason)) => {
+            tracing::warn!(
+                key = %intent.idempotency_key.0,
+                reason = %reason,
+                "executor perform failed permanently"
+            );
+            let _ = journal
+                .set_status(&intent.idempotency_key, IntentStatus::Failed)
+                .await;
+            summary.failed += 1;
+        }
+        Err(ExecError::Unsupported) => {
+            tracing::warn!(
+                key = %intent.idempotency_key.0,
+                "executor action unsupported"
+            );
             let _ = journal
                 .set_status(&intent.idempotency_key, IntentStatus::Failed)
                 .await;

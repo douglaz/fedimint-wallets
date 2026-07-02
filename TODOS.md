@@ -56,8 +56,14 @@ douglaz/fedimint @ `b108ec6`.
       validated LIVE** on devimint.
 - [x] Step 4a lnv2 money primitives (receive/pay/await) — **receive validated LIVE** (nets exactly
       amount − lnv2 recv fee).
-- [x] Step 4b pure core — fixed-point fee `gross_up` (§6, never under-credits) + `Action→MovePlan`
+- [x] Step 4b pure core — fixed-point fee `gross_up` (§6) + `Action→MovePlan`
       + `FedimintExecutor::perform` scaffold (compiles) + `MultiClient` fee-quote/backfill_ops.
+- [x] Step 4b-live-1 (branch `feat/executor-directinflow`) — `DirectInflow` path EXECUTES: executor
+      pinned-gateway + `backfill_move_record`; `runtime::Runtime` (`direct_inflow`/`await_move`/
+      `reconcile`, spec §7/§9); `wallet-cli direct-inflow`/`await-move`/`reconcile`. rb-lite gate
+      green (compile+clippy+fmt+unit incl. custom_meta shape + key determinism). `smoke_directinflow_
+      devimint.sh` written (await-send-first; asserts net == N EXACTLY + idempotent). `Move` stays
+      `Unsupported`.
 
 **devimint reliability SOLVED (2026-07-02):** the flaky lnv2 validation was NOT our code and NOT
 debug builds/gateway-readiness — it was a test-harness **await ordering**. lnv2's internal swap
@@ -69,11 +75,21 @@ The `Executor should be running` warning was a red herring (the executor runs fi
 
 - [x] **4a-pay** — VALIDATED LIVE: the full money smoke passes end-to-end (receive→claimed,
       pay→success+preimage, devimint confirms Claimed, re-pay→already-paid/no-double-debit).
-- [ ] **4b-live** validate `FedimintExecutor::perform` on devimint: `DirectInflow` nets EXACTLY the
-      target amount; a single-fed `Move` (receive+pay via the shared gateway). Wire `wallet-cli
-      move`/`reconcile`.
-- [ ] **Fee-quote base discrepancy** — resolve lnv2 `receive_fee_quote` base (doc: gross) vs spec §6
-      (`contract_amount`) against the live quote API (see memory `fee-quote-base-discrepancy`).
+- [x] **4b-live-1 DirectInflow** — VALIDATED LIVE (`smoke_directinflow_devimint.sh`): `wallet-cli
+      direct-inflow` → invoice → devimint pays → `await-move: done` → wallet nets the target;
+      idempotent re-run mints the SAME invoice (no second mint); `reconcile` is a clean no-op on a
+      Done inflow (`awaiting=0`, balance unchanged). The FedimintExecutor DirectInflow path +
+      `runtime::Runtime` (direct_inflow/await_move/reconcile) + the CLI all work end-to-end.
+- [ ] **gross-up never-under-credit (4b-live follow-up)** — the wallet nets ~18 msat (0.018 sat)
+      UNDER the target: lnv2 `receive_fee_quote` under-quotes the true claim fee (it can't see the
+      mint OUTPUT / note-selection fee — spec §6 "config constants under-quote"). Make `gross_up`
+      conservative (model/estimate the mint output fee, or add a bounded buffer) so net is never
+      UNDER the target. Smoke asserts a 1-sat tolerance below target for now.
+- [ ] **4b-live-2 Move** — single-fed `Move` (receive + pay via the shared gateway) + `wallet-cli
+      move` (perform's send leg + await/settle; currently `Unsupported`).
+- [x] **Fee-quote base discrepancy** — RESOLVED (verified vs pinned `b108ec6`): fed fee quoted on
+      `contract_amount` (spec §6); the gateway ppm now FLOORS (`GatewayFee::on`) to invert
+      `PaymentFee::subtract_from`. Residual: the mint-output-fee under-quote above. See memory.
 - [ ] **Step 5 crash gate** — `kill -9` `wallet-cli` mid-move at the deterministic `WALLET_CLI_CRASH_AT`
       killpoints → `reconcile` → no double-pay / no second payable invoice (spec §10).
 

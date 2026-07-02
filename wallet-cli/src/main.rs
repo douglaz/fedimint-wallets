@@ -11,10 +11,11 @@ use fedimint_core::db::Database;
 use fedimint_core::invite_code::InviteCode;
 use std::path::PathBuf;
 use std::str::FromStr;
-use wallet_core::{FederationId, Msat};
+use std::sync::Arc;
+use wallet_core::{FederationId, IdempotencyKey, IntentStatus, Msat, Occurrence};
 use wallet_fedimint::{
-    FedimintJournal, GatewayUrl, Invoice, MultiClient, OperationId, ReceiveState, SendOutcome,
-    SendState,
+    FedimintJournal, FinalizeOutcome, GatewayUrl, Invoice, MultiClient, OperationId, ReceiveState,
+    Runtime, SendOutcome, SendState,
 };
 
 #[derive(Parser)]
@@ -84,6 +85,43 @@ enum Command {
         #[arg(long)]
         fed: String,
     },
+    /// Route an inflow to a chosen federation via the executor (spec §6/§7): size + cap-check
+    /// the receive invoice so the wallet nets EXACTLY `amount`, print the BOLT11 to stdout and
+    /// the intent key to stderr, then `await-move <key>` once the external payer has paid.
+    DirectInflow {
+        /// Net amount the destination must end up with, in millisatoshis.
+        #[arg(long)]
+        amount: u64,
+        /// Federation to receive into (hex id). Defaults to the sole joined federation.
+        #[arg(long)]
+        to: Option<String>,
+        /// Receive-side fee cap, in millisatoshis. Defaults to a deliberately generous guard
+        /// (amount + 1000 sat); pass this to enforce a tight maximum receive fee.
+        #[arg(long)]
+        fee_cap: Option<u64>,
+        /// lnv2 gateway URL to route the inflow. Defaults to the first registered lnv2
+        /// gateway; pass one explicitly against devimint (its LDK gateway is not
+        /// auto-registered — see docs/devimint-runbook.md §4).
+        #[arg(long)]
+        gateway: Option<String>,
+        /// Idempotency occurrence. Reusing the same occurrence returns the same invoice; bump it
+        /// to create another same-amount inflow after the first one settles or fails.
+        #[arg(long, default_value_t = 0)]
+        occurrence: u64,
+    },
+    /// Finalize an awaiting DirectInflow: block on its receive op, then print the final intent
+    /// status (done / failed).
+    AwaitMove {
+        /// The intent key (as printed to stderr by `direct-inflow`).
+        key: String,
+        /// The federation the inflow receives into (hex id). Optional guard; the destination is
+        /// read from the intent's move record.
+        #[arg(long)]
+        fed: Option<String>,
+    },
+    /// Re-drive pending intents and rebuild move records from the op-log (spec §9 resume loop):
+    /// print performed/failed/skipped/awaiting counts; awaiting intent keys go to stderr.
+    Reconcile,
 }
 
 #[tokio::main]
@@ -107,9 +145,9 @@ async fn main() -> anyhow::Result<()> {
         .await?
         .into();
 
-    let journal = FedimintJournal::new(db.clone());
+    let journal = Arc::new(FedimintJournal::new(db.clone()));
     let mnemonic = load_or_generate_mnemonic(&db).await?;
-    let multi_client = MultiClient::new(db, mnemonic).await;
+    let multi_client = Arc::new(MultiClient::new(db, mnemonic).await);
 
     let joined = journal
         .list_federations()
@@ -195,9 +233,136 @@ async fn main() -> anyhow::Result<()> {
                 SendState::Failed(msg) => println!("failed: {msg}"),
             }
         }
+        Command::DirectInflow {
+            amount,
+            to,
+            fee_cap,
+            gateway,
+            occurrence,
+        } => {
+            let id = select_fed(&joined_ids, &open_ids, to.as_deref())?;
+            let gateway = pick_receive_gateway(&multi_client, &id, gateway).await?;
+            let amount = Msat(amount);
+            let fee_cap = Msat(fee_cap.unwrap_or_else(|| default_direct_inflow_fee_cap(amount.0)));
+            let runtime = Runtime::new(multi_client.clone(), journal.clone(), gateway);
+            let outcome = runtime
+                .direct_inflow(id, amount, fee_cap, Occurrence(occurrence))
+                .await?;
+            // Surface the invoice to stdout ONLY when it is a real, payable result: an
+            // `Awaiting` inflow (payable now) or an already-settled `Done` idempotent re-run
+            // (same invoice, proving no second mint). A terminal `Failed` intent keeps a DEAD
+            // invoice that must never be presented as the scriptable result, and a still-`Pending`
+            // / absent one has nothing to pay — both `bail!` with guidance and a non-zero exit.
+            match (
+                direct_inflow_surfaces_invoice(outcome.status),
+                outcome.invoice,
+            ) {
+                (true, Some(invoice)) => {
+                    // Invoice -> stdout (the payable result); key + status -> stderr (handles).
+                    println!("{}", invoice.0);
+                    eprintln!("intent_key: {}", outcome.key.0);
+                    eprintln!("status: {}", status_label(outcome.status));
+                    if outcome.status == Some(IntentStatus::Done) {
+                        eprintln!(
+                            "note: intent already settled; bump --occurrence for a new inflow"
+                        );
+                    }
+                }
+                (_, _) => anyhow::bail!(
+                    "{}",
+                    missing_direct_inflow_invoice_message(&outcome.key, outcome.status)
+                ),
+            }
+        }
+        Command::AwaitMove { key, fed } => {
+            let expected_fed = match fed.as_deref() {
+                Some(hex) => Some(select_fed(&joined_ids, &open_ids, Some(hex))?),
+                None => None,
+            };
+            let runtime = Runtime::new(multi_client.clone(), journal.clone(), None);
+            let key = IdempotencyKey(key);
+            match runtime.await_move(&key, expected_fed).await? {
+                FinalizeOutcome::Done => println!("done"),
+                FinalizeOutcome::Failed(msg) => {
+                    // Report the terminal status on stdout (the scriptable result), then fail the
+                    // process so a caller gating on the exit code (`if wallet-cli await-move …`)
+                    // never mistakes a failed finalization for a settled receive — matching
+                    // direct-inflow's deliberate non-zero-on-non-payable stance.
+                    println!("failed: {msg}");
+                    anyhow::bail!("await-move: inflow {} did not settle", key.0);
+                }
+            }
+        }
+        Command::Reconcile => {
+            let runtime = Runtime::new(multi_client.clone(), journal.clone(), None);
+            let summary = runtime.reconcile().await?;
+            // Counts -> stdout (the scriptable result); awaiting keys -> stderr (handles).
+            println!(
+                "performed={} failed={} skipped={} awaiting={}",
+                summary.performed, summary.failed, summary.skipped, summary.awaiting
+            );
+            for key in &summary.awaiting_keys {
+                eprintln!("awaiting: {}", key.0);
+            }
+        }
     }
 
     Ok(())
+}
+
+/// A deliberately loose default receive-side fee cap for a CLI `direct-inflow`: the net amount
+/// plus 1000 sat of headroom. This is an intentional no-surprises guard for the happy path, not
+/// meaningful fee protection; pass `--fee-cap` to bound the receive cost tightly.
+fn default_direct_inflow_fee_cap(amount_msat: u64) -> u64 {
+    amount_msat.saturating_add(1_000_000)
+}
+
+/// Whether a finished `direct-inflow` should surface its invoice on stdout as the scriptable
+/// result (spec §7). Only an `Awaiting` inflow (payable now) or an already-settled `Done`
+/// idempotent re-run (the same invoice, proving no second mint) does. A terminal `Failed` intent
+/// keeps a DEAD invoice that must never be presented as payable, and a still-`Pending`/`Executing`
+/// or absent one has nothing to pay.
+fn direct_inflow_surfaces_invoice(status: Option<IntentStatus>) -> bool {
+    matches!(status, Some(IntentStatus::Awaiting | IntentStatus::Done))
+}
+
+/// A stable, lowercase label for an intent status (never the `Debug`-rendered `Some(..)` wrapper).
+fn status_label(status: Option<IntentStatus>) -> &'static str {
+    match status {
+        Some(IntentStatus::Pending) => "pending",
+        Some(IntentStatus::Executing) => "executing",
+        Some(IntentStatus::Awaiting) => "awaiting",
+        Some(IntentStatus::Done) => "done",
+        Some(IntentStatus::Failed) => "failed",
+        None => "unknown",
+    }
+}
+
+fn missing_direct_inflow_invoice_message(
+    key: &IdempotencyKey,
+    status: Option<IntentStatus>,
+) -> String {
+    match status {
+        Some(IntentStatus::Failed) => format!(
+            "direct-inflow has no payable invoice (intent {} status Failed); this intent is \
+             terminal and any minted invoice is dead — retry/reconcile will not re-drive it. \
+             Correct the inputs, then start a fresh inflow with a new --occurrence value",
+            key.0
+        ),
+        Some(IntentStatus::Pending) | Some(IntentStatus::Executing) | None => format!(
+            "direct-inflow has no payable invoice (intent {} status {}); the receive may have \
+             failed before the invoice was persisted — retry direct-inflow with the same \
+             --occurrence or run reconcile",
+            key.0,
+            status_label(status)
+        ),
+        Some(IntentStatus::Awaiting) | Some(IntentStatus::Done) => format!(
+            "direct-inflow has no payable invoice (intent {} status {}); run reconcile to rebuild \
+             the move record from the operation log, then retry the command",
+            key.0,
+            status_label(status)
+        ),
+    }
 }
 
 /// Select the federation to act on: the explicit `--to`/`--fed` hex if given (and joined),
@@ -240,10 +405,10 @@ fn require_open(id: &FederationId, open_feds: &[FederationId]) -> anyhow::Result
     Ok(())
 }
 
-/// Pick the gateway for a `receive`: the explicit `--gateway` if given, else let lnv2
-/// probe the registered list and auto-select a live gateway. A federation with no listed
-/// lnv2 gateways is a clean error pointing at `--gateway` (devimint does not auto-register
-/// its LDK gateway — runbook §4).
+/// Resolve the optional CLI gateway flag. An explicit URL becomes a pinned gateway. Without one,
+/// require at least one registered lnv2 gateway and return `None`: raw `receive` passes that to
+/// lnv2's auto-selection, while `direct-inflow` pins the executor to the first registered gateway
+/// for crash-stable replay. Use `--gateway` when liveness or devimint routing matters.
 async fn pick_receive_gateway(
     multi_client: &MultiClient,
     id: &FederationId,
@@ -377,5 +542,50 @@ mod tests {
         let a = fed(1);
 
         assert_eq!(select_fed(&[a], &[a], None).unwrap(), a);
+    }
+
+    #[test]
+    fn failed_direct_inflow_missing_invoice_message_does_not_suggest_reconcile_retry() {
+        let key = IdempotencyKey("direct-inflow:test:0".into());
+        let msg = missing_direct_inflow_invoice_message(&key, Some(IntentStatus::Failed));
+
+        assert!(msg.contains("terminal"), "{msg}");
+        assert!(msg.contains("new --occurrence"), "{msg}");
+        assert!(!msg.contains("run reconcile"), "{msg}");
+        assert!(!msg.contains("retry direct-inflow"), "{msg}");
+    }
+
+    #[test]
+    fn pending_direct_inflow_missing_invoice_message_is_retryable() {
+        let key = IdempotencyKey("direct-inflow:test:0".into());
+        let msg = missing_direct_inflow_invoice_message(&key, Some(IntentStatus::Pending));
+
+        assert!(msg.contains("same --occurrence"), "{msg}");
+        assert!(msg.contains("run reconcile"), "{msg}");
+    }
+
+    #[test]
+    fn only_awaiting_or_done_direct_inflow_surfaces_the_invoice() {
+        // Payable now, or an idempotent post-settlement re-run (same invoice, no second mint).
+        assert!(direct_inflow_surfaces_invoice(Some(IntentStatus::Awaiting)));
+        assert!(direct_inflow_surfaces_invoice(Some(IntentStatus::Done)));
+        // A terminal Failed intent keeps a DEAD invoice: it must NEVER be surfaced as the
+        // scriptable stdout result (a scripted `INV=$(direct-inflow …)` must not get a dead
+        // BOLT11 with exit 0). Pending/Executing/absent have nothing payable to surface.
+        assert!(!direct_inflow_surfaces_invoice(Some(IntentStatus::Failed)));
+        assert!(!direct_inflow_surfaces_invoice(Some(IntentStatus::Pending)));
+        assert!(!direct_inflow_surfaces_invoice(Some(
+            IntentStatus::Executing
+        )));
+        assert!(!direct_inflow_surfaces_invoice(None));
+    }
+
+    #[test]
+    fn status_label_is_a_bare_lowercase_word_not_the_option_debug_wrapper() {
+        // Regression: `eprintln!("status: {:?}", Some(Awaiting))` leaked `Some(Awaiting)`.
+        assert_eq!(status_label(Some(IntentStatus::Awaiting)), "awaiting");
+        assert_eq!(status_label(Some(IntentStatus::Done)), "done");
+        assert_eq!(status_label(Some(IntentStatus::Failed)), "failed");
+        assert_eq!(status_label(None), "unknown");
     }
 }

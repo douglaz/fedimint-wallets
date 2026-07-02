@@ -1,18 +1,19 @@
-//! Pure golden tests for the integer fee model (spec §6): the `GatewayFee` ceil, the
-//! fixed-point `gross_up` solver, and the `total_within_cap` check. No async, no I/O, no
-//! floats — every assertion is exact integer millisatoshis.
+//! Pure golden tests for the integer fee model (spec §6): the `GatewayFee` floor (exactly
+//! fedimint's `PaymentFee` arithmetic), the fixed-point `gross_up` solver, and the
+//! `total_within_cap` check. No async, no I/O, no floats — every assertion is exact integer
+//! millisatoshis.
 
 use wallet_core::Msat;
 use wallet_fedimint::{gross_up, total_within_cap, GatewayFee, GrossUp};
 
 /// A pure federation-fee closure: `base + floor(ppm * amount / 1_000_000)`. Floors like
-/// fedimint's own `PaymentFee` (the gross-up rounds the *gateway* fee up to compensate, so
-/// the recipient is never short even against a floored federation fee). `base = ppm = 0`
-/// gives the zero fee.
+/// fedimint's own `PaymentFee` — and so does [`GatewayFee::on`], so the solved invoice nets
+/// the recipient EXACTLY the target against the real floored fees, not a msat over.
+/// `base = ppm = 0` gives the zero fee.
 fn fed_fee(base: u64, ppm: u64) -> impl Fn(Msat) -> Msat {
     move |amount: Msat| {
-        let ppm_part = (u128::from(ppm) * u128::from(amount.0) / 1_000_000) as u64;
-        Msat(base + ppm_part)
+        let ppm_part = amount.0.saturating_mul(ppm).saturating_div(1_000_000);
+        Msat(base.saturating_add(ppm_part))
     }
 }
 
@@ -36,7 +37,7 @@ fn recipient_nets(g: &GrossUp, gw: GatewayFee, fed: impl Fn(Msat) -> Msat) -> Ms
 /// - `receive_quote == invoice_amount − net` (the total receive-side cost);
 /// - the invoice is MINIMAL: one msat less would under-credit the recipient.
 fn assert_solves_exactly(net: Msat, gw: GatewayFee, fed: impl Fn(Msat) -> Msat) -> GrossUp {
-    let g = gross_up(net, gw, &fed);
+    let g = gross_up(net, gw, &fed).expect("a fee with gateway ppm < 100% is solvable");
 
     assert_eq!(
         recipient_nets(&g, gw, &fed),
@@ -71,25 +72,38 @@ fn assert_solves_exactly(net: Msat, gw: GatewayFee, fed: impl Fn(Msat) -> Msat) 
 }
 
 #[test]
-fn gateway_fee_ceil_rounds_up_and_adds_base() {
-    // base + ceil(ppm * amount / 1e6).
+fn gateway_fee_floors_ppm_and_adds_base() {
+    // base + floor(ppm * amount / 1e6) — byte-for-byte fedimint's `PaymentFee::absolute_fee`.
     let fee = GatewayFee {
         base_msat: Msat(100),
         ppm: 5_000,
     };
     // Exact multiple: 5000 * 1_000_000 / 1e6 = 5000, no rounding.
     assert_eq!(fee.on(Msat(1_000_000)), Msat(5_100));
-    // Fractional ppm part rounds UP: 5000 * 1 / 1e6 = 0.005 → 1.
-    assert_eq!(fee.on(Msat(1)), Msat(101));
+    // Fractional ppm part FLOORS: 5000 * 1 / 1e6 = 0.005 → 0, so just the base.
+    assert_eq!(fee.on(Msat(1)), Msat(100));
     // Zero amount is just the base.
     assert_eq!(fee.on(Msat(0)), Msat(100));
 
-    // Ceil vs floor is load-bearing: 5000 * 201 / 1e6 = 1.005 → ceil 2 (floor would give 1).
+    // Floor is load-bearing (it matches the gateway's real `subtract_from`): 5000 * 201 / 1e6 =
+    // 1.005 → floor 1 (ceil would give 2 and leave the recipient a msat over target).
     let ppm_only = GatewayFee {
         base_msat: Msat(0),
         ppm: 5_000,
     };
-    assert_eq!(ppm_only.on(Msat(201)), Msat(2));
+    assert_eq!(ppm_only.on(Msat(201)), Msat(1));
+}
+
+#[test]
+fn gateway_fee_matches_fedimint_saturating_ppm_overflow() {
+    let fee = GatewayFee {
+        base_msat: Msat(7),
+        ppm: u64::MAX,
+    };
+    assert_eq!(
+        fee.on(Msat(2)),
+        Msat(7 + u64::MAX.saturating_div(1_000_000))
+    );
 }
 
 #[test]
@@ -177,9 +191,9 @@ fn gross_up_is_stable_and_monotonic() {
     assert_eq!(a, b);
 
     // Monotonic: a larger net never yields a smaller invoice / contract / receive-quote.
-    let mut prev = gross_up(Msat(0), gw, &fed);
+    let mut prev = gross_up(Msat(0), gw, &fed).expect("solvable");
     for net in [Msat(1), Msat(1_000), Msat(1_000_000), Msat(9_999_999)] {
-        let g = gross_up(net, gw, &fed);
+        let g = gross_up(net, gw, &fed).expect("solvable");
         assert!(
             g.invoice_amount.0 >= prev.invoice_amount.0,
             "invoice monotonic in net"
@@ -206,6 +220,41 @@ fn gross_up_never_under_credits_across_a_sweep() {
     for net in (0..200_000).step_by(1_777).map(Msat) {
         assert_solves_exactly(net, gw, &fed);
     }
+}
+
+#[test]
+fn gross_up_rejects_unsolvable_gateway_fee_instead_of_hanging() {
+    // A gateway that keeps 100% (or more) of every invoice (ppm ≥ 1_000_000) has NO fixed
+    // point: no invoice can net a positive amount. The solver must report "unsolvable"
+    // (`None`) rather than spin forever — this is a value a broken/hostile gateway can
+    // advertise, so the executor turns it into a terminal error instead of a hang.
+    let net = Msat(100_000);
+    for ppm in [1_000_000_u64, 1_000_001, 5_000_000, u64::MAX] {
+        let gw = GatewayFee {
+            base_msat: Msat(0),
+            ppm,
+        };
+        assert_eq!(
+            gross_up(net, gw, fed_fee(0, 0)),
+            None,
+            "gateway ppm {ppm} (>= 100%) has no solution"
+        );
+        // A base fee on top does not change unsolvability (it only grows the invoice).
+        let gw_with_base = GatewayFee {
+            base_msat: Msat(1_000),
+            ppm,
+        };
+        assert_eq!(gross_up(net, gw_with_base, fed_fee(500, 3_000)), None);
+    }
+
+    // The exact boundary: one ppm below 100% is still solvable and terminates (even though
+    // the invoice is large), and nets exactly the target.
+    let gw = GatewayFee {
+        base_msat: Msat(0),
+        ppm: 999_999,
+    };
+    let g = gross_up(net, gw, fed_fee(0, 0)).expect("ppm 999_999 (< 100%) is solvable");
+    assert_eq!(recipient_nets(&g, gw, fed_fee(0, 0)), net);
 }
 
 #[test]

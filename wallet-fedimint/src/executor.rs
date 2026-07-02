@@ -1,13 +1,18 @@
 //! [`FedimintExecutor`] — the async [`wallet_core::Executor`] that turns a journaled
 //! `Intent` into real cross-federation ecash movement (spec §7).
 //!
-//! # Status: COMPILE-ONLY scaffold (step 4b)
+//! # Status: DirectInflow is the LIVE path (step 4b-live-1); Move stays scaffold
 //! The PURE pieces this drives — [`fee::gross_up`], [`MovePlan::from_action`],
 //! [`next_step`], [`assemble_move_record`] — are golden-tested. `perform` itself is I/O glue
-//! over [`MultiClient`] + [`FedimintJournal`]; it is structured faithfully to §7 and both
-//! compiles and type-checks against the pinned fedimint API, but is validated live on a quiet
-//! machine (the load-contended gate defers devimint). Do not read the absence of a unit test
-//! here as untested logic: the decisions live in the pure functions above.
+//! over [`MultiClient`] + [`FedimintJournal`], structured faithfully to §7. The `DirectInflow`
+//! branch (receive-only) is now wired end-to-end and driven from `wallet-cli`
+//! (`direct-inflow` / `await-move` / `reconcile`, via [`crate::runtime::Runtime`]) against a
+//! live devimint federation; its `smoke_directinflow_devimint.sh` asserts the recipient nets
+//! EXACTLY the target. The `Move` branch (a send leg) is GATED to `Unsupported` this step — its
+//! scaffolded Pay / send-side `AwaitSettle` legs type-check against the pinned API but are not
+//! yet live-validated, so no un-validated irreversible send can run until the next step un-gates
+//! and validates it. Do not read the absence of a unit test here as untested logic: the
+//! decisions live in the pure functions above.
 //!
 //! # The perform loop (spec §7)
 //! `from_action` → `assemble_record` (cached MoveRecord + backfilled op artifacts, so a
@@ -22,8 +27,8 @@
 use crate::fee;
 use crate::journal::FedimintJournal;
 use crate::move_protocol::{
-    assemble_move_record, next_step, MoveMeta, MoveParams, MovePhase, MovePlan, MoveRecord,
-    MoveRole, MoveStep,
+    assemble_move_record, next_step, Leg, MoveMeta, MoveParams, MovePhase, MovePlan, MoveRecord,
+    MoveRole, MoveStep, OpArtifact,
 };
 use crate::multi_client::{MultiClient, ReceiveState, SendOutcome, SendState};
 use crate::types::{GatewayUrl, Invoice};
@@ -32,6 +37,11 @@ use lightning_invoice::Bolt11Invoice;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use wallet_core::{ExecError, Executor, FederationId, Intent, Msat, PerformOutcome};
+
+/// Pinned lnv2 requires the gateway-reduced incoming contract to be at least 5 sats
+/// (`MINIMUM_INCOMING_CONTRACT_AMOUNT`) before it will mint a receive invoice.
+pub const MINIMUM_INCOMING_CONTRACT_MSAT: u64 =
+    fedimint_lnv2_common::MINIMUM_INCOMING_CONTRACT_AMOUNT.msats;
 
 /// How many times to re-quote the federation receive fee at the refined contract amount
 /// while sizing the invoice. `receive_fee_quote` is async but [`fee::gross_up`]'s fed-fee
@@ -44,11 +54,48 @@ const FED_FEE_REQUOTE_PASSES: u32 = 3;
 pub struct FedimintExecutor {
     mc: Arc<MultiClient>,
     journal: Arc<FedimintJournal>,
+    /// An explicitly pinned lnv2 gateway (Phase 1 pins the gateway, ⟦D4⟧). When set,
+    /// [`Self::resolve_gateway`] uses it for a FRESH move instead of the federation's
+    /// registered list — devimint does NOT auto-register its LDK gateway into that list, so
+    /// `mc.gateways` is empty there (runbook §4) and the CLI must supply the URL directly. A
+    /// RESUMED move ignores this and reuses the gateway already pinned in its `MoveRecord`.
+    pinned_gateway: Option<GatewayUrl>,
 }
 
 impl FedimintExecutor {
-    pub fn new(mc: Arc<MultiClient>, journal: Arc<FedimintJournal>) -> Self {
-        Self { mc, journal }
+    pub fn new(
+        mc: Arc<MultiClient>,
+        journal: Arc<FedimintJournal>,
+        pinned_gateway: Option<GatewayUrl>,
+    ) -> Self {
+        Self {
+            mc,
+            journal,
+            pinned_gateway,
+        }
+    }
+
+    /// Rebuild the derived [`MoveRecord`] for `intent` from the op-log (spec §9.2) and persist
+    /// it, so a subsequent `perform` / finalize REATTACHES to the existing invoice + ops instead
+    /// of re-minting (the resume-loop backfill, driven by [`crate::runtime::Runtime`]). Returns
+    /// the assembled record, or `None` when the intent is not an executable move.
+    pub async fn backfill_move_record(
+        &self,
+        intent: &Intent,
+    ) -> Result<Option<MoveRecord>, ExecError> {
+        let Some(plan) = MovePlan::from_action(&intent.action) else {
+            return Ok(None);
+        };
+        let had_cached_record = self
+            .journal
+            .get_move(&intent.idempotency_key)
+            .await?
+            .is_some();
+        let rec = self.assemble_record(intent, &plan).await?;
+        if had_cached_record || has_move_artifact(&rec) {
+            self.journal.put_move(&rec).await?;
+        }
+        Ok(Some(rec))
     }
 
     /// Rebuild the derived [`MoveRecord`] FIRST (spec §7): merge the journaled cache, the
@@ -73,9 +120,16 @@ impl FedimintExecutor {
 
         // Pin the gateway (spec §3.1/§4): a resumed move reuses the one already recorded so a
         // crash never reselects a different or non-shared gateway; a fresh move resolves one
-        // now (persisted at the first `put_move`).
-        let gateway = match &cached {
-            Some(rec) => rec.gateway.clone(),
+        // now (persisted at the first `put_move`). If the cache was lost but the receive-only
+        // op already exists, finalization/replay no longer needs the gateway at all: use a
+        // local sentinel instead of failing on an empty gateway list.
+        let gateway = match gateway_from_cache_or_recovered(
+            cached.as_ref(),
+            plan,
+            &intent.idempotency_key,
+            &artifacts,
+        ) {
+            Some(gateway) => gateway,
             None => self.resolve_gateway(&plan.to).await?,
         };
 
@@ -91,9 +145,19 @@ impl FedimintExecutor {
         Ok(assemble_move_record(params, &artifacts, cached))
     }
 
-    /// Resolve a gateway for a move into `to` via the federation's registered lnv2 gateways
-    /// (spec §7). Errors `Permanent` when none is available (Phase 1 has no fallback here).
+    /// Resolve a gateway for a FRESH move into `to` (spec §7): the explicitly pinned gateway
+    /// wins (⟦D4⟧; devimint's LDK gateway is not auto-registered, so the CLI passes it directly
+    /// — runbook §4), else the federation's first registered lnv2 gateway.
+    ///
+    /// "None available" is `Retryable`, NOT `Permanent`: a resume verb (`reconcile`/`await-move`)
+    /// carries no pinned gateway, so re-driving an intent that has none cached must leave it
+    /// `Pending` (re-drivable once the operator re-runs `direct-inflow --gateway` to supply one),
+    /// never terminally `Failed`. The fresh `direct-inflow` path never hits this — its
+    /// `pick_receive_gateway` guarantees a gateway before the runtime is built.
     async fn resolve_gateway(&self, to: &FederationId) -> Result<GatewayUrl, ExecError> {
+        if let Some(gateway) = &self.pinned_gateway {
+            return Ok(gateway.clone());
+        }
         self.mc
             .gateways(to)
             .await
@@ -101,21 +165,27 @@ impl FedimintExecutor {
             .into_iter()
             .next()
             .ok_or_else(|| {
-                ExecError::Permanent(format!(
-                    "no lnv2 gateway available to route a move into federation {}",
+                ExecError::Retryable(format!(
+                    "no lnv2 gateway available to route a move into federation {} \
+                     (pass one explicitly — devimint does not auto-register its LDK gateway)",
                     to.to_hex()
                 ))
             })
     }
 
-    /// Size the receive invoice via the §6 fixed point and cap-check the receive side ONCE
-    /// (spec §7 `CreateInvoice`). The gateway fee comes from `routing_info`; the federation
-    /// fee is resolved by a short async fixed point (see [`FED_FEE_REQUOTE_PASSES`]). Returns
-    /// the gross invoice amount; the invoice is then fixed (never re-quoted on resume).
-    async fn gross_up(&self, rec: &MoveRecord) -> Result<Msat, ExecError> {
+    /// Size the receive invoice via the §6 fixed point. The gateway fee comes from
+    /// `routing_info`; the federation fee is resolved by a short async fixed point (see
+    /// [`FED_FEE_REQUOTE_PASSES`]). Callers then apply the lnv2 minimum-contract and fee-cap
+    /// checks appropriate to their path.
+    async fn quote_receive_gross_up(
+        &self,
+        to: &FederationId,
+        gateway: &GatewayUrl,
+        amount: Msat,
+    ) -> Result<fee::GrossUp, ExecError> {
         let gateway_fee = self
             .mc
-            .receive_gateway_fee(&rec.to, &rec.gateway)
+            .receive_gateway_fee(to, gateway)
             .await
             .map_err(retryable)?;
 
@@ -123,22 +193,47 @@ impl FedimintExecutor {
         // contract amount and re-solve until it stops moving (spec §6 fixed point).
         let mut fed_fee = self
             .mc
-            .receive_fee_quote(&rec.to, rec.amount)
+            .receive_fee_quote(to, amount)
             .await
             .map_err(retryable)?;
-        let mut grossed = fee::gross_up(rec.amount, gateway_fee, |_contract| fed_fee);
+        let mut grossed = solve_gross_up(amount, gateway_fee, fed_fee)?;
         for _ in 0..FED_FEE_REQUOTE_PASSES {
             let requoted = self
                 .mc
-                .receive_fee_quote(&rec.to, grossed.contract_amount)
+                .receive_fee_quote(to, grossed.contract_amount)
                 .await
                 .map_err(retryable)?;
             if requoted == fed_fee {
                 break;
             }
             fed_fee = requoted;
-            grossed = fee::gross_up(rec.amount, gateway_fee, |_contract| fed_fee);
+            grossed = solve_gross_up(amount, gateway_fee, fed_fee)?;
         }
+        Ok(grossed)
+    }
+
+    /// Preflight a fresh CLI `DirectInflow` before it is journaled. This catches the
+    /// deterministic lnv2 dust rejection (`AmountTooSmall`) while still letting any existing
+    /// pending intent re-drive through `perform`, where the same guard marks it terminal.
+    pub async fn validate_direct_inflow_amount(
+        &self,
+        to: FederationId,
+        amount: Msat,
+    ) -> Result<(), ExecError> {
+        let gateway = self.resolve_gateway(&to).await?;
+        let grossed = self.quote_receive_gross_up(&to, &gateway, amount).await?;
+        ensure_minimum_incoming_contract(amount, grossed.contract_amount)
+    }
+
+    /// Size the receive invoice via the §6 fixed point and cap-check the receive side ONCE
+    /// (spec §7 `CreateInvoice`). The gateway fee comes from `routing_info`; the federation
+    /// fee is resolved by a short async fixed point (see [`FED_FEE_REQUOTE_PASSES`]). Returns
+    /// the gross invoice amount; the invoice is then fixed (never re-quoted on resume).
+    async fn gross_up(&self, rec: &MoveRecord) -> Result<Msat, ExecError> {
+        let grossed = self
+            .quote_receive_gross_up(&rec.to, &rec.gateway, rec.amount)
+            .await?;
+        ensure_minimum_incoming_contract(rec.amount, grossed.contract_amount)?;
 
         // Cap-check the receive side alone (spec §6/§7): for a `DirectInflow` this is the
         // whole check; for a `Move` the send leg is re-checked at `Pay`.
@@ -154,11 +249,20 @@ impl FedimintExecutor {
 #[async_trait]
 impl Executor for FedimintExecutor {
     async fn perform(&self, intent: &Intent) -> Result<PerformOutcome, ExecError> {
-        // Only `Move`/`DirectInflow` are executable moves; `Evacuate` (Phase 2) and advisory
-        // actions map to `None` → `Unsupported` (§7).
+        // `Evacuate` (Phase 2) and advisory actions map to `None` → `Unsupported` (§7).
         let Some(plan) = MovePlan::from_action(&intent.action) else {
             return Err(ExecError::Unsupported);
         };
+
+        // Phase 1 step 4b-live-1 is DirectInflow ONLY. A `Move` (`send_required`) carries a
+        // scaffolded-but-not-yet-live-validated Pay leg; gate it to `Unsupported` so an
+        // un-validated, IRREVERSIBLE send can never run until the next step wires + validates it
+        // (`wallet-cli move`). A `DirectInflow` is receive-only (`send_required == false`) and
+        // falls through. The Pay / send-side `AwaitSettle` arms below are therefore unreachable
+        // this step; they stay in place for that next step to un-gate.
+        if plan.send_required {
+            return Err(ExecError::Unsupported);
+        }
 
         // FIRST: rebuild the record from the intent + backfilled op artifacts, so a replayed
         // move reattaches (no re-quote, no spurious over-cap fail).
@@ -252,8 +356,14 @@ impl Executor for FedimintExecutor {
                 }
                 MoveStep::AwaitSettle => {
                     // A `DirectInflow` reaching `AwaitSettle` on resume is still owned by its
-                    // `recv_op` subscription (§9.5), not this drive: surface `Awaiting`.
+                    // `recv_op` subscription (§9.5), not this drive: surface `Awaiting`. Persist
+                    // the reassembled record FIRST: a crash between lnv2 `receive` committing and
+                    // the first `put_move` (the `CreateInvoice` arm) can leave the derived cache
+                    // unpersisted, and this resume rebuilt it from the op-log — re-persisting here
+                    // repairs the cache so `invoice_for`/later reattaches find the already-minted
+                    // invoice without a separate reconcile (spec §9.2).
                     if !rec.send_required {
+                        self.journal.put_move(&rec).await?;
                         return Ok(PerformOutcome::Awaiting);
                     }
                     let from = rec.from.ok_or_else(|| {
@@ -313,11 +423,70 @@ impl Executor for FedimintExecutor {
     }
 }
 
+/// Solve the §6 receive-side fixed point for a constant federation fee, mapping the pure
+/// solver's "no solution" (a gateway advertising a ≥100% ppm receive fee) to a terminal
+/// [`ExecError::Permanent`] instead of letting the solver — or a re-drive of it — hang. Such a
+/// fee is deterministically unsolvable for this gateway, so the intent must fail terminally
+/// (the operator fixes/repins the gateway and re-runs under a fresh occurrence), never spin.
+fn solve_gross_up(
+    net: Msat,
+    gateway_fee: fee::GatewayFee,
+    fed_fee: Msat,
+) -> Result<fee::GrossUp, ExecError> {
+    fee::gross_up(net, gateway_fee, |_contract| fed_fee).ok_or_else(|| {
+        ExecError::Permanent(format!(
+            "gateway receive fee is {} ppm (>= 100% of the invoice); no invoice can net the \
+             requested {} msat",
+            gateway_fee.ppm, net.0
+        ))
+    })
+}
+
+fn ensure_minimum_incoming_contract(amount: Msat, contract_amount: Msat) -> Result<(), ExecError> {
+    if contract_amount.0 < MINIMUM_INCOMING_CONTRACT_MSAT {
+        return Err(ExecError::Permanent(format!(
+            "direct inflow amount too small: net {} msat produces a {} msat incoming contract; \
+             lnv2 requires at least {} msat",
+            amount.0, contract_amount.0, MINIMUM_INCOMING_CONTRACT_MSAT
+        )));
+    }
+    Ok(())
+}
+
 /// Map a transient fedimint/I/O error to [`ExecError::Retryable`] (leave the intent
 /// `Pending` so the next `reconcile` retries). Fee-over-cap and unsupported actions are the
 /// only `Permanent`/`Unsupported` outcomes, raised explicitly above.
 fn retryable(e: anyhow::Error) -> ExecError {
     ExecError::Retryable(e.to_string())
+}
+
+fn gateway_from_cache_or_recovered(
+    cached: Option<&MoveRecord>,
+    plan: &MovePlan,
+    key: &wallet_core::IdempotencyKey,
+    artifacts: &[OpArtifact],
+) -> Option<GatewayUrl> {
+    if let Some(rec) = cached {
+        if has_move_artifact(rec) {
+            return Some(rec.gateway.clone());
+        }
+    }
+    if !plan.send_required
+        && artifacts.iter().any(|artifact| {
+            artifact.move_id == *key && artifact.leg == Leg::Receive && artifact.invoice.is_some()
+        })
+    {
+        return Some(recovered_receive_only_gateway());
+    }
+    None
+}
+
+fn has_move_artifact(rec: &MoveRecord) -> bool {
+    rec.invoice.is_some() || rec.recv_op.is_some() || rec.send_op.is_some()
+}
+
+fn recovered_receive_only_gateway() -> GatewayUrl {
+    GatewayUrl("recovered-receive-only-gateway-not-used".to_string())
 }
 
 /// The gross msat amount of a (fixed) move invoice, recovered by parsing the BOLT11 — the
@@ -329,4 +498,176 @@ fn invoice_amount_msat(invoice: &Invoice) -> Result<u64, ExecError> {
     bolt11
         .amount_milli_satoshis()
         .ok_or_else(|| ExecError::Permanent("move invoice carries no amount".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fedimint_bip39::Mnemonic;
+    use fedimint_core::db::mem_impl::MemDatabase;
+    use fedimint_core::db::IRawDatabaseExt as _;
+    use wallet_core::{Action, IdempotencyKey, IntentStatus};
+
+    const FED_A: FederationId = FederationId([0xAA; 32]);
+    const FED_B: FederationId = FederationId([0xBB; 32]);
+
+    /// A constructible executor over an in-memory db — enough to exercise the `perform` gate,
+    /// which decides `Move`/`Evacuate` BEFORE any federation I/O (no join needed).
+    async fn test_executor() -> FedimintExecutor {
+        let db = MemDatabase::new().into_database();
+        let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
+        let mc = Arc::new(MultiClient::new(db.clone(), mnemonic).await);
+        let journal = Arc::new(FedimintJournal::new(db));
+        FedimintExecutor::new(mc, journal, None)
+    }
+
+    fn intent(action: Action) -> Intent {
+        let max_fee = action.fee_cap();
+        Intent {
+            idempotency_key: IdempotencyKey("gate-test".into()),
+            action,
+            max_fee,
+            status: IntentStatus::Pending,
+        }
+    }
+
+    /// Phase 1 step 4b-live-1 is DirectInflow ONLY: `perform` must refuse a `Move` — its Pay leg
+    /// is scaffolded but NOT live-validated, so an un-validated irreversible send must not run
+    /// until the next step un-gates it.
+    #[tokio::test]
+    async fn move_is_unsupported_this_step() {
+        let executor = test_executor().await;
+        let action = Action::Move {
+            from: FED_A,
+            to: FED_B,
+            amount: Msat(50_000),
+            fee_cap: Msat(10_000),
+        };
+        assert!(matches!(
+            executor.perform(&intent(action)).await,
+            Err(ExecError::Unsupported)
+        ));
+    }
+
+    /// `Evacuate` is Phase 2: `perform` maps it to `Unsupported` (via `MovePlan::from_action`).
+    #[tokio::test]
+    async fn evacuate_is_unsupported() {
+        let executor = test_executor().await;
+        let action = Action::Evacuate {
+            from: FED_A,
+            to: FED_B,
+            amount: Msat(50_000),
+            fee_cap: Msat(10_000),
+        };
+        assert!(matches!(
+            executor.perform(&intent(action)).await,
+            Err(ExecError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn solve_gross_up_rejects_unsolvable_gateway_fee_as_permanent() {
+        // A gateway advertising a >= 100% receive fee (ppm >= 1_000_000) makes the receive
+        // fixed point unsolvable; the executor must turn that into a terminal `Permanent`
+        // (fail the intent, never hand the pure solver a fee it would search forever on).
+        let unsolvable = fee::GatewayFee {
+            base_msat: Msat(0),
+            ppm: 1_000_000,
+        };
+        let err = solve_gross_up(Msat(100_000), unsolvable, Msat(0))
+            .expect_err(">= 100% gateway fee has no solution");
+        assert!(matches!(err, ExecError::Permanent(msg) if msg.contains("ppm")));
+
+        // A realistic fee (0.5% gateway ppm + flat federation fee) solves and nets the target.
+        let solvable = fee::GatewayFee {
+            base_msat: Msat(50),
+            ppm: 5_000,
+        };
+        let grossed =
+            solve_gross_up(Msat(100_000), solvable, Msat(200)).expect("a sub-100% fee is solvable");
+        assert!(grossed.invoice_amount.0 >= 100_000);
+    }
+
+    #[test]
+    fn minimum_incoming_contract_guard_matches_pinned_lnv2_boundary() {
+        assert_eq!(MINIMUM_INCOMING_CONTRACT_MSAT, 5_000);
+        ensure_minimum_incoming_contract(Msat(4_000), Msat(5_000))
+            .expect("lnv2 accepts exactly the minimum incoming contract");
+
+        let err = ensure_minimum_incoming_contract(Msat(3_999), Msat(4_999))
+            .expect_err("contract below lnv2's minimum is terminal");
+        assert!(matches!(err, ExecError::Permanent(msg) if msg.contains("amount too small")));
+    }
+
+    #[test]
+    fn receive_only_recovery_does_not_require_gateway_resolution() {
+        let key = IdempotencyKey("direct-inflow:recover".into());
+        let plan = MovePlan {
+            from: None,
+            to: FED_B,
+            amount: Msat(50_000),
+            fee_cap: Msat(1_000),
+            send_required: false,
+        };
+        let artifacts = vec![OpArtifact {
+            move_id: key.clone(),
+            leg: Leg::Receive,
+            op_id: crate::types::OperationId([0x42; 32]),
+            invoice: Some(Invoice("lnbc1recover".into())),
+        }];
+
+        assert_eq!(
+            gateway_from_cache_or_recovered(None, &plan, &key, &artifacts),
+            Some(recovered_receive_only_gateway())
+        );
+
+        let send_plan = MovePlan {
+            from: Some(FED_A),
+            send_required: true,
+            ..plan
+        };
+        assert_eq!(
+            gateway_from_cache_or_recovered(None, &send_plan, &key, &artifacts),
+            None
+        );
+    }
+
+    #[test]
+    fn pre_op_cached_gateway_does_not_pin_retry() {
+        let key = IdempotencyKey("direct-inflow:pre-op".into());
+        let plan = MovePlan {
+            from: None,
+            to: FED_B,
+            amount: Msat(50_000),
+            fee_cap: Msat(1_000),
+            send_required: false,
+        };
+        let mut cached = MoveRecord {
+            key: key.clone(),
+            from: None,
+            to: FED_B,
+            amount: Msat(50_000),
+            fee_cap: Msat(1_000),
+            gateway: GatewayUrl("https://stale.example".into()),
+            send_required: false,
+            invoice: None,
+            recv_op: None,
+            send_op: None,
+            phase: MovePhase::Created,
+            outcome: None,
+        };
+
+        assert_eq!(
+            gateway_from_cache_or_recovered(Some(&cached), &plan, &key, &[]),
+            None,
+            "a gateway-only pre-op cache must not block an explicit retry from repinning"
+        );
+
+        cached.invoice = Some(Invoice("lnbc1cached".into()));
+        assert_eq!(
+            gateway_from_cache_or_recovered(Some(&cached), &plan, &key, &[]),
+            Some(GatewayUrl("https://stale.example".into())),
+            "once an invoice exists, the recorded gateway is part of the durable receive"
+        );
+    }
 }
