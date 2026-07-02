@@ -1,41 +1,36 @@
 ---
-status: accepted
+status: dropped
 ---
-# Warm-standby selection: guardian-independence first, gateway-overlap as tiebreaker
+# Warm-standby selection: guardian-independence first (DROPPED — unfeasible in fedimint)
 
-When the Allocator picks the warm-standby federation (see
-[ADR-0006](./0006-allocator-concentrated-warm-standby.md)), guardian/operator
-**independence from the spending federation is a hard constraint** — a standby
-that shares operators provides no sudden-death insurance. Among independent
-candidates, prefer one that **shares a healthy gateway** with the spending
-federation (enables the cheap internal swap for rebalancing), then break remaining
-ties on resilience score.
+**DROPPED (2026-07).** This ADR made guardian/operator **independence** between the spending fed
+and the warm standby a HARD constraint — the "sudden-death insurance." Phase 2 established it is
+**unfeasible to verify in fedimint**, so the constraint is removed from the design and code.
 
-## Consequences
+## Why it can't be done
+Verifying independence requires a stable per-guardian identity comparable ACROSS federations. The
+authenticated client config exposes none:
+- **Consensus pubkeys don't work.** `broadcast_public_keys` are freshly RANDOM per federation
+  (generated at every config-gen ceremony; the federation id itself derives from them). Two feds run
+  by the SAME operator never share pubkey bytes, so a pubkey-based overlap check ALWAYS reads
+  "independent" and **fails OPEN** — a check that silently does nothing.
+- **The api-endpoint URL is too weak.** It is the only cross-fed-stable signal the config carries,
+  but it only catches an operator who reuses the same endpoint across feds; one advertising
+  DIFFERENT hosts per fed still reads as independent. Best-effort, not a guarantee — a false comfort.
 
-- Independence is non-negotiable; cheap-swap convenience never overrides it.
-- A shared gateway between two operator-independent federations is fine: a gateway
-  failure is separate and recoverable (federations have multiple gateways).
-- Requires knowing each federation's guardian set to compare overlap (available
-  from the federation config / invite code).
+An honest "insurance" you cannot verify is worse than none: it invites concentration decisions on a
+guarantee that isn't there.
 
-## Guardian-identity source (Phase-2 finding, 2026-07)
+## What changes
+- Removed from the code: `GuardianId`, `FederationStatus.guardians`, `ReasonCode::NoIndependentStandby`,
+  `allocator::shares_guardian` + its uses, and the probe's `guardian_ids` sourcing.
+- **KEPT:** the STRUCTURAL guardian facts `guardian_count` / `threshold` — those ARE in the config and
+  feasible; the scorer still uses the m-of-n strength as a resilience signal.
+- The warm-standby SHAPE (ADR-0006: a spending fed + a distinct standby fed) stays; the standby is
+  selected/funded by the other scorer signals (probe health, structural strength, Lnv2, …), just no
+  longer gated on verified operator-independence. See the ADR-0006 note.
 
-The overlap check compares a stable per-guardian identity across feds. The obvious anchor — the
-guardian **consensus pubkey** — does NOT work in fedimint: `broadcast_public_keys` are freshly
-RANDOM per federation (generated at every config-gen ceremony; the federation id itself derives
-from them), so two feds run by the SAME operator never share pubkey bytes, and a pubkey-based
-check would ALWAYS read independent and **fail OPEN**. The authenticated client config carries no
-cross-federation-stable guardian pubkey.
-
-**Decision:** source `GuardianId` from the guardian's advertised **api-endpoint URL** (from the
-config's `global.api_endpoints`) — the only cross-fed-stable shared-operator signal the config
-exposes, and always non-empty for a joined fed (so the producer never emits an empty guardian set,
-which would silently defeat the check). A self-hosted operator reusing an endpoint across its feds
-is correctly detected as shared.
-
-**Known gap:** one operator advertising DIFFERENT hosts per fed still reads as independent. This
-weakens the sudden-death insurance against a sophisticated shared operator, but the URL fails in
-the SAFE direction for the common self-hosted case. A robust stable-identity source (e.g. a signed
-operator identity, or a discovery/Observer-provided operator map) is deferred to Phase 3. See
-`wallet-fedimint::probe` and the `GuardianId` doc.
+## If revisited
+A robust operator-identity source — a signed operator identity, or an operator map from the
+discovery/Observer layer (Phase 3) — could restore a real (not fail-open) independence signal. Until
+such a source exists, do not reintroduce a pubkey- or single-URL-based independence gate.

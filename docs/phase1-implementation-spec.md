@@ -126,10 +126,11 @@ pub struct OperationId(pub [u8; 32]);  pub struct Preimage(pub [u8; 32]);
 pub struct GatewayUrl(pub String);  // parse to fedimint SafeUrl via SafeUrl::parse(&self.0)
 pub struct Invoice(pub String);     // parse to Bolt11Invoice via FromStr
 ```
-**Identity ripple (bigger than just `FederationId`, P2):** `FederationStatus.guardians` becomes
-`Vec<GuardianId>` (real pubkeys/URLs) so ADR-0010 guardian-overlap/independence is correct —
-local `u32` peer indices are meaningless across feds. The allocator's idempotency-key
-formatting (currently `u32`) formats `hex(FederationId)` + `Occurrence`.
+**Identity ripple (bigger than just `FederationId`, P2):** `FederationId` becomes the 32-byte
+consensus hash (local `u32` peer indices are meaningless across feds). (This originally also added
+`FederationStatus.guardians: Vec<GuardianId>` for ADR-0010 guardian-overlap/independence — since
+DROPPED as unfeasible in fedimint; that field + `GuardianId` were removed.) The allocator's
+idempotency-key formatting (currently `u32`) formats `hex(FederationId)` + `Occurrence`.
 
 ### 3.1 Action (T12) — define all; Phase 1 executes `Move` + `DirectInflow`
 ```rust

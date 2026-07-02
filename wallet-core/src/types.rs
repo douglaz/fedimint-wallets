@@ -19,29 +19,6 @@ impl FederationId {
     }
 }
 
-/// A guardian's cross-federation identity, used by the ADR-0010 warm-standby
-/// overlap/independence check (a local `u32` peer index is meaningless across feds).
-///
-/// ENCODING (load-bearing invariant): the guardian's advertised **api-endpoint URL
-/// bytes**, encoded identically for every federation in a single `AllocatorSnapshot`.
-/// `allocator::shares_guardian` compares these bytes for EXACT equality, so it can only
-/// detect a shared guardian when both feds encode it the same way.
-///
-/// Why the URL, not the consensus pubkey (a Phase-2 finding, see `wallet-fedimint::probe`
-/// and ADR-0010): fedimint's guardian `broadcast_public_keys` are freshly RANDOM per
-/// federation (generated at every config-gen ceremony — the federation id itself derives
-/// from them), so they can NEVER match across two feds; a pubkey-based check would ALWAYS
-/// read independent and fail OPEN. The client config carries no cross-federation-stable
-/// guardian pubkey — the advertised api-endpoint URL is the only shared-operator signal it
-/// exposes. A self-hosted operator reusing the same endpoint across its feds is correctly
-/// detected as shared. KNOWN GAP: one operator advertising DIFFERENT hosts per fed still
-/// reads as independent (a robust stable-identity source is deferred to Phase 3) — but the
-/// URL fails in the SAFE direction for the common case, and the producer must never emit an
-/// EMPTY guardian set (which would silently defeat the check). The producer
-/// (`wallet-fedimint::probe`) owns enforcing this single encoding from the authenticated config.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct GuardianId(pub Vec<u8>);
-
 /// A millisatoshi amount (and fees). The arithmetic here is unit-agnostic, so the
 /// relabel from the former `Sats` keeps every numeric value as-is (no ×1000 scaling).
 #[derive(
@@ -84,7 +61,6 @@ pub struct FederationStatus {
     pub balance: FedBalance,
     pub probed_ok: bool,
     pub reputation: i32,
-    pub guardians: Vec<GuardianId>,
     pub shutdown_notice: bool,
     pub healthy: bool,
 }
@@ -178,7 +154,6 @@ pub enum ReasonCode {
     OverCap,
     NotProbed,
     LowReputation,
-    NoIndependentStandby,
 }
 
 #[derive(Clone, Debug, PartialEq)]

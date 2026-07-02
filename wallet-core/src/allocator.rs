@@ -52,32 +52,24 @@ pub fn decide(snapshot: &AllocatorSnapshot, occurrence: Occurrence) -> Vec<Alloc
             && standby.balance.spendable < snapshot.standby_target
         {
             let spending = snapshot.spending_fed.and_then(|id| find(snapshot, id));
-            let independent = spending.is_none_or(|spending| !shares_guardian(spending, standby));
-            if independent {
-                let want = snapshot.standby_target.0 - standby.balance.spendable.0;
-                let source = usable_source(spending);
-                let available = source.map_or(0, |s| {
-                    s.balance
-                        .spendable
-                        .0
-                        .saturating_sub(snapshot.target_spending_balance.0)
-                });
-                fund_into(
-                    snapshot,
-                    standby,
-                    source,
-                    available,
-                    want,
-                    FundKind::Standby,
-                    occurrence,
-                    &mut decisions,
-                );
-            } else {
-                push_decision(
-                    &mut decisions,
-                    refuse_decision(standby.id, ReasonCode::NoIndependentStandby, occurrence),
-                );
-            }
+            let want = snapshot.standby_target.0 - standby.balance.spendable.0;
+            let source = usable_source(spending);
+            let available = source.map_or(0, |s| {
+                s.balance
+                    .spendable
+                    .0
+                    .saturating_sub(snapshot.target_spending_balance.0)
+            });
+            fund_into(
+                snapshot,
+                standby,
+                source,
+                available,
+                want,
+                FundKind::Standby,
+                occurrence,
+                &mut decisions,
+            );
         }
     }
 
@@ -115,11 +107,9 @@ fn fund_into(
         return;
     }
 
+    // A self-fund (the standby IS the spending fed) is a genuine no-op: there is
+    // nothing to move, so skip it silently rather than recording a decision.
     if source.is_some_and(|src| src.id == dest.id) {
-        push_decision(
-            out,
-            refuse_decision(dest.id, ReasonCode::NoIndependentStandby, occurrence),
-        );
         return;
     }
 
@@ -174,14 +164,6 @@ fn evacuation_reason(fed: &FederationStatus) -> Option<ReasonCode> {
         .or_else(|| (!fed.healthy).then_some(ReasonCode::Unhealthy))
 }
 
-/// True if `a` and `b` share any guardian. This is byte-exact `GuardianId` equality,
-/// so it relies on the canonical-encoding invariant documented on `GuardianId`: every
-/// fed in a snapshot must encode each guardian by the SAME canonical pubkey bytes, or
-/// an overlap reads as independent and the warm-standby check fails open (ADR-0010).
-fn shares_guardian(a: &FederationStatus, b: &FederationStatus) -> bool {
-    a.guardians.iter().any(|g| b.guardians.contains(g))
-}
-
 fn cap_room(snapshot: &AllocatorSnapshot, fed: &FederationStatus) -> u64 {
     snapshot
         .per_fed_cap
@@ -190,12 +172,9 @@ fn cap_room(snapshot: &AllocatorSnapshot, fed: &FederationStatus) -> u64 {
 }
 
 /// True for a federation that is a safe evacuation TARGET: not itself evacuating,
-/// not receive-blocked, still below the hard per-fed cap, and guardian-independent
-/// from the evacuating federation. Used by `evacuate_decision` to pick the
-/// destination; does not invent new ranking policy, it reuses the same eligibility
-/// checks already used for funding decisions above — including the ADR-0010 hard
-/// guardian-independence constraint (a same-operator destination provides no
-/// sudden-death insurance, defeating the point of evacuating at all).
+/// not receive-blocked, and still below the hard per-fed cap. Used by
+/// `evacuate_decision` to pick the destination; does not invent new ranking policy,
+/// it reuses the same eligibility checks already used for funding decisions above.
 fn eligible_for_evacuation(
     snapshot: &AllocatorSnapshot,
     fed: &FederationStatus,
@@ -205,7 +184,6 @@ fn eligible_for_evacuation(
         && evacuation_reason(fed).is_none()
         && receive_blocker(fed).is_none()
         && cap_room(snapshot, fed) > 0
-        && !shares_guardian(from, fed)
 }
 
 /// The safest eligible OTHER federation to evacuate `from` into: the configured
@@ -263,7 +241,6 @@ fn reason_tag(reason: ReasonCode) -> &'static str {
         ReasonCode::OverCap => "over_cap",
         ReasonCode::NotProbed => "not_probed",
         ReasonCode::LowReputation => "low_reputation",
-        ReasonCode::NoIndependentStandby => "no_independent_standby",
     }
 }
 

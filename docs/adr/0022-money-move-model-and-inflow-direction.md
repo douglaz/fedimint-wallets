@@ -26,10 +26,10 @@ corrected here.
   durable operation artifacts (operation IDs, invoice, payment hash, gateway pubkey,
   claim/refund state) and RESUMES the same invoice/payment on replay; it never restarts.
   The occurrence/epoch (T10) must land before the `SqliteJournal` schema hardens.
-- **Real identities + structured balance.** `FederationId` = the 32-byte consensus hash;
-  guardian-independence (ADR-0010) keys on real guardian identity (pubkeys/URLs), not local
-  peer indices. `balance: Sats` → `{ spendable, in_flight, claimable, reserved_fee }` at
-  msat granularity.
+- **Real identities + structured balance.** `FederationId` = the 32-byte consensus hash.
+  (Guardian-independence — ADR-0010 — has since been DROPPED as unfeasible in fedimint; only the
+  structural `guardian_count`/`threshold` survive.) `balance: Sats` → `{ spendable, in_flight,
+  claimable, reserved_fee }` at msat granularity.
 - **Spike before model.** Phase 1 leads with a throwaway devimint spike (drive one A→B move
   by hand, crash at every step) to LEARN the real operation state machine; the journal,
   `Action`/`Intent`, and executor are then modeled from what it taught (ADR-0021 Phase 1a→1c).

@@ -32,9 +32,7 @@ use fedimint_lnv2_client::LightningOperationMeta;
 use fedimint_wallet_client::WalletClientModule;
 use std::sync::Arc;
 use std::time::Instant;
-use wallet_core::{
-    FedBalance, FederationFacts, FederationId, FederationStatus, GuardianId, Module, Msat,
-};
+use wallet_core::{FedBalance, FederationFacts, FederationId, FederationStatus, Module, Msat};
 
 /// The raw result of probing ONE federation: a plain, serde-able data struct with no
 /// fedimint types, so it can be recorded as a golden fixture and fed to the pure
@@ -57,14 +55,6 @@ pub struct ProbeResult {
     /// Whether an `lnv2` module is present (its own field because a fed with no
     /// LNv2 cannot send/receive at all — it gates eligibility unconditionally).
     pub has_lnv2: bool,
-    /// Each guardian's cross-federation identity bytes (ADR-0010 `GuardianId`
-    /// source), ordered by `PeerId`. The runner encodes each guardian's advertised
-    /// api-endpoint URL — deliberately NOT a consensus pubkey: the client config
-    /// carries no cross-federation-stable guardian pubkey (see the runner for the
-    /// full reasoning), so the URL is the only shared-operator signal available.
-    /// Opaque to the pure assembler, which passes these bytes straight into
-    /// `GuardianId`.
-    pub guardian_ids: Vec<Vec<u8>>,
 
     // ---- Light empirical signals (the trust gate, ADR-0017 — NO sats spent) ----
     /// A threshold consensus read answered: quorum is live.
@@ -143,13 +133,6 @@ pub fn assemble_status(p: &ProbeResult, id: FederationId) -> FederationStatus {
         probed_ok: p.quorum_live && p.gateway_available,
         // Reputation comes from the Phase-3 Observer; the sense layer is neutral.
         reputation: 0,
-        // ADR-0010: `GuardianId` bytes must be encoded identically for every fed in
-        // a snapshot so the warm-standby independence check can compare them for
-        // exact equality. The runner fills `guardian_ids` from each guardian's
-        // advertised api-endpoint URL (the only cross-federation-stable operator
-        // signal in the client config — see the runner for why not a pubkey); this
-        // passthrough preserves that single canonical encoding without re-encoding.
-        guardians: p.guardian_ids.iter().cloned().map(GuardianId).collect(),
         shutdown_notice: p.shutdown_scheduled,
         // `healthy` tracks quorum liveness; `shutdown_notice` (above) drives the
         // separate evacuation path in the allocator.
@@ -216,35 +199,6 @@ impl FedimintProbeRunner {
         let wallet_module_present = module_kinds
             .iter()
             .any(|k| k == fedimint_wallet_client::common::KIND.as_str());
-
-        // Guardian identities (ADR-0010 `GuardianId` source). The consumer —
-        // `allocator::shares_guardian` — needs the SAME physical guardian to encode to
-        // the SAME bytes across two DIFFERENT federations, or a shared operator reads
-        // as independent and the warm-standby sudden-death insurance fails OPEN.
-        //
-        // We deliberately do NOT use `broadcast_public_keys`, despite the `GuardianId`
-        // doc's preference for a consensus pubkey: those keys are freshly RANDOM per
-        // federation (`secp256k1::generate_keypair(&mut OsRng)` at every config-gen
-        // ceremony — verified in fedimint-server/src/config/mod.rs:476,637 — and the
-        // federation id is itself derived from that guardian set), so two distinct feds
-        // can NEVER share those bytes and the independence check would ALWAYS fail open.
-        // The client config exposes no cross-federation-stable guardian pubkey at all;
-        // the only shared-operator signal it carries is the guardian's advertised
-        // api-endpoint URL — which is exactly the guardian set ADR-0010 names as
-        // "available from the federation config / invite code". A guardian that reuses
-        // the same endpoint across the feds it runs is correctly detected as shared.
-        // The residual gap — one operator advertising DIFFERENT hosts per fed still
-        // reads as independent — is a known ADR-0010 limitation deferred to a robust
-        // stable-identity source (Phase 3); but the URL fails in the SAFE direction for
-        // the common self-hosted case instead of never firing at all. `BTreeMap`
-        // iteration is `PeerId`-ordered, so the encoding is deterministic across probes
-        // and across feds (and `api_endpoints` is always non-empty for a joined fed).
-        let guardian_ids: Vec<Vec<u8>> = config
-            .global
-            .api_endpoints
-            .values()
-            .map(|peer| peer.url.as_str().as_bytes().to_vec())
-            .collect();
 
         // network → is_mainnet, read from the wallet module's authed config. Only
         // meaningful when the wallet module is present; a fed without it can never be
@@ -335,7 +289,6 @@ impl FedimintProbeRunner {
             is_mainnet,
             module_kinds,
             has_lnv2,
-            guardian_ids,
             quorum_live,
             latency_ms,
             gateway_available,
@@ -441,7 +394,6 @@ mod tests {
         "is_mainnet": true,
         "module_kinds": ["mint", "wallet", "ln", "lnv2"],
         "has_lnv2": true,
-        "guardian_ids": [[2,1,1], [2,2,2], [2,3,3], [2,4,4]],
         "quorum_live": true,
         "latency_ms": 42,
         "gateway_available": true,
@@ -563,19 +515,6 @@ mod tests {
     }
 
     #[test]
-    fn guardian_ids_round_trip_into_guardian_ids() {
-        let probe = healthy_probe();
-        let status = assemble_status(&probe, fed_id(1));
-        let expected: Vec<GuardianId> =
-            probe.guardian_ids.iter().cloned().map(GuardianId).collect();
-        assert_eq!(status.guardians, expected);
-        // The canonical bytes survive verbatim (ADR-0010): same identity = same
-        // GuardianId, so an overlap can be detected by exact byte equality.
-        assert_eq!(status.guardians[0].0, vec![2, 1, 1]);
-        assert_eq!(status.guardians.len(), 4);
-    }
-
-    #[test]
     fn balances_map_into_fed_balance() {
         let status = assemble_status(&healthy_probe(), fed_id(1));
         assert_eq!(status.balance.spendable, Msat(1_000_000));
@@ -587,17 +526,15 @@ mod tests {
 
     #[test]
     fn assembled_statuses_drive_decide_to_rebalance() {
-        // Two independent healthy feds (distinct guardian identities → not shared):
-        // spending is under target, standby is funded. decide() must move funds from
-        // the standby into the spending fed. This proves the whole sense→decide wire.
+        // Two distinct healthy feds: spending is under target, standby is funded.
+        // decide() must move funds from the standby into the spending fed. This proves
+        // the whole sense→decide wire.
         let mut spending_probe = healthy_probe();
         spending_probe.spendable_msat = 10_000;
-        spending_probe.guardian_ids = vec![vec![2, 10, 10], vec![2, 11, 11]];
         let spending = assemble_status(&spending_probe, fed_id(0xaa));
 
         let mut standby_probe = healthy_probe();
         standby_probe.spendable_msat = 5_000_000;
-        standby_probe.guardian_ids = vec![vec![2, 20, 20], vec![2, 21, 21]];
         let standby = assemble_status(&standby_probe, fed_id(0xbb));
 
         let snapshot = AllocatorSnapshot {
@@ -627,59 +564,5 @@ mod tests {
         assert!(decisions
             .iter()
             .any(|d| d.reason == AllocReason::SpendingBelowTarget));
-    }
-
-    #[test]
-    fn shared_guardian_standby_is_refused_not_funded() {
-        // The ADR-0010 safety property, driven end-to-end through the assembler: when
-        // the standby shares a guardian IDENTITY with the spending fed, decide() must
-        // NOT fund it (a same-operator standby is no sudden-death insurance) and must
-        // record `NoIndependentStandby`. This is the exact check that silently failed
-        // OPEN while guardians were sourced from per-federation `broadcast_public_keys`
-        // (which can never collide across feds); with a shared identity present in both
-        // probes, `assemble_status` carries it into overlapping `GuardianId`s and
-        // `shares_guardian` fires.
-        let shared = vec![b"wss://alice.example:5000/".to_vec()];
-
-        // Spending fed is well-funded (a valid funding source) and above target.
-        let mut spending_probe = healthy_probe();
-        spending_probe.spendable_msat = 5_000_000;
-        spending_probe.guardian_ids = shared.clone();
-        let spending = assemble_status(&spending_probe, fed_id(0xaa));
-
-        // Standby is below target and would normally be topped up — but it shares a
-        // guardian with the spending fed.
-        let mut standby_probe = healthy_probe();
-        standby_probe.spendable_msat = 10_000;
-        standby_probe.guardian_ids = shared;
-        let standby = assemble_status(&standby_probe, fed_id(0xbb));
-
-        let snapshot = AllocatorSnapshot {
-            federations: vec![spending.clone(), standby.clone()],
-            spending_fed: Some(spending.id),
-            standby_fed: Some(standby.id),
-            per_fed_cap: Msat(100_000_000),
-            target_spending_balance: Msat(1_000_000),
-            standby_target: Msat(1_000_000),
-            max_fee: Msat(10_000),
-            now: 0,
-        };
-
-        let decisions = decide(&snapshot, Occurrence(1));
-        // No money-move INTO the standby is planned.
-        let funded_standby = decisions.iter().any(|d| {
-            matches!(&d.action, Action::Move { to, .. } | Action::Evacuate { to, .. } if *to == standby.id)
-        });
-        assert!(
-            !funded_standby,
-            "a guardian-sharing standby must never be funded; got {decisions:?}"
-        );
-        // And the refusal reason is recorded.
-        assert!(
-            decisions
-                .iter()
-                .any(|d| d.reason == AllocReason::NoIndependentStandby),
-            "expected a NoIndependentStandby refusal; got {decisions:?}"
-        );
     }
 }

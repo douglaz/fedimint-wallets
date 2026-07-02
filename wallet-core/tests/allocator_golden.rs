@@ -4,7 +4,6 @@ use wallet_core::*;
 
 macro_rules! id { ($id:expr) => { FederationId([$id; 32]) }; }
 macro_rules! msat { ($amount:expr) => { Msat($amount) }; }
-macro_rules! guardian { ($g:expr) => { GuardianId(vec![$g]) }; }
 macro_rules! balance {
     ($spendable:expr) => {
         FedBalance { spendable: msat!($spendable), in_flight: msat!(0), claimable: msat!(0), reserved_fee: msat!(0) }
@@ -12,7 +11,7 @@ macro_rules! balance {
 }
 macro_rules! fed {
     ($id:expr, $balance:expr, $probed:expr, $shutdown:expr, $healthy:expr) => { fed!($id, $balance, $probed, 0, $shutdown, $healthy) };
-    ($id:expr, $balance:expr, $probed:expr, $reputation:expr, $shutdown:expr, $healthy:expr) => { FederationStatus { id: id!($id), balance: balance!($balance), probed_ok: $probed, reputation: $reputation, guardians: if $id == 1 { vec![guardian!(1), guardian!(2), guardian!(3)] } else { vec![guardian!(4), guardian!(5), guardian!(6)] }, shutdown_notice: $shutdown, healthy: $healthy } };
+    ($id:expr, $balance:expr, $probed:expr, $reputation:expr, $shutdown:expr, $healthy:expr) => { FederationStatus { id: id!($id), balance: balance!($balance), probed_ok: $probed, reputation: $reputation, shutdown_notice: $shutdown, healthy: $healthy } };
 }
 macro_rules! snap {
     ([$($fed:expr),*], $spending:expr, $standby:expr, $cap:expr, $target:expr, $standby_target:expr, $now:expr) => { AllocatorSnapshot { federations: vec![$($fed),*], spending_fed: $spending, standby_fed: $standby, per_fed_cap: msat!($cap), target_spending_balance: msat!($target), standby_target: msat!($standby_target), max_fee: msat!(500), now: $now } };
@@ -52,7 +51,6 @@ fn reason_tag(reason: ReasonCode) -> &'static str {
         ReasonCode::OverCap => "over_cap",
         ReasonCode::NotProbed => "not_probed",
         ReasonCode::LowReputation => "low_reputation",
-        ReasonCode::NoIndependentStandby => "no_independent_standby",
     }
 }
 fn refuse_key(fed: u8, reason: ReasonCode, occurrence: u64) -> IdempotencyKey {
@@ -66,9 +64,15 @@ fn move_tops_up_spending_below_target() {
 }
 
 #[test]
-fn move_funds_independent_warm_standby() {
+fn move_funds_distinct_warm_standby() {
     let snapshot = snap!([fed!(1, 80_000, true, false, true), fed!(2, 5_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 50_000, 20_000, 2000);
     assert_eq!(decide(&snapshot, occ(1)), decision!(move_action!(1, 2, 15_000), ReasonCode::StandbyBelowTarget, occ(1), move_key(1, 2, 1)));
+}
+
+#[test]
+fn self_fund_standby_is_silent_noop() {
+    let snapshot = snap!([fed!(1, 80_000, true, false, true)], Some(id!(1)), Some(id!(1)), 100_000, 50_000, 100_000, 2500);
+    assert!(decide(&snapshot, occ(1)).is_empty());
 }
 
 #[test]
@@ -116,15 +120,6 @@ fn low_reputation_blocks_receive() {
 }
 
 #[test]
-fn no_independent_standby_when_guardians_overlap() {
-    // Standby shares a guardian with the spending fed -> not real insurance, do not fund it (ADR-0010).
-    let spending = FederationStatus { id: id!(1), balance: balance!(80_000), probed_ok: true, reputation: 0, guardians: vec![guardian!(1), guardian!(2), guardian!(3)], shutdown_notice: false, healthy: true };
-    let standby = FederationStatus { id: id!(2), balance: balance!(5_000), probed_ok: true, reputation: 0, guardians: vec![guardian!(3), guardian!(9), guardian!(9)], shutdown_notice: false, healthy: true };
-    let snapshot = AllocatorSnapshot { federations: vec![spending, standby], spending_fed: Some(id!(1)), standby_fed: Some(id!(2)), per_fed_cap: msat!(100_000), target_spending_balance: msat!(50_000), standby_target: msat!(20_000), max_fee: msat!(500), now: 8000 };
-    assert_eq!(decide(&snapshot, occ(1)), decision!(refuse!(2, ReasonCode::NoIndependentStandby), ReasonCode::NoIndependentStandby, occ(1), refuse_key(2, ReasonCode::NoIndependentStandby, 1)));
-}
-
-#[test]
 fn cap_and_liquidity_refusals_do_not_collide() {
     // cap_room=40k, want=50k, available=10k: both OverCap and
     // SpendingBelowTarget are true policy signals for the same destination.
@@ -143,18 +138,6 @@ fn cap_and_liquidity_refusals_do_not_collide() {
 fn evacuation_amount_is_clamped_to_destination_cap_room() {
     let snapshot = snap!([fed!(1, 50_000, true, true, true), fed!(2, 95_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 100_000, 0, 9500);
     assert_eq!(decide(&snapshot, occ(1)), decision!(evacuate!(1, 2, 5_000), ReasonCode::ShutdownNotice, occ(1), evac_key(1, 2, 1)));
-}
-
-#[test]
-fn evacuation_skips_a_destination_sharing_guardians_with_the_source() {
-    // fed 2 shares a guardian with evacuating fed 1: it would provide no sudden-death
-    // insurance (ADR-0010 hard constraint), so it must NOT be picked even though it is
-    // otherwise eligible (healthy, probed, cap room). No other destination exists, so
-    // this degrades to an advisory RefuseInflow rather than an unsafe Evacuate.
-    let evacuating = FederationStatus { id: id!(1), balance: balance!(50_000), probed_ok: true, reputation: 0, guardians: vec![guardian!(1), guardian!(2)], shutdown_notice: true, healthy: true };
-    let same_operator_standby = FederationStatus { id: id!(2), balance: balance!(30_000), probed_ok: true, reputation: 0, guardians: vec![guardian!(2), guardian!(9)], shutdown_notice: false, healthy: true };
-    let snapshot = AllocatorSnapshot { federations: vec![evacuating, same_operator_standby], spending_fed: Some(id!(1)), standby_fed: Some(id!(2)), per_fed_cap: msat!(100_000), target_spending_balance: msat!(100_000), standby_target: msat!(0), max_fee: msat!(500), now: 9700 };
-    assert_eq!(decide(&snapshot, occ(1)), decision!(refuse!(1, ReasonCode::ShutdownNotice), ReasonCode::ShutdownNotice, occ(1), refuse_key(1, ReasonCode::ShutdownNotice, 1)));
 }
 
 #[test]

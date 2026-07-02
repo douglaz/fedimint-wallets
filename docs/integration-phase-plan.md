@@ -152,8 +152,9 @@ data model written pre-SDK. Corrections, to land in Phase 1b (model-from-reality
   create-invoice→pay→preimage→claim→refund across crashes. The journal stores durable
   operation artifacts and RESUMES the same invoice/payment; it never restarts. T10's
   occurrence/epoch must land before the `SqliteJournal` schema hardens.
-- **Real identities.** `FederationId` → the 32-byte consensus hash; guardian-independence
-  (ADR-0010) keys on real guardian identity (pubkeys/URLs), NOT local peer indices.
+- **Real identities.** `FederationId` → the 32-byte consensus hash. (Guardian-independence —
+  ADR-0010 — has since been DROPPED as unfeasible in fedimint; only structural `guardian_count`/
+  `threshold` survive, not a cross-fed guardian identity.)
 - **Structured balance.** Replace `balance: Sats` with `{ spendable, in_flight, claimable,
   reserved_fee }` at msat granularity (T3); the allocator can't decide fees/caps/retries
   from one flat number.
