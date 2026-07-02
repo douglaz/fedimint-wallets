@@ -118,15 +118,16 @@ if [[ ! "$BAL_AFTER" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 echo "balance after inflow: ${BAL_AFTER} msat (target ${INFLOW_MSAT})"
-# Netting gate (ADR-0022 cheap lever): the fixed-point gross-up (floored to invert the gateway's
-# real receive fee) sizes the invoice so the wallet nets the target. Reality: lnv2's
-# `receive_fee_quote` UNDER-quotes the true claim fee — it can't see the mint output / note-
-# selection fee (spec §6 "config constants under-quote"), so the wallet nets a few msat UNDER the
-# target (~18 msat / 0.018 sat observed). We assert within a 1-sat tolerance below the target and
-# NEVER above it. TODO(4b-live follow-up): make gross-up conservative (model the mint output fee)
-# so net is never UNDER the target. This gate still catches gross regressions (wrong amount /
-# missing credit / double credit).
-FEE_SLACK=1000   # 1 sat — bounds the lnv2 receive-fee-quote under-estimate
+# Netting gate (ADR-0022 cheap lever): the fixed-point gross-up sizes the invoice so the wallet
+# nets the target within lnv2's fee-quote precision. Residual (INVESTIGATED, bounded): the wallet
+# nets a few tens of msat UNDER the target (<0.1 sat) — lnv2's OWN `receive_fee_quote` omits the
+# mint OUTPUT fee, and that fee is NOTE-SELECTION-dependent (the claim mints several notes, each
+# incurring `fee_consensus.fee`), so it is not exactly predictable and VARIES run-to-run (e.g. 18
+# vs 98 msat). This is a fedimint fee-model limitation, not our bug: a true never-under fix needs
+# fedimint to expose the full claim fee. Assert net in [N - 1 sat, N] — never MORE than target,
+# and within a bounded sub-sat of it. This still catches gross regressions (wrong amount / missing
+# / double credit).
+FEE_SLACK=1000   # 1 sat — bounds the omitted mint output/note-selection fee (sub-sat)
 if (( BAL_AFTER > INFLOW_MSAT || BAL_AFTER < INFLOW_MSAT - FEE_SLACK )); then
   echo "FAIL: balance ${BAL_AFTER} msat not within [$((INFLOW_MSAT - FEE_SLACK)), ${INFLOW_MSAT}] after inflow" >&2
   exit 1
