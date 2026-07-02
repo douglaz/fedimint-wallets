@@ -94,8 +94,14 @@ echo "invoice: $INV_A"
 echo "receive op: $OP_A"
 
 # devimint's funded client pays the invoice; the LDK gateway direct-swaps it into our wallet.
-echo "-- devimint (default-0) pays the invoice --"
-fedimint-cli module lnv2 send "$INV_A" --gateway "$GW" 2>/dev/null
+# IMPORTANT (devimint investigation): await the payer's SEND to Success FIRST. lnv2's internal
+# swap funds OUR incoming contract as part of the sender's send state machine completing, so by
+# awaiting the send we know the contract is funded before we await our receive — the claim is then
+# prompt + reliable (6/6). Racing `await-receive` against a not-yet-funded contract is slow/flaky:
+# the receive SM long-polls `await_incoming_contract` and retries on transport timeouts.
+echo "-- devimint (default-0) pays the invoice; await the send so the swap completes --"
+SEND_A=$(fedimint-cli module lnv2 send "$INV_A" --gateway "$GW" 2>/dev/null | tr -d '"[:space:]')
+fedimint-cli module lnv2 await-send "$SEND_A" >/dev/null 2>&1 || true
 
 echo "-- await our receive claim --"
 RECV_STATE=$(wcli await-receive "$OP_A" --fed "$FED_ID")

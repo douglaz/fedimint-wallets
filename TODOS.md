@@ -59,10 +59,16 @@ douglaz/fedimint @ `b108ec6`.
 - [x] Step 4b pure core — fixed-point fee `gross_up` (§6, never under-credits) + `Action→MovePlan`
       + `FedimintExecutor::perform` scaffold (compiles) + `MultiClient` fee-quote/backfill_ops.
 
-**Deferred to a LESS-LOADED machine (devimint validation flaked under 8-way rb-lite contention):**
-- [ ] **4a-pay** re-validate the pay direction live (receive-to-fund flaked; pay code is symmetric +
-      baseline works). Watch the `fm::client::reactor "Executor should be running"` warning seen on a
-      0-balance pay.
+**devimint reliability SOLVED (2026-07-02):** the flaky lnv2 validation was NOT our code and NOT
+debug builds/gateway-readiness — it was a test-harness **await ordering**. lnv2's internal swap
+funds the receiver's incoming contract as part of the SENDER's send SM completing, so the payer's
+`await-send` must reach `Success` BEFORE the wallet's `await-receive` (else await-receive races an
+unfunded contract, long-polls `await_incoming_contract`, and retries on transport timeouts). With
+that order + release fedimint binaries (`CARGO_PROFILE=release`), the money smoke is 6/6 reliable.
+The `Executor should be running` warning was a red herring (the executor runs fine).
+
+- [x] **4a-pay** — VALIDATED LIVE: the full money smoke passes end-to-end (receive→claimed,
+      pay→success+preimage, devimint confirms Claimed, re-pay→already-paid/no-double-debit).
 - [ ] **4b-live** validate `FedimintExecutor::perform` on devimint: `DirectInflow` nets EXACTLY the
       target amount; a single-fed `Move` (receive+pay via the shared gateway). Wire `wallet-cli
       move`/`reconcile`.
