@@ -317,10 +317,19 @@ impl Executor for FedimintExecutor {
                         )
                         .await
                         .map_err(retryable)?;
+                    // KILLPOINT (§5 backfill window): the receive op is now committed in the
+                    // CLIENT db, but our MoveRecord (recv_op + invoice) is NOT yet persisted. A
+                    // crash here forces backfill to recover the recv op by `move_id` on resume,
+                    // proving no SECOND invoice is minted.
+                    maybe_crash("before-move-record");
                     rec.invoice = Some(invoice);
                     rec.recv_op = Some(recv_op);
                     rec.phase = MovePhase::Invoiced;
                     self.journal.put_move(&rec).await?;
+                    // KILLPOINT: the MoveRecord (recv_op + invoice) is persisted and the receive
+                    // leg is committed, but the irreversible `Pay` has not run. A crash here must
+                    // resume straight into `Pay` (reattaching the fixed invoice), never re-mint.
+                    maybe_crash("after-receive-commit");
 
                     // A `DirectInflow`'s payer is EXTERNAL: surface the invoice, mark the
                     // intent `Awaiting`; the `recv_op` subscription finalizes it (§9.5).
@@ -367,6 +376,9 @@ impl Executor for FedimintExecutor {
                         from: rec.from,
                         to: rec.to,
                     };
+                    // KILLPOINT: the invoice exists but NO send has been started yet. A crash
+                    // here must let reconcile pay EXACTLY once on resume.
+                    maybe_crash("before-send");
                     let send_op = match self
                         .mc
                         .pay(&from, invoice, Some(rec.gateway.clone()), meta.to_value())
@@ -379,6 +391,11 @@ impl Executor for FedimintExecutor {
                         | SendOutcome::AlreadyInFlight(op)
                         | SendOutcome::AlreadyPaid(op) => op,
                     };
+                    // KILLPOINT (§5 backfill window): the send op is committed in the CLIENT db,
+                    // but our MoveRecord does NOT yet carry `send_op`. A crash here must NOT
+                    // double-pay: backfill recovers the send op by `move_id`; if that misses, a
+                    // re-`pay` dedups to `AlreadyInFlight`/`AlreadyPaid`.
+                    maybe_crash("after-send-commit");
                     rec.send_op = Some(send_op);
                     rec.phase = MovePhase::Sending;
                     self.journal.put_move(&rec).await?;
@@ -497,6 +514,38 @@ fn retryable(e: anyhow::Error) -> ExecError {
     ExecError::Retryable(e.to_string())
 }
 
+/// Crash-smoke deterministic hook (spec §5/§10): abort the process at the named killpoint IFF
+/// `WALLET_CLI_CRASH_AT` equals `point`. `abort()` (not `exit`) makes the kill uncatchable and
+/// unclean — it simulates a `kill -9`/OOM, so the crash-window resume paths (§5/§9) run for real
+/// rather than unwinding cleanly. A strict NO-OP when the var is unset or names a DIFFERENT point,
+/// so it never perturbs a normal run; the two-fed `smoke_crash_move_devimint.sh` (which runs the
+/// DEBUG binary) sets it per killpoint to drive the crash gate.
+///
+/// This is test-only fault injection, so it is gated to `debug_assertions` builds — the crate's
+/// established test-hook pattern (see `move_protocol.rs`). A `--release` production wallet binary
+/// compiles the abort out entirely: no `WALLET_CLI_CRASH_AT` value can crash the money path there.
+#[cfg(debug_assertions)]
+fn maybe_crash(point: &str) {
+    if crash_point_matches(std::env::var("WALLET_CLI_CRASH_AT").ok().as_deref(), point) {
+        std::process::abort();
+    }
+}
+
+/// Release counterpart: the fault injector is elided, so every killpoint call is a zero-cost
+/// no-op and no environment can abort a production binary mid-move.
+#[cfg(not(debug_assertions))]
+fn maybe_crash(_point: &str) {}
+
+/// Whether the `WALLET_CLI_CRASH_AT` value (`None` when unset) selects `point`. Split out from
+/// [`maybe_crash`] so the match logic is unit-tested WITHOUT touching process-global env or the
+/// uncatchable abort path. In a `--release` non-test build the hook above is elided and this
+/// predicate is unused; it stays defined (and tested) rather than gated so `cargo test --release`
+/// still compiles the unit test.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+fn crash_point_matches(configured: Option<&str>, point: &str) -> bool {
+    configured == Some(point)
+}
+
 fn gateway_from_cache_or_recovered(
     cached: Option<&MoveRecord>,
     plan: &MovePlan,
@@ -607,6 +656,24 @@ mod tests {
             executor.perform(&intent(action)).await,
             Err(ExecError::Unsupported)
         ));
+    }
+
+    #[test]
+    fn maybe_crash_is_a_noop_unless_the_env_var_matches() {
+        // The pure predicate: only an EXACT hit selects the abort. Unset (`None`) and a
+        // different killpoint are both no-ops, so a normal run is never perturbed.
+        assert!(
+            !crash_point_matches(None, "before-send"),
+            "an unset WALLET_CLI_CRASH_AT never crashes"
+        );
+        assert!(
+            !crash_point_matches(Some("after-send-commit"), "before-send"),
+            "a DIFFERENT killpoint never crashes"
+        );
+        assert!(
+            crash_point_matches(Some("before-send"), "before-send"),
+            "an exact match selects the crash"
+        );
     }
 
     #[test]
