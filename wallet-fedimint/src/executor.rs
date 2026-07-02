@@ -1,18 +1,21 @@
 //! [`FedimintExecutor`] — the async [`wallet_core::Executor`] that turns a journaled
 //! `Intent` into real cross-federation ecash movement (spec §7).
 //!
-//! # Status: DirectInflow is the LIVE path (step 4b-live-1); Move stays scaffold
+//! # Status: DirectInflow AND Move are both LIVE (step 4b-live-2)
 //! The PURE pieces this drives — [`fee::gross_up`], [`MovePlan::from_action`],
 //! [`next_step`], [`assemble_move_record`] — are golden-tested. `perform` itself is I/O glue
 //! over [`MultiClient`] + [`FedimintJournal`], structured faithfully to §7. The `DirectInflow`
-//! branch (receive-only) is now wired end-to-end and driven from `wallet-cli`
+//! branch (receive-only) is wired end-to-end and driven from `wallet-cli`
 //! (`direct-inflow` / `await-move` / `reconcile`, via [`crate::runtime::Runtime`]) against a
 //! live devimint federation; its `smoke_directinflow_devimint.sh` asserts the recipient nets
-//! EXACTLY the target. The `Move` branch (a send leg) is GATED to `Unsupported` this step — its
-//! scaffolded Pay / send-side `AwaitSettle` legs type-check against the pinned API but are not
-//! yet live-validated, so no un-validated irreversible send can run until the next step un-gates
-//! and validates it. Do not read the absence of a unit test here as untested logic: the
-//! decisions live in the pure functions above.
+//! EXACTLY the target. The `Move` branch (the cross-federation transfer) now EXECUTES its full
+//! two-leg send path — receive on `to`, re-quote + cap-check + `pay` from `from`, await both,
+//! settle → `Done` — synchronously (`perform` returns `Done`, never `Awaiting`, for a Move). It
+//! is resume-safe: `assemble_record` reattaches a replayed move to its existing invoice/recv_op/
+//! send_op (the send op-id is deterministic; a re-`pay` returns `AlreadyInFlight`/`AlreadyPaid`),
+//! so a crash never re-mints or re-pays. `Evacuate` (Phase 2) stays `Unsupported`. Do not read
+//! the absence of a happy-path unit test here as untested logic: the pure decisions are
+//! golden-tested above, and the live two-leg drive is exercised by `smoke_move_devimint.sh`.
 //!
 //! # The perform loop (spec §7)
 //! `from_action` → `assemble_record` (cached MoveRecord + backfilled op artifacts, so a
@@ -244,6 +247,28 @@ impl FedimintExecutor {
         }
         Ok(grossed.invoice_amount)
     }
+
+    /// For a cross-federation `Move`, prove the pinned receive gateway also serves the source
+    /// federation before minting B's invoice. Without this check a destination-only gateway can
+    /// create an invoice that A can never pay through the required shared-gateway direct swap,
+    /// leaving the move pending under a bad pinned gateway.
+    async fn validate_move_gateway_before_receive(
+        &self,
+        rec: &MoveRecord,
+    ) -> Result<(), ExecError> {
+        if !rec.send_required {
+            return Ok(());
+        }
+        let from = rec.from.ok_or_else(|| {
+            ExecError::Permanent(
+                "Move record requires a send leg but has no source federation".into(),
+            )
+        })?;
+        self.mc
+            .validate_gateway(&from, &rec.gateway)
+            .await
+            .map_err(retryable)
+    }
 }
 
 #[async_trait]
@@ -254,15 +279,11 @@ impl Executor for FedimintExecutor {
             return Err(ExecError::Unsupported);
         };
 
-        // Phase 1 step 4b-live-1 is DirectInflow ONLY. A `Move` (`send_required`) carries a
-        // scaffolded-but-not-yet-live-validated Pay leg; gate it to `Unsupported` so an
-        // un-validated, IRREVERSIBLE send can never run until the next step wires + validates it
-        // (`wallet-cli move`). A `DirectInflow` is receive-only (`send_required == false`) and
-        // falls through. The Pay / send-side `AwaitSettle` arms below are therefore unreachable
-        // this step; they stay in place for that next step to un-gate.
-        if plan.send_required {
-            return Err(ExecError::Unsupported);
-        }
+        // Step 4b-live-2: BOTH executable move shapes run here. A `DirectInflow` (receive-only,
+        // `send_required == false`) returns `Awaiting` after minting its invoice (its payer is
+        // external). A `Move` (`send_required == true`) drives on through the irreversible `Pay`
+        // and both `AwaitSettle` legs to `Done`, synchronously (spec §7). `Evacuate`/advisory
+        // actions already mapped to `None` above → `Unsupported`.
 
         // FIRST: rebuild the record from the intent + backfilled op artifacts, so a replayed
         // move reattaches (no re-quote, no spurious over-cap fail).
@@ -271,7 +292,15 @@ impl Executor for FedimintExecutor {
         loop {
             match next_step(&rec) {
                 MoveStep::CreateInvoice => {
+                    self.validate_move_gateway_before_receive(&rec).await?;
                     let invoice_amount = self.gross_up(&rec).await?;
+                    // For a `Move`, persist the chosen gateway BEFORE the non-idempotent receive
+                    // call. If the process dies after B's receive op commits but before the
+                    // invoice/op-id cache write below, backfill can recover the op but not the
+                    // gateway. This pre-op record makes the gateway authoritative on replay.
+                    if rec.send_required {
+                        self.journal.put_move(&rec).await?;
+                    }
                     let meta = MoveMeta {
                         move_id: rec.key.clone(),
                         role: MoveRole::Receive,
@@ -417,7 +446,15 @@ impl Executor for FedimintExecutor {
                     self.journal.put_move(&rec).await?;
                 }
                 MoveStep::Done => return Ok(PerformOutcome::Done),
-                MoveStep::Failed => return Err(ExecError::Permanent("move failed".into())),
+                // A `Refunded`/`Failed` phase is terminal (spec §7): the send self-refunded or a
+                // leg failed. Surface the recorded reason so the CLI/log names the actual cause.
+                MoveStep::Failed => {
+                    return Err(ExecError::Permanent(
+                        rec.outcome
+                            .clone()
+                            .unwrap_or_else(|| "move refunded/failed".into()),
+                    ))
+                }
             }
         }
     }
@@ -467,7 +504,7 @@ fn gateway_from_cache_or_recovered(
     artifacts: &[OpArtifact],
 ) -> Option<GatewayUrl> {
     if let Some(rec) = cached {
-        if has_move_artifact(rec) {
+        if plan.send_required || has_move_artifact(rec) {
             return Some(rec.gateway.clone());
         }
     }
@@ -531,11 +568,14 @@ mod tests {
         }
     }
 
-    /// Phase 1 step 4b-live-1 is DirectInflow ONLY: `perform` must refuse a `Move` — its Pay leg
-    /// is scaffolded but NOT live-validated, so an un-validated irreversible send must not run
-    /// until the next step un-gates it.
+    /// Step 4b-live-2 un-gates `Move`: `perform` must NO LONGER map it to `Unsupported`. With no
+    /// federation joined in this fixture it cannot reach the source/destination clients, so the
+    /// first I/O (`backfill_ops`/gateway resolution during `assemble_record`) surfaces a
+    /// RETRYABLE error — the intent stays `Pending`, re-drivable on the next reconcile. What
+    /// matters here is only that the terminal `Unsupported` gate is gone; the live two-leg drive
+    /// is exercised by `smoke_move_devimint.sh`.
     #[tokio::test]
-    async fn move_is_unsupported_this_step() {
+    async fn move_is_no_longer_unsupported() {
         let executor = test_executor().await;
         let action = Action::Move {
             from: FED_A,
@@ -543,10 +583,14 @@ mod tests {
             amount: Msat(50_000),
             fee_cap: Msat(10_000),
         };
-        assert!(matches!(
-            executor.perform(&intent(action)).await,
-            Err(ExecError::Unsupported)
-        ));
+        let err = executor
+            .perform(&intent(action))
+            .await
+            .expect_err("no federation joined in the fixture, so the move can't reach its clients");
+        assert!(
+            matches!(err, ExecError::Retryable(_)),
+            "Move must attempt real I/O (Retryable when the fed isn't joined), never Unsupported: {err:?}"
+        );
     }
 
     /// `Evacuate` is Phase 2: `perform` maps it to `Unsupported` (via `MovePlan::from_action`).
@@ -633,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_op_cached_gateway_does_not_pin_retry() {
+    fn pre_op_cached_gateway_pins_moves_but_not_receive_only_retries() {
         let key = IdempotencyKey("direct-inflow:pre-op".into());
         let plan = MovePlan {
             from: None,
@@ -660,7 +704,21 @@ mod tests {
         assert_eq!(
             gateway_from_cache_or_recovered(Some(&cached), &plan, &key, &[]),
             None,
-            "a gateway-only pre-op cache must not block an explicit retry from repinning"
+            "a receive-only gateway-only cache must not block an explicit retry from repinning"
+        );
+
+        let send_plan = MovePlan {
+            from: Some(FED_A),
+            send_required: true,
+            ..plan.clone()
+        };
+        let mut move_cached = cached.clone();
+        move_cached.from = Some(FED_A);
+        move_cached.send_required = true;
+        assert_eq!(
+            gateway_from_cache_or_recovered(Some(&move_cached), &send_plan, &key, &[]),
+            Some(GatewayUrl("https://stale.example".into())),
+            "a Move pre-op cache records the gateway chosen before non-idempotent receive"
         );
 
         cached.invoice = Some(Invoice("lnbc1cached".into()));

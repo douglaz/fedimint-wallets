@@ -14,8 +14,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use wallet_core::{FederationId, IdempotencyKey, IntentStatus, Msat, Occurrence};
 use wallet_fedimint::{
-    FedimintJournal, FinalizeOutcome, GatewayUrl, Invoice, MultiClient, OperationId, ReceiveState,
-    Runtime, SendOutcome, SendState,
+    FedimintJournal, FinalizeOutcome, GatewayUrl, Invoice, MoveOutcome, MultiClient, OperationId,
+    ReceiveState, Runtime, SendOutcome, SendState,
 };
 
 #[derive(Parser)]
@@ -118,6 +118,34 @@ enum Command {
         /// read from the intent's move record.
         #[arg(long)]
         fed: Option<String>,
+    },
+    /// Move ecash between two joined federations through a shared gateway's internal swap
+    /// (spec §7 — the wallet's core cross-federation capability): federation `--from` pays an
+    /// invoice minted on `--to`, so `--to` nets EXACTLY `--amount`. Synchronous: blocks until the
+    /// move settles, then prints done/failed to stdout and the move key to stderr.
+    Move {
+        /// Source federation to move ecash FROM (hex id).
+        #[arg(long)]
+        from: String,
+        /// Destination federation to move ecash TO (hex id).
+        #[arg(long)]
+        to: String,
+        /// Net amount the destination must end up with, in millisatoshis.
+        #[arg(long)]
+        amount: u64,
+        /// Total move fee cap (BOTH legs), in millisatoshis. Defaults to a deliberately generous
+        /// guard (amount + 1000 sat); pass this to bound the total move cost tightly.
+        #[arg(long)]
+        fee_cap: Option<u64>,
+        /// Shared lnv2 gateway URL routing the swap — it must serve BOTH federations. Defaults to
+        /// the first gateway registered on `--to`; pass one explicitly against devimint (its LDK
+        /// gateway is not auto-registered — see docs/devimint-runbook.md §4).
+        #[arg(long)]
+        gateway: Option<String>,
+        /// Idempotency occurrence. Reusing the same occurrence reattaches to the same move (no
+        /// re-mint/re-pay); bump it to start another same-params move after the first settles.
+        #[arg(long, default_value_t = 0)]
+        occurrence: u64,
     },
     /// Re-drive pending intents and rebuild move records from the op-log (spec §9 resume loop):
     /// print performed/failed/skipped/awaiting counts; awaiting intent keys go to stderr.
@@ -293,6 +321,49 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Command::Move {
+            from,
+            to,
+            amount,
+            fee_cap,
+            gateway,
+            occurrence,
+        } => {
+            let from_id = select_fed(&joined_ids, &open_ids, Some(&from))?;
+            let to_id = select_fed(&joined_ids, &open_ids, Some(&to))?;
+            anyhow::ensure!(
+                from_id != to_id,
+                "move --from and --to must be different federations (from == to is a no-op)"
+            );
+            // Resolve the shared gateway relative to the RECEIVE leg (`to`), which is where the
+            // executor pins it for a fresh move; it must also serve `from` for the internal swap.
+            let gateway = pick_receive_gateway(&multi_client, &to_id, gateway).await?;
+            let amount = Msat(amount);
+            let fee_cap = Msat(fee_cap.unwrap_or_else(|| default_move_fee_cap(amount.0)));
+            let runtime = Runtime::new(multi_client.clone(), journal.clone(), gateway);
+            let outcome = runtime
+                .do_move(from_id, to_id, amount, fee_cap, Occurrence(occurrence))
+                .await?;
+            // done/failed -> stdout (the scriptable result); the move key -> stderr (the handle).
+            match outcome.status {
+                Some(IntentStatus::Done) => {
+                    println!("done");
+                    eprintln!("move_key: {}", outcome.key.0);
+                }
+                status => {
+                    // Non-`Done` is not a settled move: report it and fail the process so a caller
+                    // gating on the exit code never mistakes it for success (matching await-move /
+                    // direct-inflow's deliberate non-zero-on-non-settled stance).
+                    println!("failed: {}", move_failure_reason(&outcome));
+                    eprintln!("move_key: {}", outcome.key.0);
+                    anyhow::bail!(
+                        "move {} did not settle (status {})",
+                        outcome.key.0,
+                        status_label(status)
+                    );
+                }
+            }
+        }
         Command::Reconcile => {
             let runtime = Runtime::new(multi_client.clone(), journal.clone(), None);
             let summary = runtime.reconcile().await?;
@@ -315,6 +386,30 @@ async fn main() -> anyhow::Result<()> {
 /// meaningful fee protection; pass `--fee-cap` to bound the receive cost tightly.
 fn default_direct_inflow_fee_cap(amount_msat: u64) -> u64 {
     amount_msat.saturating_add(1_000_000)
+}
+
+/// A deliberately loose default fee cap for a CLI `move`: the net amount plus 1000 sat of
+/// headroom, covering BOTH legs' federation + gateway fees on the happy path. This is a
+/// no-surprises guard, not meaningful fee protection; pass `--fee-cap` to bound the move cost.
+fn default_move_fee_cap(amount_msat: u64) -> u64 {
+    amount_msat.saturating_add(1_000_000)
+}
+
+/// A human-readable reason a `move` did not settle. A `Permanent` failure (fee over cap,
+/// refund/failed settlement) records its cause on the `MoveRecord`; a transient fault leaves the
+/// move `Pending` with no recorded outcome, so point the operator at the re-drive paths.
+fn move_failure_reason(outcome: &MoveOutcome) -> String {
+    if let Some(reason) = &outcome.outcome {
+        return reason.clone();
+    }
+    match outcome.status {
+        Some(IntentStatus::Pending) | Some(IntentStatus::Executing) => format!(
+            "move not settled (status {}); a transient fault left it re-drivable — run \
+             reconcile, or re-run move with the same --occurrence and --gateway",
+            status_label(outcome.status)
+        ),
+        other => format!("move not settled (status {})", status_label(other)),
+    }
 }
 
 /// Whether a finished `direct-inflow` should surface its invoice on stdout as the scriptable
@@ -578,6 +673,33 @@ mod tests {
             IntentStatus::Executing
         )));
         assert!(!direct_inflow_surfaces_invoice(None));
+    }
+
+    #[test]
+    fn move_failure_reason_prefers_the_recorded_outcome() {
+        // A `Permanent` move failure records its cause on the MoveRecord; the CLI surfaces it
+        // verbatim rather than a generic status line.
+        let recorded = MoveOutcome {
+            key: IdempotencyKey("move:aa:bb:0".into()),
+            status: Some(IntentStatus::Failed),
+            outcome: Some("fee over cap".into()),
+        };
+        assert_eq!(move_failure_reason(&recorded), "fee over cap");
+    }
+
+    #[test]
+    fn move_failure_reason_points_a_pending_move_at_the_re_drive_paths() {
+        // A transient fault leaves the move `Pending` with no recorded outcome: the message must
+        // tell the operator it is re-drivable (reconcile / same-occurrence re-run), not terminal.
+        let pending = MoveOutcome {
+            key: IdempotencyKey("move:aa:bb:0".into()),
+            status: Some(IntentStatus::Pending),
+            outcome: None,
+        };
+        let msg = move_failure_reason(&pending);
+        assert!(msg.contains("re-drivable"), "{msg}");
+        assert!(msg.contains("reconcile"), "{msg}");
+        assert!(msg.contains("--occurrence"), "{msg}");
     }
 
     #[test]

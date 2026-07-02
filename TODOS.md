@@ -64,6 +64,15 @@ douglaz/fedimint @ `b108ec6`.
       green (compile+clippy+fmt+unit incl. custom_meta shape + key determinism). `smoke_directinflow_
       devimint.sh` written (await-send-first; asserts net == N EXACTLY + idempotent). `Move` stays
       `Unsupported`.
+- [x] Step 4b-live-2 (branch `feat/executor-move`) — cross-federation `Move` EXECUTES: the
+      `send_required` gate is removed, so `perform` drives the full two-leg path (receive on `to`
+      → re-quote + cap-check + pay from `from` → await both → settle → `Done`), resume-safe
+      (assemble_record reattaches; deterministic send op-id + lnv2 dedup ⇒ no re-mint/re-pay).
+      `runtime::Runtime::do_move` (synchronous — returns `Done`, not `Awaiting`) + `wallet-cli
+      move --from/--to/--amount [--fee-cap] [--gateway] [--occurrence]`; `reconcile` re-drives a
+      pending Move. rb-lite gate green (compile+clippy+fmt+unit incl. `move_key` determinism +
+      `move_failure_reason`). Two-fed `smoke_move_devimint.sh` written (maintainer-run; see its
+      header for the two-federation setup). `Evacuate` stays `Unsupported`.
 
 **devimint reliability SOLVED (2026-07-02):** the flaky lnv2 validation was NOT our code and NOT
 debug builds/gateway-readiness — it was a test-harness **await ordering**. lnv2's internal swap
@@ -85,8 +94,11 @@ The `Executor should be running` warning was a red herring (the executor runs fi
       mint OUTPUT / note-selection fee — spec §6 "config constants under-quote"). Make `gross_up`
       conservative (model/estimate the mint output fee, or add a bounded buffer) so net is never
       UNDER the target. Smoke asserts a 1-sat tolerance below target for now.
-- [ ] **4b-live-2 Move** — single-fed `Move` (receive + pay via the shared gateway) + `wallet-cli
-      move` (perform's send leg + await/settle; currently `Unsupported`).
+- [ ] **4b-live-2 Move** — CODE + GATE DONE (executor two-leg `Move`, `runtime::do_move`,
+      `wallet-cli move`; compile+clippy+fmt+unit green). LIVE run PENDING: `smoke_move_devimint.sh`
+      is a TWO-federation smoke (A→B through the shared gateway) — the maintainer runs it once a
+      second federation served by the same LDK gateway is available (dev-fed only brings up one;
+      see the script header). Assert: move `done`, B nets ~N (never over), A falls by N + fees.
 - [x] **Fee-quote base discrepancy** — RESOLVED (verified vs pinned `b108ec6`): fed fee quoted on
       `contract_amount` (spec §6); the gateway ppm now FLOORS (`GatewayFee::on`) to invert
       `PaymentFee::subtract_from`. Residual: the mint-output-fee under-quote above. See memory.

@@ -20,10 +20,13 @@
 //! - the [`FedimintExecutor`] (impl [`wallet_core::Executor`]) plus the `MultiClient` fee-quote
 //!   / `backfill_ops` I/O.
 //!
-//! Step 4b-live-1 (this step) makes the `DirectInflow` path EXECUTE end-to-end and drives it
-//! through the [`runtime::Runtime`] façade (`direct_inflow` / `await_move` / `reconcile`, spec
-//! §9), exposed via `wallet-cli`. The recipient nets EXACTLY the target — the gross-up floors
-//! the gateway fee to invert fedimint's real `PaymentFee` (spec §6). `Move` stays `Unsupported`.
+//! Step 4b-live-1 made the `DirectInflow` path EXECUTE end-to-end (recipient nets EXACTLY the
+//! target — the gross-up floors the gateway fee to invert fedimint's real `PaymentFee`, spec §6).
+//! Step 4b-live-2 (this step) un-gates the cross-federation `Move`: the [`FedimintExecutor`]
+//! now drives its full two-leg send path (receive on `to`, re-quote + cap-check + pay from
+//! `from`, await both, settle → `Done`), resume-safe (no re-mint/re-pay on replay), driven via
+//! `wallet-cli move` through the [`runtime::Runtime`] façade (`do_move`). `Evacuate` stays
+//! `Unsupported` (Phase 2).
 
 pub mod executor;
 pub mod fee;
@@ -41,5 +44,5 @@ pub use move_protocol::{
     MoveRole, MoveStep, OpArtifact,
 };
 pub use multi_client::{MultiClient, ReceiveState, SendOutcome, SendState};
-pub use runtime::{DirectInflowOutcome, FinalizeOutcome, ReconcileSummary, Runtime};
+pub use runtime::{DirectInflowOutcome, FinalizeOutcome, MoveOutcome, ReconcileSummary, Runtime};
 pub use types::{GatewayUrl, Invoice, OperationId, Preimage};

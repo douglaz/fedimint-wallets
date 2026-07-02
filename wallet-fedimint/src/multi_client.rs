@@ -438,6 +438,17 @@ impl MultiClient {
         Ok(payment_fee_to_gateway_fee(send_fee))
     }
 
+    /// Validate that `gateway` serves `id` by asking the gateway for this federation's lnv2
+    /// `RoutingInfo`. This uses the same pinned-source API path as the fee quote helpers; callers
+    /// use it when they need a preflight without yet having an invoice.
+    pub async fn validate_gateway(
+        &self,
+        id: &FederationId,
+        gateway: &GatewayUrl,
+    ) -> anyhow::Result<()> {
+        self.routing_info_for(id, gateway).await.map(|_| ())
+    }
+
     /// Page `id`'s op-log to EXHAUSTION (spec §5/§9.2) and recover one [`OpArtifact`] per
     /// operation tagged with a move `custom_meta`. This is how a lost/derived `MoveRecord`
     /// is repaired: the op-log is the source of truth, and each op ties an op-id (+ the

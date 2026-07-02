@@ -1,20 +1,24 @@
 //! [`Runtime`] — the thin async façade the headless frontend drives (spec §9). It owns the
 //! shared fedimint I/O (`MultiClient`) + durable journal (`FedimintJournal`) and exposes the
-//! three engine verbs `wallet-cli` needs on top of `wallet_core::{apply, reconcile}`:
+//! engine verbs `wallet-cli` needs on top of `wallet_core::{apply, reconcile}`:
 //!
 //! - [`Runtime::direct_inflow`] — journal + drive a `DirectInflow` intent (spec §7): the
 //!   executor sizes + cap-checks the receive invoice (§6 fixed point), mints it, persists the
 //!   `MoveRecord`, and returns `Awaiting`; we then surface the BOLT11 (the payer is external).
+//! - [`Runtime::do_move`] — journal + drive a cross-federation `Move` (spec §7): B (`to`)
+//!   receives, A (`from`) pays through the shared gateway's internal swap, both legs settle.
+//!   Synchronous — `perform` runs the whole two-leg move to `Done` (never `Awaiting`).
 //! - [`Runtime::await_move`] — finalize an `Awaiting` inflow: await its `recv_op`, and on the
 //!   `Claimed` state mark the intent `Done` via the journal CAS (spec §9.5).
 //! - [`Runtime::reconcile`] — the resume loop (spec §9): rebuild `MoveRecord`s from the op-log
-//!   for pending + awaiting intents BEFORE re-driving, re-drive `pending()` only, then report
-//!   the still-`Awaiting` set (finalized out-of-band by `await-move` in a one-shot CLI).
+//!   for pending + awaiting intents BEFORE re-driving, re-drive `pending()` only (so a `Move`
+//!   left `Pending` by a transient fault is re-driven here), then report the still-`Awaiting`
+//!   set (finalized out-of-band by `await-move` in a one-shot CLI).
 //!
-//! DirectInflow ONLY in this step: a `Move`/`Evacuate` intent still maps to `Unsupported` in
-//! the executor. The `Runtime` holds an optional pinned gateway (⟦D4⟧; devimint's LDK gateway
-//! is not auto-registered, runbook §4) that a FRESH move resolves through — a resumed move
-//! reuses the gateway already recorded in its `MoveRecord`.
+//! `Evacuate` still maps to `Unsupported` in the executor (Phase 2). The `Runtime` holds an
+//! optional pinned gateway (⟦D4⟧; devimint's LDK gateway is not auto-registered, runbook §4)
+//! that a FRESH move resolves through — a resumed move reuses the gateway already recorded in
+//! its `MoveRecord`.
 
 use crate::executor::FedimintExecutor;
 use crate::journal::FedimintJournal;
@@ -35,6 +39,19 @@ pub struct DirectInflowOutcome {
     pub key: IdempotencyKey,
     pub invoice: Option<Invoice>,
     pub status: Option<IntentStatus>,
+}
+
+/// The result of a [`Runtime::do_move`] call: the move intent's key (the durable handle), the
+/// terminal intent status, and — when the move did not settle — the reason recorded on its
+/// `MoveRecord`. A `Move` is synchronous (spec §7): `perform` drives both legs to `Done` (or
+/// `Failed`), so unlike [`DirectInflowOutcome`] there is no invoice to surface and no external
+/// payer to await. A `Pending` status means a transient fault left the move re-drivable via
+/// `reconcile` (or a re-run of `move` with the same occurrence + `--gateway`).
+#[derive(Clone, Debug)]
+pub struct MoveOutcome {
+    pub key: IdempotencyKey,
+    pub status: Option<IntentStatus>,
+    pub outcome: Option<String>,
 }
 
 /// The terminal result of [`Runtime::await_move`]: the inflow settled (`Done`) or did not
@@ -169,6 +186,67 @@ impl Runtime {
             key,
             invoice,
             status,
+        })
+    }
+
+    /// Transfer `amount` net ecash from federation `from` to `to` through the shared gateway's
+    /// internal swap (spec §7): B (`to`) receives, A (`from`) pays, both legs settle. Builds a
+    /// `Move` decision under a deterministic key and drives it through `wallet_core::apply`;
+    /// `perform` runs the WHOLE two-leg move to completion (it is synchronous — it returns
+    /// `Done` when settled, never `Awaiting`), so this returns once the move is terminal.
+    ///
+    /// Idempotent on the key: a re-run of the same (`from`, `to`, `amount`, `fee_cap`,
+    /// `occurrence`) reattaches to the in-flight/settled move (backfill + the lnv2 send dedup)
+    /// and never re-mints or re-pays. A transient fault leaves the intent `Pending` (re-drivable
+    /// by `reconcile` or a same-occurrence re-run with `--gateway`); a `Permanent` fault (fee
+    /// over cap, refund/failed settlement) leaves it `Failed`, its reason on the `MoveRecord`.
+    pub async fn do_move(
+        &self,
+        from: FederationId,
+        to: FederationId,
+        amount: Msat,
+        fee_cap: Msat,
+        occurrence: Occurrence,
+    ) -> anyhow::Result<MoveOutcome> {
+        let key = move_key(&from, &to, amount, fee_cap, occurrence);
+        let decision = AllocatorDecision {
+            action: Action::Move {
+                from,
+                to,
+                amount,
+                fee_cap,
+            },
+            // The reason is decision metadata only (never persisted on the Intent), so the exact
+            // move reason does not matter here.
+            reason: ReasonCode::SpendingBelowTarget,
+            occurrence,
+            idempotency_key: key.clone(),
+            requires_auth: false,
+        };
+        let executor = self.executor();
+        let _summary = wallet_core::apply(
+            self.journal.as_ref(),
+            &executor,
+            std::slice::from_ref(&decision),
+        )
+        .await;
+
+        let status = self
+            .journal
+            .get(&key)
+            .await
+            .map_err(exec_err)?
+            .map(|i| i.status);
+        let outcome = self
+            .journal
+            .get_move(&key)
+            .await
+            .map_err(exec_err)?
+            .and_then(|rec| rec.outcome);
+        Ok(MoveOutcome {
+            key,
+            status,
+            outcome,
         })
     }
 
@@ -382,6 +460,28 @@ fn direct_inflow_key(
     ))
 }
 
+/// The deterministic idempotency key for a CLI-driven `Move` (mirrors the allocator's `move:`
+/// scheme and [`direct_inflow_key`]'s all-params form). Stable across re-runs of the same
+/// request so `apply` dedups it (no re-mint/re-pay); bumping `occurrence` produces a fresh key
+/// for a genuinely new move. All params participate, so a same-`from`/`to`/`occurrence` request
+/// with a DIFFERENT amount/cap is a distinct move rather than silently dedup'd to the old one.
+fn move_key(
+    from: &FederationId,
+    to: &FederationId,
+    amount: Msat,
+    fee_cap: Msat,
+    occurrence: Occurrence,
+) -> IdempotencyKey {
+    IdempotencyKey(format!(
+        "move:{}:{}:{}:{}:{}",
+        from.to_hex(),
+        to.to_hex(),
+        amount.0,
+        fee_cap.0,
+        occurrence.0
+    ))
+}
+
 /// Bridge an [`ExecError`] into an `anyhow::Error` for the CLI surface. `ExecError` carries its
 /// diagnostic string in the variant, so `Debug` renders the useful context.
 fn exec_err(e: ExecError) -> anyhow::Error {
@@ -477,6 +577,45 @@ mod tests {
         assert_eq!(
             base.0,
             format!("direct-inflow:{}:100000:1100000:0", to.to_hex())
+        );
+    }
+
+    #[test]
+    fn move_key_is_deterministic_and_param_sensitive() {
+        let base = move_key(&FED_A, &FED_B, Msat(50_000), Msat(2_000), Occurrence(0));
+        // Same inputs -> same key: a re-run of the same move dedups (no re-mint / no re-pay).
+        assert_eq!(
+            base,
+            move_key(&FED_A, &FED_B, Msat(50_000), Msat(2_000), Occurrence(0))
+        );
+        // Every parameter participates, so a genuinely different move gets a distinct key.
+        assert_ne!(
+            base,
+            move_key(&FED_B, &FED_B, Msat(50_000), Msat(2_000), Occurrence(0)),
+            "swapping the source federation must change the key"
+        );
+        assert_ne!(
+            base,
+            move_key(&FED_A, &FED_A, Msat(50_000), Msat(2_000), Occurrence(0)),
+            "changing the destination must change the key"
+        );
+        assert_ne!(
+            base,
+            move_key(&FED_A, &FED_B, Msat(50_001), Msat(2_000), Occurrence(0)),
+            "a different amount must not dedup to the old move"
+        );
+        assert_ne!(
+            base,
+            move_key(&FED_A, &FED_B, Msat(50_000), Msat(2_001), Occurrence(0))
+        );
+        assert_ne!(
+            base,
+            move_key(&FED_A, &FED_B, Msat(50_000), Msat(2_000), Occurrence(1))
+        );
+        // The key embeds both federation hexes + the three numeric params, in order.
+        assert_eq!(
+            base.0,
+            format!("move:{}:{}:50000:2000:0", FED_A.to_hex(), FED_B.to_hex())
         );
     }
 
