@@ -94,11 +94,17 @@ The `Executor should be running` warning was a red herring (the executor runs fi
       mint OUTPUT / note-selection fee — spec §6 "config constants under-quote"). Make `gross_up`
       conservative (model/estimate the mint output fee, or add a bounded buffer) so net is never
       UNDER the target. Smoke asserts a 1-sat tolerance below target for now.
-- [ ] **4b-live-2 Move** — CODE + GATE DONE (executor two-leg `Move`, `runtime::do_move`,
-      `wallet-cli move`; compile+clippy+fmt+unit green). LIVE run PENDING: `smoke_move_devimint.sh`
-      is a TWO-federation smoke (A→B through the shared gateway) — the maintainer runs it once a
-      second federation served by the same LDK gateway is available (dev-fed only brings up one;
-      see the script header). Assert: move `done`, B nets ~N (never over), A falls by N + fees.
+- [x] **4b-live-2 Move** — VALIDATED LIVE (two-fed A→B): `wallet-cli move --from A --to B --amount N`
+      → `done`; B netted ~N (within the fee tolerance, never over), A fell by N + the two-leg fees
+      (~10848 msat); idempotent re-run does NOT move again; `reconcile` is a no-op on a Done move.
+      The cross-federation transfer — the wallet's core capability — works end-to-end.
+- [x] **Two-fed devimint harness** — built: patched `devimint dev-fed` so `--num-feds >= 2` stands
+      up federation B (index 1), connects the LDK gateway, pegs in its B-side liquidity, and exposes
+      `FED_B_INVITE` for the `--exec`. Patch saved at `docs/devimint-two-fed-harness.patch` (apply to
+      `~/p/fedimint` + rebuild `devimint --release`). Reused by step 5's crash gate.
+- [ ] **wallet-cli SIGPIPE robustness (follow-up)** — `wallet-cli` panics (broken pipe) when its
+      stdout is closed early (e.g. piped to `head`, or `awk '…{exit}'` with multiple feds). Reset
+      SIGPIPE to SIG_DFL at startup (the Unix CLI convention). Worked around in the move smoke.
 - [x] **Fee-quote base discrepancy** — RESOLVED (verified vs pinned `b108ec6`): fed fee quoted on
       `contract_amount` (spec §6); the gateway ppm now FLOORS (`GatewayFee::on`) to invert
       `PaymentFee::subtract_from`. Residual: the mint-output-fee under-quote above. See memory.

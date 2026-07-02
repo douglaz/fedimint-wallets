@@ -1,0 +1,49 @@
+diff --git a/devimint/src/cli.rs b/devimint/src/cli.rs
+index 27c1c423e59..eb931c123e6 100644
+--- a/devimint/src/cli.rs
++++ b/devimint/src/cli.rs
+@@ -401,6 +401,44 @@ async fn handle_dev_fed_command(
+                 unsafe {
+                     std::env::set_var(FM_INVITE_CODE_ENV, dev_fed.fed().await?.invite_code()?);
+                 };
++
++                // Two-federation harness (local dev tool for the fedimint-wallets cross-fed
++                // Move/crash smokes): with --num-feds >= 2, stand up federation B (pre-allocated
++                // index 1), connect the LDK gateway to it, peg in the gateway's B-side liquidity so
++                // it can fund incoming contracts during the A->B internal swap, and expose B's
++                // invite as FED_B_INVITE for the --exec.
++                if process_mgr.globals.FM_NUM_FEDS >= 2 {
++                    info!(target: LOG_DEVIMINT, "Two-fed harness: standing up federation B (index 1)");
++                    let bitcoind_b = dev_fed.bitcoind().await?.clone();
++                    let fed_b = crate::federation::Federation::new(
++                        &process_mgr,
++                        bitcoind_b,
++                        skip_setup,
++                        false,
++                        false,
++                        1,
++                        "fedB".to_string(),
++                    )
++                    .await?;
++                    let gw_ldk = dev_fed.gw_ldk_connected().await?;
++                    gw_ldk.client().connect_fed(fed_b.invite_code()?).await?;
++                    let pegin_addr = gw_ldk
++                        .client()
++                        .get_pegin_addr(&fed_b.calculate_federation_id())
++                        .await?;
++                    dev_fed
++                        .bitcoind()
++                        .await?
++                        .send_to(pegin_addr, 1_000_000)
++                        .await?;
++                    dev_fed.bitcoind().await?.mine_blocks(21).await?;
++                    unsafe {
++                        std::env::set_var("FED_B_INVITE", fed_b.invite_code()?);
++                    };
++                    info!(target: LOG_DEVIMINT, "Two-fed harness: fed B up + LDK gateway connected + funded");
++                    // Keep fed B's guardians alive for the exec's lifetime (Drop would kill them).
++                    std::mem::forget(fed_b);
++                }
+             }
+ 
+             if pre_restore {

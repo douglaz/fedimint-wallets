@@ -111,7 +111,9 @@ trap 'rm -rf "$DATA_DIR" "$DI_ERR" "$MOVE_ERR"' EXIT
 wcli() { "$WALLET_CLI" --data-dir "$DATA_DIR" "$@"; }
 balance_msat_for_fed() {
   local fed_id="$1"
-  wcli balance | awk -v id="$fed_id" '$1 == id ":" && $3 == "msat" { print $2; exit }'
+  # NOTE: no `exit` in awk — it must consume ALL of `wcli balance`'s output, else awk closes the
+  # pipe early and wallet-cli gets SIGPIPE mid-print (panics) once there are multiple feds.
+  wcli balance | awk -v id="$fed_id" '$1 == id ":" && $3 == "msat" { print $2 }'
 }
 
 echo "== join BOTH federations =="
