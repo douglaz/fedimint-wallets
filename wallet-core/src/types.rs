@@ -22,17 +22,23 @@ impl FederationId {
 /// A guardian's cross-federation identity, used by the ADR-0010 warm-standby
 /// overlap/independence check (a local `u32` peer index is meaningless across feds).
 ///
-/// CANONICAL ENCODING (load-bearing invariant): this MUST be the guardian's
-/// consensus public-key bytes, encoded identically for every federation in a single
-/// `AllocatorSnapshot`. `allocator::shares_guardian` compares these bytes for EXACT
-/// equality, so it can only detect a shared guardian when both feds encode it the
-/// same way. The pubkey is the right anchor because it is the guardian's
-/// cryptographic identity (same key = same signer = NOT independent); an api-url is
-/// a mutable host address, not a stable identity. Mixing encodings (one fed by
-/// pubkey, another by URL) would make an overlap read as independent and fail OPEN —
-/// funding a non-independent standby and silently defeating the insurance. The
-/// producer (wallet-fedimint, a later step) owns enforcing this single encoding when
-/// it populates guardians from real federation config.
+/// ENCODING (load-bearing invariant): the guardian's advertised **api-endpoint URL
+/// bytes**, encoded identically for every federation in a single `AllocatorSnapshot`.
+/// `allocator::shares_guardian` compares these bytes for EXACT equality, so it can only
+/// detect a shared guardian when both feds encode it the same way.
+///
+/// Why the URL, not the consensus pubkey (a Phase-2 finding, see `wallet-fedimint::probe`
+/// and ADR-0010): fedimint's guardian `broadcast_public_keys` are freshly RANDOM per
+/// federation (generated at every config-gen ceremony — the federation id itself derives
+/// from them), so they can NEVER match across two feds; a pubkey-based check would ALWAYS
+/// read independent and fail OPEN. The client config carries no cross-federation-stable
+/// guardian pubkey — the advertised api-endpoint URL is the only shared-operator signal it
+/// exposes. A self-hosted operator reusing the same endpoint across its feds is correctly
+/// detected as shared. KNOWN GAP: one operator advertising DIFFERENT hosts per fed still
+/// reads as independent (a robust stable-identity source is deferred to Phase 3) — but the
+/// URL fails in the SAFE direction for the common case, and the producer must never emit an
+/// EMPTY guardian set (which would silently defeat the check). The producer
+/// (`wallet-fedimint::probe`) owns enforcing this single encoding from the authenticated config.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct GuardianId(pub Vec<u8>);
 
