@@ -32,6 +32,11 @@ fedimint-lnv2-common = { git = "https://github.com/douglaz/fedimint.git", rev = 
 # fedimint's workspace uses (0.33), so it resolves to the one copy already in the lockfile;
 # depending on it directly adds no new version and guarantees the exact same type.
 lightning-invoice = "0.33"
+# `bitcoin::Network` (the type `WalletClientModule::get_network` returns, used by the
+# probe runner to derive `is_mainnet`) — pinned to the SAME version fedimint's
+# workspace uses (0.32), so it resolves to the one copy already in the lockfile and
+# the `Network` type matches exactly (a mismatched copy would not compare equal).
+bitcoin = "0.32"
 anyhow = "1"
 async-trait = "0.1"
 futures = "0.3"

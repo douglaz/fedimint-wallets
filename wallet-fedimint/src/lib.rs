@@ -33,6 +33,7 @@ pub mod fee;
 pub mod journal;
 pub mod move_protocol;
 pub mod multi_client;
+pub mod probe;
 pub mod runtime;
 pub mod types;
 
@@ -44,5 +45,6 @@ pub use move_protocol::{
     MoveRole, MoveStep, OpArtifact,
 };
 pub use multi_client::{MultiClient, ReceiveState, SendOutcome, SendState};
+pub use probe::{assemble_facts, assemble_status, FedimintProbeRunner, ProbeResult};
 pub use runtime::{DirectInflowOutcome, FinalizeOutcome, MoveOutcome, ReconcileSummary, Runtime};
 pub use types::{GatewayUrl, Invoice, OperationId, Preimage};

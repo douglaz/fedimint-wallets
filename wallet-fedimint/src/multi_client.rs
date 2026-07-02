@@ -522,8 +522,9 @@ impl MultiClient {
 
     /// Clone out the open client for `id`, or error if the federation isn't joined/opened.
     /// Cloning the `Arc` under the (sync) map lock keeps the guard from crossing an await
-    /// point in the money methods above.
-    fn client(&self, id: &FederationId) -> anyhow::Result<ClientHandleArc> {
+    /// point in the money methods above. `pub(crate)` so the [`crate::probe`] runner can
+    /// read structural facts (`config`), a light status, and the op-log off the same handle.
+    pub(crate) fn client(&self, id: &FederationId) -> anyhow::Result<ClientHandleArc> {
         self.clients
             .read()
             .expect("client map lock poisoned")
