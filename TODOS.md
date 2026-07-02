@@ -108,8 +108,23 @@ The `Executor should be running` warning was a red herring (the executor runs fi
 - [x] **Fee-quote base discrepancy** — RESOLVED (verified vs pinned `b108ec6`): fed fee quoted on
       `contract_amount` (spec §6); the gateway ppm now FLOORS (`GatewayFee::on`) to invert
       `PaymentFee::subtract_from`. Residual: the mint-output-fee under-quote above. See memory.
-- [ ] **Step 5 crash gate** — `kill -9` `wallet-cli` mid-move at the deterministic `WALLET_CLI_CRASH_AT`
-      killpoints → `reconcile` → no double-pay / no second payable invoice (spec §10).
+- [x] **Step 5 crash gate** — VALIDATED LIVE (`smoke_crash_move_devimint.sh`, two-fed): for EACH of
+      {before-move-record, after-receive-commit, before-send, after-send-commit} the A→B move was
+      crashed mid-flight (`WALLET_CLI_CRASH_AT` → `abort()`, rc=134) and RESUMED under `reconcile`
+      (`performed=1`), completing EXACTLY once — B credited once (never 2N / over N), A debited once,
+      re-run + reconcile balance no-ops. No double-pay, no second payable invoice, at any crash point.
+
+## ✅ PHASE 1 COMPLETE (2026-07-02) — the exit gate is MET
+
+The multi-federation ecash **money engine** works and survives crashes, all validated LIVE on
+devimint: **join** → **receive** → **pay + dedup** → **DirectInflow** (cheap lever, nets target,
+idempotent) → **cross-fed Move A→B** (nets ~target, resume-safe) → **crash gate** (kill mid-move at
+every step → reconcile → exactly-once). ~90 unit tests + gates green throughout; the pin is
+douglaz/fedimint @ `b108ec6`; the two-fed harness is `docs/devimint-two-fed-harness.patch`.
+
+Residual polish (non-blocking follow-ups, tracked above): gross-up never-under-credit (model the
+mint output fee); `wallet-cli` SIGPIPE robustness. Phase 2 (scorer/allocator wiring, discovery,
+orchestrator tick, executing Evacuate) + the Android frontend are the next phases (ADR-0023).
 
 ## Phase 1 model corrections (codex state review, 2026-06-29) — LANDED in the model rebuild above
 
