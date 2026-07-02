@@ -154,6 +154,15 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Restore the default SIGPIPE disposition. Rust sets SIGPIPE to SIG_IGN at startup, which
+    // turns a consumer closing our stdout early (e.g. `wallet-cli balance | head`, or an awk that
+    // exits mid-stream) into an EPIPE that makes the next `println!` PANIC. SIG_DFL makes the
+    // process terminate quietly on a broken pipe instead — the Unix CLI convention.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     // Diagnostics go to STDERR (never stdout), so command output stays scriptable: e.g.
     // `id=$(wallet-cli join <invite>)` must capture only the federation id, not log lines.
     // Honor `RUST_LOG` (the smoke runbook sets `RUST_LOG=warn`), defaulting to `warn`.

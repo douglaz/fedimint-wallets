@@ -7476,6 +7476,7 @@ dependencies = [
  "fedimint-client",
  "fedimint-core",
  "fedimint-rocksdb",
+ "libc",
  "rand 0.8.6",
  "serde_json",
  "tokio",
