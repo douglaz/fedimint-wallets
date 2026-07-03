@@ -21,7 +21,7 @@ Matches the June-2026 research in `docs/federation-data-sources-spec.md` + [ADR-
 
 ## Constraints already decided (ADRs)
 - **Evacuation is LN-only in v1** ([ADR-0018](./adr/0018-v1-evacuation-balance-cap.md), [ADR-0004](./adr/0004-v1-lightning-only.md)): shared-gateway internal swap → public-LN fallback. NO on-chain peg-out (early v2). Plus a hard low per-federation balance cap to bound stranding.
-- **Never silent** ([ADR-0007](./adr/0007-auto-allocate-disclose-not-consent.md)): every evacuation is disclosed/surfaced (the CLI/report shows it), not consented per-move.
+- **Never silent** ([ADR-0014](./adr/0014-on-device-agent-standing-instruction.md), which superseded ADR-0007): the agent acts on the user's recorded standing instruction, and every evacuation is disclosed/surfaced (the CLI/report shows it; durably auditable once the operation ledger lands — [operation-history-spec.md](./operation-history-spec.md)), not consented per-move.
 - **Discovery/Observer/Nostr are UNTRUSTED** ([ADR-0017](./adr/0017-sybil-resistant-selection-probes-gate.md)/[ADR-0019](./adr/0019-federation-signals-trust-model.md)): they can only supply a candidate set + a demote-only prior; the empirical probe gate + authenticated config are the only trust inputs. Nostr kind-38000 ratings are dropped entirely; kind-38173 is a discovery feed only.
 
 ## Build order (Evacuate first — self-contained, completes the money path)

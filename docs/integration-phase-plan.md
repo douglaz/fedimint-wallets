@@ -1,5 +1,14 @@
 # Integration-phase architecture (locked)
 
+> **STATUS (2026-07): Phase 1 COMPLETE** (money path live-validated on devimint;
+> crash/reconcile gate passed) — **Phase 2 COMPLETE** (probe → score → snapshot → decide →
+> apply via `Runtime::tick`; two-fed exit gate passed, see [phase2-plan.md](./phase2-plan.md)) —
+> **Phase 3 in progress** ([phase3-plan.md](./phase3-plan.md); 3.A Evacuate execution in
+> flight). Next after Phase 3.A: [phase4-plan.md](./phase4-plan.md) (hardening + operation
+> ledger), then the sequence in [roadmap-to-v1.md](./roadmap-to-v1.md). Naming drift from
+> reality: the durable journal shipped as `FedimintJournal` over the fedimint RocksDB
+> `Database` (NOT SQLite) — read `SqliteJournal` below as `FedimintJournal`.
+
 From the pure decision core (scorer + allocator + executor, all on `main`, tested) to a
 working on-device agent that actually moves ecash across federations. Source of truth: the
 design report, ADRs 0001-0020, `docs/federation-data-sources-spec.md`. Reviewed via
@@ -99,9 +108,11 @@ manages a small active set + ephemeral probe-joins, not an N-client registry.
   - **1c GATE.** Exit: a devimint test moves ecash A→B via `apply()` AND survives
     `reconcile()` (crash-at-every-step) with no double-pay, plus the misbehaving-gateway
     double + the restore-from-seed-mid-move hazard (T4). Candidate set = a bundled invite list.
-- **Phase 2 — sense + decide.** `FedimintProbeRunner` (config-fetch + round-trip + peg-out)
-  + the facts assembler → real `FederationFacts` → `score()` → snapshot → `decide()` →
-  `apply()`. Recorded-fixture parser tests in the fast layer. Exit: full tick vs devimint.
+- **Phase 2 — sense + decide.** `FedimintProbeRunner` + the facts assembler → real
+  `FederationFacts` → `score()` → snapshot → `decide()` → `apply()`. Recorded-fixture parser
+  tests in the fast layer. Exit: full tick vs devimint. (As built, `round_trip_ok`/
+  `peg_out_quotable` are cheap PROXIES — gateway availability / wallet-module presence — not a
+  paid round-trip or a peg-out quote; the real active probe stays on the roadmap.)
 - **Phase 3 — discovery + triggers.** `ObserverClient` + `NostrClient` (untrusted candidate
   set + prior) + the concrete tick runner's triggers (foreground / WorkManager / push) +
   evacuation on shutdown notice. Exit: self-driving discover → score → rebalance vs devimint.
