@@ -27,6 +27,13 @@
 //! `from`, await both, settle → `Done`), resume-safe (no re-mint/re-pay on replay), driven via
 //! `wallet-cli move` through the [`runtime::Runtime`] façade (`do_move`). `Evacuate` stays
 //! `Unsupported` (Phase 2).
+//!
+//! Phase 2 step 2.2 wires the whole engine into ONE orchestrator tick: [`probe`] each open
+//! fed → `wallet_core::score` → [`tick::build_snapshot`] → `wallet_core::decide` →
+//! `wallet_core::apply` (through the Phase-1 [`FedimintExecutor`]), so the wallet rebalances per
+//! the standing-instruction [`tick::TickPolicy`]. Exposed as [`runtime::Runtime::tick`] (decide +
+//! apply) and [`runtime::Runtime::status`] (decide only, a dry run). `build_snapshot` is PURE
+//! (golden-tested); the live tick is validated on the two-fed devimint harness at step 2.3.
 
 pub mod executor;
 pub mod fee;
@@ -35,6 +42,7 @@ pub mod move_protocol;
 pub mod multi_client;
 pub mod probe;
 pub mod runtime;
+pub mod tick;
 pub mod types;
 
 pub use executor::FedimintExecutor;
@@ -47,4 +55,5 @@ pub use move_protocol::{
 pub use multi_client::{MultiClient, ReceiveState, SendOutcome, SendState};
 pub use probe::{assemble_facts, assemble_status, FedimintProbeRunner, ProbeResult};
 pub use runtime::{DirectInflowOutcome, FinalizeOutcome, MoveOutcome, ReconcileSummary, Runtime};
+pub use tick::{build_snapshot, ScoredFed, StatusReport, TickPolicy, TickReport};
 pub use types::{GatewayUrl, Invoice, OperationId, Preimage};
