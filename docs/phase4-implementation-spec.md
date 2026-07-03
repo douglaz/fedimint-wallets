@@ -245,10 +245,13 @@ pub enum OperationKind {
     Join { fed: FederationId },
     Receive { fed: FederationId, amount: Msat, op_id: Option<OperationId>,
               gateway: Option<GatewayUrl> },
-    Pay { fed: FederationId, invoice_amount: Option<Msat>, op_id: Option<OperationId>,
-          gateway: Option<GatewayUrl> },   // amount None on the pre-parse Started row
-                                           // (§10.1 — a malformed invoice never yields one);
-                                           // filled by record_update once parsed
+    Pay { fed: FederationId, invoice_amount: Option<Msat>,
+          payment_hash: Option<[u8; 32]>, op_id: Option<OperationId>,
+          gateway: Option<GatewayUrl> },   // amount+hash None on the pre-parse Started row
+                                           // (§10.1 — a malformed invoice never yields them);
+                                           // filled by the post-parse record_update BEFORE
+                                           // the SDK call — the hash is the durable link that
+                                           // lets repair recover DEDUPED retries (§10.3)
     DirectInflow { to: FederationId, amount: Msat, recv_op: Option<OperationId>,
                    gateway: Option<GatewayUrl> },
     Move { from: FederationId, to: FederationId, amount: Msat,
@@ -378,8 +381,13 @@ ordering authority). `Runtime` passes `now_ms` where §8 needs it via the same s
    synchronous-error path below); dedup/grouping rides on the recorded `op_id`, not the key.
    The nonce is 32 random hex chars = 128 bits, everywhere a nonce appears in a ledger key
    incl. `join:`/`tick:` — 32-bit nonces make birthday collisions realistic over a wallet
-   lifetime, and a collision aliases two attempts onto one `0x06` entry. The CLI writes the
-   `Started` row (`record_started`) BEFORE calling
+   lifetime, and a collision aliases two attempts onto one `0x06` entry. The recorded window
+   opens BEFORE any resolution can fail: fed selection (pure registry read) → key generation
+   → `record_started` → THEN gateway resolution (`pick_receive_gateway` bails on
+   no-registered-gateway — that failure must be a `Failed` row, so it happens inside the
+   window) → invoice parse → post-parse `record_update` (amount + payment hash, durable
+   BEFORE the SDK call) → the SDK call. So the CLI writes the `Started` row
+   (`record_started`) BEFORE calling
    `MultiClient::receive`/`pay`, embeds the key in the op's `custom_meta` (extend the current
    role-tag JSON: `{ "role": "receive", "correlation_key": "<key>" }` — `MoveMeta` for
    journaled moves is UNTOUCHED), then `record_update` with the returned op id — which
@@ -421,8 +429,15 @@ ordering authority). `Runtime` passes `now_ms` where §8 needs it via the same s
      "never joined" would not be (local partition state may exist).
    - `pay:`/`recv:` rows with `op_id: None` → search the fed's op-log for the
      `correlation_key` in `custom_meta` (reuse the `backfill_ops` pagination; match on the
-     new field). Found → fill `op_id`; not found (and > 1h old, per the repair principle) →
-     `Failed("never reached the federation")`.
+     new field). Found → fill `op_id`. NOT found and the row carries a `payment_hash`
+     (a `pay:` row that parsed before crashing) → second lookup: scan the fed's lnv2 SEND
+     ops for one whose invoice payment-hash matches — a DEDUPED retry
+     (`AlreadyInFlight`/`AlreadyPaid`) reuses the ORIGINAL op, so the retry's key is in NO
+     op's `custom_meta`; the hash, written durably pre-call, is the recovery link → adopt
+     the shared op id (+ terminal outcome if recorded). Still nothing (and > 1h old, per the
+     repair principle) → `Failed("never reached the federation")` — truthful at ATTEMPT
+     granularity (this attempt never called; a no-hash row was malformed or crashed
+     pre-parse).
    - `pay:`/`recv:` rows in `Awaiting` with `op_id: Some` (the COMMON stuck case: crash
      after `record_update`, or the user never ran `await-*` with `--key`) → read that
      op-log entry directly; if it carries a recorded terminal outcome, `record_terminal`
