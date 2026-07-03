@@ -101,8 +101,11 @@ pub struct FeeBreakdown {
 }
 ```
 
-Net-effect display is derived, not stored: a `Move` shows `from: -(amount + fees)`,
-`to: +amount`.
+Net-effect display is derived, not stored, and is STATUS-DEPENDENT: only a `Succeeded` move
+renders `from: -(amount + fees)`, `to: +amount`. A `Started`/`Awaiting` move renders the
+debit as in-flight with NO credit yet, and a stranded/failed-after-send row (Phase 4.A)
+renders the debit with an explicit "not credited" marker — history must be most accurate
+exactly when a move is unsettled.
 
 ## 3. Storage + write discipline
 
