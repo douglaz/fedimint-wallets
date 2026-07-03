@@ -304,10 +304,12 @@ Pure helpers, golden-tested in `wallet-core`:
   (op-ids/gateway/fees/error filled in) at the SAME status (`record_update`' normal
   post-call path is exactly that), bumping `updated_at_ms`. ONE principled exception:
   `OperationRecord` carries `repaired: bool` and every write is flagged as REPAIR or
-  AUTHORITATIVE (a parameter on `advance`/the record helpers; reconcile's negative-inference
-  repair is the only repair-flagged writer). A `Failed` written by repair sets
+  AUTHORITATIVE (a parameter on `advance`/the record helpers; reconcile's repair passes are
+  the only repair-flagged writers). ANY terminal row written by repair — soft-`Failed`
+  (negative inference) AND soft-`Succeeded` (ambiguous join/hash correlation, §10.3) — sets
   `repaired: true`, and `advance` permits exactly one transition out of such a row by ANY
-  AUTHORITATIVE write (clearing the flag) — an op-evidence update for `pay:`/`recv:`, the
+  AUTHORITATIVE write (clearing the flag; e.g. a late-returning join call or an
+  `await-send --key` reporting the real outcome replaces the repair's guess) — an op-evidence update for `pay:`/`recv:`, the
   real `record_terminal` for `join:`/`tick:` rows (whose writers have no op id to show), or
   a journal-integrated status write. Repair writes never supersede anything terminal.
   Absence-of-evidence conclusions are defeasible; authority wins — this is what makes a
@@ -480,8 +482,15 @@ where §8 needs it via the same source.
    without it they behave as today, ledger row advanced by reconcile repair instead) and
    `record_terminal` on the final state.
 2. **Join**: `Command::Join` checks the registry FIRST (`journal.get_federation`): already
-   registered → open only, NO ledger row. Otherwise `record_started(join:<fed>:<nonce>)` →
-   `multi_client.join(...)` → `record_terminal(Succeeded|Failed)`.
+   registered → open only, NO ledger row (the fast path). Otherwise
+   `record_started(join:<fed>:<nonce>)` → `multi_client.join(...)` →
+   `record_terminal(...)`. `MultiClient::join` RE-CHECKS under its own lock and returns
+   `Ok` for a federation another process registered meanwhile — so it must surface which
+   case happened: return `JoinOutcome { id, newly_joined: bool }` (mechanical greenfield
+   change). `newly_joined` → `Succeeded`; `!newly_joined` (the concurrent window) →
+   `Succeeded` with note "already joined (concurrent/prior); no-op re-open" — the
+   pre-written row cannot be un-written, so it is terminalized TRUTHFULLY instead of
+   masquerading as a fresh membership.
 3. **Reconcile repair** (`Runtime::reconcile`): after the existing §9 passes, scan the FULL
    ledger for non-terminal (`Started`/`Awaiting`) rows — no window cap: repair is the ONLY
    path that terminalizes stale rows, so a cap would strand anything beyond it permanently.
@@ -512,6 +521,12 @@ where §8 needs it via the same source.
      soft, so any authoritative writer still wins. With exactly one candidate, it is
      soft-`Succeeded` without the note; every OTHER `Started` join row for that fed →
      soft-`Failed("superseded by a later join attempt")`.
+     The timestamp window only ARBITRATES between multiple candidates — it never overrides
+     the registry: if the registry contains the fed but NO `Started` attempt falls inside
+     the window (backward clock jump stamped the row after `joined_at`), the NEWEST
+     attempt is still soft-`Succeeded` with the ambiguity note — membership is
+     registry-proven, and a crash-interrupted join usually has no later authoritative
+     writer to rescue a false `Failed`.
      Registry absent (and > 1h old) →
      soft-`Failed("join did not complete — federation not in the registry; re-run join")`.
      The registry is the wallet's MEMBERSHIP authority: a crash between the client-partition
