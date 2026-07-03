@@ -269,10 +269,13 @@ Pure helpers, golden-tested in `wallet-core`:
 
 ## 8. `Intent` extension + reason threading (`wallet-core/src/executor.rs`, `types.rs`)
 
-1. `ReasonCode` gains `UserInitiated` (+ `reason_tag` arm `"user_initiated"`). The dummy
+1. `ReasonCode` gains `UserInitiated` (+ `reason_tag` arm `"user_initiated"`) AND
+   `StandingInstruction` (+ `"standing_instruction"`). The dummy
    `ReasonCode::SpendingBelowTarget` hardcoded in `runtime.rs` `direct_inflow`/`do_move`
    (`:172`, `:245`) becomes `ReasonCode::UserInitiated` — delete the "never persisted"
-   comments; it IS persisted now.
+   comments; it IS persisted now. `Tick` ledger rows carry `StandingInstruction` (truthful:
+   the run exists because the standing instruction executed; the run's individual decisions
+   carry their OWN reasons on their own rows — a tick has no single allocator reason).
 2. `Intent` gains `reason: ReasonCode`, `actor: Actor`, `created_at_ms: u64`.
    `Intent::from_decision(decision: &AllocatorDecision, actor: Actor, now_ms: u64)` — the two
    new parameters are threaded from `apply`:
@@ -351,7 +354,10 @@ ordering authority). `Runtime` passes `now_ms` where §8 needs it via the same s
    (`record_started`) BEFORE calling
    `MultiClient::receive`/`pay`, embeds the key in the op's `custom_meta` (extend the current
    role-tag JSON: `{ "role": "receive", "correlation_key": "<key>" }` — `MoveMeta` for
-   journaled moves is UNTOUCHED), then `record_update_ops` with the returned op id.
+   journaled moves is UNTOUCHED), then `record_update_ops` with the returned op id — which
+   ALSO advances the row `Started → Awaiting`: once the federation returned an op id the
+   operation is live-and-awaiting, a distinct state from "may never have reached the
+   federation", and `history --status awaiting` must surface it.
    `await-receive`/`await-send` take the correlation key via a new `--key` flag (optional —
    without it they behave as today, ledger row advanced by reconcile repair instead) and
    `record_terminal` on the final state.
@@ -375,10 +381,13 @@ ordering authority). `Runtime` passes `now_ms` where §8 needs it via the same s
      `correlation_key` in `custom_meta` (reuse the `backfill_ops` pagination; match on the
      new field). Found → fill `op_id`; not found (and > 1h old, per the repair principle) →
      `Failed("never reached the federation")`.
-   - `pay:`/`recv:` rows with `op_id: Some` (the COMMON stuck case: crash after
-     `record_update_ops`, or the user never ran `await-*` with `--key`) → read that op-log
-     entry directly; if it carries a recorded terminal outcome, `record_terminal`
-     accordingly; still in flight → leave `Started` (truthful) for a later pass.
+   - `pay:`/`recv:` rows in `Awaiting` with `op_id: Some` (the COMMON stuck case: crash
+     after `record_update_ops`, or the user never ran `await-*` with `--key`) → read that
+     op-log entry directly; if it carries a recorded terminal outcome, `record_terminal`
+     accordingly; still in flight → leave `Awaiting` (truthful) for a later pass. (The scan
+     therefore covers `Started` AND `Awaiting` raw rows; the negative-inference `Failed`
+     applies only to `Started` ones — an `Awaiting` row proves the op reached the
+     federation.)
    - `tick:` rows still `Started` with `created_at_ms` older than ONE HOUR (far beyond any
      tick's runtime) → `Failed("interrupted — no terminal report")`. A crash between the
      tick's `Started` write and its terminal write is otherwise unrepairable (later ticks use
