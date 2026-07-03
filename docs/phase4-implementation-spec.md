@@ -188,9 +188,12 @@ eligibles tie.
 
 # Part II — the operation ledger (4.B)
 
-Implements [operation-history-spec.md](./operation-history-spec.md) exactly; this section is
-the code-level mapping. Read that spec first — its §2 (data model), §3 (write discipline),
-and correlation-key rules are normative.
+Implements [operation-history-spec.md](./operation-history-spec.md); this section is the
+code-level mapping. Authority split (recorded in both docs): the history spec is normative
+for the MODEL — the three-structures separation, the write discipline (append-once /
+advance-forward / terminal-immutable / same-dbtx), and the correlation-key rules; **this
+spec's §7 is authoritative for the exact field-level Rust shapes** (it refines the history
+spec's sketch: `reason` is mandatory via `UserInitiated`, gateways are `Option`).
 
 ## 6. Newtype moves (`wallet-fedimint/src/types.rs` → `wallet-core/src/types.rs`)
 
@@ -256,10 +259,13 @@ Pure helpers, golden-tested in `wallet-core`:
   `Action::DirectInflow` → `DirectInflow`, `Action::RefuseInflow` → `Refusal`.
 - `fn status_from_intent(s: IntentStatus) -> OperationStatus` — `Pending|Executing →
   Started`, `Awaiting → Awaiting`, `Done → Succeeded`, `Failed → Failed`.
-- `fn advance(record, new_status, now_ms, fees, error) -> Option<OperationRecord>` — the
+- `fn advance(record, new_status, now_ms, fees, ops, error) -> Option<OperationRecord>` — the
   append-once/advance-forward/terminal-immutable rule as a PURE function: returns `None`
-  (no write) when the stored record is already terminal or the transition is a no-op;
-  otherwise the updated record. Golden the full transition matrix.
+  (no write) ONLY when the stored record is already TERMINAL, or when the requested status
+  would REGRESS (e.g. `Awaiting → Started`) — a NON-terminal row may always be ENRICHED
+  (op-ids/gateway/fees/error filled in) at the SAME status (`record_update_ops`' normal
+  post-call path is exactly that), bumping `updated_at_ms`. Golden the full transition
+  matrix including same-status enrichment and terminal-rejects-everything.
 
 ## 8. `Intent` extension + reason threading (`wallet-core/src/executor.rs`, `types.rs`)
 
@@ -353,11 +359,22 @@ ordering authority). `Runtime` passes `now_ms` where §8 needs it via the same s
    registered → open only, NO ledger row. Otherwise `record_started(join:<fed>:<nonce>)` →
    `multi_client.join(...)` → `record_terminal(Succeeded|Failed)`.
 3. **Reconcile repair** (`Runtime::reconcile`): after the existing §9 passes, scan ledger
-   `Started` rows (bounded: newest 200):
-   - `join:` rows → registry present → `Succeeded`; absent → `Failed("never joined")`.
+   `Started` rows (bounded: newest 200). **Repair principle:** POSITIVE inferences (an
+   op-log outcome found; the registry contains the fed) apply immediately; NEGATIVE
+   inferences (marking `Failed` on absence of evidence) require the row to be older than
+   ONE HOUR — a fresh `Started` row may belong to an operation currently in flight in
+   another process, and a false terminal write would then block the real one
+   (terminal-immutable). Per key prefix:
+   - `join:` rows → registry present → `Succeeded`; absent (and > 1h old) →
+     `Failed("join did not complete — federation not in the registry; re-run join")`.
+     The registry is the wallet's MEMBERSHIP authority: a crash between the client-partition
+     init and `put_federation` leaves an orphaned partition (`next_db_prefix` already never
+     reuses it) and the fed genuinely unusable until a re-join, so this wording is honest —
+     "never joined" would not be (local partition state may exist).
    - `pay:`/`recv:` rows with `op_id: None` → search the fed's op-log for the
      `correlation_key` in `custom_meta` (reuse the `backfill_ops` pagination; match on the
-     new field). Found → fill `op_id`; not found → `Failed("never reached the federation")`.
+     new field). Found → fill `op_id`; not found (and > 1h old, per the repair principle) →
+     `Failed("never reached the federation")`.
    - `pay:`/`recv:` rows with `op_id: Some` (the COMMON stuck case: crash after
      `record_update_ops`, or the user never ran `await-*` with `--key`) → read that op-log
      entry directly; if it carries a recorded terminal outcome, `record_terminal`
