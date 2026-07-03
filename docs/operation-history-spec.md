@@ -24,6 +24,11 @@ rebuildable by design, refusals and raw `receive`/`pay` leave no durable trace a
 ## 2. Data model
 
 All types in `wallet-core` (pure, serde). Storage in `wallet-fedimint` next to the journal.
+**Authority split:** this spec is normative for the MODEL (structure separation, write
+discipline, correlation-key rules); the exact field-level Rust shapes are authoritative in
+[phase4-implementation-spec.md](./phase4-implementation-spec.md) §7, which refines the
+sketch below (notably: `reason` is mandatory — user verbs carry `ReasonCode::UserInitiated`
+— and gateways are `Option`).
 
 ```rust
 /// One row per user-meaningful operation. Append-only: a row is created once, its
