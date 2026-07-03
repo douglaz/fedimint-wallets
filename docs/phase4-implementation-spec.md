@@ -251,8 +251,12 @@ pub enum OperationStatus { Started, Awaiting, Succeeded, Failed }
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OperationKind {
     Join { fed: FederationId },
-    Receive { fed: FederationId, amount: Msat, op_id: Option<OperationId>,
+    Receive { fed: FederationId, amount_invoiced: Msat, op_id: Option<OperationId>,
               gateway: Option<GatewayUrl> },
+              // GROSS invoiced amount — the user's input, known BEFORE any resolution, so
+              // the pre-call Started row is complete; the NET credit is
+              // amount_invoiced − fees.receive_fee (lnv2 raw receive deducts fees from the
+              // invoiced amount, unlike the exact-net DirectInflow)
     Pay { fed: FederationId, invoice_amount: Option<Msat>,
           payment_hash: Option<[u8; 32]>, op_id: Option<OperationId>,
           gateway: Option<GatewayUrl> },   // amount+hash None on the pre-parse Started row
@@ -272,7 +276,10 @@ pub enum OperationKind {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FeeBreakdown {
     pub fee_cap: Option<Msat>,
-    pub receive_fee: Option<Msat>,        // exact (invoice − net), from the MoveRecord
+    /// Receive-side cost. EXACT for intent-backed ops (invoice − net, from the
+    /// MoveRecord's fixed invoice); a pre-call QUOTE for raw receives (§9.3 — gateway
+    /// deduction + federation claim-fee quote on the post-gateway contract).
+    pub receive_fee: Option<Msat>,
     pub send_fee_quoted: Option<Msat>,    // pay-time quote, from the MoveRecord (§2)
 }
 ```
@@ -371,9 +378,12 @@ Public async methods on `FedimintJournal` (each one dbtx via the same helper):
   path is the ONLY writer for raw rows, so it must carry the parsed `invoice_amount` (a
   `Pay` row otherwise stays amount-less forever) AND the fees: the CLI fills them from the
   SAME quote helpers the executor uses — raw `pay`: `send_gateway_fee` + `send_fee_quote`
-  (on the §2 contract base) → `send_fee_quoted`; raw `receive`: the gateway's
-  `receive_fee` from `routing_info` applied to the invoiced amount → `receive_fee`
-  (what lnv2's `subtract_from` will take). These quotes require a CONCRETE gateway: they
+  (on the §2 contract base) → `send_fee_quoted`; raw `receive`: BOTH receive-side
+  components — the gateway deduction (`routing_info.receive_fee` via `subtract_from` on the
+  invoiced amount) PLUS the federation claim fee (`receive_fee_quote` on the post-gateway
+  contract amount) → `receive_fee` (omitting the fed component would under-report every
+  raw receive on a fed with a non-zero receive tx fee; see the `FeeBreakdown.receive_fee`
+  doc — this raw-path value is a QUOTE, unlike the exact intent-backed one). These quotes require a CONCRETE gateway: they
   are filled only when one is known (an explicit `--gateway`, or a pinned executor
   gateway); on the lnv2 AUTO-SELECT path (`None` passed through, the current default
   semantics — unchanged) `gateway` and the fee fields stay `None`, an honest recorded gap
