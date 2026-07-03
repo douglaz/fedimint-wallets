@@ -128,8 +128,22 @@ every step → reconcile → exactly-once). ~90 unit tests + gates green through
 douglaz/fedimint @ `b108ec6`; the two-fed harness is `docs/devimint-two-fed-harness.patch`.
 
 Residual polish (non-blocking follow-ups, tracked above): gross-up never-under-credit (model the
-mint output fee); `wallet-cli` SIGPIPE robustness. Phase 2 (scorer/allocator wiring, discovery,
-orchestrator tick, executing Evacuate) + the Android frontend are the next phases (ADR-0023).
+mint output fee); `wallet-cli` SIGPIPE robustness.
+
+## Phase 2 — sense + decide: COMPLETE (2026-07)
+
+The pure decision core (`scorer::score`, `allocator::decide`) is now wired to REAL federation data
+and drives the Phase-1 executor. Landed: `wallet-fedimint::probe` (light no-sats `FedimintProbeRunner`
++ pure `assemble_facts`/`assemble_status`), the orchestrator `Runtime::tick`/`status` + pure
+`build_snapshot` (probe → score → snapshot → decide → apply), and `wallet-cli tick`/`status` driven by
+the standing-instruction `TickPolicy`. ADR-0010 (guardian-independence standby) was DROPPED as
+unfeasible in fedimint; the standby is best-effort diversification (ADR-0006 note). Exit gate passed
+LIVE on the two-fed devimint harness (`wallet-cli/tests/smoke_tick_devimint.sh`): the allocator itself
+decided the fund-standby Move A→B and `apply()` performed it (B never over-credited; stale occurrence
+fails loudly). See [docs/phase2-plan.md](./docs/phase2-plan.md).
+
+Phase 3 (discovery of NEW candidates via Nostr/Observer, automated triggers, executing Evacuate on a
+shutdown notice) + the Android frontend are the next phases (ADR-0023).
 
 ## Phase 1 model corrections (codex state review, 2026-06-29) — LANDED in the model rebuild above
 

@@ -1,5 +1,12 @@
 # Phase 2 plan — sense + decide
 
+> **STATUS: COMPLETE (2026-07).** All three steps landed and the 2.3 exit gate passed LIVE on the
+> two-fed devimint harness: one `wallet-cli tick` over a funded fed A + empty standby B had the
+> *allocator itself* decide `move 100000 msat A→B (reason StandbyBelowTarget)` and `apply()` perform
+> it — B netted 99982 msat (never over), A fell 110848 msat (move + fees), and a stale same-occurrence
+> re-run failed loudly without moving funds. `sense → decide → act` is closed end-to-end. Next: Phase 3
+> (discovery of NEW candidates, automated triggers, Evacuate execution) + the Android frontend.
+
 Phase 1 built + validated the **money engine** (join/receive/pay/DirectInflow/Move + crash gate).
 Phase 2 wires the already-built, golden-tested pure decision core (`scorer::score`,
 `allocator::decide`) to **real federation data** and drives the executor — the "sense + decide"
