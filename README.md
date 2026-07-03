@@ -8,8 +8,12 @@ Engineering analysis of existing Fedimint/ecash wallets, and a design report for
   Deep-dives of four existing wallets, plus a design for a new **pure-Rust, Android-only, Slint**
   wallet: Wallet-of-Satoshi-simple on the surface, with an automated multi-federation risk engine
   underneath. A CEO-mode plan review (with an independent second-model challenge) re-sequenced the
-  build to **foundation-first** — ship a single-federation wallet architected for the engine, turn
-  the engine on in v2 behind a fee-vs-risk EV gate. See §0.5 and the `GSTACK REVIEW REPORT` section.
+  SHIP plan to **foundation-first** — a single-federation wallet architected for the engine, the
+  engine on behind a fee-vs-risk EV gate. See §0.5 and the `GSTACK REVIEW REPORT` section.
+  The BUILD order has since evolved (the headless engine was built first, Phases 1–3 complete
+  through sense+decide); current build state and the path to a full product live in
+  **[docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md)** — the ship-configuration decision stays
+  gated as the report describes.
 
 ## Wallets analyzed (not vendored here — gitignored)
 

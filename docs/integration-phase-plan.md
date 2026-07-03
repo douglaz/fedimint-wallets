@@ -112,7 +112,10 @@ manages a small active set + ephemeral probe-joins, not an N-client registry.
   `FederationFacts` → `score()` → snapshot → `decide()` → `apply()`. Recorded-fixture parser
   tests in the fast layer. Exit: full tick vs devimint. (As built, `round_trip_ok`/
   `peg_out_quotable` are cheap PROXIES — gateway availability / wallet-module presence — not a
-  paid round-trip or a peg-out quote; the real active probe stays on the roadmap.)
+  paid round-trip or a peg-out quote. Acceptable while rebalancing only among USER-joined feds;
+  the ADR-0017 trust gate for funding a DISCOVERED federation is the real sats-spending active
+  probe, so discovery-driven auto-funding is BLOCKED on building it — see
+  [roadmap-to-v1.md](./roadmap-to-v1.md) Phase 5.0.)
 - **Phase 3 — discovery + triggers.** `ObserverClient` + `NostrClient` (untrusted candidate
   set + prior) + the concrete tick runner's triggers (foreground / WorkManager / push) +
   evacuation on shutdown notice. Exit: self-driving discover → score → rebalance vs devimint.
