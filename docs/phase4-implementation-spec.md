@@ -47,8 +47,13 @@ trust boundary and 3.B's discovery assemblers will feed it attacker-influenced f
 2. In the structural floor, hard-reject (push reason, `floor_ok = false`) when:
    `facts.threshold == 0 || facts.threshold > facts.guardian_count`.
 3. **Proportional floor — SETTLED: require the BFT bound.** Also hard-reject (same reason)
-   when `facts.threshold < facts.guardian_count - (facts.guardian_count - 1) / 3`
-   (integer math; this is fedimint's own `n - f` with `f = (n-1)/3` — `NumPeers::threshold`).
+   when `facts.threshold < bft_threshold(facts.guardian_count)` where
+   `fn bft_threshold(n: u32) -> u32 { n.saturating_sub(n.saturating_sub(1) / 3) }`
+   (fedimint's own `n − f` with `f = (n−1)/3` — `NumPeers::threshold`). SATURATING on
+   purpose: the floor collects ALL failing reasons, so this check still EXECUTES for
+   `guardian_count == 0` (already rejected by `NoFaultTolerance` above) and must not
+   underflow on attacker-supplied facts — the scorer is the trust boundary; no arithmetic
+   in it may panic. Golden: `guardian_count = 0` yields a verdict (no panic).
    Every real fedimint federation satisfies it exactly, so nothing live is rejected; a
    discovered config CLAIMING a weaker threshold (e.g. 3-of-100) is rejected as structurally
    dishonest rather than ranked equal to a 3-of-4. Absolute `min_threshold` stays as-is.
@@ -347,11 +352,14 @@ ordering authority). `Runtime` passes `now_ms` where §8 needs it via the same s
 ## 10. Raw ops, join, tick, refusals (`wallet-cli/src/main.rs`, `runtime.rs`, `multi_client.rs`)
 
 1. **Raw `receive`/`pay`** (operation-history-spec §3 rule 5): the CLI generates the
-   per-attempt key (`pay:<fed>:<payment_hash>:<nonce>` / `recv:<fed>:<nonce>`; the nonce is
-   32 random hex chars = 128 bits, everywhere a nonce appears in a ledger key incl.
-   `join:`/`tick:` — 32-bit nonces make birthday collisions realistic over a wallet lifetime,
-   and a collision aliases two attempts onto one `0x06` entry), writes the `Started` row
-   (`record_started`) BEFORE calling
+   per-attempt key — `pay:<fed>:<nonce>` / `recv:<fed>:<nonce>`, NONCE-ONLY: the key must be
+   constructible from the RAW input BEFORE parsing, because a malformed BOLT11 has no
+   payment hash yet its failed attempt must still be a durable history row (the
+   synchronous-error path below); dedup/grouping rides on the recorded `op_id`, not the key.
+   The nonce is 32 random hex chars = 128 bits, everywhere a nonce appears in a ledger key
+   incl. `join:`/`tick:` — 32-bit nonces make birthday collisions realistic over a wallet
+   lifetime, and a collision aliases two attempts onto one `0x06` entry. The CLI writes the
+   `Started` row (`record_started`) BEFORE calling
    `MultiClient::receive`/`pay`, embeds the key in the op's `custom_meta` (extend the current
    role-tag JSON: `{ "role": "receive", "correlation_key": "<key>" }` — `MoveMeta` for
    journaled moves is UNTOUCHED), then `record_update_ops` with the returned op id — which
