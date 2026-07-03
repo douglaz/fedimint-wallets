@@ -390,16 +390,19 @@ Public async methods on `FedimintJournal` (each one dbtx via the same helper):
   doc — this raw-path value is a QUOTE, unlike the exact intent-backed one). These quotes
   require a CONCRETE gateway. Getting one on the default (no `--gateway`) path — the COMMON
   case, whose fees must not be a permanent blank:
-  - raw `receive` — SETTLED: adopt `direct-inflow`'s existing convention and PIN the first
-    registered lnv2 gateway when none is given (the verb already bails on an empty
-    registered set, so this only replaces blind auto-select with a recorded choice, exactly
-    as `direct-inflow` does for crash-stable replay). Gateway + quote always recordable.
-  - raw `pay` — keeps lnv2 auto-select (the issuing-gateway direct-swap default matters for
-    routing). Pre-call quote best-effort (against the invoice's issuing gateway when it
-    serves the fed); DEFINITIVE backfill at settlement: the lnv2 send op-log meta records
-    the funded OUTGOING CONTRACT, so `await-send --key` and reconcile repair fill
-    `send_fee_quoted` from `contract.amount − invoice_amount` (the exact gateway component)
-    plus the federation fee quote — a successful raw pay always ends with its cost recorded.
+  BOTH raw verbs KEEP lnv2 auto-select untouched (pinning the first registered gateway for
+  metadata would disable lnv2's gateway FAILOVER — a receive that succeeds today via the
+  second gateway would fail synchronously; recording must never regress availability).
+  Instead, two-stage capture, same shape for both verbs:
+  - Pre-call ESTIMATE (best-effort): quote against the first registered gateway (`receive`)
+    / the invoice's issuing gateway when it serves the fed (`pay`); `gateway` field stays
+    `None` — the actual auto-selected choice is unknown at this point.
+  - DEFINITIVE backfill at settlement: the lnv2 op-log meta records the funded CONTRACT, so
+    `await-* --key` and reconcile repair fill the real numbers — `pay`:
+    `contract.amount − invoice_amount` (exact gateway component) + the federation fee
+    quote → `send_fee_quoted`; `receive`: `amount_invoiced − contract.amount` (exact
+    gateway deduction) + the federation claim-fee quote → `receive_fee`. A successful raw
+    op always ENDS with its cost recorded even when it started with none.
   Residual quote failures degrade to `None` (never block the money op on a fee display).
 - `record_tick_started(key, occurrence, now_ms)` and
   `record_tick_terminal(key, counts: Option<(decisions, performed, failed)>,
@@ -472,8 +475,14 @@ ordering authority). `Runtime` passes `now_ms` where §8 needs it via the same s
    the real writer's evidence-carrying update supersedes the false `Failed` instead of being
    blocked by terminal immutability. Wall-clock therefore stays non-destructive: it only
    delays a defeasible mark. Per key prefix:
-   - `join:` rows → registry present → `Succeeded`; absent (and > 1h old) →
-     `Failed("join did not complete — federation not in the registry; re-run join")`.
+   - `join:` rows are repaired PER ATTEMPT (per-attempt keys mean registry presence alone
+     cannot bless every lingering row — a stale interrupted attempt must not flip
+     `Succeeded` because a LATER retry joined): registry present → `Succeeded` ONLY for the
+     NEWEST `Started` attempt for that fed whose `created_at_ms` ≤ the registry row's
+     `joined_at` (+60s slack; both stamps come from the same device clock); every OTHER
+     `Started` join row for that fed → soft-`Failed("superseded by a later join attempt")`.
+     Registry absent (and > 1h old) →
+     soft-`Failed("join did not complete — federation not in the registry; re-run join")`.
      The registry is the wallet's MEMBERSHIP authority: a crash between the client-partition
      init and `put_federation` leaves an orphaned partition (`next_db_prefix` already never
      reuses it) and the fed genuinely unusable until a re-join, so this wording is honest —
