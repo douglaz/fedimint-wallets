@@ -33,15 +33,17 @@ pub struct OperationRecord {
     /// The ordering authority — robust to clock skew; wall-clock is for display.
     pub seq: u64,
     /// Joins ledger <-> journal <-> MoveRecord. For journaled ops this IS the intent's
-    /// IdempotencyKey. For raw ops the key is known BEFORE the side effect (crash-safety,
-    /// §3 rule 5): `pay:<fed>:<payment_hash>` (from the invoice, pre-call — also matching
-    /// lnv2's own dedup), `recv:<fed>:<nonce>` (pre-generated, embedded in the op's
-    /// `custom_meta`), `join:<fed>:<nonce>` (PER ATTEMPT — a failed join then a successful
-    /// retry are two rows), `tick:<occurrence>:<nonce>` (PER RUN — each tick invocation is
-    /// its own row, created `Started` before deciding and advanced to terminal with the
-    /// counts; a crash mid-tick truthfully leaves a `Started` tick row, while the tick's
-    /// individual moves remain covered by their own intent-keyed rows).
-    /// Exactly one ledger row per correlation key.
+    /// IdempotencyKey. Raw/tick ops use PER-ATTEMPT keys, known BEFORE the side effect
+    /// (crash-safety, §3 rule 5): `pay:<fed>:<payment_hash>:<nonce>` and
+    /// `recv:<fed>:<nonce>` (nonce pre-generated, embedded in the op's `custom_meta`),
+    /// `join:<fed>:<nonce>`, `tick:<occurrence>:<nonce>` (each tick invocation is its own
+    /// row, created `Started` before deciding, advanced to terminal with the counts; the
+    /// tick's individual moves remain covered by their own intent-keyed rows).
+    /// Per-attempt keys keep append-only semantics under retry: a crashed/failed attempt
+    /// and its retry are two truthful rows. Retries that lnv2 DEDUPS to the same
+    /// underlying payment (`AlreadyInFlight`/`AlreadyPaid`) still record the SHARED
+    /// `op_id`; aggregation (fee/amount sums) groups by `op_id` so shared-op attempt rows
+    /// are never double-counted. Exactly one ledger row per correlation key.
     pub correlation_key: IdempotencyKey,
     pub kind: OperationKind,
     /// Who initiated it — THE audit discriminator ADR-0014 needs.
@@ -132,7 +134,14 @@ Rules (load-bearing):
    the `op_id` update → reconcile's op-log backfill re-finds the op by its `custom_meta` key
    and repairs the row (the same pattern `MoveRecord` backfill already uses). Crash before the
    SDK call → the row stays `Started` with no matching op; reconcile marks it `Failed`
-   ("never reached the federation") rather than leaving it ambiguous.
+   ("never reached the federation") rather than leaving it ambiguous — a retry is a NEW
+   attempt row (§2), so this terminal marking never blocks recovery.
+6. **`Join` repairs from the registry, and idempotent re-joins are not rows.** The CLI
+   checks the federation registry first: already joined → the join verb just (re)opens the
+   client, NO ledger row (nothing happened). Not joined → new `join:<fed>:<nonce>` attempt
+   row pre-call, updated to terminal post-call. Reconcile repairs a stranded `Started` join
+   row from the registry (the authority on membership): fed present in the registry →
+   `Succeeded`; absent → `Failed` ("never joined").
 
 ## 4. Upstream changes this requires
 
