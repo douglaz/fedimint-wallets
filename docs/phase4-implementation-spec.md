@@ -4,6 +4,8 @@ Detailed, buildable design for [phase4-plan.md](./phase4-plan.md), implementing
 [operation-history-spec.md](./operation-history-spec.md) and the fix backlog from
 [reviews/2026-07-03-engine-review.md](./reviews/2026-07-03-engine-review.md). SDK claims
 verified against the pin (`~/p/fedimint` @ `b108ec6`); exact citations inline.
+**Status: hardened through 19 codex passes (gpt-5.4 / xhigh) — 48 findings absorbed,
+final pass clean.** Decisions settled in §14.
 
 **Base:** `main` AFTER Phase 3.A (Evacuate execution) merges — 3.A touches
 `executor.rs`/`probe.rs`/`tick.rs`/`runtime.rs`, and this phase edits the same files. Where
