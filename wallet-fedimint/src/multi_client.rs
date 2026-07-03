@@ -387,27 +387,20 @@ impl MultiClient {
         Ok(Msat(quote.total().get_bitcoin().msats))
     }
 
-    /// The FEDERATION send-tx fee for paying `invoice` from `id` (spec §6.1), in msat. Only
-    /// the on-federation cost; the gateway's send fee is quoted via [`Self::send_gateway_fee`].
-    ///
-    /// lnv2 quotes the send fee on the full outgoing-contract value (`send_fee.add_to(amount)`);
-    /// quoting on the invoice amount here is the floor. The exact contract-amount refinement
-    /// is a live-validation detail (the gateway send fee is added separately, spec §6).
-    pub async fn send_fee_quote(
+    /// The FEDERATION send-tx fee for an outgoing contract of `amount` from `id` (spec §6.1),
+    /// in msat. Only the on-federation cost; the gateway's send fee is quoted via
+    /// [`Self::send_gateway_fee`]. lnv2 quotes the send fee on the full outgoing-contract value
+    /// (`send_fee.add_to(amount)`), so the executor calls this on invoice + gateway-send-fee —
+    /// both at the §7 Pay-step cap re-check and to pre-size a fresh evacuation before it mints
+    /// the destination invoice.
+    pub async fn send_fee_quote_for_amount(
         &self,
         id: &FederationId,
-        invoice: &Invoice,
+        amount: Msat,
     ) -> anyhow::Result<Msat> {
         let client = self.client(id)?;
         let lnv2 = client.get_first_module::<LightningClientModule>()?;
-        let bolt11 = Bolt11Invoice::from_str(&invoice.0)
-            .map_err(|e| anyhow::anyhow!("parsing invoice: {e}"))?;
-        let invoice_msat = bolt11
-            .amount_milli_satoshis()
-            .ok_or_else(|| anyhow::anyhow!("invoice carries no amount"))?;
-        let quote = lnv2
-            .send_fee_quote(Amount::from_msats(invoice_msat))
-            .await?;
+        let quote = lnv2.send_fee_quote(Amount::from_msats(amount.0)).await?;
         Ok(Msat(quote.total().get_bitcoin().msats))
     }
 
@@ -436,6 +429,19 @@ impl MultiClient {
             .map_err(|e| anyhow::anyhow!("parsing invoice: {e}"))?;
         let (send_fee, _expiration_delta) = routing_info.send_parameters(&bolt11);
         Ok(payment_fee_to_gateway_fee(send_fee))
+    }
+
+    /// The gateway SEND fee for the direct-swap route this wallet creates when it mints a
+    /// destination invoice through `gateway` and pays that invoice from `id`. Before the invoice
+    /// exists, the executor cannot call [`Self::send_gateway_fee`], but lnv2 invoices minted by
+    /// that gateway select the gateway's direct-swap `send_fee_minimum`.
+    pub async fn direct_swap_send_gateway_fee(
+        &self,
+        id: &FederationId,
+        gateway: &GatewayUrl,
+    ) -> anyhow::Result<GatewayFee> {
+        let routing_info = self.routing_info_for(id, gateway).await?;
+        Ok(payment_fee_to_gateway_fee(routing_info.send_fee_minimum))
     }
 
     /// Validate that `gateway` serves `id` by asking the gateway for this federation's lnv2
@@ -504,13 +510,8 @@ impl MultiClient {
         id: &FederationId,
         gateway: &GatewayUrl,
     ) -> anyhow::Result<RoutingInfo> {
-        let client = self.client(id)?;
-        let lnv2 = client.get_first_module::<LightningClientModule>()?;
-        let url = SafeUrl::parse(&gateway.0)
-            .map_err(|e| anyhow::anyhow!("invalid gateway url {:?}: {e}", gateway.0))?;
-        lnv2.routing_info(&url)
-            .await
-            .map_err(|e| anyhow::anyhow!("fetching routing info from gateway {}: {e}", gateway.0))?
+        self.maybe_routing_info_for(id, gateway)
+            .await?
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "gateway {} does not serve federation {}",
@@ -518,6 +519,20 @@ impl MultiClient {
                     id.to_hex()
                 )
             })
+    }
+
+    async fn maybe_routing_info_for(
+        &self,
+        id: &FederationId,
+        gateway: &GatewayUrl,
+    ) -> anyhow::Result<Option<RoutingInfo>> {
+        let client = self.client(id)?;
+        let lnv2 = client.get_first_module::<LightningClientModule>()?;
+        let url = SafeUrl::parse(&gateway.0)
+            .map_err(|e| anyhow::anyhow!("invalid gateway url {:?}: {e}", gateway.0))?;
+        lnv2.routing_info(&url)
+            .await
+            .map_err(|e| anyhow::anyhow!("fetching routing info from gateway {}: {e}", gateway.0))
     }
 
     /// Clone out the open client for `id`, or error if the federation isn't joined/opened.
@@ -587,6 +602,7 @@ fn op_artifact_from_meta(
         move_id: move_meta.move_id,
         leg,
         op_id,
+        amount: move_meta.amount,
         invoice,
     }))
 }

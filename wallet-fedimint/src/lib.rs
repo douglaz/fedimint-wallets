@@ -22,11 +22,11 @@
 //!
 //! Step 4b-live-1 made the `DirectInflow` path EXECUTE end-to-end (recipient nets EXACTLY the
 //! target — the gross-up floors the gateway fee to invert fedimint's real `PaymentFee`, spec §6).
-//! Step 4b-live-2 (this step) un-gates the cross-federation `Move`: the [`FedimintExecutor`]
-//! now drives its full two-leg send path (receive on `to`, re-quote + cap-check + pay from
-//! `from`, await both, settle → `Done`), resume-safe (no re-mint/re-pay on replay), driven via
-//! `wallet-cli move` through the [`runtime::Runtime`] façade (`do_move`). `Evacuate` stays
-//! `Unsupported` (Phase 2).
+//! Step 4b-live-2 un-gates the cross-federation `Move`: the [`FedimintExecutor`] drives its
+//! full two-leg send path (receive on `to`, re-quote + cap-check + pay from `from`, await both,
+//! settle → `Done`), resume-safe (no re-mint/re-pay on replay), driven via `wallet-cli move`
+//! through the [`runtime::Runtime`] façade (`do_move`). Phase 3.A maps `Evacuate` onto that same
+//! send-required path so a shutdown tick can drain a dying federation into the safest other fed.
 //!
 //! Phase 2 step 2.2 wires the whole engine into ONE orchestrator tick: [`probe`] each open
 //! fed → `wallet_core::score` → [`tick::build_snapshot`] → `wallet_core::decide` →

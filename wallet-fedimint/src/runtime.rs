@@ -15,10 +15,10 @@
 //!   left `Pending` by a transient fault is re-driven here), then report the still-`Awaiting`
 //!   set (finalized out-of-band by `await-move` in a one-shot CLI).
 //!
-//! `Evacuate` still maps to `Unsupported` in the executor (Phase 2). The `Runtime` holds an
-//! optional pinned gateway (⟦D4⟧; devimint's LDK gateway is not auto-registered, runbook §4)
-//! that a FRESH move resolves through — a resumed move reuses the gateway already recorded in
-//! its `MoveRecord`.
+//! `Evacuate` now drives through the executor as a send-required move (Phase 3.A), so the tick
+//! can flee a dying federation, not just top up a standby. The `Runtime` holds an optional pinned
+//! gateway (⟦D4⟧; devimint's LDK gateway is not auto-registered, runbook §4) that a FRESH move
+//! resolves through — a resumed move reuses the gateway already recorded in its `MoveRecord`.
 
 use crate::executor::FedimintExecutor;
 use crate::journal::FedimintJournal;
@@ -81,6 +81,7 @@ pub struct ReconcileSummary {
     pub awaiting_keys: Vec<IdempotencyKey>,
 }
 
+#[derive(Clone, Debug)]
 struct TickPlan {
     raw_probes: Vec<(FederationId, ProbeResult)>,
     probes: Vec<(FederationId, ProbeResult)>,
@@ -88,12 +89,31 @@ struct TickPlan {
     decisions: Vec<AllocatorDecision>,
 }
 
+#[derive(Clone, Debug)]
+struct EvacuationFallback {
+    from: FederationId,
+    plan: TickPlan,
+}
+
 struct MoveRouteProblem {
     from: FederationId,
     to: FederationId,
+    /// The federation whose gateway is marked unavailable in the planning probe copy so
+    /// `plan_tick` re-runs allocation onto a different route. This is ALWAYS the selected
+    /// destination `to`: a destination that cannot receive is skipped directly, and a source
+    /// leg that the destination-selected gateway cannot serve is retried against another
+    /// eligible destination (an evacuation additionally captures a fallback plan first). There
+    /// is no route problem that leaves the destination usable, so this is never absent.
     mark_unavailable: FederationId,
     gateway: Option<GatewayUrl>,
     error: String,
+    evacuation_source_route: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SendRouteKind {
+    Move,
+    Evacuate,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -404,12 +424,12 @@ impl Runtime {
 
     /// ONE orchestrator tick (Phase 2 step 2.2, `docs/phase2-plan.md`): probe every open
     /// federation → build the `AllocatorSnapshot` (via `build_snapshot` — `score()` +
-    /// designation) → `decide()` → `wallet_core::apply` the decisions through the Phase-1
-    /// [`FedimintExecutor`], which performs the resulting `Move`s (each synchronous to `Done`).
-    /// Advisory `RefuseInflow`/`Cap` decisions are surfaced in the returned [`TickReport`] but
-    /// never executed (`apply` skips them); an `Evacuate` (a Phase-3 non-goal the executor still
-    /// reports `Unsupported`) is likewise surfaced but withheld from `apply` (via
-    /// [`decisions_to_apply`]) so it never lands as a misleading terminal `Failed` intent.
+    /// designation) → `decide()` → `wallet_core::apply` the decisions through the
+    /// [`FedimintExecutor`], which performs the resulting `Move`s AND `Evacuate`s (each a
+    /// send-required move, synchronous to `Done`). Advisory `RefuseInflow`/`Cap` decisions are
+    /// surfaced in the returned [`TickReport`] but never executed (`apply` skips them via
+    /// `Action::is_executable`). As of Phase 3.A an `Evacuate` is executed like a `Move`
+    /// (draining a dying fed into `safest_other`), no longer withheld from `apply`.
     /// Returns the FULL decision list + the [`ExecutionSummary`].
     ///
     /// The scorer runs at [`ScorerPolicy::default`] (the v1 structural floor); the money policy
@@ -494,22 +514,33 @@ impl Runtime {
     /// Probe, build, decide, and fold executor-route facts back into the probe view before the
     /// caller either reports a dry run or applies money moves.
     ///
-    /// Without an explicit `--gateway`, the executor routes each fresh `Move` through the
-    /// destination federation's FIRST registered gateway, then requires that same gateway to serve
-    /// the source. The raw probe only knows whether each federation has some usable gateway. This
-    /// loop validates the exact executor route for each FRESH decided `Move`; when a destination's
-    /// concrete route cannot serve the planned source, that destination is marked unavailable in
-    /// the planning copy and the pure `build_snapshot`/`decide` path runs again. Same-key replays
-    /// are left to `apply`, which resumes the stored intent and its cached `MoveRecord` gateway.
+    /// Without an explicit `--gateway`, the executor routes each fresh `Move`/`Evacuate` through
+    /// the destination federation's FIRST registered gateway, then requires that same gateway to
+    /// serve the send leg. The raw probe only knows whether each federation has some usable
+    /// gateway. This loop validates the exact executor route for each FRESH decided send-required
+    /// action; when a destination's concrete route cannot support the move, that destination is
+    /// marked unavailable in the planning copy and the pure `build_snapshot`/`decide` path runs
+    /// again. Same-key replays are left to `apply`, which resumes the stored intent and its cached
+    /// `MoveRecord` gateway. The preflight uses the same `decisions_to_apply` projection as
+    /// `apply`.
     /// `status` still reports the RAW scored probe view so a route-revision does not relabel a
     /// healthy federation as generally unprobed just because this tick's concrete move route failed.
     async fn plan_tick(&self, policy: &TickPolicy, scorer_policy: &ScorerPolicy) -> TickPlan {
         let raw_probes = self.probe_all().await;
         let mut probes = raw_probes.clone();
         let mut route_revisions = 0usize;
+        let mut evacuation_fallback: Option<EvacuationFallback> = None;
         loop {
             let snapshot = build_snapshot(&probes, policy, scorer_policy);
             let decisions = wallet_core::decide(&snapshot, policy.occurrence);
+            if let Some(fallback) = &evacuation_fallback {
+                let still_trying_evacuation = decisions.iter().any(|d| {
+                    matches!(&d.action, Action::Evacuate { from, .. } if *from == fallback.from)
+                });
+                if !still_trying_evacuation {
+                    return fallback.plan.clone();
+                }
+            }
             let Some(problem) = self.first_move_route_problem(&decisions).await else {
                 return TickPlan {
                     raw_probes,
@@ -519,6 +550,17 @@ impl Runtime {
                 };
             };
 
+            if problem.evacuation_source_route {
+                evacuation_fallback = Some(EvacuationFallback {
+                    from: problem.from,
+                    plan: TickPlan {
+                        raw_probes: raw_probes.clone(),
+                        probes: probes.clone(),
+                        snapshot: snapshot.clone(),
+                        decisions: decisions.clone(),
+                    },
+                });
+            }
             let changed = mark_gateway_unavailable(&mut probes, problem.mark_unavailable);
             tracing::warn!(
                 from = %problem.from.to_hex(),
@@ -526,7 +568,7 @@ impl Runtime {
                 marked_unavailable = %problem.mark_unavailable.to_hex(),
                 gateway = %problem.gateway.as_ref().map(|g| g.0.as_str()).unwrap_or("<none>"),
                 error = %problem.error,
-                "tick: planned move route failed executor gateway validation; revising this tick's fundable set"
+                "tick: planned send-required route failed executor gateway validation; revising this tick's fundable set"
             );
             if !changed {
                 return TickPlan {
@@ -605,19 +647,42 @@ impl Runtime {
         Ok(replays)
     }
 
+    /// The first route problem in this tick's fresh, apply-bound send-required decisions.
+    /// Destination failures and send-gateway source failures both mark the selected
+    /// destination unavailable, letting `plan_tick` rerun allocation and fall through to a
+    /// later eligible federation when one can actually serve the route. If every destination
+    /// fails an evacuation source-route preflight, `plan_tick` falls back to the last
+    /// evacuation plan and lets `apply` surface the real execution failure loudly instead of
+    /// silently reporting that nothing needed to run.
     async fn first_move_route_problem(
         &self,
         decisions: &[AllocatorDecision],
     ) -> Option<MoveRouteProblem> {
-        for decision in decisions {
-            if let Action::Move { from, to, .. } = &decision.action {
-                if self.has_existing_intent(decision).await {
-                    continue;
+        let decisions = decisions_to_apply(decisions);
+        for decision in &decisions {
+            let problem = match &decision.action {
+                Action::Move { from, to, .. } => {
+                    if self.has_existing_intent(decision).await {
+                        continue;
+                    }
+                    self.validate_executor_move_route(SendRouteKind::Move, *from, *to)
+                        .await
+                        .err()
                 }
-                if let Err(problem) = self.validate_executor_move_route(*from, *to).await {
-                    return Some(problem);
+                Action::Evacuate { from, to, .. } => {
+                    if self.has_existing_intent(decision).await {
+                        continue;
+                    }
+                    self.validate_executor_move_route(SendRouteKind::Evacuate, *from, *to)
+                        .await
+                        .err()
                 }
-            }
+                _ => None,
+            };
+            let Some(problem) = problem else {
+                continue;
+            };
+            return Some(problem);
         }
         None
     }
@@ -637,8 +702,16 @@ impl Runtime {
         }
     }
 
+    /// Preflight the executor's concrete gateway route for a fresh send-required action.
+    ///
+    /// Destination failures mean this tick's chosen target cannot receive through the same
+    /// gateway the executor will use, so `plan_tick` marks that destination unavailable and
+    /// reruns allocation. Source-side failures are also tied to the destination-selected
+    /// gateway: if that gateway cannot serve the source, another eligible destination may
+    /// still work and should be tried before the executor commits any receive-side artifact.
     async fn validate_executor_move_route(
         &self,
+        kind: SendRouteKind,
         from: FederationId,
         to: FederationId,
     ) -> Result<(), MoveRouteProblem> {
@@ -651,6 +724,7 @@ impl Runtime {
                     mark_unavailable: to,
                     gateway: None,
                     error,
+                    evacuation_source_route: false,
                 });
             }
         };
@@ -662,16 +736,11 @@ impl Runtime {
                 mark_unavailable: to,
                 gateway: Some(gateway),
                 error: format!("destination gateway validation failed: {e}"),
+                evacuation_source_route: false,
             });
         }
         if let Err(e) = self.mc.validate_gateway(&from, &gateway).await {
-            return Err(MoveRouteProblem {
-                from,
-                to,
-                mark_unavailable: to,
-                gateway: Some(gateway),
-                error: format!("source gateway validation failed: {e}"),
-            });
+            return Err(source_route_problem(kind, from, to, gateway, e.to_string()));
         }
         Ok(())
     }
@@ -833,8 +902,31 @@ fn mark_gateway_unavailable(probes: &mut [(FederationId, ProbeResult)], id: Fede
     true
 }
 
+fn source_route_problem(
+    kind: SendRouteKind,
+    from: FederationId,
+    to: FederationId,
+    gateway: GatewayUrl,
+    error: String,
+) -> MoveRouteProblem {
+    MoveRouteProblem {
+        from,
+        to,
+        mark_unavailable: to,
+        gateway: Some(gateway),
+        error: format!("source gateway validation failed: {error}"),
+        evacuation_source_route: matches!(kind, SendRouteKind::Evacuate),
+    }
+}
+
+/// Whether a decision is one the tick drives through `apply` — kept in lockstep with
+/// [`decisions_to_apply`](crate::tick::decisions_to_apply), so the stale-occurrence guard in
+/// [`Runtime::terminal_replayed_executable_decisions`] checks EXACTLY the set `apply` runs. As
+/// of Phase 3.A that is every executable action (`Move`/`Evacuate`/`DirectInflow`); `Evacuate` is
+/// no longer excluded, so a same-occurrence re-tick of a now-terminal evacuate fails loudly like a
+/// Move instead of silently reporting success.
 fn tick_applies_decision(decision: &AllocatorDecision) -> bool {
-    decision.action.is_executable() && !matches!(decision.action, Action::Evacuate { .. })
+    decision.action.is_executable()
 }
 
 fn describe_terminal_replays(replays: &[TerminalReplay]) -> String {
@@ -924,6 +1016,25 @@ mod tests {
                 fee_cap: Msat(1_000),
             },
             reason: ReasonCode::StandbyBelowTarget,
+            occurrence: Occurrence(0),
+            idempotency_key: IdempotencyKey(key.to_string()),
+            requires_auth: false,
+        }
+    }
+
+    fn tick_evacuate_decision(
+        key: &str,
+        from: FederationId,
+        to: FederationId,
+    ) -> AllocatorDecision {
+        AllocatorDecision {
+            action: Action::Evacuate {
+                from,
+                to,
+                amount: Msat(100_000),
+                fee_cap: Msat(1_000),
+            },
+            reason: ReasonCode::ShutdownNotice,
             occurrence: Occurrence(0),
             idempotency_key: IdempotencyKey(key.to_string()),
             requires_auth: false,
@@ -1169,6 +1280,75 @@ mod tests {
         assert_eq!(problem.from, FED_A);
         assert_eq!(problem.to, FED_B);
         assert_eq!(problem.mark_unavailable, FED_B);
+    }
+
+    #[tokio::test]
+    async fn tick_route_preflight_skips_existing_evacuate_intents() {
+        let (runtime, journal) = runtime_fixture().await;
+        let decision = tick_evacuate_decision("evac-existing", FED_A, FED_B);
+        journal
+            .upsert(&Intent::from_decision(&decision))
+            .await
+            .expect("upsert existing evacuate intent");
+
+        let problem = runtime
+            .first_move_route_problem(std::slice::from_ref(&decision))
+            .await;
+
+        assert!(
+            problem.is_none(),
+            "same-key evacuate replay must be left to apply/executor so it can reuse the stored intent and cached gateway"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_route_preflight_checks_fresh_evacuate_intents() {
+        let (runtime, _journal) = runtime_fixture().await;
+        let decision = tick_evacuate_decision("evac-fresh", FED_A, FED_B);
+
+        let problem = runtime
+            .first_move_route_problem(std::slice::from_ref(&decision))
+            .await
+            .expect("fresh evacuate should be preflighted against executor gateway selection");
+
+        assert_eq!(problem.from, FED_A);
+        assert_eq!(problem.to, FED_B);
+        assert_eq!(problem.mark_unavailable, FED_B);
+    }
+
+    #[test]
+    fn evacuation_source_route_failure_revises_destination() {
+        let problem = source_route_problem(
+            SendRouteKind::Evacuate,
+            FED_A,
+            FED_B,
+            GatewayUrl("https://gw.example".into()),
+            "not connected".into(),
+        );
+
+        assert_eq!(problem.from, FED_A);
+        assert_eq!(problem.to, FED_B);
+        assert_eq!(problem.mark_unavailable, FED_B);
+        assert!(problem.evacuation_source_route);
+        assert!(
+            problem.error.contains("source gateway validation failed"),
+            "{}",
+            problem.error
+        );
+    }
+
+    #[test]
+    fn move_source_route_failure_still_revises_destination() {
+        let problem = source_route_problem(
+            SendRouteKind::Move,
+            FED_A,
+            FED_B,
+            GatewayUrl("https://gw.example".into()),
+            "not connected".into(),
+        );
+
+        assert_eq!(problem.mark_unavailable, FED_B);
+        assert!(!problem.evacuation_source_route);
     }
 
     #[tokio::test]

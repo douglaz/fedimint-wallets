@@ -3,7 +3,7 @@
 //! load-bearing: it is how a lost `MoveRecord` is repaired from the op-log, so the on-the-wire
 //! field names + the `DirectInflow` `from`-omission must be pinned.
 
-use wallet_core::{FederationId, IdempotencyKey};
+use wallet_core::{FederationId, IdempotencyKey, Msat};
 use wallet_fedimint::{MoveMeta, MoveRole};
 
 const FED_A: FederationId = FederationId([0xAA; 32]);
@@ -20,6 +20,7 @@ fn direct_inflow_receive_meta_omits_from_and_round_trips() {
     let meta = MoveMeta {
         move_id: key("direct-inflow:bb..bb:100000:1100000:0"),
         role: MoveRole::Receive,
+        amount: Msat(100_000),
         from: None,
         to: FED_B,
     };
@@ -30,6 +31,7 @@ fn direct_inflow_receive_meta_omits_from_and_round_trips() {
     let expected = serde_json::json!({
         "move_id": "direct-inflow:bb..bb:100000:1100000:0",
         "role": "receive",
+        "amount": 100_000,
         "to": vec![0xBBu8; 32],
     });
     assert_eq!(value, expected);
@@ -49,6 +51,7 @@ fn move_send_meta_carries_from_and_round_trips() {
     let meta = MoveMeta {
         move_id: key("move:aa..aa:bb..bb:0"),
         role: MoveRole::Send,
+        amount: Msat(100_000),
         from: Some(FED_A),
         to: FED_B,
     };

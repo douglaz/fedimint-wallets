@@ -25,14 +25,17 @@
 
 use crate::multi_client::MultiClient;
 use crate::types::GatewayUrl;
+use fedimint_api_client::api::{FederationApiExt as _, StatusResponse};
 use fedimint_client::db::ChronologicalOperationLogKey;
 use fedimint_client::ClientHandleArc;
+use fedimint_core::endpoint_constants::STATUS_ENDPOINT;
+use fedimint_core::module::ApiRequestErased;
 use fedimint_core::NumPeers;
 use fedimint_lnv2_client::common::LightningInvoice;
 use fedimint_lnv2_client::LightningOperationMeta;
 use fedimint_wallet_client::WalletClientModule;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use wallet_core::{FedBalance, FederationFacts, FederationId, FederationStatus, Module, Msat};
 
 /// The raw result of probing ONE federation: a plain, serde-able data struct with no
@@ -72,7 +75,20 @@ pub struct ProbeResult {
     pub wallet_module_present: bool,
 
     // ---- Lifecycle ----
-    /// The federation is winding down (do not fund it).
+    /// RAW PRIMARY shutdown signal: the consensus-backed `federation_expiry_timestamp`
+    /// meta as unix seconds, if the federation published one
+    /// (`client.get_meta_expiration_timestamp()`, no auth). `None` = no expiry meta.
+    /// Carried raw so [`derive_shutdown_scheduled`] stays pure and golden-testable.
+    pub expiry_timestamp_secs: Option<u64>,
+    /// RAW SECONDARY shutdown signal: f+1 peers' public `/status` responses reported a
+    /// `federation.scheduled_shutdown` session index (per-peer reads need BFT
+    /// corroboration before driving a money-moving evacuation — see
+    /// [`status_scheduled_shutdown`]). Best-effort — a `/status` transport error reads
+    /// as `false` (no signal), never a probe failure.
+    pub status_scheduled_shutdown: bool,
+    /// The federation is winding down (do not fund it — evacuate it). DERIVED from the two
+    /// raw signals above via [`derive_shutdown_scheduled`], OR'd with the debug-only
+    /// force-shutdown seam. Kept on the result so the pure assemblers read one boolean.
     pub shutdown_scheduled: bool,
 
     // ---- Balance (msat) ----
@@ -155,6 +171,69 @@ fn module_from_kind(kind: &str) -> Module {
         "meta" => Module::Meta,
         _ => Module::Other,
     }
+}
+
+/// How long BEFORE a federation's `federation_expiry_timestamp` we begin treating it as
+/// shutting-down, so the wallet evacuates while the gateways are still up — the whole point
+/// is to LEAVE before expiry, not after (ADR-0018). 24h.
+const SHUTDOWN_EVACUATION_LEAD_SECS: u64 = 86_400;
+
+/// PURE derivation of `shutdown_scheduled` from the two no-auth signals the probe reads
+/// (the `federation_expiry_timestamp` meta and the public `/status.scheduled_shutdown`)
+/// plus the wall clock. No I/O, no async — golden-tested. `true` when the guardians have
+/// SCHEDULED a shutdown, OR when the consensus expiry is within `lead_secs` of `now`
+/// (i.e. `now + lead_secs >= expiry`, which also covers an expiry already passed). A
+/// missing/absent signal is never a shutdown.
+fn derive_shutdown_scheduled(
+    expiry_secs: Option<u64>,
+    status_scheduled: bool,
+    now_secs: u64,
+    lead_secs: u64,
+) -> bool {
+    if status_scheduled {
+        return true;
+    }
+    match expiry_secs {
+        Some(expiry) => now_secs.saturating_add(lead_secs) >= expiry,
+        None => false,
+    }
+}
+
+/// Test-only force-shutdown seam (Phase 3.A) — MIRRORS `executor::maybe_crash`'s
+/// `debug_assertions` + env pattern. Reports a federation as shutting-down when
+/// `WALLET_CLI_FORCE_SHUTDOWN` lists its hex id (comma-separated), so the deferred devimint
+/// smoke can force an evacuation deterministically without winding a real federation down.
+/// The `#[cfg(not(debug_assertions))]` stub below is compiled into a release binary instead,
+/// so the money path can NEVER be forced to evacuate in production.
+#[cfg(debug_assertions)]
+fn forced_shutdown(id: &FederationId) -> bool {
+    forced_shutdown_matches(
+        std::env::var("WALLET_CLI_FORCE_SHUTDOWN").ok().as_deref(),
+        id,
+    )
+}
+
+/// Release counterpart: the force seam is elided, so no environment can force an evacuation.
+#[cfg(not(debug_assertions))]
+fn forced_shutdown(_id: &FederationId) -> bool {
+    false
+}
+
+/// Whether the `WALLET_CLI_FORCE_SHUTDOWN` value (`None` when unset) lists `id`'s hex. Split
+/// out from [`forced_shutdown`] so the match logic is unit-tested WITHOUT process-global env
+/// (the same split as `executor::crash_point_matches`). The value is a comma-separated list of
+/// federation hex ids; surrounding whitespace is ignored and the compare is case-insensitive.
+/// In a `--release` non-test build the seam above is elided and this predicate is unused; it
+/// stays defined (and tested) rather than gated so `cargo test --release` still compiles it.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+fn forced_shutdown_matches(configured: Option<&str>, id: &FederationId) -> bool {
+    let Some(list) = configured else {
+        return false;
+    };
+    let hex = id.to_hex();
+    list.split(',')
+        .map(str::trim)
+        .any(|entry| entry.eq_ignore_ascii_case(hex.as_str()))
 }
 
 /// Probes each open federation into a [`ProbeResult`] over a shared [`MultiClient`].
@@ -255,10 +334,35 @@ impl FedimintProbeRunner {
         // the model can later account for pending value without a balance rewrite.
         let (in_flight_msat, claimable_msat) = pending_lnv2_balances(&client).await;
 
-        // `shutdown_scheduled`: the pinned config exposes no non-admin shutdown-
-        // notice signal (only an auth-gated `shutdown` endpoint), so v1 reports
-        // `false`. Real shutdown detection + `Evacuate` is Phase 3 per the plan.
-        let shutdown_scheduled = false;
+        // `shutdown_scheduled`: sourced from TWO no-auth, client-readable signals (both
+        // best-effort — a failed/absent read is NOT a shutdown). The pure
+        // `derive_shutdown_scheduled` below combines them with the wall clock so the
+        // derivation is golden-testable off the raw fields.
+        //
+        // PRIMARY: the consensus-backed `federation_expiry_timestamp` meta
+        // (`get_meta_expiration_timestamp`, `fedimint-client`). A missing meta is `None`
+        // (no signal) by nature — no error to swallow.
+        let expiry_timestamp_secs = client
+            .get_meta_expiration_timestamp()
+            .await
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        // SECONDARY: the public `/status.federation.scheduled_shutdown` session index.
+        // Best-effort — a transport error is warn-logged and treated as no signal, never a
+        // probe failure.
+        let status_scheduled_shutdown = status_scheduled_shutdown(&client, id).await;
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Derive from the raw signals, then OR the debug-only force-shutdown seam (a strict
+        // no-op / compiled out in release — see `forced_shutdown`).
+        let shutdown_scheduled = derive_shutdown_scheduled(
+            expiry_timestamp_secs,
+            status_scheduled_shutdown,
+            now_secs,
+            SHUTDOWN_EVACUATION_LEAD_SECS,
+        ) || forced_shutdown(id);
 
         Ok(ProbeResult {
             guardian_count,
@@ -270,6 +374,8 @@ impl FedimintProbeRunner {
             latency_ms,
             gateway_available,
             wallet_module_present,
+            expiry_timestamp_secs,
+            status_scheduled_shutdown,
             shutdown_scheduled,
             spendable_msat,
             in_flight_msat,
@@ -325,6 +431,74 @@ impl FedimintProbeRunner {
             }
         }
     }
+}
+
+/// SECONDARY shutdown signal: the public `/status` endpoint exposes
+/// `federation.scheduled_shutdown` as an optional session index. Query it through ordinary
+/// single-peer no-auth requests instead of `client.api().status()`: the SDK helper is no-auth
+/// but still admin-shaped and requires `self_peer`, which normal wallet clients do not have.
+/// Best-effort — an absent federation block, absent scheduled shutdown, or transport/helper
+/// error is NEVER a probe failure, just "no signal".
+///
+/// `/status` is a PER-PEER (non-consensus) read, and this signal now drives a money-moving
+/// `Evacuate`: one desynced/compromised guardian must not be able to force the wallet to
+/// drain the federation and pay LN fees. So the signal requires **f+1 corroborating peers**
+/// (`f = (n-1)/3`, the BFT fault bound): f+1 reports guarantee at least one HONEST peer says
+/// a shutdown is scheduled. Early-exits once corroborated. The consensus-backed expiry meta
+/// (the PRIMARY signal) needs no such gate.
+async fn status_scheduled_shutdown(client: &ClientHandleArc, id: &FederationId) -> bool {
+    let api = client.api();
+    let peers: Vec<_> = api.all_peers().iter().copied().collect();
+    let needed = shutdown_report_quorum(peers.len());
+    let mut reporting = 0usize;
+    for peer in peers {
+        match api
+            .request_single_peer_federation::<StatusResponse>(
+                STATUS_ENDPOINT.to_owned(),
+                ApiRequestErased::default(),
+                peer,
+            )
+            .await
+        {
+            Ok(status) => {
+                if status
+                    .federation
+                    .and_then(|f| f.scheduled_shutdown)
+                    .is_some()
+                {
+                    reporting += 1;
+                    if reporting >= needed {
+                        return true;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    federation = %id.to_hex(),
+                    peer = %peer,
+                    error = ?e,
+                    "probe: /status peer read failed; treating peer as no shutdown signal"
+                );
+            }
+        }
+    }
+    if reporting > 0 {
+        tracing::warn!(
+            federation = %id.to_hex(),
+            reporting,
+            needed,
+            "probe: scheduled_shutdown reported by fewer than f+1 peers; not corroborated, ignoring"
+        );
+    }
+    false
+}
+
+/// The f+1 corroboration bound for the per-peer `/status.scheduled_shutdown` signal:
+/// `f = (n-1)/3` (the BFT fault bound already used by `NumPeers`), so f+1 reporting peers
+/// include at least one honest one. PURE; `n == 0` degrades to 1 (an empty peer set can
+/// then never corroborate, since zero reports < 1).
+fn shutdown_report_quorum(n: usize) -> usize {
+    n.saturating_sub(1) / 3 + 1
 }
 
 /// Sum the pending (unsettled) lnv2 OUTGOING value from `client`'s op-log, returning
@@ -424,6 +598,8 @@ mod tests {
         "latency_ms": 42,
         "gateway_available": true,
         "wallet_module_present": true,
+        "expiry_timestamp_secs": null,
+        "status_scheduled_shutdown": false,
         "shutdown_scheduled": false,
         "spendable_msat": 1000000,
         "in_flight_msat": 5000,
@@ -508,6 +684,74 @@ mod tests {
         assert!(status.shutdown_notice);
         // A shutdown notice does not, by itself, mean quorum is dead.
         assert!(status.healthy);
+    }
+
+    #[test]
+    fn derive_shutdown_scheduled_covers_every_signal_case() {
+        let lead = SHUTDOWN_EVACUATION_LEAD_SECS;
+        let now = 1_000_000;
+        // expiry far in the future -> not yet within the lead window -> false.
+        assert!(!derive_shutdown_scheduled(
+            Some(now + 10 * lead),
+            false,
+            now,
+            lead
+        ));
+        // expiry inside the lead window (now + lead >= expiry) -> true (evacuate EARLY).
+        assert!(derive_shutdown_scheduled(
+            Some(now + lead / 2),
+            false,
+            now,
+            lead
+        ));
+        // exactly at the lead boundary is inclusive -> true.
+        assert!(derive_shutdown_scheduled(
+            Some(now + lead),
+            false,
+            now,
+            lead
+        ));
+        // expiry already passed -> true.
+        assert!(derive_shutdown_scheduled(Some(now - 1), false, now, lead));
+        // status scheduled -> true regardless of expiry (even a far-future one, or none).
+        assert!(derive_shutdown_scheduled(
+            Some(now + 10 * lead),
+            true,
+            now,
+            lead
+        ));
+        assert!(derive_shutdown_scheduled(None, true, now, lead));
+        // both signals absent -> false.
+        assert!(!derive_shutdown_scheduled(None, false, now, lead));
+    }
+
+    #[test]
+    fn shutdown_report_quorum_is_the_bft_f_plus_one_bound() {
+        // f = (n-1)/3, quorum = f+1: one honest reporter is guaranteed.
+        assert_eq!(shutdown_report_quorum(0), 1); // empty set can never corroborate
+        assert_eq!(shutdown_report_quorum(1), 1);
+        assert_eq!(shutdown_report_quorum(4), 2); // devimint: 4 guardians, f=1
+        assert_eq!(shutdown_report_quorum(7), 3);
+        assert_eq!(shutdown_report_quorum(10), 4);
+    }
+
+    #[test]
+    fn forced_shutdown_matches_only_listed_hex_ids() {
+        let a = fed_id(0xaa);
+        let b = fed_id(0xbb);
+        let ha = a.to_hex();
+        let hb = b.to_hex();
+        // Unset never forces (mirrors an unset WALLET_CLI_CRASH_AT).
+        assert!(!forced_shutdown_matches(None, &a));
+        // A single-id list forces only that fed.
+        assert!(forced_shutdown_matches(Some(ha.as_str()), &a));
+        assert!(!forced_shutdown_matches(Some(ha.as_str()), &b));
+        // A comma-separated list (with whitespace + mixed case) forces each listed fed.
+        let list = format!(" {}, {} ", ha.to_uppercase(), hb);
+        assert!(forced_shutdown_matches(Some(list.as_str()), &a));
+        assert!(forced_shutdown_matches(Some(list.as_str()), &b));
+        // An empty value forces nothing.
+        assert!(!forced_shutdown_matches(Some(""), &a));
     }
 
     #[test]

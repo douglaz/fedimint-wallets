@@ -13,9 +13,12 @@
 //! settle → `Done` — synchronously (`perform` returns `Done`, never `Awaiting`, for a Move). It
 //! is resume-safe: `assemble_record` reattaches a replayed move to its existing invoice/recv_op/
 //! send_op (the send op-id is deterministic; a re-`pay` returns `AlreadyInFlight`/`AlreadyPaid`),
-//! so a crash never re-mints or re-pays. `Evacuate` (Phase 2) stays `Unsupported`. Do not read
+//! so a crash never re-mints or re-pays. `Evacuate` (Phase 3.A) maps to the SAME send-required
+//! plan as `Move` (`MovePlan::from_action`), so it drives the identical validated two-leg path —
+//! the money engine can now flee a dying federation, not just top up a standby. Do not read
 //! the absence of a happy-path unit test here as untested logic: the pure decisions are
-//! golden-tested above, and the live two-leg drive is exercised by `smoke_move_devimint.sh`.
+//! golden-tested above, and the live two-leg drive is exercised by `smoke_move_devimint.sh`
+//! (and the deferred `smoke_evacuate_devimint.sh` for the evacuate tick).
 //!
 //! # The perform loop (spec §7)
 //! `from_action` → `assemble_record` (cached MoveRecord + backfilled op artifacts, so a
@@ -39,7 +42,7 @@ use async_trait::async_trait;
 use lightning_invoice::Bolt11Invoice;
 use std::str::FromStr as _;
 use std::sync::Arc;
-use wallet_core::{ExecError, Executor, FederationId, Intent, Msat, PerformOutcome};
+use wallet_core::{Action, ExecError, Executor, FederationId, Intent, Msat, PerformOutcome};
 
 /// Pinned lnv2 requires the gateway-reduced incoming contract to be at least 5 sats
 /// (`MINIMUM_INCOMING_CONTRACT_AMOUNT`) before it will mint a receive invoice.
@@ -51,6 +54,33 @@ pub const MINIMUM_INCOMING_CONTRACT_MSAT: u64 =
 /// closure is sync, so the executor resolves the (contract-amount-dependent) fee with a
 /// short async fixed point; a couple of passes converge for any real fee (ppm slope < 1).
 const FED_FEE_REQUOTE_PASSES: u32 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FreshMoveCost {
+    invoice_amount: Msat,
+    receive_quote: Msat,
+    send_quote: Msat,
+}
+
+impl FreshMoveCost {
+    fn total_fee(self) -> Msat {
+        Msat(self.receive_quote.0.saturating_add(self.send_quote.0))
+    }
+
+    fn source_debit(self) -> Msat {
+        Msat(self.invoice_amount.0.saturating_add(self.send_quote.0))
+    }
+}
+
+fn evacuation_cost_fits(cost: FreshMoveCost, fee_cap: Msat, spendable: Msat) -> bool {
+    cost.total_fee() <= fee_cap && cost.source_debit() <= spendable
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FreshSendRequiredGatewayFees {
+    receive: fee::GatewayFee,
+    send: fee::GatewayFee,
+}
 
 /// The production [`Executor`]: shared, `Send + Sync`, holds `Arc`s to the fedimint I/O
 /// (`MultiClient`) and the durable journal (spec §2, `&self` + interior mutability).
@@ -191,7 +221,16 @@ impl FedimintExecutor {
             .receive_gateway_fee(to, gateway)
             .await
             .map_err(retryable)?;
+        self.quote_receive_gross_up_with_gateway_fee(to, amount, gateway_fee)
+            .await
+    }
 
+    async fn quote_receive_gross_up_with_gateway_fee(
+        &self,
+        to: &FederationId,
+        amount: Msat,
+        gateway_fee: fee::GatewayFee,
+    ) -> Result<fee::GrossUp, ExecError> {
         // Quote the federation fee at the net amount, solve, then re-quote at the solved
         // contract amount and re-solve until it stops moving (spec §6 fixed point).
         let mut fed_fee = self
@@ -269,25 +308,245 @@ impl FedimintExecutor {
             .await
             .map_err(retryable)
     }
+
+    /// A fresh `Evacuate` may be sized by the allocator as the source's full spendable balance
+    /// (`min(spendable, cap_room)`). A normal move invoice is grossed up and then paid with
+    /// send-side fees, so asking the dying federation to net its full balance would require it to
+    /// spend more than it has. Before minting the destination invoice, quote the move cost and
+    /// reduce only fresh, side-effect-free evacuation records to the largest net amount the source
+    /// can actually fund under `fee_cap`. The sized amount is persisted with the pre-receive
+    /// `put_move` and honored on re-assembly (`assemble_move_record` prefers the cached amount),
+    /// so a resume after the invoice is minted keeps the Pay-step cap re-check honest.
+    ///
+    /// "Nothing evacuable fits" is `Retryable`, NOT `Permanent` (same convention as
+    /// `resolve_gateway`): the `None` can come from a TRANSIENT shortfall — the source's funds are
+    /// momentarily in flight (the send dry-run hits `InsufficientBalanceError`, treated as unfit),
+    /// or a fee quote ticked up between attempts — and this runs BEFORE any side effect, on every
+    /// pre-receive resume. Terminally `Failed`-ing here would abandon funds on a dying federation
+    /// the wallet could have drained one tick later, defeating the whole point of a flee. Leaving
+    /// the intent `Pending` lets the next tick retry once the shortfall clears; a source holding
+    /// only sub-minimum dust simply keeps retrying harmlessly (nothing meaningful is stranded).
+    async fn size_fresh_evacuation(
+        &self,
+        action: &Action,
+        rec: &mut MoveRecord,
+    ) -> Result<(), ExecError> {
+        // The full ask comes from the ACTION, not `rec.amount`: a resumed pre-receive record
+        // may already carry a previously sized-down amount, and re-sizing (no side effect has
+        // happened yet) must start over from the intent so a fee drop between retries can
+        // still evacuate the full desired amount.
+        let &Action::Evacuate {
+            amount: desired, ..
+        } = action
+        else {
+            return Ok(());
+        };
+        if has_move_artifact(rec) {
+            return Ok(());
+        }
+        let from = rec.from.ok_or_else(|| {
+            ExecError::Permanent(
+                "Evacuate record requires a send leg but has no source federation".into(),
+            )
+        })?;
+        let spendable = self.mc.balance(&from).await.map_err(retryable)?;
+        let Some(amount) = self
+            .max_affordable_evacuation_net(
+                &from,
+                &rec.to,
+                &rec.gateway,
+                desired,
+                rec.fee_cap,
+                spendable,
+            )
+            .await?
+        else {
+            return Err(ExecError::Retryable(format!(
+                "no evacuable amount fits: desired {} msat cannot reserve move fees within source \
+                 balance {} msat and fee_cap {} msat (retrying — a later tick may succeed once \
+                 in-flight funds settle or the fee quote eases)",
+                desired.0, spendable.0, rec.fee_cap.0
+            )));
+        };
+        if amount < desired {
+            tracing::warn!(
+                from = %from.to_hex(),
+                to = %rec.to.to_hex(),
+                requested_msat = desired.0,
+                executable_msat = amount.0,
+                spendable_msat = spendable.0,
+                fee_cap_msat = rec.fee_cap.0,
+                "executor: reducing fresh evacuation amount to reserve move fees"
+            );
+        }
+        rec.amount = amount;
+        Ok(())
+    }
+
+    /// The largest net amount (≤ `desired`) the source can fund under `fee_cap`, or `None`
+    /// when nothing evacuable fits.
+    ///
+    /// `evacuation_candidate_fits` is NOT monotone over the full `[0, desired]` range: it is
+    /// false BELOW the lnv2 minimum-incoming-contract threshold as well as above the budget
+    /// ceiling, so an unclamped bisection can probe into the too-small region and skip a
+    /// feasible window entirely (e.g. desired 500_000 with only ~5_500 msat affordable). The
+    /// §6 gross-up guarantees `contract_amount = net + fed_fee ≥ net`, so every net at or
+    /// above [`MINIMUM_INCOMING_CONTRACT_MSAT`] clears the contract minimum and the predicate
+    /// is monotone (fits-then-doesn't) on `[MINIMUM_INCOMING_CONTRACT_MSAT, desired]` — the
+    /// search is clamped to that range. A net that would only fit BELOW the floor (< 5 sats,
+    /// with the contract lifted over the minimum by the federation fee alone) is reported as
+    /// not evacuable; the fast path still handles a small `desired` asked for outright.
+    ///
+    /// Resilience note (accepted trade-off): a transient error on ANY of the ~log2(desired)
+    /// sizing probes aborts the whole sizing as `Retryable`, discarding bisection progress —
+    /// the next tick restarts it from scratch. On a genuinely flaky federation this can fail
+    /// to converge for a while; mitigated by the 24h evacuation lead (guardians are usually
+    /// still healthy when the signal fires) and by retry-on-every-tick. Per-probe retries
+    /// can be added later without changing the search's shape.
+    async fn max_affordable_evacuation_net(
+        &self,
+        from: &FederationId,
+        to: &FederationId,
+        gateway: &GatewayUrl,
+        desired: Msat,
+        fee_cap: Msat,
+        spendable: Msat,
+    ) -> Result<Option<Msat>, ExecError> {
+        let gateway_fees = self
+            .fresh_send_required_gateway_fees(from, to, gateway)
+            .await?;
+        if self
+            .evacuation_candidate_fits(from, to, desired, fee_cap, spendable, gateway_fees)
+            .await?
+        {
+            return Ok(Some(desired));
+        }
+
+        let found = largest_fitting_amount(
+            MINIMUM_INCOMING_CONTRACT_MSAT,
+            desired.0.saturating_sub(1),
+            |amount| {
+                self.evacuation_candidate_fits(
+                    from,
+                    to,
+                    Msat(amount),
+                    fee_cap,
+                    spendable,
+                    gateway_fees,
+                )
+            },
+        )
+        .await?;
+        Ok(found.map(Msat))
+    }
+
+    async fn fresh_send_required_gateway_fees(
+        &self,
+        from: &FederationId,
+        to: &FederationId,
+        gateway: &GatewayUrl,
+    ) -> Result<FreshSendRequiredGatewayFees, ExecError> {
+        let receive = self
+            .mc
+            .receive_gateway_fee(to, gateway)
+            .await
+            .map_err(retryable)?;
+        let send = self
+            .mc
+            .direct_swap_send_gateway_fee(from, gateway)
+            .await
+            .map_err(retryable)?;
+        Ok(FreshSendRequiredGatewayFees { receive, send })
+    }
+
+    async fn evacuation_candidate_fits(
+        &self,
+        from: &FederationId,
+        to: &FederationId,
+        amount: Msat,
+        fee_cap: Msat,
+        spendable: Msat,
+        gateway_fees: FreshSendRequiredGatewayFees,
+    ) -> Result<bool, ExecError> {
+        let Some(cost) = self
+            .quote_fresh_send_required_cost(from, to, amount, gateway_fees)
+            .await?
+        else {
+            return Ok(false);
+        };
+        Ok(evacuation_cost_fits(cost, fee_cap, spendable))
+    }
+
+    async fn quote_fresh_send_required_cost(
+        &self,
+        from: &FederationId,
+        to: &FederationId,
+        amount: Msat,
+        gateway_fees: FreshSendRequiredGatewayFees,
+    ) -> Result<Option<FreshMoveCost>, ExecError> {
+        if amount.0 == 0 {
+            return Ok(None);
+        }
+        let grossed = self
+            .quote_receive_gross_up_with_gateway_fee(to, amount, gateway_fees.receive)
+            .await?;
+        if grossed.contract_amount.0 < MINIMUM_INCOMING_CONTRACT_MSAT {
+            return Ok(None);
+        }
+
+        let send_gateway_quote = gateway_fees.send.on(grossed.invoice_amount);
+        let outgoing_contract_amount = Msat(
+            grossed
+                .invoice_amount
+                .0
+                .saturating_add(send_gateway_quote.0),
+        );
+        let send_tx_fee = match self
+            .mc
+            .send_fee_quote_for_amount(from, outgoing_contract_amount)
+            .await
+        {
+            Ok(fee) => fee,
+            // The send-side dry-run balances the hypothetical outgoing contract against the
+            // source's REAL note inventory, so a candidate too large to fund fails HERE with
+            // the mint's `InsufficientBalanceError` — before `evacuation_cost_fits` ever sees
+            // a cost. That is a definitive "does not fit" (the source debit already exceeds
+            // spendable), not a transient fault: report the candidate as unquotable so the
+            // sizing search keeps probing smaller amounts. Without this, a fresh full-balance
+            // evacuation (`desired == spendable`, the common shutdown case) errors `Retryable`
+            // on its very FIRST probe — invoice + gateway fee already exceed the balance — and
+            // the downsizing search never runs.
+            Err(e) if is_insufficient_balance(&e) => return Ok(None),
+            Err(e) => return Err(retryable(e)),
+        };
+        Ok(Some(FreshMoveCost {
+            invoice_amount: grossed.invoice_amount,
+            receive_quote: grossed.receive_quote,
+            send_quote: Msat(send_gateway_quote.0.saturating_add(send_tx_fee.0)),
+        }))
+    }
 }
 
 #[async_trait]
 impl Executor for FedimintExecutor {
     async fn perform(&self, intent: &Intent) -> Result<PerformOutcome, ExecError> {
-        // `Evacuate` (Phase 2) and advisory actions map to `None` → `Unsupported` (§7).
+        // Only the advisory `RefuseInflow`/`Cap` actions map to `None` → `Unsupported` (§7);
+        // `Move`/`Evacuate`/`DirectInflow` all yield an executable plan.
         let Some(plan) = MovePlan::from_action(&intent.action) else {
             return Err(ExecError::Unsupported);
         };
 
-        // Step 4b-live-2: BOTH executable move shapes run here. A `DirectInflow` (receive-only,
+        // BOTH send-required move shapes run here identically. A `DirectInflow` (receive-only,
         // `send_required == false`) returns `Awaiting` after minting its invoice (its payer is
-        // external). A `Move` (`send_required == true`) drives on through the irreversible `Pay`
-        // and both `AwaitSettle` legs to `Done`, synchronously (spec §7). `Evacuate`/advisory
-        // actions already mapped to `None` above → `Unsupported`.
+        // external). A `Move` OR `Evacuate` (`send_required == true`) drives on through the
+        // irreversible `Pay` and both `AwaitSettle` legs to `Done`, synchronously (spec §7):
+        // an evacuate is just a move that drains a dying fed. Advisory actions already mapped
+        // to `None` above → `Unsupported`.
 
         // FIRST: rebuild the record from the intent + backfilled op artifacts, so a replayed
         // move reattaches (no re-quote, no spurious over-cap fail).
         let mut rec = self.assemble_record(intent, &plan).await?;
+        self.size_fresh_evacuation(&intent.action, &mut rec).await?;
 
         loop {
             match next_step(&rec) {
@@ -304,6 +563,7 @@ impl Executor for FedimintExecutor {
                     let meta = MoveMeta {
                         move_id: rec.key.clone(),
                         role: MoveRole::Receive,
+                        amount: rec.amount,
                         from: rec.from,
                         to: rec.to,
                     };
@@ -355,17 +615,15 @@ impl Executor for FedimintExecutor {
                         .send_gateway_fee(&from, &rec.gateway, &invoice)
                         .await
                         .map_err(retryable)?;
+                    let send_gateway_quote = send_gateway_fee.on(Msat(invoice_msat));
+                    let outgoing_contract_amount =
+                        Msat(invoice_msat.saturating_add(send_gateway_quote.0));
                     let send_tx_fee = self
                         .mc
-                        .send_fee_quote(&from, &invoice)
+                        .send_fee_quote_for_amount(&from, outgoing_contract_amount)
                         .await
                         .map_err(retryable)?;
-                    let send_quote = Msat(
-                        send_gateway_fee
-                            .on(Msat(invoice_msat))
-                            .0
-                            .saturating_add(send_tx_fee.0),
-                    );
+                    let send_quote = Msat(send_gateway_quote.0.saturating_add(send_tx_fee.0));
                     if !fee::total_within_cap(receive_quote, send_quote, rec.fee_cap) {
                         return Err(ExecError::Permanent("fee over cap".into()));
                     }
@@ -373,6 +631,7 @@ impl Executor for FedimintExecutor {
                     let meta = MoveMeta {
                         move_id: rec.key.clone(),
                         role: MoveRole::Send,
+                        amount: rec.amount,
                         from: rec.from,
                         to: rec.to,
                     };
@@ -470,11 +729,44 @@ impl Executor for FedimintExecutor {
                         rec.outcome
                             .clone()
                             .unwrap_or_else(|| "move refunded/failed".into()),
-                    ))
+                    ));
                 }
             }
         }
     }
+}
+
+/// The largest `amount` in `[floor, hi]` for which `fits` holds, by bisection. `None` when
+/// the range is empty or nothing in it fits. The CALLER owns the monotonicity argument:
+/// `fits` must be fits-then-doesn't as the amount grows over `[floor, hi]` (see
+/// `max_affordable_evacuation_net` — the floor is what makes its predicate monotone).
+/// Requires `floor ≥ 1`.
+async fn largest_fitting_amount<F, Fut>(
+    floor: u64,
+    mut hi: u64,
+    mut fits: F,
+) -> Result<Option<u64>, ExecError>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, ExecError>>,
+{
+    debug_assert!(floor > 0, "a zero floor would underflow the sentinel below");
+    if hi < floor {
+        return Ok(None);
+    }
+    // `lo` trails the largest amount VERIFIED to fit; it starts one below the floor as the
+    // "nothing verified yet" sentinel and only ever advances to probed-true amounts, so the
+    // loop never evaluates `fits` outside `[floor, hi]`.
+    let mut lo = floor - 1;
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(mid).await? {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok((lo >= floor).then_some(lo))
 }
 
 /// Solve the §6 receive-side fixed point for a constant federation fee, mapping the pure
@@ -512,6 +804,19 @@ fn ensure_minimum_incoming_contract(amount: Msat, contract_amount: Msat) -> Resu
 /// only `Permanent`/`Unsupported` outcomes, raised explicitly above.
 fn retryable(e: anyhow::Error) -> ExecError {
     ExecError::Retryable(e.to_string())
+}
+
+/// Whether an SDK error is the mint's `InsufficientBalanceError` — the send-side fee-quote
+/// dry-run's way of saying the source cannot fund the probed outgoing contract at all
+/// (verified against the pinned source: the mint's funding selection propagates it
+/// `?`-converted, so it sits in the `anyhow` chain un-wrapped). The evacuation sizing search
+/// reads it as "this candidate does not fit", never as a transport fault.
+fn is_insufficient_balance(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<fedimint_mint_client::InsufficientBalanceError>()
+            .is_some()
+    })
 }
 
 /// Crash-smoke deterministic hook (spec §5/§10): abort the process at the named killpoint IFF
@@ -642,20 +947,128 @@ mod tests {
         );
     }
 
-    /// `Evacuate` is Phase 2: `perform` maps it to `Unsupported` (via `MovePlan::from_action`).
-    #[tokio::test]
-    async fn evacuate_is_unsupported() {
-        let executor = test_executor().await;
+    /// Phase 3.A un-gates `Evacuate`: `MovePlan::from_action` now maps it to the SAME
+    /// send-required plan as `Move` (drain `from` into `to`), so `perform` drives it through
+    /// the identical validated two-leg path instead of returning `Unsupported`. Assert the
+    /// pure mapping threads from/to/amount/fee_cap through with `send_required == true`.
+    #[test]
+    fn evacuate_maps_to_a_send_required_plan() {
         let action = Action::Evacuate {
             from: FED_A,
             to: FED_B,
             amount: Msat(50_000),
             fee_cap: Msat(10_000),
         };
-        assert!(matches!(
-            executor.perform(&intent(action)).await,
-            Err(ExecError::Unsupported)
-        ));
+        let plan = MovePlan::from_action(&action).expect("Evacuate must map to a plan");
+        assert_eq!(plan.from, Some(FED_A));
+        assert_eq!(plan.to, FED_B);
+        assert_eq!(plan.amount, Msat(50_000));
+        assert_eq!(plan.fee_cap, Msat(10_000));
+        assert!(
+            plan.send_required,
+            "an evacuate drains `from` into `to`, so it requires a send leg like a Move"
+        );
+    }
+
+    #[test]
+    fn evacuation_fee_fit_reserves_source_side_fees() {
+        let full_balance_with_fees = FreshMoveCost {
+            invoice_amount: Msat(100_100),
+            receive_quote: Msat(100),
+            send_quote: Msat(200),
+        };
+        assert!(
+            !evacuation_cost_fits(full_balance_with_fees, Msat(1_000), Msat(100_000)),
+            "a full-balance net evacuation cannot fit once receive/send fees make the source debit exceed spendable"
+        );
+
+        let quoted_down = FreshMoveCost {
+            invoice_amount: Msat(99_700),
+            receive_quote: Msat(100),
+            send_quote: Msat(200),
+        };
+        assert!(
+            evacuation_cost_fits(quoted_down, Msat(1_000), Msat(100_000)),
+            "a quoted-down evacuation fits when invoice + send fees stay within source spendable and fee_cap"
+        );
+
+        let over_cap = FreshMoveCost {
+            receive_quote: Msat(900),
+            send_quote: Msat(200),
+            ..quoted_down
+        };
+        assert!(
+            !evacuation_cost_fits(over_cap, Msat(1_000), Msat(100_000)),
+            "fee_cap still bounds the total move cost"
+        );
+    }
+
+    /// The downsizing search must not assume its predicate is monotone below the lnv2
+    /// minimum-contract floor. Regression for the skipped-window bug: with desired 500_000
+    /// and only ~5_500 msat affordable, an unclamped bisection from 0 halves straight from
+    /// the over-budget region into the below-minimum region (250_000 → … → 3_906, all
+    /// unfit) and abandons the evacuation; the clamped search stays in `[5_000, desired]`,
+    /// where fits-then-doesn't holds, and finds the window.
+    #[tokio::test]
+    async fn downsizing_search_finds_a_feasible_window_above_the_contract_floor() {
+        let affordable = |amount: u64| async move { Ok(amount <= 5_500) };
+        let found = largest_fitting_amount(MINIMUM_INCOMING_CONTRACT_MSAT, 499_999, affordable)
+            .await
+            .expect("probes never fail");
+        assert_eq!(found, Some(5_500));
+    }
+
+    #[tokio::test]
+    async fn downsizing_search_edge_cases() {
+        // Nothing in range fits → None (the genuinely-infeasible evacuation).
+        let none = largest_fitting_amount(5_000, 100_000, |_| async { Ok(false) })
+            .await
+            .expect("probes never fail");
+        assert_eq!(none, None);
+
+        // Everything fits → the top of the range.
+        let all = largest_fitting_amount(5_000, 100_000, |_| async { Ok(true) })
+            .await
+            .expect("probes never fail");
+        assert_eq!(all, Some(100_000));
+
+        // An empty range (desired below the floor) is None without probing.
+        let empty = largest_fitting_amount(5_000, 4_999, |_| async {
+            panic!("an empty range must not be probed")
+        })
+        .await
+        .expect("probes never run");
+        assert_eq!(empty, None);
+
+        // Exactly the floor fitting is found, one msat under the floor is out of scope.
+        let at_floor =
+            largest_fitting_amount(5_000, 100_000, |amount| async move { Ok(amount <= 5_000) })
+                .await
+                .expect("probes never fail");
+        assert_eq!(at_floor, Some(5_000));
+    }
+
+    /// Regression for the aborted full-balance evacuation: the send-side dry-run quote fails
+    /// with the mint's `InsufficientBalanceError` when a probed candidate cannot be funded, and
+    /// the sizing search must classify that as "does not fit" (keep probing smaller amounts) —
+    /// never as a `Retryable` transport fault that aborts the search. The classifier walks the
+    /// whole anyhow chain so an added `.context(...)` wrap cannot silently break it.
+    #[test]
+    fn insufficient_balance_is_classified_as_unfit_not_transport_failure() {
+        let root = fedimint_mint_client::InsufficientBalanceError {
+            requested_amount: fedimint_core::Amount::from_msats(100_000),
+            total_amount: fedimint_core::Amount::from_msats(60_000),
+        };
+        let plain = anyhow::Error::from(root.clone());
+        assert!(is_insufficient_balance(&plain));
+
+        let wrapped = anyhow::Error::from(root).context("quoting send fee for evacuation probe");
+        assert!(is_insufficient_balance(&wrapped));
+
+        assert!(
+            !is_insufficient_balance(&anyhow::anyhow!("connection reset by peer")),
+            "an ordinary transport error must stay Retryable"
+        );
     }
 
     #[test]
@@ -724,6 +1137,7 @@ mod tests {
             move_id: key.clone(),
             leg: Leg::Receive,
             op_id: crate::types::OperationId([0x42; 32]),
+            amount: Msat(50_000),
             invoice: Some(Invoice("lnbc1recover".into())),
         }];
 

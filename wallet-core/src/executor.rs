@@ -74,8 +74,9 @@ pub enum ExecError {
     Retryable(String),
     /// Terminal: mark `Failed`. NOT auto-re-driven; only a manual retry resets it.
     Permanent(String),
-    /// The action is not supported by this executor implementation yet (e.g.
-    /// `Evacuate`, modeled but Phase 1 returns `Unsupported`). → `Failed`.
+    /// The action is not one this executor implementation performs (an `Executor`
+    /// need not map every `Action` shape to a side effect — the fedimint executor
+    /// returns this only for a non-move action reaching `perform`). → `Failed`.
     Unsupported,
 }
 
