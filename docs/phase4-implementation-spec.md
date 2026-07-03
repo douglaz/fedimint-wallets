@@ -157,12 +157,18 @@ work — the invariant THIS phase buys is that the proof is durable and the stat
    ```
    - `cap_room(snapshot, fed)` becomes `cap_room_with(snapshot, fed, &credited)` =
      `per_fed_cap − spendable − credited[fed]` (saturating).
-   - available/spendable reads for a SOURCE become `spendable − debited[fed]` (saturating).
-   - Every emitted `Move`/`Evacuate` records `credited[to] += amount` and
-     `debited[from] += amount + fee_cap` — the source pays the NET amount PLUS the
-     receive-side gross-up and send-side fees, unknowable at decide time but bounded by the
-     decision's `fee_cap` (= `snapshot.max_fee`); reserving the cap is the conservative
-     bound that makes two same-source moves provably non-overdrawing.
+   - available/spendable reads for a SOURCE become
+     `spendable − debited[fed] − fee_cap` (saturating, `fee_cap = snapshot.max_fee`) —
+     the move's OWN fee reserve, not just prior moves': the executor spends up to
+     `amount + fee_cap` from the source, so an amount chosen against bare `spendable` would
+     be emitted and then fail on insufficient funds. Same rule for the evacuation amount:
+     `min(spendable − fee_cap, cap_room_with(..))` (saturating) — an evacuation may leave
+     ≤ `max_fee` behind when actual fees run lower; bounded, honest, and preferable to a
+     move that cannot execute.
+   - Every emitted `Move`/`Evacuate` then records `credited[to] += amount` and
+     `debited[from] += amount + fee_cap` — the conservative bound that makes any number of
+     same-source moves provably non-overdrawing (fees are unknowable at decide time but
+     bounded by the cap).
    - `eligible_for_evacuation`'s `cap_room > 0` check uses the reserved-aware value.
 3. **Document the deliberate asymmetry** (one comment on `usable_source`): source-side trust
    is intentionally NOT gated on `probed_ok`/reputation — draining a distrusted fed is
@@ -239,8 +245,10 @@ pub enum OperationKind {
     Join { fed: FederationId },
     Receive { fed: FederationId, amount: Msat, op_id: Option<OperationId>,
               gateway: Option<GatewayUrl> },
-    Pay { fed: FederationId, invoice_amount: Msat, op_id: Option<OperationId>,
-          gateway: Option<GatewayUrl> },
+    Pay { fed: FederationId, invoice_amount: Option<Msat>, op_id: Option<OperationId>,
+          gateway: Option<GatewayUrl> },   // amount None on the pre-parse Started row
+                                           // (§10.1 — a malformed invoice never yields one);
+                                           // filled by record_update_ops once parsed
     DirectInflow { to: FederationId, amount: Msat, recv_op: Option<OperationId>,
                    gateway: Option<GatewayUrl> },
     Move { from: FederationId, to: FederationId, amount: Msat,
@@ -323,9 +331,12 @@ async fn ledger_upsert_in(dbtx, key, build: impl FnOnce(Option<OperationRecord>,
   - `write_intent_and_index` (shared by `set_status`/`set_status_if`) — after the index+row
     writes: advance the ledger row to `status_from_intent(new_intent.status)`; on `Failed`
     the `error` is the executor-provided string from `set_status`'s error param (§8.3)
-    first, `MoveRecord.outcome` as fallback; on terminal also refresh fees/op-ids from the
-    move row (it was persisted by `perform` BEFORE the status flip — `executor.rs` ordering,
-    verified).
+    first, `MoveRecord.outcome` as fallback. Fees/op-ids/gateway are refreshed from the
+    `0x02` move row on EVERY ledger write, not only terminal ones — a `DirectInflow` goes
+    `Awaiting` right after `perform` persisted its `recv_op`/gateway/receive-fee, and a
+    retryable `Move` can carry op ids before resetting to `Pending`; `history`/`show` must
+    reflect in-flight metadata. (Same-dbtx read; `perform` persists the record BEFORE the
+    status flip — `executor.rs` ordering, verified.)
 - Consistency guarantee: ledger and journal commit or fail together; the ledger can never
   claim a state the journal doesn't have.
 
