@@ -99,8 +99,9 @@ pub enum Action {
         amount: Msat,
         fee_cap: Msat,
     },
-    /// Move a federation's balance out ahead of a shutdown/health problem. Modeled
-    /// here; the executor returns `Unsupported` for it in Phase 1.
+    /// Move a federation's balance out ahead of a shutdown/health problem. Executed
+    /// since Phase 3.A as a send-required move (the same validated two-leg path as
+    /// `Move`), LN-only per ADR-0018.
     Evacuate {
         from: FederationId,
         to: FederationId,

@@ -76,6 +76,11 @@ pub struct OpArtifact {
     pub move_id: IdempotencyKey,
     pub leg: Leg,
     pub op_id: OperationId,
+    /// The net move amount committed in the op's [`MoveMeta`]. This is the crash-safe
+    /// recovery source for a fresh evacuation that was sized down before minting its invoice:
+    /// if the journal cache is lost, the recovered receive op still tells the Pay-step cap
+    /// check which net amount the fixed invoice was intended to deliver.
+    pub amount: Msat,
     /// The `Receive` leg carries the invoice; the `Send` leg leaves this `None`.
     pub invoice: Option<Invoice>,
 }
@@ -114,16 +119,29 @@ pub struct MovePlan {
 }
 
 impl MovePlan {
-    /// Map an [`Action`] to a [`MovePlan`], or `None` for anything Phase 1's executor does
-    /// not perform as a move (spec §3.1/§7):
+    /// Map an [`Action`] to a [`MovePlan`], or `None` for anything the executor does not
+    /// perform as a move (spec §3.1/§7):
     ///
     /// - `Move` → `Some` with `from = Some`, `send_required = true`.
+    /// - `Evacuate` → `Some` with `from = Some`, `send_required = true` — the SAME send-
+    ///   required shape as `Move` (spec §7 / ADR-0018): `from` (the dying fed) pays an
+    ///   invoice minted on `to`, so it reuses the identical validated two-leg + idempotent-
+    ///   replay + gross-up path. LN-only: v1 validates that the destination-selected gateway
+    ///   also serves the source, giving the same internal-swap route as `Move`. No peg-out.
     /// - `DirectInflow` → `Some` with `from = None`, `send_required = false` (receive-only).
-    /// - `Evacuate` → `None` (modeled but Phase 1 returns `Unsupported`).
     /// - `RefuseInflow` / `Cap` → `None` (advisory policy signals, never executed).
     pub fn from_action(a: &Action) -> Option<MovePlan> {
         match a {
+            // A `Move` and an `Evacuate` are the same executable send-required move (drain
+            // `from` into `to`); they differ only in the reason/idempotency scheme the pure
+            // allocator stamps, which lives on the `Action`/`Intent`, not the plan.
             Action::Move {
+                from,
+                to,
+                amount,
+                fee_cap,
+            }
+            | Action::Evacuate {
                 from,
                 to,
                 amount,
@@ -146,9 +164,8 @@ impl MovePlan {
                 fee_cap: *fee_cap,
                 send_required: false,
             }),
-            // `Evacuate` is Phase 2 (executor → `Unsupported`); advisory actions are never
-            // executed. Both are absent from the money path here.
-            Action::Evacuate { .. } | Action::RefuseInflow { .. } | Action::Cap { .. } => None,
+            // Advisory policy signals are never executed — absent from the money path.
+            Action::RefuseInflow { .. } | Action::Cap { .. } => None,
         }
     }
 }
@@ -178,6 +195,11 @@ pub struct MoveMeta {
     /// `== MoveRecord.key == Intent key` — the join key across both legs (embeds occurrence).
     pub move_id: IdempotencyKey,
     pub role: MoveRole,
+    /// The net amount the destination should receive. For a fresh evacuation this may be lower
+    /// than the allocator's desired amount after the executor sizes it down to reserve fees; it
+    /// is committed with the op so full journal-loss recovery keeps the fixed invoice's fee-cap
+    /// accounting honest.
+    pub amount: Msat,
     /// The move's source federation (`None` for a `DirectInflow`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<FederationId>,
@@ -243,12 +265,20 @@ pub fn next_step(rec: &MoveRecord) -> MoveStep {
 
 /// Assemble a [`MoveRecord`] by merging three sources (spec §5), newest-known wins:
 ///
-/// 1. `params` — AUTHORITATIVE for the move's parameters (from/to/amount/**fee_cap**/
-///    gateway/send_required). These come from the durable Intent and are NEVER dropped.
+/// 1. `params` — AUTHORITATIVE for the move's parameters (from/to/**fee_cap**/gateway/
+///    send_required). These come from the durable Intent and are NEVER dropped.
 /// 2. `artifacts` — the op-log entries for this `move_id`: a `Receive` leg fills
-///    `recv_op` (and `invoice`), a `Send` leg fills `send_op`. Authoritative for op-ids.
+///    `recv_op` (and `invoice`), a `Send` leg fills `send_op`, and either leg can recover
+///    the move's net amount from committed `MoveMeta`. Authoritative for op-ids.
 /// 3. `cached` — the previously-known `MoveRecord`, the fallback for any leg an artifact
-///    does not (re)supply.
+///    does not (re)supply — and AUTHORITATIVE for `amount`: the executor may size a fresh
+///    evacuation DOWN from the intent's ask (reserving the fees the dying source must pay)
+///    and persists that decision before the non-idempotent receive, so on re-assembly the
+///    cached amount wins over recovered op metadata, and recovered op metadata wins over
+///    `params.amount`. Rebuilding from `params` would silently revert the sizing, and the
+///    §7 Pay-step cap re-check derives the receive fee as `invoice_amount − amount` — a
+///    reverted amount zeroes the receive fee out of the fee-cap guard on every resume. For
+///    `Move`/`DirectInflow` the two are always equal.
 ///
 /// The merge **never blanks an existing leg**: a missing artifact cannot erase an op-id
 /// already known from `cached` (a one-client backfill only sees one leg), and `fee_cap`
@@ -292,13 +322,18 @@ pub fn assemble_move_record(
 
     // Cache fallback means a missing artifact never blanks an existing leg (a missing
     // leg here means "this client's op-log didn't see it", not "it doesn't exist").
+    let cached_amount = cached.as_ref().map(|c| c.amount);
     let cached_invoice = cached.as_ref().and_then(|c| c.invoice.clone());
     let cached_recv_op = cached.as_ref().and_then(|c| c.recv_op);
     let cached_send_op = cached.as_ref().and_then(|c| c.send_op);
     let cached_phase = cached.as_ref().map(|c| c.phase);
     let cached_outcome = cached.as_ref().and_then(|c| c.outcome.clone());
+    let mut artifact_amount = None;
 
     for artifact in artifacts.iter().filter(|a| a.move_id == params.key) {
+        if artifact_amount.is_none() {
+            artifact_amount = Some(artifact.amount);
+        }
         match artifact.leg {
             Leg::Receive => {
                 if artifact_recv_op.is_some() {
@@ -342,7 +377,10 @@ pub fn assemble_move_record(
         key: params.key,
         from: params.from,
         to: params.to,
-        amount: params.amount,
+        // The cached amount is the executor's persisted sizing decision (see the doc
+        // contract above). If the cache is gone, recover the committed op metadata amount
+        // before falling back to the intent's original amount.
+        amount: cached_amount.or(artifact_amount).unwrap_or(params.amount),
         fee_cap: params.fee_cap,
         gateway: params.gateway,
         send_required: params.send_required,

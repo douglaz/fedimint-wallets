@@ -121,6 +121,7 @@ fn resume_after_send_only_no_double_invoice_or_pay() {
         move_id: k,
         leg: Leg::Send,
         op_id: SEND_OP,
+        amount: Msat(100_000),
         invoice: None,
     }];
 
@@ -212,12 +213,14 @@ fn assemble_merges_both_legs() {
             move_id: k.clone(),
             leg: Leg::Receive,
             op_id: RECV_OP,
+            amount: Msat(100_000),
             invoice: Some(invoice()),
         },
         OpArtifact {
             move_id: k.clone(),
             leg: Leg::Send,
             op_id: SEND_OP,
+            amount: Msat(100_000),
             invoice: None,
         },
     ];
@@ -252,24 +255,28 @@ fn assemble_preserves_newest_duplicate_leg_artifacts() {
             move_id: k.clone(),
             leg: Leg::Receive,
             op_id: RECV_OP,
+            amount: Msat(100_000),
             invoice: Some(invoice()),
         },
         OpArtifact {
             move_id: k.clone(),
             leg: Leg::Receive,
             op_id: STALE_RECV_OP,
+            amount: Msat(100_000),
             invoice: Some(stale_invoice()),
         },
         OpArtifact {
             move_id: k.clone(),
             leg: Leg::Send,
             op_id: SEND_OP,
+            amount: Msat(100_000),
             invoice: None,
         },
         OpArtifact {
             move_id: k,
             leg: Leg::Send,
             op_id: STALE_SEND_OP,
+            amount: Msat(100_000),
             invoice: None,
         },
     ];
@@ -340,6 +347,7 @@ fn assemble_directinflow_receive_only() {
         move_id: k.clone(),
         leg: Leg::Receive,
         op_id: RECV_OP,
+        amount: Msat(20_000),
         invoice: Some(invoice()),
     }];
 
@@ -397,6 +405,76 @@ fn assemble_preserves_cached_terminal_phase() {
     }
 }
 
+/// A fresh `Evacuate` may be sized DOWN by the executor (reserving the fees the dying
+/// source must pay) and persisted with the pre-receive `put_move`. Re-assembly must keep
+/// that persisted amount: params carry the intent's full desired amount, and rebuilding
+/// from them would silently revert the sizing — the §7 Pay-step cap re-check derives the
+/// receive fee as `invoice_amount − amount`, so a reverted (larger) amount zeroes the
+/// receive fee out of the fee-cap guard on every resume.
+#[test]
+fn assemble_keeps_cached_downsized_amount() {
+    let k = key("evac-downsized");
+    let params = || MoveParams {
+        key: k.clone(),
+        from: Some(FED_A),
+        to: FED_B,
+        amount: Msat(100_000), // the intent's full desired amount
+        fee_cap: Msat(2_000),
+        gateway: gateway(),
+        send_required: true,
+    };
+    // The pre-receive record: amount sized down to 95_000, no legs yet.
+    let pre_op = MoveRecord {
+        key: k.clone(),
+        from: Some(FED_A),
+        to: FED_B,
+        amount: Msat(95_000),
+        fee_cap: Msat(2_000),
+        gateway: gateway(),
+        send_required: true,
+        invoice: None,
+        recv_op: None,
+        send_op: None,
+        phase: MovePhase::Created,
+        outcome: None,
+    };
+
+    // The exact crash window: the receive op committed (backfill recovers it), but the
+    // invoiced record was never persisted — only the pre-op cache carries the sizing.
+    let artifacts = vec![OpArtifact {
+        move_id: k.clone(),
+        leg: Leg::Receive,
+        op_id: RECV_OP,
+        amount: Msat(95_000),
+        invoice: Some(invoice()),
+    }];
+    let rec = assemble_move_record(params(), &artifacts, Some(pre_op.clone()));
+    assert_eq!(rec.amount, Msat(95_000));
+    assert_eq!(rec.invoice, Some(invoice()));
+    assert_eq!(next_step(&rec), MoveStep::Pay);
+
+    // If the whole MoveRecord cache is lost but the receive op survives in the fedimint
+    // client DB, the op metadata still recovers the sized amount. This keeps the Pay-step
+    // receive-fee calculation (`invoice_amount - amount`) from reverting to the intent's
+    // larger desired amount and saturating the receive-side fee to zero.
+    let rec = assemble_move_record(params(), &artifacts, None);
+    assert_eq!(rec.amount, Msat(95_000));
+    assert_eq!(rec.invoice, Some(invoice()));
+    assert_eq!(next_step(&rec), MoveStep::Pay);
+
+    // A plain resume of the persisted invoiced record keeps the sizing too.
+    let mut invoiced = pre_op;
+    invoiced.invoice = Some(invoice());
+    invoiced.recv_op = Some(RECV_OP);
+    invoiced.phase = MovePhase::Invoiced;
+    let rec = assemble_move_record(params(), &[], Some(invoiced));
+    assert_eq!(rec.amount, Msat(95_000));
+
+    // With no cache, params seed the amount as before.
+    let rec = assemble_move_record(params(), &[], None);
+    assert_eq!(rec.amount, Msat(100_000));
+}
+
 /// Op artifacts are keyed by `move_id`; artifacts from another move must not attach
 /// invoice/op ids to this record.
 #[test]
@@ -417,12 +495,14 @@ fn assemble_ignores_foreign_move_artifacts() {
             move_id: foreign.clone(),
             leg: Leg::Receive,
             op_id: FOREIGN_OP,
+            amount: Msat(100_000),
             invoice: Some(invoice()),
         },
         OpArtifact {
             move_id: foreign,
             leg: Leg::Send,
             op_id: SEND_OP,
+            amount: Msat(100_000),
             invoice: None,
         },
     ];
@@ -472,6 +552,7 @@ fn assemble_partial_backfill_send_leg_does_not_blank_receive() {
         move_id: k,
         leg: Leg::Send,
         op_id: SEND_OP,
+        amount: Msat(100_000),
         invoice: None,
     }];
 
@@ -508,6 +589,7 @@ fn assemble_receive_artifact_without_invoice_trips_contract() {
         move_id: k,
         leg: Leg::Receive,
         op_id: RECV_OP,
+        amount: Msat(100_000),
         invoice: None,
     }];
 
@@ -538,6 +620,7 @@ fn assemble_invoice_less_receive_artifact_never_half_states() {
             move_id: k.clone(),
             leg: Leg::Receive,
             op_id: RECV_OP,
+            amount: Msat(100_000),
             invoice: None,
         }]
     };

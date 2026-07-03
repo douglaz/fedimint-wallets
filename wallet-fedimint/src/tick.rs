@@ -268,14 +268,25 @@ pub fn pinned_input_problems(
     problems
 }
 
-/// Whether `id` is the source or destination of an executable `Move` in `decisions` — a rebalance
-/// leg that will actually reach `apply` (advisory `RefuseInflow`/`Cap` never do, and `Evacuate` is
-/// withheld by [`decisions_to_apply`]). A pinned fed in such a move had its end-to-end route
-/// validated by the runtime, so it is not failed on the coarser per-fed probe gate.
+/// Whether `id` is the source or destination of an executable `Move` OR `Evacuate` in
+/// `decisions` — a rebalance leg that will actually reach `apply` (advisory `RefuseInflow`/`Cap`
+/// never do). A pinned fed in such a move had its end-to-end route validated by the runtime, so it
+/// is not failed on the coarser per-fed probe gate.
+///
+/// `Evacuate` counts as of Phase 3.A (it is no longer withheld by [`decisions_to_apply`]). The
+/// evacuating SOURCE is unhealthy/shutting-down BY DEFINITION — that is exactly why it is being
+/// drained — so its own red probe gate must not abort the evacuate; only the DESTINATION needs to
+/// be route-eligible, and `safest_other` already picks the destination from healthy, cap-roomed
+/// feds. Treating the source `from` as route-validated here keeps a pinned dying fed from failing
+/// the tick on the very unhealthiness that triggered its evacuation.
 fn fed_in_executable_move(id: FederationId, decisions: &[AllocatorDecision]) -> bool {
-    decisions
-        .iter()
-        .any(|d| matches!(&d.action, Action::Move { from, to, .. } if *from == id || *to == id))
+    decisions.iter().any(|d| {
+        matches!(
+            &d.action,
+            Action::Move { from, to, .. } | Action::Evacuate { from, to, .. }
+                if *from == id || *to == id
+        )
+    })
 }
 
 /// Comma-join federation ids as hex for a diagnostic message.
@@ -286,20 +297,16 @@ fn hexes(ids: &[FederationId]) -> String {
         .join(", ")
 }
 
-/// The decisions a Phase-2 tick actually drives through the executor. PURE, total over
-/// the input. `Move`/`DirectInflow` stay; the advisory `RefuseInflow`/`Cap` stay too (the
-/// pure `apply` already skips them via `Action::is_executable`, and the tick surfaces them
-/// from the full decision list). `Evacuate` is DROPPED here: it is executable per
-/// `is_executable`, but the Phase-1 executor still returns `Unsupported` for it and
-/// evacuation EXECUTION is a Phase-3 non-goal — driving it would only record a misleading
-/// terminal `Failed` intent and poison its idempotency key for the rest of the occurrence.
-/// Callers keep the FULL decision list for reporting; this only trims what reaches `apply`.
+/// The decisions a tick drives through the executor. PURE, total over the input. As of
+/// Phase 3.A this is the FULL decision list: `Move`/`DirectInflow`/`Evacuate` are all
+/// executable and the executor performs each (`MovePlan::from_action` maps `Evacuate` to
+/// the same send-required plan as `Move`), while the advisory `RefuseInflow`/`Cap` pass
+/// through and the pure `apply` skips them via `Action::is_executable`. `Evacuate` is no
+/// longer dropped — evacuation execution is a Phase-3 GOAL, not a non-goal. Callers still
+/// keep the full decision list for reporting; this seam remains the single, documented
+/// "what reaches `apply`" projection.
 pub fn decisions_to_apply(decisions: &[AllocatorDecision]) -> Vec<AllocatorDecision> {
-    decisions
-        .iter()
-        .filter(|d| !matches!(d.action, Action::Evacuate { .. }))
-        .cloned()
-        .collect()
+    decisions.to_vec()
 }
 
 /// One federation's scored view for the `status` (dry-run) report: its fundability
@@ -353,6 +360,8 @@ mod tests {
             latency_ms: 42,
             gateway_available: true,
             wallet_module_present: true,
+            expiry_timestamp_secs: None,
+            status_scheduled_shutdown: false,
             shutdown_scheduled: false,
             spendable_msat,
             in_flight_msat: 0,
@@ -589,6 +598,13 @@ mod tests {
             "{problems:?}"
         );
 
+        // A pinned STANDBY whose quorum is DEAD (fed 3) is now EVACUATED, not pre-failed. As of
+        // Phase 3.A a dead/unhealthy fed drives an `Evacuate` (drain it into `safest_other`), and
+        // `fed_in_executable_move` treats that evacuate leg as route-validated — the evacuating
+        // SOURCE is unhealthy BY DEFINITION, so its own red probe gate must not abort the evacuate.
+        // The raw per-fed gate still SEES fed 3 as unusable, but `pinned_input_problems` clears it
+        // because it drives an executable evacuate this tick. (A dead-quorum evacuate that genuinely
+        // cannot complete surfaces loudly at EXECUTION via `summary.failed`, not this pure pre-gate.)
         let dead_quorum_pin = TickPolicy {
             spending_fed: Some(fed_id(2)),
             standby_fed: Some(fed_id(3)),
@@ -596,17 +612,26 @@ mod tests {
         };
         let dead_quorum_snap = build_snapshot(&probes, &dead_quorum_pin, &ScorerPolicy::default());
         let dead_quorum_decisions = decide(&dead_quorum_snap, dead_quorum_pin.occurrence);
-        let problems = pinned_input_problems(
-            &dead_quorum_pin,
-            &dead_quorum_snap,
-            &probes,
-            &dead_quorum_decisions,
-        );
+        // Sanity: the dead standby really is being evacuated into the healthy fed.
         assert!(
-            problems.iter().any(|p| {
-                p.contains("failed the lnv2/probe gate") && p.contains(&fed_id(3).to_hex())
-            }),
-            "{problems:?}"
+            dead_quorum_decisions.iter().any(|d| matches!(
+                &d.action,
+                Action::Evacuate { from, to, .. } if *from == fed_id(3) && *to == fed_id(2)
+            )),
+            "expected an evacuate draining the dead standby; decisions: {dead_quorum_decisions:?}"
+        );
+        // The raw probe gate still flags fed 3 (dead quorum)...
+        assert!(unusable_pinned_feds(&dead_quorum_pin, &probes).contains(&fed_id(3)));
+        // ...but because fed 3 drives an executable evacuate this tick, the tick does NOT pre-fail.
+        assert!(
+            pinned_input_problems(
+                &dead_quorum_pin,
+                &dead_quorum_snap,
+                &probes,
+                &dead_quorum_decisions,
+            )
+            .is_empty(),
+            "an evacuating pinned fed must not be pre-failed on its own probe gate"
         );
 
         // A present + routable pin is clean, even though a DIFFERENT (undesignated) fed is
@@ -668,11 +693,10 @@ mod tests {
     }
 
     #[test]
-    fn evacuate_decisions_are_not_applied() {
+    fn evacuate_decisions_are_applied() {
         // An unhealthy fed with a healthy destination makes `decide` emit an `Evacuate`.
-        // The Phase-2 tick must NOT drive it (evacuation execution is a Phase-3 non-goal and
-        // the executor returns `Unsupported`), so `decisions_to_apply` drops it — while the
-        // full decision list the tick reports still carries it.
+        // As of Phase 3.A the tick MUST drive it (the executor performs evacuate as a
+        // send-required move), so `decisions_to_apply` KEEPS it — draining the dying fed.
         let mut sick = healthy_probe(5_000_000);
         sick.quorum_live = false; // -> unhealthy -> evacuation_reason
         let probes = vec![(fed_id(1), sick), (fed_id(2), healthy_probe(100_000))];
@@ -685,16 +709,53 @@ mod tests {
         assert!(
             decisions
                 .iter()
-                .any(|d| matches!(&d.action, Action::Evacuate { from, .. } if *from == fed_id(1))),
-            "expected an evacuate decision for the unhealthy fed; decisions: {decisions:?}"
+                .any(|d| matches!(&d.action, Action::Evacuate { from, to, .. }
+                    if *from == fed_id(1) && *to == fed_id(2))),
+            "expected an evacuate decision draining the unhealthy fed; decisions: {decisions:?}"
         );
         let applied = decisions_to_apply(&decisions);
         assert!(
-            !applied
+            applied
                 .iter()
-                .any(|d| matches!(d.action, Action::Evacuate { .. })),
-            "evacuate must be filtered out of what the tick applies; applied: {applied:?}"
+                .any(|d| matches!(&d.action, Action::Evacuate { from, .. } if *from == fed_id(1))),
+            "evacuate must reach what the tick applies; applied: {applied:?}"
         );
+
+        // ...while advisory decisions still pass through here unchanged — they are dropped only
+        // at `apply` (via `Action::is_executable`), not by this projection. The under-target
+        // spending fed with no usable source yields a `RefuseInflow`, which survives here.
+        let advisory_count = |ds: &[AllocatorDecision]| {
+            ds.iter()
+                .filter(|d| matches!(&d.action, Action::RefuseInflow { .. } | Action::Cap { .. }))
+                .count()
+        };
+        assert!(advisory_count(&decisions) > 0, "decisions: {decisions:?}");
+        assert_eq!(
+            advisory_count(&applied),
+            advisory_count(&decisions),
+            "advisory decisions pass through decisions_to_apply unchanged; applied: {applied:?}"
+        );
+    }
+
+    #[test]
+    fn tiny_evacuate_decision_is_still_applied() {
+        // `decisions_to_apply` must not apply its own dust policy. A small evacuation may come
+        // from destination cap room rather than source balance, and the Phase 3.A contract is
+        // that EVERY Evacuate reaches the executor.
+        let tiny = AllocatorDecision {
+            action: Action::Evacuate {
+                from: fed_id(1),
+                to: fed_id(2),
+                amount: Msat(1),
+                fee_cap: Msat(50_000),
+            },
+            reason: ReasonCode::ShutdownNotice,
+            occurrence: Occurrence(0),
+            idempotency_key: wallet_core::IdempotencyKey("evac-tiny".into()),
+            requires_auth: false,
+        };
+        let kept = decisions_to_apply(std::slice::from_ref(&tiny));
+        assert_eq!(kept, vec![tiny]);
     }
 
     #[test]
