@@ -372,7 +372,11 @@ async fn ledger_upsert_in(dbtx, key, build: impl FnOnce(Option<OperationRecord>,
 ### 9.3 Standalone recording (no intent involved)
 Public async methods on `FedimintJournal` (each one dbtx via the same helper):
 - `record_started(key, kind, actor, reason, now_ms, fee_cap)` / `record_terminal(key, status,
-  now_ms, error)` / `record_update(key, upd: RawOpUpdate)` with
+  now_ms, error, upd: Option<RawOpUpdate>)` — the terminal write CARRIES the final
+  enrichment (fees/ops/gateway) applied atomically WITH the transition: the definitive
+  raw-op costs are only known AT settlement, and terminal immutability forbids enriching
+  afterwards, so the one terminal write is where they land — / `record_update(key,
+  upd: RawOpUpdate)` with
   `RawOpUpdate { op_id: Option<OperationId>, gateway: Option<GatewayUrl>,
   invoice_amount: Option<Msat>, payment_hash: Option<[u8; 32]>,
   fees: Option<FeeBreakdown> }` (the hash is what the §10.3 dedup repair keys on — the
@@ -479,7 +483,10 @@ ordering authority). `Runtime` passes `now_ms` where §8 needs it via the same s
      cannot bless every lingering row — a stale interrupted attempt must not flip
      `Succeeded` because a LATER retry joined): registry present → `Succeeded` ONLY for the
      NEWEST `Started` attempt for that fed whose `created_at_ms` ≤ the registry row's
-     `joined_at` (+60s slack; both stamps come from the same device clock); every OTHER
+     `joined_at` CONVERTED to millis — `FederationInfo.joined_at` is unix SECONDS
+     (`journal.rs:82`), so compare against `joined_at * 1000` (+60_000ms slack; both stamps
+     come from the same device clock; an unconverted compare would never match and every
+     crash-interrupted successful join would be mis-routed to soft-failure); every OTHER
      `Started` join row for that fed → soft-`Failed("superseded by a later join attempt")`.
      Registry absent (and > 1h old) →
      soft-`Failed("join did not complete — federation not in the registry; re-run join")`.
@@ -493,11 +500,18 @@ ordering authority). `Runtime` passes `now_ms` where §8 needs it via the same s
      (a `pay:` row that parsed before crashing) → second lookup: scan the fed's lnv2 SEND
      ops for one whose invoice payment-hash matches — a DEDUPED retry
      (`AlreadyInFlight`/`AlreadyPaid`) reuses the ORIGINAL op, so the retry's key is in NO
-     op's `custom_meta`; the hash, written durably pre-call, is the recovery link → adopt
-     the shared op id (+ terminal outcome if recorded). Still nothing (and > 1h old, per the
-     repair principle) → `Failed("never reached the federation")` — truthful at ATTEMPT
-     granularity (this attempt never called; a no-hash row was malformed or crashed
-     pre-parse).
+     op's `custom_meta`; the hash, written durably pre-call, is the recovery link. The
+     crash-before-call and crash-after-deduped-call windows are DURABLY INDISTINGUISHABLE
+     (nothing is written between the hash update and the SDK call), so a hash match is
+     adopted with the ambiguity RECORDED, not papered over: soft-terminal
+     (`repaired: true`) with the matched op's outcome and a note — "correlated by payment
+     hash to an existing payment of this invoice; attempt-level correlation uncertain
+     (deduped retry or never-sent attempt); the matched operation is authoritative".
+     Money-truth is exact either way (the invoice is paid once; op-id grouping keeps sums
+     single-counted); only the attempt attribution is uncertain, and the row says so.
+     Still nothing (and > 1h old, per the repair principle) →
+     soft-`Failed("never reached the federation")` — truthful at ATTEMPT granularity (a
+     no-hash row was malformed or crashed pre-parse).
    - `pay:`/`recv:` rows in `Awaiting` with `op_id: Some` (the COMMON stuck case: crash
      after `record_update`, or the user never ran `await-*` with `--key`) → read that
      op-log entry directly; if it carries a recorded terminal outcome, `record_terminal`
