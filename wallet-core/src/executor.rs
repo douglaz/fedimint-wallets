@@ -45,6 +45,10 @@ pub struct ExecutionSummary {
     pub performed: usize,
     pub skipped: usize,
     pub failed: usize,
+    /// Existing intents that were already terminal `Failed` and therefore skipped instead of
+    /// re-driven. This is a subset of `skipped`; callers that gate money operations on success
+    /// can distinguish these from benign idempotent `Done` skips.
+    pub terminal_failed_skipped: usize,
 }
 
 /// The result of a successful [`Executor::perform`].
@@ -382,11 +386,12 @@ pub async fn apply<J: Journal, E: Executor>(
         };
 
         match existing {
+            Some(intent) if intent.status == IntentStatus::Failed => {
+                summary.skipped += 1;
+                summary.terminal_failed_skipped += 1;
+            }
             Some(intent)
-                if matches!(
-                    intent.status,
-                    IntentStatus::Done | IntentStatus::Failed | IntentStatus::Awaiting
-                ) =>
+                if matches!(intent.status, IntentStatus::Done | IntentStatus::Awaiting) =>
             {
                 summary.skipped += 1;
             }

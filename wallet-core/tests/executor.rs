@@ -46,6 +46,21 @@ fn counts(performed: usize, skipped: usize, failed: usize) -> ExecutionSummary {
         performed,
         skipped,
         failed,
+        terminal_failed_skipped: 0,
+    }
+}
+
+fn counts_with_terminal_failed_skipped(
+    performed: usize,
+    skipped: usize,
+    failed: usize,
+    terminal_failed_skipped: usize,
+) -> ExecutionSummary {
+    ExecutionSummary {
+        performed,
+        skipped,
+        failed,
+        terminal_failed_skipped,
     }
 }
 
@@ -554,7 +569,7 @@ async fn apply_does_not_resurrect_failed_intent() {
     // nor refresh its fields nor re-perform it (§2: apply treats Failed as terminal).
     assert_eq!(
         apply(&journal, &executor, &[new_decision]).await,
-        counts(0, 1, 0)
+        counts_with_terminal_failed_skipped(0, 1, 0, 1)
     );
     let intent = journal
         .get(&ikey(key))
@@ -655,6 +670,7 @@ async fn concurrent_drive_performs_once() {
         performed: a.performed + b.performed,
         skipped: a.skipped + b.skipped,
         failed: a.failed + b.failed,
+        terminal_failed_skipped: a.terminal_failed_skipped + b.terminal_failed_skipped,
     };
     assert_eq!(
         combined,

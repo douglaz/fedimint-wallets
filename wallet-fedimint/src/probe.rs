@@ -1,4 +1,4 @@
-//! The "sense" layer (Phase 2 step 2.1): turn each JOINED federation into the real
+//! The "sense" layer (Phase 2 step 2.1): turn each OPEN federation into the real
 //! inputs the pure `wallet_core::scorer::score` / `wallet_core::allocator::decide`
 //! consume (`docs/phase2-plan.md`).
 //!
@@ -24,6 +24,7 @@
 //! (`douglaz/fedimint` @ `b108ec6`).
 
 use crate::multi_client::MultiClient;
+use crate::types::GatewayUrl;
 use fedimint_client::db::ChronologicalOperationLogKey;
 use fedimint_client::ClientHandleArc;
 use fedimint_core::NumPeers;
@@ -61,8 +62,10 @@ pub struct ProbeResult {
     pub quorum_live: bool,
     /// Wall-clock latency (ms) of that threshold read.
     pub latency_ms: u32,
-    /// The federation advertises at least one usable lnv2 gateway (the no-sats
-    /// proxy for "can route a receive/pay").
+    /// The federation has a usable lnv2 gateway route (the no-sats proxy for
+    /// "can route a receive/pay"). If the caller pinned a gateway, this means that
+    /// exact gateway validates for the federation; otherwise it means the federation's
+    /// first registered gateway validates, matching the executor's default selection.
     pub gateway_available: bool,
     /// The wallet (on-chain peg-out) module is present in the authed config (the
     /// no-sats proxy for "peg-out is quotable").
@@ -93,11 +96,11 @@ pub fn assemble_facts(p: &ProbeResult, id: FederationId) -> FederationFacts {
         modules: p.module_kinds.iter().map(|k| module_from_kind(k)).collect(),
         // Own empirical probe: quorum answered a threshold consensus read.
         quorum_live: p.quorum_live,
-        // PROXY (no sats): a usable lnv2 gateway is the stand-in for "a receive/pay
-        // round-trip would succeed". We never perform the real round-trip (decision:
-        // light probes), so gateway availability is what the probe gate reads for
-        // `round_trip_ok`. This fails CLOSED — no advertised gateway reads as
-        // not-routable, the safe direction for a trust gate.
+        // PROXY (no sats): a usable lnv2 gateway route is the stand-in for "a
+        // receive/pay round-trip would succeed". We never perform the real
+        // round-trip (decision: light probes), so gateway availability is what the
+        // probe gate reads for `round_trip_ok`. This fails CLOSED — no usable route
+        // reads as not-routable, the safe direction for a trust gate.
         round_trip_ok: p.gateway_available,
         // PROXY (no sats): the wallet module (the on-chain peg-out path) being
         // present in the authed config is the stand-in for "a peg-out is quotable".
@@ -126,10 +129,10 @@ pub fn assemble_status(p: &ProbeResult, id: FederationId) -> FederationStatus {
             // not sensed from the federation — a fresh probe reserves nothing.
             reserved_fee: Msat(0),
         },
-        // `probed_ok` = BOTH liveness (quorum answered) AND a usable route (a
-        // registered gateway answers `routing_info`): the two no-sats empirical
-        // signals the allocator's receive-gating reads before it directs an inflow
-        // into a federation.
+        // `probed_ok` = BOTH liveness (quorum answered) AND a usable route (the
+        // pinned gateway, if supplied, or the executor-default first registered
+        // gateway answers `routing_info`): the two no-sats empirical signals the allocator's
+        // receive-gating reads before it directs an inflow into a federation.
         probed_ok: p.quorum_live && p.gateway_available,
         // Reputation comes from the Phase-3 Observer; the sense layer is neutral.
         reputation: 0,
@@ -154,10 +157,11 @@ fn module_from_kind(kind: &str) -> Module {
     }
 }
 
-/// Probes each joined federation into a [`ProbeResult`] over a shared [`MultiClient`].
+/// Probes each open federation into a [`ProbeResult`] over a shared [`MultiClient`].
 /// I/O — validated live on devimint, NOT in the rb-lite gate.
 pub struct FedimintProbeRunner {
     mc: Arc<MultiClient>,
+    pinned_gateway: Option<GatewayUrl>,
 }
 
 /// Op-log page size for the pending-balance scan. Paging runs to exhaustion, so this
@@ -166,10 +170,14 @@ const PROBE_OPLOG_PAGE_SIZE: usize = 100;
 
 impl FedimintProbeRunner {
     pub fn new(mc: Arc<MultiClient>) -> Self {
-        Self { mc }
+        Self::with_pinned_gateway(mc, None)
     }
 
-    /// Probe one joined federation. LIGHT — NO sats spent: structural facts from the
+    pub fn with_pinned_gateway(mc: Arc<MultiClient>, pinned_gateway: Option<GatewayUrl>) -> Self {
+        Self { mc, pinned_gateway }
+    }
+
+    /// Probe one open federation. LIGHT — NO sats spent: structural facts from the
     /// authenticated `ClientConfig` (free), empirical fields from light reachability
     /// + capability proxies, never a real receive/pay round-trip.
     pub async fn probe(&self, id: &FederationId) -> anyhow::Result<ProbeResult> {
@@ -223,46 +231,15 @@ impl FedimintProbeRunner {
         let quorum_live = client.api().session_count().await.is_ok();
         let latency_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
 
-        // `gateway_available`: at least one registered lnv2 gateway answers
-        // `routing_info` for this federation. NOTE (runbook §4): devimint does NOT
-        // auto-register its LDK gateway here, so this can read empty even when a
-        // usable gateway exists — the live validation passes the gateway URL directly
-        // in that case. As the `round_trip_ok` proxy this fails CLOSED: a missing
-        // lnv2 module, empty list, stale/unreachable gateway, or unreachable gateway
+        // `gateway_available`: a pinned lnv2 gateway, if supplied, must answer
+        // `routing_info` for this federation; otherwise the executor-default first registered
+        // lnv2 gateway must answer. NOTE (runbook §4): devimint does NOT auto-register its
+        // LDK gateway, so the live tick passes that gateway URL directly. As the
+        // `round_trip_ok` proxy this fails CLOSED: a missing lnv2 module, empty list,
+        // stale/unreachable gateway, invalid pinned gateway, or unreachable gateway
         // registry all read as not-routable, producing a scorable `ProbeResult`
         // instead of hiding a dead federation behind `Err`.
-        let gateway_available = if has_lnv2 {
-            match self.mc.gateways(id).await {
-                Ok(gateways) => {
-                    let mut usable = false;
-                    for gateway in gateways {
-                        match self.mc.validate_gateway(id, &gateway).await {
-                            Ok(()) => {
-                                usable = true;
-                                break;
-                            }
-                            Err(e) => tracing::warn!(
-                                federation = %id.to_hex(),
-                                gateway = %gateway.0,
-                                error = ?e,
-                                "probe: registered gateway failed routing-info validation"
-                            ),
-                        }
-                    }
-                    usable
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        federation = %id.to_hex(),
-                        error = ?e,
-                        "probe: treating gateway registry read failure as unavailable"
-                    );
-                    false
-                }
-            }
-        } else {
-            false
-        };
+        let gateway_available = self.gateway_available(id, has_lnv2).await;
 
         // ---- Balance (msat) ----
         // `?` here (and on `get_first_module` for `is_mainnet` above) is intentional and
@@ -298,6 +275,55 @@ impl FedimintProbeRunner {
             in_flight_msat,
             claimable_msat,
         })
+    }
+
+    async fn gateway_available(&self, id: &FederationId, has_lnv2: bool) -> bool {
+        if !has_lnv2 {
+            return false;
+        }
+
+        if let Some(gateway) = &self.pinned_gateway {
+            return match self.mc.validate_gateway(id, gateway).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        federation = %id.to_hex(),
+                        gateway = %gateway.0,
+                        error = ?e,
+                        "probe: pinned gateway failed routing-info validation"
+                    );
+                    false
+                }
+            };
+        }
+
+        match self.mc.gateways(id).await {
+            Ok(gateways) => {
+                let Some(gateway) = gateways.into_iter().next() else {
+                    return false;
+                };
+                match self.mc.validate_gateway(id, &gateway).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            federation = %id.to_hex(),
+                            gateway = %gateway.0,
+                            error = ?e,
+                            "probe: default registered gateway failed routing-info validation"
+                        );
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    federation = %id.to_hex(),
+                    error = ?e,
+                    "probe: treating gateway registry read failure as unavailable"
+                );
+                false
+            }
+        }
     }
 }
 

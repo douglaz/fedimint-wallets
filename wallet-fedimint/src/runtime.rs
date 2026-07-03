@@ -24,11 +24,16 @@ use crate::executor::FedimintExecutor;
 use crate::journal::FedimintJournal;
 use crate::move_protocol::{MovePhase, MoveRecord};
 use crate::multi_client::{MultiClient, ReceiveState};
+use crate::probe::{assemble_facts, assemble_status, FedimintProbeRunner, ProbeResult};
+use crate::tick::{
+    build_snapshot, decisions_to_apply, pinned_input_problems, ScoredFed, StatusReport, TickPolicy,
+    TickReport,
+};
 use crate::types::{GatewayUrl, Invoice};
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 use wallet_core::{
-    Action, AllocatorDecision, ExecError, FederationId, IdempotencyKey, IntentStatus, Journal,
-    Msat, Occurrence, ReasonCode,
+    score, Action, AllocatorDecision, AllocatorSnapshot, ExecError, FederationId, IdempotencyKey,
+    IntentStatus, Journal, Msat, Occurrence, ReasonCode, ScorerPolicy,
 };
 
 /// The result of a [`Runtime::direct_inflow`] call: the intent's key (the durable handle the
@@ -74,6 +79,27 @@ pub struct ReconcileSummary {
     pub skipped: usize,
     pub awaiting: usize,
     pub awaiting_keys: Vec<IdempotencyKey>,
+}
+
+struct TickPlan {
+    raw_probes: Vec<(FederationId, ProbeResult)>,
+    probes: Vec<(FederationId, ProbeResult)>,
+    snapshot: AllocatorSnapshot,
+    decisions: Vec<AllocatorDecision>,
+}
+
+struct MoveRouteProblem {
+    from: FederationId,
+    to: FederationId,
+    mark_unavailable: FederationId,
+    gateway: Option<GatewayUrl>,
+    error: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalReplay {
+    key: IdempotencyKey,
+    status: IntentStatus,
 }
 
 /// The engine façade over one wallet's shared fedimint clients + journal (spec §9).
@@ -376,6 +402,320 @@ impl Runtime {
         })
     }
 
+    /// ONE orchestrator tick (Phase 2 step 2.2, `docs/phase2-plan.md`): probe every open
+    /// federation → build the `AllocatorSnapshot` (via `build_snapshot` — `score()` +
+    /// designation) → `decide()` → `wallet_core::apply` the decisions through the Phase-1
+    /// [`FedimintExecutor`], which performs the resulting `Move`s (each synchronous to `Done`).
+    /// Advisory `RefuseInflow`/`Cap` decisions are surfaced in the returned [`TickReport`] but
+    /// never executed (`apply` skips them); an `Evacuate` (a Phase-3 non-goal the executor still
+    /// reports `Unsupported`) is likewise surfaced but withheld from `apply` (via
+    /// [`decisions_to_apply`]) so it never lands as a misleading terminal `Failed` intent.
+    /// Returns the FULL decision list + the [`ExecutionSummary`].
+    ///
+    /// The scorer runs at [`ScorerPolicy::default`] (the v1 structural floor); the money policy
+    /// (caps/targets/fees + designation) comes from `policy`. A `Move` needs a routable shared
+    /// gateway — supply it as this runtime's pinned gateway (devimint does not auto-register its
+    /// LDK gateway; §4), exactly as `do_move` does. The probe route gate validates that same
+    /// pinned gateway when present, so decisions match the route the executor will use.
+    pub async fn tick(&self, policy: &TickPolicy) -> anyhow::Result<TickReport> {
+        let plan = self.plan_tick(policy, &ScorerPolicy::default()).await;
+        // A tick is a money op: an operator-pinned fed that could not be sensed or failed the
+        // lnv2/probe gate this pass means the requested rebalance was NOT evaluated. Fail LOUDLY
+        // (non-zero exit) rather than let `decide` degrade it to an advisory `RefuseInflow` that
+        // `apply` skips, which would report a false success to a scheduler gating on the exit code.
+        let problems = pinned_input_problems(policy, &plan.snapshot, &plan.probes, &plan.decisions);
+        anyhow::ensure!(problems.is_empty(), "tick: {}", problems.join("; "));
+        self.ensure_fresh_tick_decisions(&plan.decisions, policy.occurrence)
+            .await?;
+        let executor = self.executor();
+        let summary = wallet_core::apply(
+            self.journal.as_ref(),
+            &executor,
+            &decisions_to_apply(&plan.decisions),
+        )
+        .await;
+        Ok(TickReport {
+            decisions: plan.decisions,
+            summary,
+        })
+    }
+
+    /// A DRY-RUN tick (Phase 2 step 2.2): probe → `score()` → `build_snapshot` → `decide()`, but
+    /// DO NOT apply. Returns the per-fed scored view (each fed's `FederationVerdict` +
+    /// `FederationStatus`), the designation `build_snapshot` chose, and the decisions that WOULD
+    /// run. No money moves — this is `wallet-cli status`.
+    ///
+    /// Unlike [`Runtime::tick`], `status` does NOT bail on an unsensed / unusable pin: its whole
+    /// job is to SHOW the operator why a tick would fail, so hard-failing before assembling the
+    /// scored view would blank out exactly the diagnostic they ran it for. It surfaces each such
+    /// pin problem as a `warn!` (to stderr) and still returns the full scored view + would-run
+    /// decisions. The route check reflects the pinned gateway when one was supplied, same as `tick`.
+    pub async fn status(&self, policy: &TickPolicy) -> anyhow::Result<StatusReport> {
+        let scorer_policy = ScorerPolicy::default();
+        let plan = self.plan_tick(policy, &scorer_policy).await;
+        // Surface (do NOT bail on) any pinned-input problem the equivalent `tick` would fail on, so
+        // the operator sees BOTH the warning and the full scored view that explains it.
+        for problem in pinned_input_problems(policy, &plan.snapshot, &plan.probes, &plan.decisions)
+        {
+            tracing::warn!("status: {problem}");
+        }
+        match self
+            .terminal_replayed_executable_decisions(&plan.decisions)
+            .await
+        {
+            Ok(replays) if !replays.is_empty() => tracing::warn!(
+                "status: occurrence {} would replay already-terminal/subscription-owned decision(s) {}; \
+                 tick will fail until --occurrence is advanced",
+                policy.occurrence.0,
+                describe_terminal_replays(&replays)
+            ),
+            Err(e) => tracing::warn!(
+                "status: could not check whether this occurrence replays terminal decisions: {e}"
+            ),
+            _ => {}
+        }
+        let scored = plan
+            .raw_probes
+            .iter()
+            .map(|(id, probe)| ScoredFed {
+                id: *id,
+                verdict: score(&assemble_facts(probe, *id), &scorer_policy),
+                status: assemble_status(probe, *id),
+            })
+            .collect();
+        Ok(StatusReport {
+            scored,
+            spending_fed: plan.snapshot.spending_fed,
+            standby_fed: plan.snapshot.standby_fed,
+            decisions: plan.decisions,
+        })
+    }
+
+    /// Probe, build, decide, and fold executor-route facts back into the probe view before the
+    /// caller either reports a dry run or applies money moves.
+    ///
+    /// Without an explicit `--gateway`, the executor routes each fresh `Move` through the
+    /// destination federation's FIRST registered gateway, then requires that same gateway to serve
+    /// the source. The raw probe only knows whether each federation has some usable gateway. This
+    /// loop validates the exact executor route for each FRESH decided `Move`; when a destination's
+    /// concrete route cannot serve the planned source, that destination is marked unavailable in
+    /// the planning copy and the pure `build_snapshot`/`decide` path runs again. Same-key replays
+    /// are left to `apply`, which resumes the stored intent and its cached `MoveRecord` gateway.
+    /// `status` still reports the RAW scored probe view so a route-revision does not relabel a
+    /// healthy federation as generally unprobed just because this tick's concrete move route failed.
+    async fn plan_tick(&self, policy: &TickPolicy, scorer_policy: &ScorerPolicy) -> TickPlan {
+        let raw_probes = self.probe_all().await;
+        let mut probes = raw_probes.clone();
+        let mut route_revisions = 0usize;
+        loop {
+            let snapshot = build_snapshot(&probes, policy, scorer_policy);
+            let decisions = wallet_core::decide(&snapshot, policy.occurrence);
+            let Some(problem) = self.first_move_route_problem(&decisions).await else {
+                return TickPlan {
+                    raw_probes,
+                    probes,
+                    snapshot,
+                    decisions,
+                };
+            };
+
+            let changed = mark_gateway_unavailable(&mut probes, problem.mark_unavailable);
+            tracing::warn!(
+                from = %problem.from.to_hex(),
+                to = %problem.to.to_hex(),
+                marked_unavailable = %problem.mark_unavailable.to_hex(),
+                gateway = %problem.gateway.as_ref().map(|g| g.0.as_str()).unwrap_or("<none>"),
+                error = %problem.error,
+                "tick: planned move route failed executor gateway validation; revising this tick's fundable set"
+            );
+            if !changed {
+                return TickPlan {
+                    raw_probes,
+                    probes,
+                    snapshot,
+                    decisions,
+                };
+            }
+            route_revisions += 1;
+            if route_revisions > probes.len() {
+                return TickPlan {
+                    raw_probes,
+                    probes,
+                    snapshot,
+                    decisions,
+                };
+            }
+        }
+    }
+
+    async fn ensure_fresh_tick_decisions(
+        &self,
+        decisions: &[AllocatorDecision],
+        occurrence: Occurrence,
+    ) -> anyhow::Result<()> {
+        let replays = self
+            .terminal_replayed_executable_decisions(decisions)
+            .await?;
+        anyhow::ensure!(
+            replays.is_empty(),
+            "tick: occurrence {} would replay already-terminal/subscription-owned decision(s) {}; pass a fresh \
+             --occurrence for a new rebalance, or use the same occurrence only to retry a \
+             Pending/Executing tick",
+            occurrence.0,
+            describe_terminal_replays(&replays)
+        );
+        Ok(())
+    }
+
+    /// The same-occurrence decisions whose key already maps to an intent `apply` treats as
+    /// TERMINAL, so re-driving them this tick is impossible without a fresh `--occurrence`. This
+    /// MUST mirror `apply`'s terminal set (`wallet-core/src/executor.rs`): `Done` (idempotent
+    /// replay of a settled intent), `Awaiting` (a `DirectInflow` owned by its subscription), and
+    /// `Failed` (terminal until a manual reset — a recurring tick must not resurrect it). `apply`
+    /// skips a `Failed` replay as `terminal_failed_skipped`, which `wallet-cli` turns into a
+    /// non-zero tick exit; including it here lets `tick` fail early with the "advance --occurrence"
+    /// remedy and lets the `status` dry run surface the SAME stale-occurrence signal.
+    async fn terminal_replayed_executable_decisions(
+        &self,
+        decisions: &[AllocatorDecision],
+    ) -> anyhow::Result<Vec<TerminalReplay>> {
+        let mut replays = Vec::new();
+        let mut seen = BTreeSet::new();
+        for decision in decisions {
+            if !tick_applies_decision(decision) || !seen.insert(decision.idempotency_key.clone()) {
+                continue;
+            }
+            if let Some(intent) = self
+                .journal
+                .get(&decision.idempotency_key)
+                .await
+                .map_err(exec_err)?
+            {
+                if matches!(
+                    intent.status,
+                    IntentStatus::Done | IntentStatus::Awaiting | IntentStatus::Failed
+                ) {
+                    replays.push(TerminalReplay {
+                        key: decision.idempotency_key.clone(),
+                        status: intent.status,
+                    });
+                }
+            }
+        }
+        Ok(replays)
+    }
+
+    async fn first_move_route_problem(
+        &self,
+        decisions: &[AllocatorDecision],
+    ) -> Option<MoveRouteProblem> {
+        for decision in decisions {
+            if let Action::Move { from, to, .. } = &decision.action {
+                if self.has_existing_intent(decision).await {
+                    continue;
+                }
+                if let Err(problem) = self.validate_executor_move_route(*from, *to).await {
+                    return Some(problem);
+                }
+            }
+        }
+        None
+    }
+
+    async fn has_existing_intent(&self, decision: &AllocatorDecision) -> bool {
+        match self.journal.get(&decision.idempotency_key).await {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(
+                    key = %decision.idempotency_key.0,
+                    error = ?e,
+                    "tick: could not read existing intent before route preflight; leaving route validation to apply"
+                );
+                true
+            }
+        }
+    }
+
+    async fn validate_executor_move_route(
+        &self,
+        from: FederationId,
+        to: FederationId,
+    ) -> Result<(), MoveRouteProblem> {
+        let gateway = match self.executor_gateway_for(&to).await {
+            Ok(gateway) => gateway,
+            Err(error) => {
+                return Err(MoveRouteProblem {
+                    from,
+                    to,
+                    mark_unavailable: to,
+                    gateway: None,
+                    error,
+                });
+            }
+        };
+
+        if let Err(e) = self.mc.validate_gateway(&to, &gateway).await {
+            return Err(MoveRouteProblem {
+                from,
+                to,
+                mark_unavailable: to,
+                gateway: Some(gateway),
+                error: format!("destination gateway validation failed: {e}"),
+            });
+        }
+        if let Err(e) = self.mc.validate_gateway(&from, &gateway).await {
+            return Err(MoveRouteProblem {
+                from,
+                to,
+                mark_unavailable: to,
+                gateway: Some(gateway),
+                error: format!("source gateway validation failed: {e}"),
+            });
+        }
+        Ok(())
+    }
+
+    async fn executor_gateway_for(&self, to: &FederationId) -> Result<GatewayUrl, String> {
+        if let Some(gateway) = &self.pinned_gateway {
+            return Ok(gateway.clone());
+        }
+        self.mc
+            .gateways(to)
+            .await
+            .map_err(|e| format!("listing destination gateways failed: {e}"))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                format!(
+                    "no lnv2 gateway registered for destination federation {}",
+                    to.to_hex()
+                )
+            })
+    }
+
+    /// Probe every OPEN federation into a `(FederationId, ProbeResult)` list, BEST-EFFORT: a fed
+    /// whose probe errors (a local db/config read genuinely failed) is warn-logged and skipped,
+    /// mirroring [`MultiClient::open_all`]'s poison-tolerance so one un-probeable fed cannot
+    /// strand the whole tick. A skipped fed simply drops out of the snapshot — the allocator then
+    /// cannot fund it or from it, which is the safe degradation (never a bad move).
+    async fn probe_all(&self) -> Vec<(FederationId, ProbeResult)> {
+        let runner =
+            FedimintProbeRunner::with_pinned_gateway(self.mc.clone(), self.pinned_gateway.clone());
+        let mut probes = Vec::new();
+        for id in self.mc.federations() {
+            match runner.probe(&id).await {
+                Ok(probe) => probes.push((id, probe)),
+                Err(e) => tracing::warn!(
+                    federation = %id.to_hex(),
+                    error = ?e,
+                    "tick: skipping federation that failed to probe"
+                ),
+            }
+        }
+        probes
+    }
+
     /// Persist the settled/failed phase (+ optional outcome message) of a finalized move's
     /// `MoveRecord`, keeping the derived cache consistent with the intent's terminal status.
     async fn settle_move(
@@ -482,6 +822,39 @@ fn move_key(
     ))
 }
 
+fn mark_gateway_unavailable(probes: &mut [(FederationId, ProbeResult)], id: FederationId) -> bool {
+    let Some((_, probe)) = probes.iter_mut().find(|(probe_id, _)| *probe_id == id) else {
+        return false;
+    };
+    if !probe.gateway_available {
+        return false;
+    }
+    probe.gateway_available = false;
+    true
+}
+
+fn tick_applies_decision(decision: &AllocatorDecision) -> bool {
+    decision.action.is_executable() && !matches!(decision.action, Action::Evacuate { .. })
+}
+
+fn describe_terminal_replays(replays: &[TerminalReplay]) -> String {
+    replays
+        .iter()
+        .map(|replay| format!("{} ({})", replay.key.0, intent_status_label(replay.status)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn intent_status_label(status: IntentStatus) -> &'static str {
+    match status {
+        IntentStatus::Pending => "pending",
+        IntentStatus::Executing => "executing",
+        IntentStatus::Done => "done",
+        IntentStatus::Awaiting => "awaiting",
+        IntentStatus::Failed => "failed",
+    }
+}
+
 /// Bridge an [`ExecError`] into an `anyhow::Error` for the CLI surface. `ExecError` carries its
 /// diagnostic string in the variant, so `Debug` renders the useful context.
 fn exec_err(e: ExecError) -> anyhow::Error {
@@ -539,6 +912,21 @@ mod tests {
             send_op: None,
             phase,
             outcome: outcome.map(str::to_string),
+        }
+    }
+
+    fn tick_move_decision(key: &str, from: FederationId, to: FederationId) -> AllocatorDecision {
+        AllocatorDecision {
+            action: Action::Move {
+                from,
+                to,
+                amount: Msat(100_000),
+                fee_cap: Msat(1_000),
+            },
+            reason: ReasonCode::StandbyBelowTarget,
+            occurrence: Occurrence(0),
+            idempotency_key: IdempotencyKey(key.to_string()),
+            requires_auth: false,
         }
     }
 
@@ -721,6 +1109,149 @@ mod tests {
             journal.get(&key).await.expect("get").map(|i| i.status),
             Some(IntentStatus::Failed)
         );
+    }
+
+    #[tokio::test]
+    async fn tick_bails_when_a_pinned_fed_cannot_be_probed() {
+        // The fixture has NO joined federations, so `probe_all` yields an empty batch and any
+        // pinned fed is necessarily absent from the snapshot. A tick pinning a spending fed must
+        // therefore fail LOUDLY (so a scheduler gating on the exit code never mistakes an
+        // un-evaluated, explicitly-pinned rebalance for success) rather than report `decisions:
+        // none` and exit 0. An UNPINNED (fully auto) tick over the same empty batch is a no-op, not
+        // an error — auto designation degrades safely.
+        let (runtime, _journal) = runtime_fixture().await;
+        let pinned = TickPolicy {
+            spending_fed: Some(FED_A),
+            ..TickPolicy::default()
+        };
+        let err = runtime
+            .tick(&pinned)
+            .await
+            .expect_err("a pinned fed that cannot be probed must fail the tick");
+        assert!(err.to_string().contains("failed to probe"), "{err}");
+
+        let report = runtime
+            .tick(&TickPolicy::default())
+            .await
+            .expect("an all-auto tick over an empty fed set is a clean no-op");
+        assert!(report.decisions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tick_route_preflight_skips_existing_move_intents() {
+        let (runtime, journal) = runtime_fixture().await;
+        let decision = tick_move_decision("move-existing", FED_A, FED_B);
+        journal
+            .upsert(&Intent::from_decision(&decision))
+            .await
+            .expect("upsert existing move intent");
+
+        let problem = runtime
+            .first_move_route_problem(std::slice::from_ref(&decision))
+            .await;
+
+        assert!(
+            problem.is_none(),
+            "same-key replay must be left to apply/executor so it can reuse the stored intent and cached gateway"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_route_preflight_checks_fresh_move_intents() {
+        let (runtime, _journal) = runtime_fixture().await;
+        let decision = tick_move_decision("move-fresh", FED_A, FED_B);
+
+        let problem = runtime
+            .first_move_route_problem(std::slice::from_ref(&decision))
+            .await
+            .expect("fresh move should be preflighted against executor gateway selection");
+
+        assert_eq!(problem.from, FED_A);
+        assert_eq!(problem.to, FED_B);
+        assert_eq!(problem.mark_unavailable, FED_B);
+    }
+
+    #[tokio::test]
+    async fn tick_rejects_already_terminal_same_occurrence_replays() {
+        let (runtime, journal) = runtime_fixture().await;
+        let decision = tick_move_decision("move-stale", FED_A, FED_B);
+        let mut done = Intent::from_decision(&decision);
+        done.status = IntentStatus::Done;
+        journal.upsert(&done).await.expect("upsert done intent");
+
+        let replays = runtime
+            .terminal_replayed_executable_decisions(std::slice::from_ref(&decision))
+            .await
+            .expect("freshness scan");
+        assert_eq!(
+            replays,
+            vec![TerminalReplay {
+                key: decision.idempotency_key.clone(),
+                status: IntentStatus::Done,
+            }]
+        );
+
+        let err = runtime
+            .ensure_fresh_tick_decisions(std::slice::from_ref(&decision), Occurrence(0))
+            .await
+            .expect_err("same-occurrence terminal replay must fail a tick");
+        let msg = err.to_string();
+        assert!(msg.contains("already-terminal"), "{msg}");
+        assert!(msg.contains("fresh --occurrence"), "{msg}");
+        assert!(msg.contains("move-stale"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn tick_rejects_failed_same_occurrence_replays() {
+        // A `Failed` intent is terminal in `apply` (skipped as `terminal_failed_skipped`, which the
+        // CLI turns into a non-zero tick exit). The freshness scan must flag it too so `tick` fails
+        // early with the "advance --occurrence" remedy and `status` surfaces the same signal.
+        let (runtime, journal) = runtime_fixture().await;
+        let decision = tick_move_decision("move-failed", FED_A, FED_B);
+        let mut failed = Intent::from_decision(&decision);
+        failed.status = IntentStatus::Failed;
+        journal.upsert(&failed).await.expect("upsert failed intent");
+
+        let replays = runtime
+            .terminal_replayed_executable_decisions(std::slice::from_ref(&decision))
+            .await
+            .expect("freshness scan");
+        assert_eq!(
+            replays,
+            vec![TerminalReplay {
+                key: decision.idempotency_key.clone(),
+                status: IntentStatus::Failed,
+            }]
+        );
+
+        let err = runtime
+            .ensure_fresh_tick_decisions(std::slice::from_ref(&decision), Occurrence(0))
+            .await
+            .expect_err("same-occurrence terminal Failed replay must fail a tick");
+        let msg = err.to_string();
+        assert!(msg.contains("already-terminal"), "{msg}");
+        assert!(msg.contains("fresh --occurrence"), "{msg}");
+        assert!(msg.contains("move-failed"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn tick_freshness_allows_pending_same_occurrence_retries() {
+        let (runtime, journal) = runtime_fixture().await;
+        let decision = tick_move_decision("move-pending", FED_A, FED_B);
+        journal
+            .upsert(&Intent::from_decision(&decision))
+            .await
+            .expect("upsert pending intent");
+
+        assert!(runtime
+            .terminal_replayed_executable_decisions(std::slice::from_ref(&decision))
+            .await
+            .expect("freshness scan")
+            .is_empty());
+        runtime
+            .ensure_fresh_tick_decisions(std::slice::from_ref(&decision), Occurrence(0))
+            .await
+            .expect("pending same-occurrence tick remains retryable");
     }
 
     #[tokio::test]

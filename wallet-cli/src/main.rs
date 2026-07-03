@@ -3,7 +3,7 @@
 //! parses arguments, drives the engine, and formats output. No interactive prompts (the
 //! engine assumes no UI).
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use fedimint_bip39::{Bip39RootSecretStrategy, Mnemonic};
 use fedimint_client::secret::RootSecretStrategy as _;
 use fedimint_client::Client;
@@ -12,10 +12,13 @@ use fedimint_core::invite_code::InviteCode;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use wallet_core::{FederationId, IdempotencyKey, IntentStatus, Msat, Occurrence};
+use wallet_core::{
+    Action, AllocatorDecision, ExecutionSummary, FederationId, IdempotencyKey, IntentStatus, Msat,
+    Occurrence,
+};
 use wallet_fedimint::{
     FedimintJournal, FinalizeOutcome, GatewayUrl, Invoice, MoveOutcome, MultiClient, OperationId,
-    ReceiveState, Runtime, SendOutcome, SendState,
+    ReceiveState, Runtime, ScoredFed, SendOutcome, SendState, TickPolicy,
 };
 
 #[derive(Parser)]
@@ -150,6 +153,64 @@ enum Command {
     /// Re-drive pending intents and rebuild move records from the op-log (spec §9 resume loop):
     /// print performed/failed/skipped/awaiting counts; awaiting intent keys go to stderr.
     Reconcile,
+    /// Run ONE orchestrator tick (Phase 2 step 2.2): probe every open federation, score them,
+    /// build the allocator snapshot from the standing-instruction policy, decide, and APPLY the
+    /// decisions through the executor — the wallet actually rebalances/tops-up. Prints the
+    /// decisions and execution counts to stdout. Recurring schedulers must advance
+    /// `--occurrence` after a settled move; a terminal same-occurrence replay exits non-zero
+    /// instead of silently skipping the same edge forever.
+    Tick {
+        #[command(flatten)]
+        policy: PolicyFlags,
+        /// Shared lnv2 gateway URL routing any rebalance `Move` this tick performs — it must
+        /// serve BOTH endpoints of the move. Defaults to each fed's first registered gateway;
+        /// pass one explicitly against devimint (its LDK gateway is not auto-registered — see
+        /// docs/devimint-runbook.md §4).
+        #[arg(long)]
+        gateway: Option<String>,
+    },
+    /// DRY-RUN a tick (Phase 2 step 2.2): probe, score, and decide, but do NOT apply. Prints the
+    /// per-federation scored view (eligibility, rank, balance) and the decisions that WOULD run.
+    /// Use the same `--occurrence` value you would pass to `tick`; recurring schedulers must
+    /// advance it after a settled move.
+    Status {
+        #[command(flatten)]
+        policy: PolicyFlags,
+        /// Shared lnv2 gateway URL to validate route availability for the dry run. Pass the same
+        /// value as `tick --gateway` against devimint, where the LDK gateway is not
+        /// auto-registered.
+        #[arg(long)]
+        gateway: Option<String>,
+    },
+}
+
+/// The standing-instruction (ADR-0009) flags shared by `tick` and `status`. Every numeric flag
+/// falls back to [`TickPolicy::default`]'s v1 default; the designation flags fall back to
+/// auto-designation from the scored-eligible feds.
+#[derive(Args)]
+struct PolicyFlags {
+    /// Per-fed balance cap (ADR-0018), in millisatoshis.
+    #[arg(long)]
+    per_fed_cap: Option<u64>,
+    /// Target spending-fed balance, in millisatoshis (top up below it).
+    #[arg(long)]
+    spending_target: Option<u64>,
+    /// Target warm-standby balance, in millisatoshis (fund below it).
+    #[arg(long)]
+    standby_target: Option<u64>,
+    /// Per-move fee cap, in millisatoshis.
+    #[arg(long)]
+    max_fee: Option<u64>,
+    /// Pin the spending federation (hex id). Default: auto-designate the best-ranked eligible fed.
+    #[arg(long)]
+    spending: Option<String>,
+    /// Pin the standby federation (hex id). Default: auto-designate the next eligible fed.
+    #[arg(long)]
+    standby: Option<String>,
+    /// Allocation epoch stamped into each decision's idempotency key. Keep it for retrying
+    /// Pending/Executing work; bump it after a settled tick to let the decision recur.
+    #[arg(long, default_value_t = 0)]
+    occurrence: u64,
 }
 
 #[tokio::main]
@@ -385,9 +446,207 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("awaiting: {}", key.0);
             }
         }
+        Command::Tick { policy, gateway } => {
+            let tick_policy = build_tick_policy(&policy, &joined_ids, &open_ids)?;
+            let runtime = Runtime::new(
+                multi_client.clone(),
+                journal.clone(),
+                gateway.map(GatewayUrl),
+            );
+            let report = runtime.tick(&tick_policy).await?;
+            // Decisions + the apply summary -> stdout (the scriptable result).
+            print_decisions(&report.decisions);
+            println!(
+                "performed={} skipped={} failed={} terminal_failed_skipped={}",
+                report.summary.performed,
+                report.summary.skipped,
+                report.summary.failed,
+                report.summary.terminal_failed_skipped
+            );
+            // A tick IS a money operation: if any decision failed to apply, exit NON-ZERO — the
+            // same stance `move`/`await-move`/`direct-inflow` take — so a scheduled caller gating
+            // on the exit code never mistakes a failed rebalance for success. The per-intent reason
+            // is logged to stderr by the executor; stdout already carries the scriptable result.
+            if let Some(msg) = tick_apply_failure(&report.summary) {
+                anyhow::bail!("{msg}");
+            }
+        }
+        Command::Status { policy, gateway } => {
+            let tick_policy = build_tick_policy(&policy, &joined_ids, &open_ids)?;
+            // Dry-run only, but the route gate must match the tick that would apply.
+            let runtime = Runtime::new(
+                multi_client.clone(),
+                journal.clone(),
+                gateway.map(GatewayUrl),
+            );
+            let report = runtime.status(&tick_policy).await?;
+            // The dry-run view -> stdout: designation, the per-fed scored rows, then the
+            // decisions that WOULD run (nothing is applied).
+            println!("spending_fed: {}", opt_fed_hex(report.spending_fed));
+            println!("standby_fed: {}", opt_fed_hex(report.standby_fed));
+            for scored in &report.scored {
+                println!(
+                    "{}",
+                    describe_scored(scored, report.spending_fed, report.standby_fed)
+                );
+            }
+            print_decisions(&report.decisions);
+        }
     }
 
     Ok(())
+}
+
+/// Build a [`TickPolicy`] from the shared policy flags: each numeric flag overrides the v1
+/// default, and each designation flag (when given) is validated as a joined+open federation.
+fn build_tick_policy(
+    flags: &PolicyFlags,
+    joined_ids: &[FederationId],
+    open_ids: &[FederationId],
+) -> anyhow::Result<TickPolicy> {
+    let mut policy = TickPolicy::default();
+    if let Some(v) = flags.per_fed_cap {
+        policy.per_fed_cap = Msat(v);
+    }
+    if let Some(v) = flags.spending_target {
+        policy.target_spending_balance = Msat(v);
+    }
+    if let Some(v) = flags.standby_target {
+        policy.standby_target = Msat(v);
+    }
+    if let Some(v) = flags.max_fee {
+        policy.max_fee = Msat(v);
+    }
+    policy.occurrence = Occurrence(flags.occurrence);
+    if let Some(hex) = flags.spending.as_deref() {
+        policy.spending_fed = Some(select_fed(joined_ids, open_ids, Some(hex))?);
+    }
+    if let Some(hex) = flags.standby.as_deref() {
+        policy.standby_fed = Some(select_fed(joined_ids, open_ids, Some(hex))?);
+    }
+    // Reject pinning both roles to the SAME fed: the allocator treats a self-fund as a no-op,
+    // so this would silently produce no rebalance. Mirror `move`'s `from == to` guard and fail
+    // with a clear diagnostic. (Pinning only one role is fine — `build_snapshot` auto-designates
+    // a DISTINCT counterpart for the other.)
+    if let (Some(spending), Some(standby)) = (policy.spending_fed, policy.standby_fed) {
+        anyhow::ensure!(
+            spending != standby,
+            "--spending and --standby must be different federations (a shared fed is a no-op rebalance)"
+        );
+    }
+    Ok(policy)
+}
+
+/// Print each allocator decision on its own `decision: …` line, or `decisions: none` when the
+/// tick/dry-run produced no decisions.
+fn print_decisions(decisions: &[AllocatorDecision]) {
+    if decisions.is_empty() {
+        println!("decisions: none");
+        return;
+    }
+    for decision in decisions {
+        println!("decision: {}", describe_decision(decision));
+    }
+}
+
+/// The non-zero-exit message for a `tick` whose apply did not settle every executable decision,
+/// or `None` when it did. A tick is a money operation, so — like `move`/`await-move`/
+/// `direct-inflow` — it must exit NON-ZERO on any failed decision, including an existing terminal
+/// `Failed` intent that `apply` skips rather than resurrects. The executor logs each failing
+/// intent's key + reason to stderr.
+fn tick_apply_failure(summary: &ExecutionSummary) -> Option<String> {
+    (summary.failed > 0 || summary.terminal_failed_skipped > 0).then(|| {
+        format!(
+            "tick: {} decision(s) did not apply (performed={} skipped={} failed={} \
+             terminal_failed_skipped={}); check stderr for per-intent reasons. Retryable failures \
+             can be re-driven with reconcile or the same --occurrence; terminal Failed intents \
+             require correcting the input/route and starting a fresh --occurrence",
+            summary.failed + summary.terminal_failed_skipped,
+            summary.performed,
+            summary.skipped,
+            summary.failed,
+            summary.terminal_failed_skipped
+        )
+    })
+}
+
+/// A one-line human description of an allocator decision (its action + reason). The advisory
+/// `RefuseInflow`/`Cap` actions are surfaced here even though `apply` never executes them.
+fn describe_decision(decision: &AllocatorDecision) -> String {
+    match &decision.action {
+        Action::Move {
+            from,
+            to,
+            amount,
+            fee_cap,
+        } => format!(
+            "move {} msat {} -> {} (fee_cap {} msat, reason {:?})",
+            amount.0,
+            from.to_hex(),
+            to.to_hex(),
+            fee_cap.0,
+            decision.reason
+        ),
+        Action::DirectInflow {
+            to,
+            amount,
+            fee_cap,
+        } => format!(
+            "direct-inflow {} msat -> {} (fee_cap {} msat, reason {:?})",
+            amount.0,
+            to.to_hex(),
+            fee_cap.0,
+            decision.reason
+        ),
+        Action::Evacuate {
+            from,
+            to,
+            amount,
+            fee_cap,
+        } => format!(
+            "evacuate {} msat {} -> {} (fee_cap {} msat, reason {:?})",
+            amount.0,
+            from.to_hex(),
+            to.to_hex(),
+            fee_cap.0,
+            decision.reason
+        ),
+        Action::RefuseInflow { fed, reason } => {
+            format!("refuse-inflow {} (reason {reason:?})", fed.to_hex())
+        }
+        Action::Cap { fed, reason } => format!("cap {} (reason {reason:?})", fed.to_hex()),
+    }
+}
+
+/// A one-line human description of a federation's scored view for `status`: its designated role
+/// (if any), fundability verdict, rank, spendable balance, and probe/health flags.
+fn describe_scored(
+    scored: &ScoredFed,
+    spending: Option<FederationId>,
+    standby: Option<FederationId>,
+) -> String {
+    let role = if Some(scored.id) == spending {
+        " [spending]"
+    } else if Some(scored.id) == standby {
+        " [standby]"
+    } else {
+        ""
+    };
+    format!(
+        "{}{role} eligible={} rank={} spendable={} msat probed_ok={} healthy={} reasons={:?}",
+        scored.id.to_hex(),
+        scored.verdict.eligible_to_fund,
+        scored.verdict.rank_score,
+        scored.status.balance.spendable.0,
+        scored.status.probed_ok,
+        scored.status.healthy,
+        scored.verdict.reasons,
+    )
+}
+
+/// A federation id as hex, or the literal `none` for an undesignated slot.
+fn opt_fed_hex(id: Option<FederationId>) -> String {
+    id.map_or_else(|| "none".to_string(), |fed| fed.to_hex())
 }
 
 /// A deliberately loose default receive-side fee cap for a CLI `direct-inflow`: the net amount
@@ -709,6 +968,83 @@ mod tests {
         assert!(msg.contains("re-drivable"), "{msg}");
         assert!(msg.contains("reconcile"), "{msg}");
         assert!(msg.contains("--occurrence"), "{msg}");
+    }
+
+    fn policy_flags_with_designation(
+        spending: Option<String>,
+        standby: Option<String>,
+    ) -> PolicyFlags {
+        PolicyFlags {
+            per_fed_cap: None,
+            spending_target: None,
+            standby_target: None,
+            max_fee: None,
+            spending,
+            standby,
+            occurrence: 0,
+        }
+    }
+
+    #[test]
+    fn build_tick_policy_rejects_equal_spending_and_standby() {
+        // Pinning both roles to the same fed is a silent no-op rebalance; reject it with a
+        // diagnostic, matching `move`'s `from == to` stance.
+        let a = fed(1);
+        let flags = policy_flags_with_designation(Some(a.to_hex()), Some(a.to_hex()));
+        let err = build_tick_policy(&flags, &[a], &[a]).expect_err("equal pin must be rejected");
+        assert!(
+            err.to_string().contains("must be different federations"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn build_tick_policy_accepts_a_single_pinned_role() {
+        // Pinning only one role is legitimate — the other is auto-designated distinctly by
+        // `build_snapshot`, so `build_tick_policy` must not reject it.
+        let a = fed(1);
+        let b = fed(2);
+        let flags = policy_flags_with_designation(Some(a.to_hex()), None);
+        let policy = build_tick_policy(&flags, &[a, b], &[a, b]).expect("single pin is valid");
+        assert_eq!(policy.spending_fed, Some(a));
+        assert_eq!(policy.standby_fed, None);
+    }
+
+    #[test]
+    fn tick_apply_failure_fires_only_when_a_decision_failed() {
+        // A clean tick (nothing failed) exits zero — no failure message.
+        let clean = ExecutionSummary {
+            performed: 2,
+            skipped: 1,
+            failed: 0,
+            terminal_failed_skipped: 0,
+        };
+        assert!(tick_apply_failure(&clean).is_none());
+
+        // Any failed decision (a retryable `Pending` OR a permanent `Failed`, both counted as
+        // `failed` by `apply`) must produce a non-zero-exit message, matching the money-op
+        // exit-code convention `move`/`await-move`/`direct-inflow` already follow.
+        let failed = ExecutionSummary {
+            performed: 1,
+            skipped: 0,
+            failed: 1,
+            terminal_failed_skipped: 0,
+        };
+        let msg = tick_apply_failure(&failed).expect("a failed decision must fail the tick");
+        assert!(msg.contains("did not apply"), "{msg}");
+        assert!(msg.contains("failed=1"), "{msg}");
+        assert!(msg.contains("Retryable failures"), "{msg}");
+
+        let terminal_skip = ExecutionSummary {
+            performed: 0,
+            skipped: 1,
+            failed: 0,
+            terminal_failed_skipped: 1,
+        };
+        let msg =
+            tick_apply_failure(&terminal_skip).expect("a terminal Failed skip must fail the tick");
+        assert!(msg.contains("terminal_failed_skipped=1"), "{msg}");
+        assert!(msg.contains("fresh --occurrence"), "{msg}");
     }
 
     #[test]
