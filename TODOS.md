@@ -171,9 +171,11 @@ Full findings in [docs/reviews/2026-07-03-engine-review.md](./docs/reviews/2026-
 build plan in [docs/phase4-plan.md](./docs/phase4-plan.md); sequence in
 [docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md).
 
-- [ ] **R1 (P1, scorer)** Reject `threshold == 0 || threshold > guardian_count` in the structural
-  floor + clamp the rank term — an impossible-quorum config currently passes AND ranks highest.
-  Decide proportional-threshold stance (3-of-100 passes today).
+- [ ] **R1 (P2, scorer — must land before 3.B)** Reject `threshold == 0 || threshold >
+  guardian_count` in the structural floor + clamp the rank term — an impossible-quorum config
+  passes AND ranks highest. Not reachable via today's probe (threshold is derived `2f+1`), but
+  the scorer is the trust boundary and 3.B's discovery assemblers will feed it
+  attacker-influenced facts. Decide proportional-threshold stance too.
 - [ ] **R2 (P1, executor)** Quote send-leg fees on the outgoing-contract amount (both gateway ppm
   and fed fee are quoted on the smaller invoice amount today), so `fee_cap` hard-bounds BOTH legs.
 - [ ] **R3 (P1, executor)** Success-send + failed-receive must not be terminal `Failed` with the

@@ -37,7 +37,11 @@ pub struct OperationRecord {
     /// §3 rule 5): `pay:<fed>:<payment_hash>` (from the invoice, pre-call — also matching
     /// lnv2's own dedup), `recv:<fed>:<nonce>` (pre-generated, embedded in the op's
     /// `custom_meta`), `join:<fed>:<nonce>` (PER ATTEMPT — a failed join then a successful
-    /// retry are two rows). Exactly one ledger row per correlation key.
+    /// retry are two rows), `tick:<occurrence>:<nonce>` (PER RUN — each tick invocation is
+    /// its own row, created `Started` before deciding and advanced to terminal with the
+    /// counts; a crash mid-tick truthfully leaves a `Started` tick row, while the tick's
+    /// individual moves remain covered by their own intent-keyed rows).
+    /// Exactly one ledger row per correlation key.
     pub correlation_key: IdempotencyKey,
     pub kind: OperationKind,
     /// Who initiated it — THE audit discriminator ADR-0014 needs.
@@ -66,10 +70,11 @@ pub enum OperationStatus { Started, Awaiting, Succeeded, Failed }
 /// Typed, complete per-kind details. Amounts are NET unless stated.
 pub enum OperationKind {
     Join     { fed: FederationId },
-    /// Raw LN receive (user verb; journal-less today but ledger-recorded).
-    Receive  { fed: FederationId, amount: Msat, op_id: OperationId, gateway: Option<GatewayUrl> },
-    /// Raw LN pay (user verb).
-    Pay      { fed: FederationId, invoice_amount: Msat, op_id: OperationId, gateway: Option<GatewayUrl> },
+    /// Raw LN receive (user verb; journal-less today but ledger-recorded). `op_id` is
+    /// None on the pre-call `Started` row (§3 rule 5) and filled post-call/by backfill.
+    Receive  { fed: FederationId, amount: Msat, op_id: Option<OperationId>, gateway: Option<GatewayUrl> },
+    /// Raw LN pay (user verb). `op_id` optional for the same pre-call reason.
+    Pay      { fed: FederationId, invoice_amount: Msat, op_id: Option<OperationId>, gateway: Option<GatewayUrl> },
     /// Executor-driven inflow netting exactly `amount`.
     DirectInflow { to: FederationId, amount: Msat, recv_op: Option<OperationId>, gateway: GatewayUrl },
     /// Cross-fed move/evacuation: BOTH legs correlated in one row.
