@@ -164,3 +164,27 @@ state machine. See [docs/integration-phase-plan.md](./docs/integration-phase-pla
 - [x] **Inflow-direction first** — `DirectInflow` is the cheap primary lever + built before the swap
   (receive path validated live; `DirectInflow`-nets-amount is in the deferred 4b-live gate).
 - [ ] **Honesty (ties to T5):** after ADR-0006, v1 holds ~2 active feds; "allocates across many federations" is the candidate/discovery universe + a v2 promise. Keep product copy honest.
+
+## Engine + spec review backlog (2026-07-03) — Phase 4 after 3.A merges
+
+Full findings in [docs/reviews/2026-07-03-engine-review.md](./docs/reviews/2026-07-03-engine-review.md);
+build plan in [docs/phase4-plan.md](./docs/phase4-plan.md); sequence in
+[docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md).
+
+- [ ] **R1 (P1, scorer)** Reject `threshold == 0 || threshold > guardian_count` in the structural
+  floor + clamp the rank term — an impossible-quorum config currently passes AND ranks highest.
+  Decide proportional-threshold stance (3-of-100 passes today).
+- [ ] **R2 (P1, executor)** Quote send-leg fees on the outgoing-contract amount (both gateway ppm
+  and fed fee are quoted on the smaller invoice amount today), so `fee_cap` hard-bounds BOTH legs.
+- [ ] **R3 (P1, executor)** Success-send + failed-receive must not be terminal `Failed` with the
+  preimage discarded: persist the preimage on the `MoveRecord`, keep the claim retryable (or a
+  loud `Stranded` phase) — never a silent terminal loss.
+- [ ] **R4 (P0, product)** Append-only operation ledger + `wallet-cli history`/`show` per
+  [docs/operation-history-spec.md](./docs/operation-history-spec.md): timestamps, real reasons,
+  actual fees, actor (user vs agent), failures + refusals recorded — today NONE of these persist
+  and completed ops are unscannable. This is the ADR-0014 auditability substrate.
+- [ ] **R5 (P2, allocator)** `Ord` tie-break in `safest_other`; per-tick cap/balance reservation
+  (two evacuations can jointly over-fill one destination at N>=3); document the deliberate
+  source-side trust asymmetry.
+- [ ] **R6 (P3, cleanup)** Drop dead surface: `Action::Cap` (no producer), `requires_auth`
+  (always false, never read); wire `AllocatorSnapshot.now` (CLI passes real time) or drop it.
