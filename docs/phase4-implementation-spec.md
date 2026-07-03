@@ -83,11 +83,14 @@ send-side fixed point is needed (gateway on invoice; federation on contract; no 
    let send_quote = Msat(gw_cost.saturating_add(fed_fee.0));
    ```
    `total_within_cap(receive_quote, send_quote, rec.fee_cap)` unchanged.
-3. **Persist the quotes** on the `MoveRecord` (new fields, §3's table): at the `Pay` arm's
-   existing `put_move` (after the send commits), set
-   `rec.send_fee_quoted = Some(send_quote)`; the receive-side cost is derivable
-   (`invoice_amount − amount`) but store it too at `CreateInvoice`'s `put_move`
-   (`rec.receive_fee = Some(receive_quote)`) so the ledger (§9) never re-parses invoices.
+3. **Persist the quotes** on the `MoveRecord` (new fields, §3's table) — BEFORE the cap
+   check: in the `Pay` arm, once `send_quote` is computed, set
+   `rec.send_fee_quoted = Some(send_quote)` and `put_move` FIRST, THEN run
+   `total_within_cap` — the paradigm failure this field must explain is precisely the
+   "fee over cap" refusal, which returns before any send commits (persisting a quote on a
+   refused move is safe: it is a derived cache write, no money moves). The receive-side cost
+   is stored at `CreateInvoice`'s `put_move` (`rec.receive_fee = Some(receive_quote)`) so the
+   ledger (§9) never re-parses invoices.
 
 Tests: golden on the arithmetic helper (extract
 `fn send_quote(invoice_msat, gw_fee, fed_fee_on_contract) -> Msat` into `fee.rs` if that
@@ -267,7 +270,14 @@ Pure helpers, golden-tested in `wallet-core`:
 2. `Intent` gains `reason: ReasonCode`, `actor: Actor`, `created_at_ms: u64`.
    `Intent::from_decision(decision: &AllocatorDecision, actor: Actor, now_ms: u64)` — the two
    new parameters are threaded from `apply`:
-3. `apply(journal, executor, decisions, actor: Actor, now_ms: u64)` (and NOT `reconcile` —
+3. **Failure strings reach the ledger:** `Journal::set_status` gains an error parameter —
+   `set_status(key, status, error: Option<&str>)` (greenfield trait change; `MemJournal` and
+   all test doubles updated mechanically). `drive()` passes the `ExecError`'s diagnostic
+   string on the `Permanent`/`Unsupported` paths and `None` elsewhere — several permanent
+   failures ("fee over cap", `Unsupported`, early bails) never reach a terminal `put_move`,
+   so `MoveRecord.outcome` alone cannot source the ledger's `error` (§9.2 uses the
+   executor-provided error first, `MoveRecord.outcome` as fallback).
+4. `apply(journal, executor, decisions, actor: Actor, now_ms: u64)` (and NOT `reconcile` —
    it re-drives stored intents that already carry actor/reason/created_at). Call sites:
    - `Runtime::tick` → `Actor::Agent { occurrence: policy.occurrence }`, `now_ms` from the
      runtime clock (§9.4).
@@ -298,7 +308,8 @@ async fn ledger_upsert_in(dbtx, key, build: impl FnOnce(Option<OperationRecord>,
     when present and copy `receive_fee`/`send_fee_quoted`/op-ids/gateway into the kind/fees.
   - `write_intent_and_index` (shared by `set_status`/`set_status_if`) — after the index+row
     writes: advance the ledger row to `status_from_intent(new_intent.status)`; on `Failed`
-    copy `MoveRecord.outcome` into `error`; on terminal also refresh fees/op-ids from the
+    the `error` is the executor-provided string from `set_status`'s error param (§8.3)
+    first, `MoveRecord.outcome` as fallback; on terminal also refresh fees/op-ids from the
     move row (it was persisted by `perform` BEFORE the status flip — `executor.rs` ordering,
     verified).
 - Consistency guarantee: ledger and journal commit or fail together; the ledger can never
@@ -351,6 +362,13 @@ ordering authority). `Runtime` passes `now_ms` where §8 needs it via the same s
      `record_update_ops`, or the user never ran `await-*` with `--key`) → read that op-log
      entry directly; if it carries a recorded terminal outcome, `record_terminal`
      accordingly; still in flight → leave `Started` (truthful) for a later pass.
+   - `tick:` rows still `Started` with `created_at_ms` older than ONE HOUR (far beyond any
+     tick's runtime) → `Failed("interrupted — no terminal report")`. A crash between the
+     tick's `Started` write and its terminal write is otherwise unrepairable (later ticks use
+     fresh nonces). The age threshold keeps a CONCURRENTLY-running tick's row safe from a
+     simultaneous reconcile (the CLI is one-shot single-writer by convention, but the ledger
+     must not corrupt a live row if that convention is broken; clock dependence here is
+     display-only harm at worst).
    - Intent-keyed rows are NEVER repaired here — the journal integration (§9.2) owns them.
 4. **Tick + refusals** (`Runtime::tick`): `record_tick(Started)` before probing (key
    `tick:<occurrence>:<nonce>`, nonce per §2 of the history spec); after apply,
@@ -418,6 +436,11 @@ wallet-cli show <correlation-key | seq> [--json]
    own dbtx via the same helper (§9).
 9. `seq` is the ordering authority; wall-clock is display-only, injected for tests (§9.4).
 10. `history`/`show` are offline journal scans; TSV + JSONL output shapes fixed in §11.
+11. `Journal::set_status` carries the failure string (§8.3) — the ledger's `error` is the
+    executor's diagnostic first, `MoveRecord.outcome` as fallback.
+12. The send quote persists BEFORE the cap check (§2.3), so a "fee over cap" refusal is
+    fully explained in history.
+13. Stuck `Started` tick rows are repaired by reconcile after a 1-hour age threshold (§10.3).
 
 ## Scope guard / non-goals
 
