@@ -33,8 +33,11 @@ pub struct OperationRecord {
     /// The ordering authority — robust to clock skew; wall-clock is for display.
     pub seq: u64,
     /// Joins ledger <-> journal <-> MoveRecord. For journaled ops this IS the intent's
-    /// IdempotencyKey; for raw ops it is derived ("pay:<fed>:<op_id>", "recv:<fed>:<op_id>";
-    /// "join:<fed>"). Exactly one ledger row per correlation key.
+    /// IdempotencyKey. For raw ops the key is known BEFORE the side effect (crash-safety,
+    /// §3 rule 5): `pay:<fed>:<payment_hash>` (from the invoice, pre-call — also matching
+    /// lnv2's own dedup), `recv:<fed>:<nonce>` (pre-generated, embedded in the op's
+    /// `custom_meta`), `join:<fed>:<nonce>` (PER ATTEMPT — a failed join then a successful
+    /// retry are two rows). Exactly one ledger row per correlation key.
     pub correlation_key: IdempotencyKey,
     pub kind: OperationKind,
     /// Who initiated it — THE audit discriminator ADR-0014 needs.
@@ -116,6 +119,15 @@ Rules (load-bearing):
    comes from a `now_ms()` injected clock (testable); a bad clock degrades display, never order.
 4. **Failures and refusals are first-class rows.** A `Failed` op, a `Refusal`, an expired
    inflow — all recorded with their reason/error. History without failures is not history.
+5. **Row before side effect, repaired by backfill (raw ops).** An `op_id` only exists AFTER
+   the SDK commits the operation, so a row keyed on it can be lost to a crash — exactly the
+   window the ledger must cover. Therefore: the correlation key is known/generated BEFORE the
+   SDK call (§2), the `Started` row is written pre-call, and the key rides in the op's
+   `custom_meta` (extending the existing role-tag meta). Crash after the SDK call but before
+   the `op_id` update → reconcile's op-log backfill re-finds the op by its `custom_meta` key
+   and repairs the row (the same pattern `MoveRecord` backfill already uses). Crash before the
+   SDK call → the row stays `Started` with no matching op; reconcile marks it `Failed`
+   ("never reached the federation") rather than leaving it ambiguous.
 
 ## 4. Upstream changes this requires
 
@@ -125,8 +137,10 @@ Rules (load-bearing):
   the original decision in hand.
 - The executor persists what it already computes: send/receive quotes at `Pay`, and (Phase 4.A)
   the preimage on the `MoveRecord`.
-- CLI raw `receive`/`pay` call `record_*` at start; `await-receive`/`await-send` advance the row
-  to terminal via the correlation key.
+- CLI raw `receive`/`pay`: generate the correlation key pre-call (§2), write the `Started` row,
+  embed the key in `custom_meta`, update the row with the `op_id` post-call;
+  `await-receive`/`await-send` advance the row to terminal via the correlation key; reconcile
+  backfills/repairs rows per §3 rule 5.
 - `Runtime::tick` writes the `Tick` row + `Refusal` rows for advisory decisions (deduped by
   their existing `refuse:` idempotency keys).
 
@@ -143,7 +157,9 @@ Rules (load-bearing):
 - **Pure goldens:** record construction per kind; append-once/terminal-immutability property
   (a terminal row rejects mutation); one-row-per-key under replay; seq monotonicity.
 - **Journal tests (MemDatabase):** same-dbtx atomicity — a crash injected between intent flip
-  and ledger write is impossible by construction (single commit); scans ordered by seq.
+  and ledger write is impossible by construction (single commit); scans ordered by seq; the
+  §3-rule-5 raw-op windows (row-no-op → reconcile marks Failed; op-no-op_id → backfill repairs
+  via `custom_meta`); a failed `join` attempt followed by a successful retry yields two rows.
 - **Devimint smoke (`smoke_history_devimint.sh`):** join → direct-inflow → move → tick, then
   `history` shows all rows with correct kinds/actors/fees, timestamps non-decreasing, a forced
   failure and a refusal both present. This is the phase exit gate.
