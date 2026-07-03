@@ -38,9 +38,11 @@ pub struct OperationRecord {
     /// The ordering authority — robust to clock skew; wall-clock is for display.
     pub seq: u64,
     /// Joins ledger <-> journal <-> MoveRecord. For journaled ops this IS the intent's
-    /// IdempotencyKey. Raw/tick ops use PER-ATTEMPT keys, known BEFORE the side effect
-    /// (crash-safety, §3 rule 5): `pay:<fed>:<payment_hash>:<nonce>` and
-    /// `recv:<fed>:<nonce>` (nonce pre-generated, embedded in the op's `custom_meta`),
+    /// IdempotencyKey. Raw/tick ops use PER-ATTEMPT, NONCE-ONLY keys, constructible from
+    /// the RAW input BEFORE any parsing or side effect (crash-safety, §3 rule 5 — a
+    /// malformed invoice's failed attempt must still be a durable row):
+    /// `pay:<fed>:<nonce>` and `recv:<fed>:<nonce>` (nonce pre-generated, embedded in the
+    /// op's `custom_meta`; dedup/grouping rides on the recorded op_id, not the key),
     /// `join:<fed>:<nonce>`, `tick:<occurrence>:<nonce>` (each tick invocation is its own
     /// row, created `Started` before deciding, advanced to terminal with the counts; the
     /// tick's individual moves remain covered by their own intent-keyed rows).
