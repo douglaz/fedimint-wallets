@@ -94,8 +94,14 @@ send-side fixed point is needed (gateway on invoice; federation on contract; no 
    `total_within_cap` — the paradigm failure this field must explain is precisely the
    "fee over cap" refusal, which returns before any send commits (persisting a quote on a
    refused move is safe: it is a derived cache write, no money moves). The receive-side cost
-   is stored at `CreateInvoice`'s `put_move` (`rec.receive_fee = Some(receive_quote)`) so the
-   ledger (§9) never re-parses invoices.
+   is stored at `CreateInvoice`'s `put_move` (`rec.receive_fee_quoted = Some(receive_quote)`)
+   so the ledger (§9) never re-parses invoices — and symmetrically, a `gross_up` receive-side
+   "fee over cap" failure persists the computed quote on the record BEFORE returning
+   `Permanent`, so that refusal is explained in history too. The field is named QUOTED
+   deliberately: it becomes the actual paid cost only when the receive CLAIMS (the invoice
+   is fixed, so a `Succeeded` row's receive cost is exactly this value); on a never-paid /
+   refunded / stranded row it is what the move WOULD have cost — `history` presents receive
+   fees as exact only on `Succeeded` rows (§11).
 
 Tests: golden on the arithmetic helper (extract
 `fn send_quote(invoice_msat, gw_fee, fed_fee_on_contract) -> Msat` into `fee.rs` if that
@@ -112,7 +118,8 @@ A's payment and did not fund B's contract.
 1. `MoveRecord` gains (greenfield row-shape change, no migration):
    ```rust
    pub preimage: Option<Preimage>,        // proof A's payment settled; recovery artifact
-   pub receive_fee: Option<Msat>,         // §2 — receive-side cost, set at CreateInvoice
+   pub receive_fee_quoted: Option<Msat>,  // §2 — receive-side quote, set at CreateInvoice
+                                          // (== the paid cost iff the receive claims)
    pub send_fee_quoted: Option<Msat>,     // §2 — send-side quote, set at Pay
    ```
 2. `MovePhase` gains a `Stranded` variant. Semantics: TERMINAL (like
@@ -276,9 +283,9 @@ pub enum OperationKind {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FeeBreakdown {
     pub fee_cap: Option<Msat>,
-    /// Receive-side cost. EXACT for intent-backed ops (invoice − net, from the
-    /// MoveRecord's fixed invoice); a pre-call QUOTE for raw receives (§9.3 — gateway
-    /// deduction + federation claim-fee quote on the post-gateway contract).
+    /// Receive-side cost. EXACT only on a Succeeded intent-backed row (the fixed
+    /// invoice's cost, realized at claim); a QUOTE otherwise — raw pre-call estimates
+    /// (§9.3) and unclaimed/refused/stranded intent rows (§2.3: what it WOULD have cost).
     pub receive_fee: Option<Msat>,
     pub send_fee_quoted: Option<Msat>,    // pay-time quote, from the MoveRecord (§2)
 }
@@ -356,7 +363,7 @@ async fn ledger_upsert_in(dbtx, key, build: impl FnOnce(Option<OperationRecord>,
 - Journal-integrated writes happen in the SAME dbtx as the intent write they describe:
   - `Journal::upsert` — after the intent row write: ledger row for `intent` (create-or-advance
     with `status_from_intent`). Fees/ops: read the `0x02` move row (same partition, same dbtx)
-    when present and copy `receive_fee`/`send_fee_quoted`/op-ids/gateway into the kind/fees.
+    when present and copy `receive_fee_quoted`/`send_fee_quoted`/op-ids/gateway into the kind/fees.
   - `write_intent_and_index` (shared by `set_status`/`set_status_if`) — after the index+row
     writes: advance the ledger row to `status_from_intent(new_intent.status)`; on `Failed`
     the `error` is the executor-provided string from `set_status`'s error param (§8.3)
@@ -496,8 +503,15 @@ where §8 needs it via the same source.
      `joined_at` CONVERTED to millis — `FederationInfo.joined_at` is unix SECONDS
      (`journal.rs:82`), so compare against `joined_at * 1000` (+60_000ms slack; both stamps
      come from the same device clock; an unconverted compare would never match and every
-     crash-interrupted successful join would be mis-routed to soft-failure); every OTHER
-     `Started` join row for that fed → soft-`Failed("superseded by a later join attempt")`.
+     crash-interrupted successful join would be mis-routed to soft-failure). When MORE THAN
+     ONE `Started` attempt predates `joined_at` (overlapping `join` processes — the CLI is
+     single-writer by convention but repair must not corrupt if that breaks), the newest is
+     NOT auto-blessed as certain: it goes soft-`Succeeded` WITH an ambiguity note
+     ("overlapping attempts; correlation uncertain — membership itself is registry-proven"),
+     and the rest → soft-`Failed("superseded by a later join attempt")`; all writes are
+     soft, so any authoritative writer still wins. With exactly one candidate, it is
+     soft-`Succeeded` without the note; every OTHER `Started` join row for that fed →
+     soft-`Failed("superseded by a later join attempt")`.
      Registry absent (and > 1h old) →
      soft-`Failed("join did not complete — federation not in the registry; re-run join")`.
      The registry is the wallet's MEMBERSHIP authority: a crash between the client-partition
@@ -513,10 +527,14 @@ where §8 needs it via the same source.
      op's `custom_meta`; the hash, written durably pre-call, is the recovery link. The
      crash-before-call and crash-after-deduped-call windows are DURABLY INDISTINGUISHABLE
      (nothing is written between the hash update and the SDK call), so a hash match is
-     adopted with the ambiguity RECORDED, not papered over: soft-terminal
-     (`repaired: true`) with the matched op's outcome and a note — "correlated by payment
-     hash to an existing payment of this invoice; attempt-level correlation uncertain
-     (deduped retry or never-sent attempt); the matched operation is authoritative".
+     adopted with the ambiguity RECORDED, not papered over. Branch on the matched op's
+     state: outcome already TERMINAL → soft-terminal (`repaired: true`) with that outcome
+     and a note — "correlated by payment hash to an existing payment of this invoice;
+     attempt-level correlation uncertain (deduped retry or never-sent attempt); the matched
+     operation is authoritative". Matched op still IN FLIGHT (the crash-after-
+     `AlreadyInFlight` case) → adopt the op id and move the row to `Awaiting` (with the
+     same note) — no terminal outcome exists yet; the normal `Awaiting` repair path
+     observes the final send result on a later pass.
      Money-truth is exact either way (the invoice is paid once; op-id grouping keeps sums
      single-counted); only the attempt attribution is uncertain, and the row says so.
      Still nothing (and > 1h old, per the repair principle) →
@@ -555,8 +573,9 @@ wallet-cli show <correlation-key | seq> [--json]
   where `kind` ∈ `join|receive|pay|direct-inflow|move|evacuation|refusal|tick`, `actor` ∈
   `user|agent:<occurrence>`, `reason` = `reason_tag` (snake_case), unknown fields = `-`.
   The two fee columns are deliberately SEPARATE and the send column is NAMED quoted: the
-  receive fee is exact, the send fee is a pay-time estimate until the SDK exposes the final
-  contract cost — one collapsed "fees" number would present a quote as exact. Filters apply
+  receive fee is exact ON `Succeeded` ROWS ONLY (elsewhere it is a quote too — §2.3/§7),
+  the send fee is a pay-time estimate until the SDK exposes the final contract cost — one
+  collapsed "fees" number would present a quote as exact. Filters apply
   before `--limit`. `--json`: one serde_json `OperationRecord` per line (JSONL), no tab
   table.
 - `show` prints the full record multi-line (both op ids, gateway, fee breakdown, timestamps,
