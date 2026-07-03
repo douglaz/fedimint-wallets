@@ -39,15 +39,18 @@ structural fact (ADR-0017/0019).
 (new `ReasonCode::InvalidThreshold`); clamp the rank term to `guardian_count`.
 
 ### 2. Send-leg fee-cap check under-estimates the real cost
-`wallet-fedimint/src/executor.rs:353-368`: at `MoveStep::Pay` the gateway fee is quoted
-`on(invoice_msat)` and `send_fee_quote` also quotes on the invoice amount — but lnv2 charges
-both on the (larger) outgoing-contract amount (`multi_client.rs` documents this as a deferred
-"live-validation detail"). The destination still nets exactly `amount` (that side is exact), but
-the **`fee_cap`/`--max-fee` promise is soft on the send leg**: a move whose true cost exceeds
-the cap can pass `total_within_cap` and pay anyway.
-**Fix:** quote both send-side fees on the outgoing-contract amount via the same fixed-point
-pattern as the receive side, or at minimum round the send quote conservatively (over-estimate)
-so the cap never under-blocks. Record the final quote (feeds the operation ledger, below).
+`wallet-fedimint/src/executor.rs:353-368`: at `MoveStep::Pay` the FEDERATION send fee is
+quoted on the invoice amount, but the SDK's own `send_fee_quote` doc (verified at the pin,
+`fedimint-lnv2-client/src/lib.rs:875-882`) requires the FULL outgoing-contract value —
+`send_fee.add_to(invoice_amount)` = invoice + gateway fee (`lib.rs:599`). So the federation
+component of the send quote is under-estimated by the fee on the gateway-fee delta.
+(Refinement over the original audit claim: the GATEWAY component on the invoice amount is
+exactly what the SDK computes — `add_to` applies base+ppm to the invoice amount — so only the
+federation-fee base is wrong, and no send-side fixed point is needed.) The destination still
+nets exactly `amount`; the **`fee_cap`/`--max-fee` promise is soft on the send leg**: a move
+whose true cost exceeds the cap can pass `total_within_cap` and pay anyway.
+**Fix:** compute `contract = invoice + gateway_fee.on(invoice)` and quote the federation send
+fee on `contract`. Record the final quote (feeds the operation ledger, below).
 
 ### 3. Send-settled + receive-failed strands funds and discards the preimage
 `wallet-fedimint/src/executor.rs:430-452`: on `SendState::Success(_preimage)` the preimage is
