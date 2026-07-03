@@ -150,7 +150,11 @@ work — the invariant THIS phase buys is that the proof is durable and the stat
    - `cap_room(snapshot, fed)` becomes `cap_room_with(snapshot, fed, &credited)` =
      `per_fed_cap − spendable − credited[fed]` (saturating).
    - available/spendable reads for a SOURCE become `spendable − debited[fed]` (saturating).
-   - Every emitted `Move`/`Evacuate` records its amount into `credited[to]`/`debited[from]`.
+   - Every emitted `Move`/`Evacuate` records `credited[to] += amount` and
+     `debited[from] += amount + fee_cap` — the source pays the NET amount PLUS the
+     receive-side gross-up and send-side fees, unknowable at decide time but bounded by the
+     decision's `fee_cap` (= `snapshot.max_fee`); reserving the cap is the conservative
+     bound that makes two same-source moves provably non-overdrawing.
    - `eligible_for_evacuation`'s `cap_room > 0` check uses the reserved-aware value.
 3. **Document the deliberate asymmetry** (one comment on `usable_source`): source-side trust
    is intentionally NOT gated on `probed_ok`/reputation — draining a distrusted fed is
@@ -323,8 +327,11 @@ ordering authority). `Runtime` passes `now_ms` where §8 needs it via the same s
 ## 10. Raw ops, join, tick, refusals (`wallet-cli/src/main.rs`, `runtime.rs`, `multi_client.rs`)
 
 1. **Raw `receive`/`pay`** (operation-history-spec §3 rule 5): the CLI generates the
-   per-attempt key (`pay:<fed>:<payment_hash>:<nonce>` / `recv:<fed>:<nonce>`, 8 random hex
-   chars of nonce), writes the `Started` row (`record_started`) BEFORE calling
+   per-attempt key (`pay:<fed>:<payment_hash>:<nonce>` / `recv:<fed>:<nonce>`; the nonce is
+   32 random hex chars = 128 bits, everywhere a nonce appears in a ledger key incl.
+   `join:`/`tick:` — 32-bit nonces make birthday collisions realistic over a wallet lifetime,
+   and a collision aliases two attempts onto one `0x06` entry), writes the `Started` row
+   (`record_started`) BEFORE calling
    `MultiClient::receive`/`pay`, embeds the key in the op's `custom_meta` (extend the current
    role-tag JSON: `{ "role": "receive", "correlation_key": "<key>" }` — `MoveMeta` for
    journaled moves is UNTOUCHED), then `record_update_ops` with the returned op id.
@@ -339,8 +346,11 @@ ordering authority). `Runtime` passes `now_ms` where §8 needs it via the same s
    - `join:` rows → registry present → `Succeeded`; absent → `Failed("never joined")`.
    - `pay:`/`recv:` rows with `op_id: None` → search the fed's op-log for the
      `correlation_key` in `custom_meta` (reuse the `backfill_ops` pagination; match on the
-     new field). Found → fill `op_id`; if the op-log entry already carries a terminal outcome,
-     `record_terminal` accordingly. Not found → `Failed("never reached the federation")`.
+     new field). Found → fill `op_id`; not found → `Failed("never reached the federation")`.
+   - `pay:`/`recv:` rows with `op_id: Some` (the COMMON stuck case: crash after
+     `record_update_ops`, or the user never ran `await-*` with `--key`) → read that op-log
+     entry directly; if it carries a recorded terminal outcome, `record_terminal`
+     accordingly; still in flight → leave `Started` (truthful) for a later pass.
    - Intent-keyed rows are NEVER repaired here — the journal integration (§9.2) owns them.
 4. **Tick + refusals** (`Runtime::tick`): `record_tick(Started)` before probing (key
    `tick:<occurrence>:<nonce>`, nonce per §2 of the history spec); after apply,
@@ -386,9 +396,11 @@ wallet-cli show <correlation-key | seq> [--json]
 - **Deferred devimint smoke (`wallet-cli/tests/smoke_history_devimint.sh`, the 4.C exit
   gate):** two-fed harness (await-send-first pattern): join A+B → direct-inflow A →
   move A→B → tick (agent move) → one forced failure (fee cap 1 msat) → assert `history`
-  shows every row with correct kind/actor/reason/fees, timestamps non-decreasing by seq,
-  the failure `Failed` with its error, at least one `Refusal` or advisory row when induced,
-  and `show <key>` resolves both legs' op ids. Plus §2's fee-cap refusal check.
+  shows every row with correct kind/actor/reason/fees, `created_at_ms` non-decreasing by seq
+  (NOT `updated_at_ms` — an older row may legitimately finish after newer rows were created;
+  seq stays the ordering authority), the failure `Failed` with its error, at least one
+  `Refusal` or advisory row when induced, and `show <key>` resolves both legs' op ids. Plus
+  §2's fee-cap refusal check.
 
 ## 14. Settled decisions
 
