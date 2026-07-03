@@ -424,8 +424,14 @@ Public async methods on `FedimintJournal` (each one dbtx via the same helper):
 
 ### 9.4 Clock
 `FedimintJournal::new(db)` gains `with_clock(db, clock: fn() -> u64 /*ms*/)` for tests;
-production uses `SystemTime::now()` millis (a bad clock degrades display only — `seq` is the
-ordering authority). `Runtime` passes `now_ms` where §8 needs it via the same source.
+production uses `SystemTime::now()` millis. `seq` is the ordering authority; the clock is
+display material PLUS one real dependency, stated honestly: §10.3's repair heuristics read
+`created_at_ms` (the negative-inference age gate and the join-attempt ↔ `joined_at` match),
+so clock skew can influence DURABLE repair decisions — which is exactly why negative repairs
+are SOFT/defeasible (§7) and why a mismatched join heuristic degrades to the soft-failure
+path rather than certainty. Repair-path tests MUST include skewed-clock cases (forward jump
+during the 1h window; join attempt stamped after `joined_at`). `Runtime` passes `now_ms`
+where §8 needs it via the same source.
 
 ## 10. Raw ops, join, tick, refusals (`wallet-cli/src/main.rs`, `runtime.rs`, `multi_client.rs`)
 
@@ -453,8 +459,12 @@ ordering authority). `Runtime` passes `now_ms` where §8 needs it via the same s
      exists): the CLI's error path calls `record_terminal(Failed, <the real error string>)`
      before bailing — never leave the pre-written row for a generic repair to mislabel.
    - **`SendOutcome::AlreadyPaid(op)`**: the outcome is already terminal at creation time —
-     `record_update` + `record_terminal(Succeeded)` immediately (the row records the
-     shared op id; op-id grouping keeps aggregation single-counted).
+     but FIRST read the ORIGINAL op-log entry's meta (the funded contract + gateway live
+     there, not in this deduped attempt), derive the definitive fees per §9.3's backfill
+     formula, THEN `record_terminal(Succeeded, upd)` carrying them — terminalizing before
+     the meta lookup would freeze the row with blank/estimated fees, breaking §9.3's
+     "a successful raw op ends with its cost recorded". (The row records the shared op id;
+     op-id grouping keeps aggregation single-counted.)
      `AlreadyInFlight(op)` → `Awaiting` like `Started(op)`.
    - **The key is surfaced**: `pay`/`receive` print `key: <correlation_key>` to stderr
      (the handle convention `direct-inflow`/`move` already use), so `await-* --key` is
