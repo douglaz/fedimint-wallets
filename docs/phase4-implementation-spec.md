@@ -236,6 +236,10 @@ pub struct OperationRecord {
     pub updated_at_ms: u64,
     pub fees: FeeBreakdown,
     pub error: Option<String>,
+    /// Set when this row's terminal `Failed` came from reconcile's NEGATIVE-inference
+    /// repair (§10.3): such a failure is DEFEASIBLE — `advance` permits one
+    /// evidence-carrying supersession (see the `advance` rule below).
+    pub repaired: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -284,8 +288,15 @@ Pure helpers, golden-tested in `wallet-core`:
   (no write) ONLY when the stored record is already TERMINAL, or when the requested status
   would REGRESS (e.g. `Awaiting → Started`) — a NON-terminal row may always be ENRICHED
   (op-ids/gateway/fees/error filled in) at the SAME status (`record_update`' normal
-  post-call path is exactly that), bumping `updated_at_ms`. Golden the full transition
-  matrix including same-status enrichment and terminal-rejects-everything.
+  post-call path is exactly that), bumping `updated_at_ms`. ONE principled exception:
+  `OperationRecord` carries `repaired: bool` — a `Failed` written by reconcile's
+  NEGATIVE-inference repair (§10.3) sets it, and `advance` permits exactly one
+  EVIDENCE-CARRYING transition out of such a row (an update bearing an `op_id` or a real
+  awaited terminal outcome), clearing the flag. Absence-of-evidence conclusions are
+  defeasible; evidence wins — this is what makes a clock-skewed false repair self-healing
+  instead of permanently blocking the real writer. Golden the full transition matrix
+  including same-status enrichment, terminal-rejects-everything, and
+  repaired-Failed-superseded-by-evidence (once, and only with evidence).
 
 ## 8. `Intent` extension + reason threading (`wallet-core/src/executor.rs`, `types.rs`)
 
@@ -362,8 +373,12 @@ Public async methods on `FedimintJournal` (each one dbtx via the same helper):
   SAME quote helpers the executor uses — raw `pay`: `send_gateway_fee` + `send_fee_quote`
   (on the §2 contract base) → `send_fee_quoted`; raw `receive`: the gateway's
   `receive_fee` from `routing_info` applied to the invoiced amount → `receive_fee`
-  (what lnv2's `subtract_from` will take). Quote failures degrade to `None` (never block
-  the money op on a fee display).
+  (what lnv2's `subtract_from` will take). These quotes require a CONCRETE gateway: they
+  are filled only when one is known (an explicit `--gateway`, or a pinned executor
+  gateway); on the lnv2 AUTO-SELECT path (`None` passed through, the current default
+  semantics — unchanged) `gateway` and the fee fields stay `None`, an honest recorded gap
+  rather than the CLI silently pinning a gateway to obtain a quote. Quote failures likewise
+  degrade to `None` (never block the money op on a fee display).
 - `record_tick_started(key, occurrence, now_ms)` and
   `record_tick_terminal(key, counts: Option<(decisions, performed, failed)>,
   status: OperationStatus /* Succeeded | Failed */, error: Option<String>, now_ms)` —
@@ -427,11 +442,14 @@ ordering authority). `Runtime` passes `now_ms` where §8 needs it via the same s
    The non-terminal set is what the scan costs, and it is self-shrinking (each repair
    terminalizes); the ledger itself is small by the non-goals (~10^5 rows ceiling).
    **Repair principle:** POSITIVE inferences (an
-   op-log outcome found; the registry contains the fed) apply immediately; NEGATIVE
-   inferences (marking `Failed` on absence of evidence) require the row to be older than
-   ONE HOUR — a fresh `Started` row may belong to an operation currently in flight in
-   another process, and a false terminal write would then block the real one
-   (terminal-immutable). Per key prefix:
+   op-log outcome found; the registry contains the fed) apply immediately and are ordinary
+   terminal writes. NEGATIVE inferences (marking `Failed` on absence of evidence) are (a)
+   deferred by a ONE-HOUR row-age heuristic — a fresh `Started` row may belong to an
+   operation in flight in another process — and (b) written as SOFT failures
+   (`repaired: true`, §7): if the heuristic ever misfires (clock jump, mis-set test clock),
+   the real writer's evidence-carrying update supersedes the false `Failed` instead of being
+   blocked by terminal immutability. Wall-clock therefore stays non-destructive: it only
+   delays a defeasible mark. Per key prefix:
    - `join:` rows → registry present → `Succeeded`; absent (and > 1h old) →
      `Failed("join did not complete — federation not in the registry; re-run join")`.
      The registry is the wallet's MEMBERSHIP authority: a crash between the client-partition
