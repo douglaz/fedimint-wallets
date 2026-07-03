@@ -28,8 +28,13 @@ own spec: [operation-history-spec.md](../operation-history-spec.md), built in
 check, and `rank()` (line 182) multiplies raw `threshold` by `STRUCTURAL_WEIGHT`. A
 malformed or malicious config reporting `guardian_count = 4, threshold = 10` passes the floor
 and **ranks strictly above every honest federation** — while being unable to ever reach quorum.
-`threshold` is an untrusted structural fact from the config; letting it promote a fed unbounded
-is exactly what the ADR-0017/0019 trust model exists to prevent.
+**Reachability caveat (P1 → P2 today):** the only current `FederationFacts` producer is the
+probe, which DERIVES `threshold` as `2f+1` from the guardian set (`NumPeers::threshold()`,
+`probe.rs:49-50`) — so an impossible threshold is not constructible from a real config via
+today's path. The guard still lands in Phase 4 as defense-in-depth on the trust boundary
+itself: Phase 3.B discovery introduces new facts assemblers (Observer/Nostr/fetched configs),
+and the scorer must not rely on every future caller sanitizing an attacker-influenced
+structural fact (ADR-0017/0019).
 **Fix:** hard-reject `threshold > guardian_count || threshold == 0` in the structural floor
 (new `ReasonCode::InvalidThreshold`); clamp the rank term to `guardian_count`.
 

@@ -13,6 +13,10 @@ layers anywhere in this phase.
 1. **Scorer trust floor** (`wallet-core/src/scorer.rs`): hard-reject `threshold == 0 ||
    threshold > guardian_count` (new `ReasonCode::InvalidThreshold`); clamp the rank term to
    `guardian_count`. Golden tests: impossible-quorum config is ineligible and rank 0.
+   Severity note: NOT currently reachable — the probe derives `threshold` as `2f+1` from the
+   guardian set (`NumPeers::threshold()`), so this is defense-in-depth that becomes
+   load-bearing when 3.B's discovery assemblers start producing `FederationFacts` from
+   attacker-influenced sources; it lands BEFORE 3.B for that reason.
    DECIDE + record: proportional threshold floor (`threshold * 2 > guardian_count`) in the
    default policy, or document absolute-only as the v1 stance in the ADR-0019 trust model.
 2. **Send-leg fee quote on the contract amount** (`wallet-fedimint/src/executor.rs`,
