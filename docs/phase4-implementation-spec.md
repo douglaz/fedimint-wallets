@@ -296,14 +296,18 @@ Pure helpers, golden-tested in `wallet-core`:
   would REGRESS (e.g. `Awaiting → Started`) — a NON-terminal row may always be ENRICHED
   (op-ids/gateway/fees/error filled in) at the SAME status (`record_update`' normal
   post-call path is exactly that), bumping `updated_at_ms`. ONE principled exception:
-  `OperationRecord` carries `repaired: bool` — a `Failed` written by reconcile's
-  NEGATIVE-inference repair (§10.3) sets it, and `advance` permits exactly one
-  EVIDENCE-CARRYING transition out of such a row (an update bearing an `op_id` or a real
-  awaited terminal outcome), clearing the flag. Absence-of-evidence conclusions are
-  defeasible; evidence wins — this is what makes a clock-skewed false repair self-healing
-  instead of permanently blocking the real writer. Golden the full transition matrix
-  including same-status enrichment, terminal-rejects-everything, and
-  repaired-Failed-superseded-by-evidence (once, and only with evidence).
+  `OperationRecord` carries `repaired: bool` and every write is flagged as REPAIR or
+  AUTHORITATIVE (a parameter on `advance`/the record helpers; reconcile's negative-inference
+  repair is the only repair-flagged writer). A `Failed` written by repair sets
+  `repaired: true`, and `advance` permits exactly one transition out of such a row by ANY
+  AUTHORITATIVE write (clearing the flag) — an op-evidence update for `pay:`/`recv:`, the
+  real `record_terminal` for `join:`/`tick:` rows (whose writers have no op id to show), or
+  a journal-integrated status write. Repair writes never supersede anything terminal.
+  Absence-of-evidence conclusions are defeasible; authority wins — this is what makes a
+  clock-skewed false repair self-healing instead of permanently blocking the real writer.
+  Golden the full transition matrix including same-status enrichment,
+  terminal-rejects-everything, repaired-Failed-superseded-by-authoritative (once), and
+  repair-never-supersedes-terminal.
 
 ## 8. `Intent` extension + reason threading (`wallet-core/src/executor.rs`, `types.rs`)
 
@@ -383,12 +387,20 @@ Public async methods on `FedimintJournal` (each one dbtx via the same helper):
   invoiced amount) PLUS the federation claim fee (`receive_fee_quote` on the post-gateway
   contract amount) → `receive_fee` (omitting the fed component would under-report every
   raw receive on a fed with a non-zero receive tx fee; see the `FeeBreakdown.receive_fee`
-  doc — this raw-path value is a QUOTE, unlike the exact intent-backed one). These quotes require a CONCRETE gateway: they
-  are filled only when one is known (an explicit `--gateway`, or a pinned executor
-  gateway); on the lnv2 AUTO-SELECT path (`None` passed through, the current default
-  semantics — unchanged) `gateway` and the fee fields stay `None`, an honest recorded gap
-  rather than the CLI silently pinning a gateway to obtain a quote. Quote failures likewise
-  degrade to `None` (never block the money op on a fee display).
+  doc — this raw-path value is a QUOTE, unlike the exact intent-backed one). These quotes
+  require a CONCRETE gateway. Getting one on the default (no `--gateway`) path — the COMMON
+  case, whose fees must not be a permanent blank:
+  - raw `receive` — SETTLED: adopt `direct-inflow`'s existing convention and PIN the first
+    registered lnv2 gateway when none is given (the verb already bails on an empty
+    registered set, so this only replaces blind auto-select with a recorded choice, exactly
+    as `direct-inflow` does for crash-stable replay). Gateway + quote always recordable.
+  - raw `pay` — keeps lnv2 auto-select (the issuing-gateway direct-swap default matters for
+    routing). Pre-call quote best-effort (against the invoice's issuing gateway when it
+    serves the fed); DEFINITIVE backfill at settlement: the lnv2 send op-log meta records
+    the funded OUTGOING CONTRACT, so `await-send --key` and reconcile repair fill
+    `send_fee_quoted` from `contract.amount − invoice_amount` (the exact gateway component)
+    plus the federation fee quote — a successful raw pay always ends with its cost recorded.
+  Residual quote failures degrade to `None` (never block the money op on a fee display).
 - `record_tick_started(key, occurrence, now_ms)` and
   `record_tick_terminal(key, counts: Option<(decisions, performed, failed)>,
   status: OperationStatus /* Succeeded | Failed */, error: Option<String>, now_ms)` —
