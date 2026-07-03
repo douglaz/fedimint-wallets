@@ -357,15 +357,29 @@ ordering authority). `Runtime` passes `now_ms` where §8 needs it via the same s
    journaled moves is UNTOUCHED), then `record_update_ops` with the returned op id — which
    ALSO advances the row `Started → Awaiting`: once the federation returned an op id the
    operation is live-and-awaiting, a distinct state from "may never have reached the
-   federation", and `history --status awaiting` must surface it.
+   federation", and `history --status awaiting` must surface it. Completing the flow:
+   - **Synchronous SDK errors** (bad invoice, no gateway, failed federation call — no op id
+     exists): the CLI's error path calls `record_terminal(Failed, <the real error string>)`
+     before bailing — never leave the pre-written row for a generic repair to mislabel.
+   - **`SendOutcome::AlreadyPaid(op)`**: the outcome is already terminal at creation time —
+     `record_update_ops` + `record_terminal(Succeeded)` immediately (the row records the
+     shared op id; op-id grouping keeps aggregation single-counted).
+     `AlreadyInFlight(op)` → `Awaiting` like `Started(op)`.
+   - **The key is surfaced**: `pay`/`receive` print `key: <correlation_key>` to stderr
+     (the handle convention `direct-inflow`/`move` already use), so `await-* --key` is
+     actually usable.
    `await-receive`/`await-send` take the correlation key via a new `--key` flag (optional —
    without it they behave as today, ledger row advanced by reconcile repair instead) and
    `record_terminal` on the final state.
 2. **Join**: `Command::Join` checks the registry FIRST (`journal.get_federation`): already
    registered → open only, NO ledger row. Otherwise `record_started(join:<fed>:<nonce>)` →
    `multi_client.join(...)` → `record_terminal(Succeeded|Failed)`.
-3. **Reconcile repair** (`Runtime::reconcile`): after the existing §9 passes, scan ledger
-   `Started` rows (bounded: newest 200). **Repair principle:** POSITIVE inferences (an
+3. **Reconcile repair** (`Runtime::reconcile`): after the existing §9 passes, scan the FULL
+   ledger for non-terminal (`Started`/`Awaiting`) rows — no window cap: repair is the ONLY
+   path that terminalizes stale rows, so a cap would strand anything beyond it permanently.
+   The non-terminal set is what the scan costs, and it is self-shrinking (each repair
+   terminalizes); the ledger itself is small by the non-goals (~10^5 rows ceiling).
+   **Repair principle:** POSITIVE inferences (an
    op-log outcome found; the registry contains the fed) apply immediately; NEGATIVE
    inferences (marking `Failed` on absence of evidence) require the row to be older than
    ONE HOUR — a fresh `Started` row may belong to an operation currently in flight in
