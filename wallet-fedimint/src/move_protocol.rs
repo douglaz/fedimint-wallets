@@ -271,14 +271,16 @@ pub fn next_step(rec: &MoveRecord) -> MoveStep {
 ///    `recv_op` (and `invoice`), a `Send` leg fills `send_op`, and either leg can recover
 ///    the move's net amount from committed `MoveMeta`. Authoritative for op-ids.
 /// 3. `cached` — the previously-known `MoveRecord`, the fallback for any leg an artifact
-///    does not (re)supply — and AUTHORITATIVE for `amount`: the executor may size a fresh
-///    evacuation DOWN from the intent's ask (reserving the fees the dying source must pay)
-///    and persists that decision before the non-idempotent receive, so on re-assembly the
-///    cached amount wins over recovered op metadata, and recovered op metadata wins over
-///    `params.amount`. Rebuilding from `params` would silently revert the sizing, and the
-///    §7 Pay-step cap re-check derives the receive fee as `invoice_amount − amount` — a
-///    reverted amount zeroes the receive fee out of the fee-cap guard on every resume. For
-///    `Move`/`DirectInflow` the two are always equal.
+///    does not (re)supply. For `amount` the preference is: RECOVERED OP METADATA first
+///    (a committed op's `MoveMeta` amount is definitive — the invoice was fixed at that
+///    sizing; the executor commits the hair-under-adjusted net there precisely so a lost
+///    cache write cannot resurrect a stale higher ask and weaken the Pay-step fee-cap
+///    re-check), then the CACHED amount (the executor sizes a fresh evacuation DOWN and
+///    persists that decision before the non-idempotent receive — no artifact exists yet
+///    in that window), then `params.amount`. Rebuilding from `params` alone would
+///    silently revert the sizing, and the §7 Pay-step cap re-check derives the receive
+///    fee as `invoice_amount − amount`. For an exact-net `Move`/`DirectInflow` all three
+///    agree.
 ///
 /// The merge **never blanks an existing leg**: a missing artifact cannot erase an op-id
 /// already known from `cached` (a one-client backfill only sees one leg), and `fee_cap`
@@ -380,7 +382,7 @@ pub fn assemble_move_record(
         // The cached amount is the executor's persisted sizing decision (see the doc
         // contract above). If the cache is gone, recover the committed op metadata amount
         // before falling back to the intent's original amount.
-        amount: cached_amount.or(artifact_amount).unwrap_or(params.amount),
+        amount: artifact_amount.or(cached_amount).unwrap_or(params.amount),
         fee_cap: params.fee_cap,
         gateway: params.gateway,
         send_required: params.send_required,
