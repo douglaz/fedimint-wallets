@@ -621,6 +621,17 @@ impl Executor for FedimintExecutor {
                             .0
                             .saturating_sub(grossed.receive_quote.0),
                     );
+                    // The net this move will actually deliver (== rec.amount for an exact
+                    // solve). Committed in the receive op's own MoveMeta below, so a crash
+                    // that loses the post-receive cache write still recovers the HONEST
+                    // amount from the op itself (backfill prefers recovered op metadata
+                    // over the intent's ask) — the Pay-step cap re-check can then never be
+                    // weakened by a stale higher amount.
+                    let net_amount = if rec.send_required && delivered < rec.amount {
+                        delivered
+                    } else {
+                        rec.amount
+                    };
                     // For a `Move`, persist the chosen gateway BEFORE the non-idempotent receive
                     // call. If the process dies after B's receive op commits but before the
                     // invoice/op-id cache write below, backfill can recover the op but not the
@@ -631,7 +642,7 @@ impl Executor for FedimintExecutor {
                     let meta = MoveMeta {
                         move_id: rec.key.clone(),
                         role: MoveRole::Receive,
-                        amount: rec.amount,
+                        amount: net_amount,
                         from: rec.from,
                         to: rec.to,
                     };
@@ -653,20 +664,20 @@ impl Executor for FedimintExecutor {
                     rec.invoice = Some(invoice);
                     rec.recv_op = Some(recv_op);
                     rec.phase = MovePhase::Invoiced;
-                    // The invoice is now FIXED, so the delivered net is a fact: for a
-                    // send-required move that accepted a verified hair-under solve, record
-                    // it as the move's amount so the Pay-step cap re-check
-                    // (`invoice − rec.amount`) counts the honest receive cost across
-                    // crash/resume. (A crash in the §5 backfill window loses only this
-                    // adjustment — the re-check then understates the receive cost by the
-                    // bounded shortfall, the pre-existing approximation class.)
-                    if rec.send_required && delivered < rec.amount {
+                    // The invoice is now FIXED, so the delivered net is a fact: record it
+                    // as the move's amount so the Pay-step cap re-check
+                    // (`invoice − rec.amount`) counts the honest receive cost. Crash-safe
+                    // BOTH ways: the committed receive op's MoveMeta above carries the same
+                    // adjusted amount (cache loss recovers it via backfill), and a crash
+                    // BEFORE the receive committed left no reduced amount anywhere — a
+                    // fresh retry re-quotes from the intent's full ask.
+                    if rec.amount != net_amount {
                         tracing::warn!(
                             requested_msat = rec.amount.0,
-                            delivered_msat = delivered.0,
+                            delivered_msat = net_amount.0,
                             "executor: fee fixed point settled a hair under; adjusting move net"
                         );
-                        rec.amount = delivered;
+                        rec.amount = net_amount;
                     }
                     self.journal.put_move(&rec).await?;
                     // KILLPOINT: the MoveRecord (recv_op + invoice) is persisted and the receive
