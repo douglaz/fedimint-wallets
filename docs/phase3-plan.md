@@ -1,5 +1,14 @@
 # Phase 3 plan — discovery + triggers + evacuation (close the autonomy loop)
 
+> **STATUS: 3.A COMPLETE (2026-07-04).** Evacuate execution merged (`5315df3`) and the live
+> two-fed exit gate PASSED: the real no-auth sense path reports a healthy fed as healthy; a
+> forced shutdown made `decide()` emit `Evacuate A→B (reason ShutdownNotice)` at exactly the
+> cap-room bound and `apply()` drained A into B (B netted a hair under, NEVER over; A → ~0).
+> The gate also caught + fixed a latent over-credit in the shared §6 receive fixed point
+> (`5588b44` — never-over verification clamp). The `/status` shutdown signal requires f+1
+> corroborating peers. Next: [phase4-plan.md](./phase4-plan.md) (hardening + operation
+> ledger, spec review-clean), then 3.B/3.C per [roadmap-to-v1.md](./roadmap-to-v1.md).
+
 Phase 1 built the **money engine**; Phase 2 wired **sense + decide** (probe → score → snapshot →
 decide → apply) and proved a self-directed rebalance live on two federations. Phase 3 closes the
 loop: the wallet must (a) **flee a dying federation** on its own (the last money-path primitive),
