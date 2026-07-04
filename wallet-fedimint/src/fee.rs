@@ -161,3 +161,44 @@ pub fn gross_up(
 pub fn total_within_cap(receive_quote: Msat, send_quote: Msat, fee_cap: Msat) -> bool {
     receive_quote.0.saturating_add(send_quote.0) <= fee_cap.0
 }
+
+/// What the recipient nets for a FIXED `invoice_amount` under `recv_gateway` and a federation
+/// fee of `recv_fed_fee` quoted at that invoice's contract: the §6 forward pass as a pure,
+/// standalone check. The executor uses it to VERIFY the async fixed point's exit: the fed fee
+/// is a step function of the contract amount, so the bounded re-quote loop can exhaust its
+/// passes on an oscillation and exit with a solve whose constant-fee assumption no longer
+/// matches the fee at the solved contract — netting the recipient MORE than `net` (an
+/// over-credit that can also push the destination past its hard per-fed cap).
+pub fn predicted_net(invoice_amount: Msat, recv_gateway: GatewayFee, recv_fed_fee: Msat) -> Msat {
+    let contract = invoice_amount
+        .0
+        .saturating_sub(recv_gateway.on(invoice_amount).0);
+    Msat(contract.saturating_sub(recv_fed_fee.0))
+}
+
+/// Shrink an over-netting solve back toward the never-over contract: reduce the invoice by
+/// `excess` (the caller's measured `predicted_net − net`) and re-derive the dependent fields.
+/// The recipient's net moves by at most one msat per msat of invoice (the [`gross_up`]
+/// monotonicity argument), so the shrunk invoice's net drops by AT MOST `excess` — i.e. to
+/// `net` or a hair under, never further overshooting upward from THIS fee. The smaller
+/// contract may step the federation fee DOWN again, though, so the caller re-verifies with
+/// [`predicted_net`] and repeats (bounded), never accepting an over-netting invoice.
+/// Saturates at zero; the caller's minimum-contract check runs afterwards as usual.
+pub fn shrink_invoice(
+    grossed: GrossUp,
+    recv_gateway: GatewayFee,
+    net: Msat,
+    excess: Msat,
+) -> GrossUp {
+    let invoice_amount = Msat(grossed.invoice_amount.0.saturating_sub(excess.0));
+    let contract_amount = Msat(
+        invoice_amount
+            .0
+            .saturating_sub(recv_gateway.on(invoice_amount).0),
+    );
+    GrossUp {
+        invoice_amount,
+        contract_amount,
+        receive_quote: Msat(invoice_amount.0.saturating_sub(net.0)),
+    }
+}

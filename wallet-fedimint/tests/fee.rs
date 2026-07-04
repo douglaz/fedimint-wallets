@@ -4,7 +4,9 @@
 //! millisatoshis.
 
 use wallet_core::Msat;
-use wallet_fedimint::{gross_up, total_within_cap, GatewayFee, GrossUp};
+use wallet_fedimint::{
+    gross_up, predicted_net, shrink_invoice, total_within_cap, GatewayFee, GrossUp,
+};
 
 /// A pure federation-fee closure: `base + floor(ppm * amount / 1_000_000)`. Floors like
 /// fedimint's own `PaymentFee` — and so does [`GatewayFee::on`], so the solved invoice nets
@@ -280,4 +282,78 @@ fn direct_inflow_cap_check_ignores_the_send_leg() {
     assert!(total_within_cap(receive_quote, Msat(0), fee_cap));
     // Same receive cost as a Move (with the send leg) blows the cap.
     assert!(!total_within_cap(receive_quote, send_quote, fee_cap));
+}
+
+#[test]
+fn predicted_net_matches_the_solver_for_a_constant_fee() {
+    // When the async re-quote loop CONVERGES (fee at the solved contract == the fee the
+    // solve used), the verification pass must confirm exact net — no clamp, no drift.
+    let gw = GatewayFee {
+        base_msat: Msat(10),
+        ppm: 1_000,
+    };
+    let net = Msat(449_968);
+    let fed = Msat(1_234);
+    let g = gross_up(net, gw, |_| fed).expect("solvable");
+    assert_eq!(predicted_net(g.invoice_amount, gw, fed), net);
+}
+
+#[test]
+fn never_over_clamp_recovers_the_oscillating_step_fee_over_credit() {
+    // The live 3.A evacuate-smoke failure shape: the bounded fixed point exits with a solve
+    // whose constant-fee assumption (fee = 100) no longer matches the STEP fee at the solved
+    // contract (fee = 22 below the step boundary), so the recipient would net +78 OVER.
+    // The executor's verification measures the excess and shrinks the invoice; one pass
+    // lands the prediction back at exactly net (never over).
+    let gw = GatewayFee {
+        base_msat: Msat(0),
+        ppm: 0,
+    };
+    let net = Msat(950);
+    // Solve as the loop would have, with the stale constant fee of 100.
+    let stale = gross_up(net, gw, |_| Msat(100)).expect("solvable");
+    assert_eq!(stale.invoice_amount, Msat(1_050));
+    // The REAL step fee at the solved contract (1_050 >= 1_000 boundary? no: fee steps DOWN
+    // below 1_000... here the real fee at contract 1_050 turns out to be 22):
+    let real_fee_at_contract = Msat(22);
+    let predicted = predicted_net(stale.invoice_amount, gw, real_fee_at_contract);
+    assert_eq!(
+        predicted,
+        Msat(1_028),
+        "over-credits by 78 without the clamp"
+    );
+    let excess = Msat(predicted.0 - net.0);
+    let clamped = shrink_invoice(stale, gw, net, excess);
+    assert_eq!(clamped.invoice_amount, Msat(972));
+    // Re-verify at the shrunk contract (972, below the step boundary: fee still 22):
+    assert_eq!(
+        predicted_net(clamped.invoice_amount, gw, real_fee_at_contract),
+        net,
+        "one clamp pass lands exactly on net — never over"
+    );
+    assert_eq!(clamped.receive_quote, Msat(972 - 950));
+}
+
+#[test]
+fn shrink_invoice_never_lets_the_net_move_up() {
+    // Monotonicity under a nonzero gateway ppm: shrinking the invoice by the excess drops
+    // the prediction by AT MOST the excess (net lands at or a hair under target, given the
+    // same fee), never above it.
+    let gw = GatewayFee {
+        base_msat: Msat(5),
+        ppm: 10_000, // 1%
+    };
+    let net = Msat(100_000);
+    let fed = Msat(50);
+    let g = gross_up(net, gw, |_| fed).expect("solvable");
+    // Pretend the verification measured a 78-msat overshoot (a stale-fee exit).
+    let excess = Msat(78);
+    let clamped = shrink_invoice(g, gw, net, excess);
+    let before = predicted_net(g.invoice_amount, gw, fed);
+    let after = predicted_net(clamped.invoice_amount, gw, fed);
+    assert!(after.0 <= before.0);
+    assert!(
+        before.0 - after.0 <= excess.0,
+        "net drops by at most the excess"
+    );
 }
