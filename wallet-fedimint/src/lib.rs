@@ -46,7 +46,7 @@ pub mod tick;
 pub mod types;
 
 pub use executor::FedimintExecutor;
-pub use fee::{gross_up, predicted_net, shrink_invoice, total_within_cap, GatewayFee, GrossUp};
+pub use fee::{gross_up, predicted_net, total_within_cap, GatewayFee, GrossUp};
 pub use journal::{FederationInfo, FederationListReport, FedimintJournal};
 pub use move_protocol::{
     assemble_move_record, next_step, Leg, MoveMeta, MoveParams, MovePhase, MovePlan, MoveRecord,
