@@ -177,10 +177,25 @@ impl Runtime {
     ) -> anyhow::Result<DirectInflowOutcome> {
         let key = direct_inflow_key(&to, amount, fee_cap, occurrence);
         if self.journal.get(&key).await.map_err(exec_err)?.is_none() {
-            self.executor()
+            // The preflight exists to catch DETERMINISTIC rejections (lnv2 dust) before an
+            // intent is journaled. A RETRYABLE failure here (e.g. the never-over quote loop
+            // not settling this instant) must NOT hard-fail the command pre-journal — there
+            // would be no pending intent for `reconcile`/a same-occurrence re-run to
+            // re-drive. Proceed to journal + drive instead: `perform` re-quotes from
+            // scratch, and if the quotes are still unstable it leaves the intent `Pending`
+            // for the re-drive paths, which is the documented behavior.
+            match self
+                .executor()
                 .validate_direct_inflow_amount(to, amount)
                 .await
-                .map_err(exec_err)?;
+            {
+                Ok(()) => {}
+                Err(ExecError::Retryable(reason)) => tracing::warn!(
+                    %reason,
+                    "direct-inflow preflight retryable; journaling the intent and driving anyway"
+                ),
+                Err(e) => return Err(exec_err(e)),
+            }
         }
         let decision = AllocatorDecision {
             action: Action::DirectInflow {
