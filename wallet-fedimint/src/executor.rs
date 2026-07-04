@@ -268,8 +268,18 @@ impl FedimintExecutor {
             match predicted.0.cmp(&amount.0) {
                 std::cmp::Ordering::Equal => return Ok(grossed),
                 std::cmp::Ordering::Less => {
-                    // Never-over holds; keep as the fallback and still try for exact.
-                    safe_under = Some(grossed);
+                    // Never-over holds; keep as the fallback and still try for exact. RESTATE
+                    // the receive quote to the VERIFIED cost (`invoice − predicted`, what the
+                    // recipient actually pays under the verified fee): the solve's own
+                    // `invoice − amount` assumes the requested net was delivered and would
+                    // UNDERSTATE the cost by the shortfall — every downstream fee-cap check
+                    // (DirectInflow's receive-side cap, fresh-evacuation costing) reads this
+                    // field, and an understated quote could approve a move whose real fees
+                    // exceed `fee_cap`.
+                    safe_under = Some(fee::GrossUp {
+                        receive_quote: Msat(grossed.invoice_amount.0.saturating_sub(predicted.0)),
+                        ..grossed
+                    });
                 }
                 std::cmp::Ordering::Greater => {}
             }

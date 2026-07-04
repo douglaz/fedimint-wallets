@@ -365,4 +365,17 @@ fn oscillating_step_fee_yields_a_safe_under_netting_fallback() {
         net.0 - predicted.0 <= (f_hi.0 - f_lo.0),
         "under by at most the fee step"
     );
+    // The executor's fallback RESTATES the receive quote to the VERIFIED cost
+    // (invoice − predicted): the solve's own invoice − net would UNDERSTATE the real fees
+    // by the shortfall and weaken every downstream fee-cap check.
+    let honest_quote = solved_lo.invoice_amount.0 - predicted.0;
+    assert!(
+        honest_quote > solved_lo.receive_quote.0,
+        "restated quote exceeds the stale one"
+    );
+    assert_eq!(
+        honest_quote,
+        solved_lo.receive_quote.0 + (net.0 - predicted.0),
+        "restatement adds exactly the shortfall"
+    );
 }
