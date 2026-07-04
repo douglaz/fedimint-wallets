@@ -258,6 +258,7 @@ impl FedimintExecutor {
             .map_err(retryable)?;
         let mut grossed = solve_gross_up(amount, gateway_fee, fed_fee)?;
         let mut safe_under: Option<fee::GrossUp> = None;
+        let mut last_over_invoice: Option<u64> = None;
         // `0..=` so EVERY solve is verified, including the one built on the final pass — a
         // stable quote staircase that reaches its exact fixed point on the last re-solve
         // must be accepted, not dropped to `Retryable` unverified.
@@ -289,7 +290,9 @@ impl FedimintExecutor {
                         ..grossed
                     });
                 }
-                std::cmp::Ordering::Greater => {}
+                std::cmp::Ordering::Greater => {
+                    last_over_invoice = Some(grossed.invoice_amount.0);
+                }
             }
             if pass == FED_FEE_REQUOTE_PASSES {
                 break;
@@ -297,20 +300,42 @@ impl FedimintExecutor {
             fed_fee = verified_fee;
             grossed = solve_gross_up(amount, gateway_fee, fed_fee)?;
         }
-        if let Some(grossed) = safe_under {
-            return Ok(grossed);
+        // Exactness was not reached in bounded passes. Close the remaining gap with a
+        // VERIFIED bisection over the invoice itself: each probe verifies the fee AT the
+        // candidate's own contract, so the search needs NO fee monotonicity to stay SAFE —
+        // its result is always a verified never-over invoice adjacent to a verified
+        // over-netting one (a frontier). On an adversarial non-monotone curve that frontier
+        // may not be the GLOBAL maximum never-over invoice (accepted: under-delivery stays
+        // bounded by the receive fee and is honestly restated in the quote; safety — never
+        // over — is unconditional). Seeding:
+        //   - `lo` = the best VERIFIED under-netting candidate when one was seen (returning
+        //     it outright could leave a whole fee step on the table when a verified
+        //     over-netting invoice exists to bisect toward), else `amount` (always nets
+        //     ≤ amount: fees are non-negative).
+        //   - `hi` = a verified over-netting invoice; if NO pass over-netted there is
+        //     nothing to bisect toward — return the best under candidate directly.
+        let (mut lo, mut lo_quote): (u64, Option<Msat>) = match &safe_under {
+            Some(under) => (under.invoice_amount.0, None),
+            None => (amount.0, None),
+        };
+        let Some(mut hi) = last_over_invoice else {
+            return match safe_under {
+                Some(under) => Ok(under),
+                // Unreachable for a deterministic stream (every pass returned Equal would
+                // have exited; no over and no under means no pass ran) — clean retry.
+                None => Err(ExecError::Retryable(
+                    "receive fee quotes did not converge to a never-over invoice".into(),
+                )),
+            };
+        };
+        if hi <= lo {
+            // The over candidate sits at/below the under seed (non-monotone curve): the
+            // under candidate is already the best verified frontier we can prove.
+            if let Some(under) = safe_under {
+                return Ok(under);
+            }
+            hi = lo.saturating_add(1);
         }
-        // Every verified pass over-netted. A long non-monotone quote staircase can do this
-        // DETERMINISTICALLY — an error here would re-run the identical loop on every drive
-        // and livelock the intent as Pending forever. Fall back to a VERIFIED bisection over
-        // the invoice itself: `invoice = amount` always nets ≤ amount (fees are
-        // non-negative), the current solve's invoice verifiably nets > amount, and each
-        // probe verifies the fee AT the candidate's own contract — so the search needs NO
-        // fee monotonicity, terminates in O(log) quote calls, and lands on a verified
-        // never-over invoice one msat below an over-netting one (exact or a hair under).
-        let mut lo = amount.0;
-        let mut lo_quote: Option<Msat> = None;
-        let mut hi = grossed.invoice_amount.0;
         while hi - lo > 1 {
             let mid = lo + (hi - lo) / 2;
             let mid_invoice = Msat(mid);
