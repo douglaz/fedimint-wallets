@@ -175,30 +175,3 @@ pub fn predicted_net(invoice_amount: Msat, recv_gateway: GatewayFee, recv_fed_fe
         .saturating_sub(recv_gateway.on(invoice_amount).0);
     Msat(contract.saturating_sub(recv_fed_fee.0))
 }
-
-/// Shrink an over-netting solve back toward the never-over contract: reduce the invoice by
-/// `excess` (the caller's measured `predicted_net − net`) and re-derive the dependent fields.
-/// The recipient's net moves by at most one msat per msat of invoice (the [`gross_up`]
-/// monotonicity argument), so the shrunk invoice's net drops by AT MOST `excess` — i.e. to
-/// `net` or a hair under, never further overshooting upward from THIS fee. The smaller
-/// contract may step the federation fee DOWN again, though, so the caller re-verifies with
-/// [`predicted_net`] and repeats (bounded), never accepting an over-netting invoice.
-/// Saturates at zero; the caller's minimum-contract check runs afterwards as usual.
-pub fn shrink_invoice(
-    grossed: GrossUp,
-    recv_gateway: GatewayFee,
-    net: Msat,
-    excess: Msat,
-) -> GrossUp {
-    let invoice_amount = Msat(grossed.invoice_amount.0.saturating_sub(excess.0));
-    let contract_amount = Msat(
-        invoice_amount
-            .0
-            .saturating_sub(recv_gateway.on(invoice_amount).0),
-    );
-    GrossUp {
-        invoice_amount,
-        contract_amount,
-        receive_quote: Msat(invoice_amount.0.saturating_sub(net.0)),
-    }
-}

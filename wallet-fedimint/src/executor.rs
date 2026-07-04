@@ -231,55 +231,58 @@ impl FedimintExecutor {
         amount: Msat,
         gateway_fee: fee::GatewayFee,
     ) -> Result<fee::GrossUp, ExecError> {
-        // Quote the federation fee at the net amount, solve, then re-quote at the solved
-        // contract amount and re-solve until it stops moving (spec §6 fixed point).
+        // Quote the federation fee at the net amount, solve, then VERIFY the fee at the
+        // solved contract and re-solve until the verified prediction is exact (spec §6
+        // fixed point, exit condition on the NET, not on fee equality).
+        //
+        // NEVER-OVER is the hard half of the exact-net contract: the federation fee is a
+        // STEP function of the contract amount, so a bounded loop can oscillate without
+        // settling — and an unverified exit can mint an invoice netting the recipient MORE
+        // than `amount`, breaking exact-net AND potentially pushing the destination past its
+        // hard per-fed cap (the allocator sized the move by cap_room). So each pass verifies
+        // `predicted_net` with the fee quoted AT the current solve's contract:
+        //   - exact        → done (a converged fee always lands here: the solver nets
+        //                    exactly `net` for the fee it was handed);
+        //   - a hair UNDER → remember it as a SAFE fallback (never-over holds), then keep
+        //                    re-solving for exact;
+        //   - OVER         → re-solve with the fresher fee (a full re-solve, not a linear
+        //                    invoice shrink: with a ppm gateway fee, shrinking the invoice
+        //                    by the excess only closes a fraction of the overshoot per pass).
+        // On exhaustion return the safe under-netting candidate if one was seen (a true
+        // two-step oscillation always yields one — solving with the higher fee under-nets
+        // under the lower); only a genuinely unstable quote stream errors `Retryable`.
         let mut fed_fee = self
             .mc
             .receive_fee_quote(to, amount)
             .await
             .map_err(retryable)?;
         let mut grossed = solve_gross_up(amount, gateway_fee, fed_fee)?;
+        let mut safe_under: Option<fee::GrossUp> = None;
         for _ in 0..FED_FEE_REQUOTE_PASSES {
-            let requoted = self
+            let verified_fee = self
                 .mc
                 .receive_fee_quote(to, grossed.contract_amount)
                 .await
                 .map_err(retryable)?;
-            if requoted == fed_fee {
-                break;
+            let predicted = fee::predicted_net(grossed.invoice_amount, gateway_fee, verified_fee);
+            match predicted.0.cmp(&amount.0) {
+                std::cmp::Ordering::Equal => return Ok(grossed),
+                std::cmp::Ordering::Less => {
+                    // Never-over holds; keep as the fallback and still try for exact.
+                    safe_under = Some(grossed);
+                }
+                std::cmp::Ordering::Greater => {}
             }
-            fed_fee = requoted;
+            fed_fee = verified_fee;
             grossed = solve_gross_up(amount, gateway_fee, fed_fee)?;
         }
-
-        // NEVER-OVER verification (the §6 exact-net contract's hard half). The federation fee
-        // is a STEP function of the contract amount, so the bounded loop above can exhaust its
-        // passes on an oscillation and exit with a solve whose constant-fee assumption no
-        // longer matches the fee at the solved contract — minting an invoice that nets the
-        // recipient MORE than `amount`. Over-crediting is never acceptable: it breaks the
-        // exact-net contract AND can push the destination past its hard per-fed cap (the
-        // allocator sized the move by cap_room). Verify the fee AT the final contract; while
-        // the prediction overshoots, shrink the invoice by the exact excess and re-verify
-        // (each pass strictly shrinks; a smaller contract can step the fee down and re-expose
-        // a smaller overshoot, hence the loop). Netting a hair UNDER is the accepted
-        // degradation (same as the fee-under-estimate slack the smokes already tolerate).
-        for _ in 0..FED_FEE_REQUOTE_PASSES {
-            let final_fee = self
-                .mc
-                .receive_fee_quote(to, grossed.contract_amount)
-                .await
-                .map_err(retryable)?;
-            let predicted = fee::predicted_net(grossed.invoice_amount, gateway_fee, final_fee);
-            if predicted.0 <= amount.0 {
-                return Ok(grossed);
-            }
-            let excess = Msat(predicted.0 - amount.0);
-            grossed = fee::shrink_invoice(grossed, gateway_fee, amount, excess);
+        if let Some(grossed) = safe_under {
+            return Ok(grossed);
         }
-        // Still over after the bounded clamp: refuse to mint an over-crediting invoice this
-        // pass; the next drive re-quotes from scratch (fees may have settled by then).
+        // No verified never-over candidate: refuse to mint a possibly over-crediting invoice
+        // this pass; the next drive re-quotes from scratch (fees may have settled by then).
         Err(ExecError::Retryable(
-            "receive fee quote would over-credit the destination and did not converge".into(),
+            "receive fee quotes did not converge to a never-over invoice".into(),
         ))
     }
 
