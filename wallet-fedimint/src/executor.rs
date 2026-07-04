@@ -607,28 +607,20 @@ impl Executor for FedimintExecutor {
                     self.validate_move_gateway_before_receive(&rec).await?;
                     let grossed = self.gross_up(&rec).await?;
                     let invoice_amount = grossed.invoice_amount;
-                    // A send-required move may have accepted a verified hair-under solve
-                    // (`NetPolicy::AllowUnder`): the DELIVERED net is invoice − receive_quote.
-                    // Adjust `rec.amount` to it BEFORE minting, so the Pay-step cap re-check
-                    // (`invoice − rec.amount`) counts the honest receive cost and the record
-                    // states what the destination will actually receive. Persisted with the
-                    // pre-receive `put_move` below and honored on re-assembly (the same
-                    // cached-amount mechanism the evacuation sizing relies on). No-op for an
-                    // exact solve.
+                    // A send-required move may have accepted a verified hair-under solve:
+                    // the DELIVERED net is invoice − receive_quote. The adjustment to
+                    // `rec.amount` happens AFTER `mc.receive` commits (below), NOT here —
+                    // lowering the cached amount before the receive exists would make a
+                    // crash/transient-failure retry prefer the smaller cached amount over
+                    // the intent's ask (`assemble_move_record`) and mint a fresh invoice
+                    // for less than requested even though fees may have settled; a fresh
+                    // attempt must re-quote from the intent's full ask.
                     let delivered = Msat(
                         grossed
                             .invoice_amount
                             .0
                             .saturating_sub(grossed.receive_quote.0),
                     );
-                    if rec.send_required && delivered < rec.amount {
-                        tracing::warn!(
-                            requested_msat = rec.amount.0,
-                            delivered_msat = delivered.0,
-                            "executor: fee fixed point settled a hair under; adjusting move net"
-                        );
-                        rec.amount = delivered;
-                    }
                     // For a `Move`, persist the chosen gateway BEFORE the non-idempotent receive
                     // call. If the process dies after B's receive op commits but before the
                     // invoice/op-id cache write below, backfill can recover the op but not the
@@ -661,6 +653,21 @@ impl Executor for FedimintExecutor {
                     rec.invoice = Some(invoice);
                     rec.recv_op = Some(recv_op);
                     rec.phase = MovePhase::Invoiced;
+                    // The invoice is now FIXED, so the delivered net is a fact: for a
+                    // send-required move that accepted a verified hair-under solve, record
+                    // it as the move's amount so the Pay-step cap re-check
+                    // (`invoice − rec.amount`) counts the honest receive cost across
+                    // crash/resume. (A crash in the §5 backfill window loses only this
+                    // adjustment — the re-check then understates the receive cost by the
+                    // bounded shortfall, the pre-existing approximation class.)
+                    if rec.send_required && delivered < rec.amount {
+                        tracing::warn!(
+                            requested_msat = rec.amount.0,
+                            delivered_msat = delivered.0,
+                            "executor: fee fixed point settled a hair under; adjusting move net"
+                        );
+                        rec.amount = delivered;
+                    }
                     self.journal.put_move(&rec).await?;
                     // KILLPOINT: the MoveRecord (recv_op + invoice) is persisted and the receive
                     // leg is committed, but the irreversible `Pay` has not run. A crash here must
