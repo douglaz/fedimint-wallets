@@ -300,11 +300,58 @@ impl FedimintExecutor {
         if let Some(grossed) = safe_under {
             return Ok(grossed);
         }
-        // No verified never-over candidate: refuse to mint a possibly over-crediting invoice
-        // this pass; the next drive re-quotes from scratch (fees may have settled by then).
-        Err(ExecError::Retryable(
-            "receive fee quotes did not converge to a never-over invoice".into(),
-        ))
+        // Every verified pass over-netted. A long non-monotone quote staircase can do this
+        // DETERMINISTICALLY — an error here would re-run the identical loop on every drive
+        // and livelock the intent as Pending forever. Fall back to a VERIFIED bisection over
+        // the invoice itself: `invoice = amount` always nets ≤ amount (fees are
+        // non-negative), the current solve's invoice verifiably nets > amount, and each
+        // probe verifies the fee AT the candidate's own contract — so the search needs NO
+        // fee monotonicity, terminates in O(log) quote calls, and lands on a verified
+        // never-over invoice one msat below an over-netting one (exact or a hair under).
+        let mut lo = amount.0;
+        let mut lo_quote: Option<Msat> = None;
+        let mut hi = grossed.invoice_amount.0;
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            let mid_invoice = Msat(mid);
+            let mid_contract = Msat(mid.saturating_sub(gateway_fee.on(mid_invoice).0));
+            let mid_fee = self
+                .mc
+                .receive_fee_quote(to, mid_contract)
+                .await
+                .map_err(retryable)?;
+            if fee::predicted_net(mid_invoice, gateway_fee, mid_fee).0 > amount.0 {
+                hi = mid;
+            } else {
+                lo = mid;
+                lo_quote = Some(mid_fee);
+            }
+        }
+        let invoice_amount = Msat(lo);
+        let contract_amount = Msat(lo.saturating_sub(gateway_fee.on(invoice_amount).0));
+        let fed_fee = match lo_quote {
+            Some(fed_fee) => fed_fee,
+            None => self
+                .mc
+                .receive_fee_quote(to, contract_amount)
+                .await
+                .map_err(retryable)?,
+        };
+        let predicted = fee::predicted_net(invoice_amount, gateway_fee, fed_fee);
+        if predicted.0 > amount.0 {
+            // Unreachable for a deterministic quote stream (invoice = amount cannot net over
+            // with non-negative fees); a non-deterministic stream gets a clean retry.
+            return Err(ExecError::Retryable(
+                "receive fee quotes did not converge to a never-over invoice".into(),
+            ));
+        }
+        Ok(fee::GrossUp {
+            invoice_amount,
+            contract_amount,
+            // The verified honest cost (invoice − predicted), same restatement convention
+            // as the safe-under fallback above.
+            receive_quote: Msat(lo.saturating_sub(predicted.0)),
+        })
     }
 
     /// Preflight a fresh CLI `DirectInflow` before it is journaled. This catches the
