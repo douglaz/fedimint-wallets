@@ -258,7 +258,10 @@ impl FedimintExecutor {
             .map_err(retryable)?;
         let mut grossed = solve_gross_up(amount, gateway_fee, fed_fee)?;
         let mut safe_under: Option<fee::GrossUp> = None;
-        for _ in 0..FED_FEE_REQUOTE_PASSES {
+        // `0..=` so EVERY solve is verified, including the one built on the final pass — a
+        // stable quote staircase that reaches its exact fixed point on the last re-solve
+        // must be accepted, not dropped to `Retryable` unverified.
+        for pass in 0..=FED_FEE_REQUOTE_PASSES {
             let verified_fee = self
                 .mc
                 .receive_fee_quote(to, grossed.contract_amount)
@@ -268,20 +271,28 @@ impl FedimintExecutor {
             match predicted.0.cmp(&amount.0) {
                 std::cmp::Ordering::Equal => return Ok(grossed),
                 std::cmp::Ordering::Less => {
-                    // Never-over holds; keep as the fallback and still try for exact. RESTATE
-                    // the receive quote to the VERIFIED cost (`invoice − predicted`, what the
-                    // recipient actually pays under the verified fee): the solve's own
-                    // `invoice − amount` assumes the requested net was delivered and would
-                    // UNDERSTATE the cost by the shortfall — every downstream fee-cap check
-                    // (DirectInflow's receive-side cap, fresh-evacuation costing) reads this
-                    // field, and an understated quote could approve a move whose real fees
-                    // exceed `fee_cap`.
+                    // Never-over holds; keep as the fallback and still try for exact — a
+                    // verified hair-under solve is the ACCEPTED degradation for every path
+                    // (live feds cannot guarantee msat-exact: the claim-time fee model gap
+                    // already under-delivers a hair, which the smokes' slack tolerates;
+                    // demanding quote-time exactness would spuriously retry real inflows).
+                    // RESTATE the receive quote to the VERIFIED cost (`invoice − predicted`,
+                    // what the recipient actually pays): the solve's own `invoice − amount`
+                    // assumes the requested net was delivered and would UNDERSTATE the cost
+                    // by the shortfall — every downstream fee-cap check (DirectInflow's
+                    // receive-side cap, fresh-evacuation costing) reads this field, and an
+                    // understated quote could approve a move whose real fees exceed
+                    // `fee_cap`. Send-required moves additionally adjust `rec.amount` to
+                    // the delivered net at CreateInvoice, keeping the Pay re-check honest.
                     safe_under = Some(fee::GrossUp {
                         receive_quote: Msat(grossed.invoice_amount.0.saturating_sub(predicted.0)),
                         ..grossed
                     });
                 }
                 std::cmp::Ordering::Greater => {}
+            }
+            if pass == FED_FEE_REQUOTE_PASSES {
+                break;
             }
             fed_fee = verified_fee;
             grossed = solve_gross_up(amount, gateway_fee, fed_fee)?;
@@ -313,7 +324,7 @@ impl FedimintExecutor {
     /// (spec §7 `CreateInvoice`). The gateway fee comes from `routing_info`; the federation
     /// fee is resolved by a short async fixed point (see [`FED_FEE_REQUOTE_PASSES`]). Returns
     /// the gross invoice amount; the invoice is then fixed (never re-quoted on resume).
-    async fn gross_up(&self, rec: &MoveRecord) -> Result<Msat, ExecError> {
+    async fn gross_up(&self, rec: &MoveRecord) -> Result<fee::GrossUp, ExecError> {
         let grossed = self
             .quote_receive_gross_up(&rec.to, &rec.gateway, rec.amount)
             .await?;
@@ -326,7 +337,7 @@ impl FedimintExecutor {
                 "fee over cap (receive side exceeds fee_cap)".into(),
             ));
         }
-        Ok(grossed.invoice_amount)
+        Ok(grossed)
     }
 
     /// For a cross-federation `Move`, prove the pinned receive gateway also serves the source
@@ -594,7 +605,30 @@ impl Executor for FedimintExecutor {
             match next_step(&rec) {
                 MoveStep::CreateInvoice => {
                     self.validate_move_gateway_before_receive(&rec).await?;
-                    let invoice_amount = self.gross_up(&rec).await?;
+                    let grossed = self.gross_up(&rec).await?;
+                    let invoice_amount = grossed.invoice_amount;
+                    // A send-required move may have accepted a verified hair-under solve
+                    // (`NetPolicy::AllowUnder`): the DELIVERED net is invoice − receive_quote.
+                    // Adjust `rec.amount` to it BEFORE minting, so the Pay-step cap re-check
+                    // (`invoice − rec.amount`) counts the honest receive cost and the record
+                    // states what the destination will actually receive. Persisted with the
+                    // pre-receive `put_move` below and honored on re-assembly (the same
+                    // cached-amount mechanism the evacuation sizing relies on). No-op for an
+                    // exact solve.
+                    let delivered = Msat(
+                        grossed
+                            .invoice_amount
+                            .0
+                            .saturating_sub(grossed.receive_quote.0),
+                    );
+                    if rec.send_required && delivered < rec.amount {
+                        tracing::warn!(
+                            requested_msat = rec.amount.0,
+                            delivered_msat = delivered.0,
+                            "executor: fee fixed point settled a hair under; adjusting move net"
+                        );
+                        rec.amount = delivered;
+                    }
                     // For a `Move`, persist the chosen gateway BEFORE the non-idempotent receive
                     // call. If the process dies after B's receive op commits but before the
                     // invoice/op-id cache write below, backfill can recover the op but not the
