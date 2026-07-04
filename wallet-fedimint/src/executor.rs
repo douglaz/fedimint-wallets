@@ -251,7 +251,36 @@ impl FedimintExecutor {
             fed_fee = requoted;
             grossed = solve_gross_up(amount, gateway_fee, fed_fee)?;
         }
-        Ok(grossed)
+
+        // NEVER-OVER verification (the §6 exact-net contract's hard half). The federation fee
+        // is a STEP function of the contract amount, so the bounded loop above can exhaust its
+        // passes on an oscillation and exit with a solve whose constant-fee assumption no
+        // longer matches the fee at the solved contract — minting an invoice that nets the
+        // recipient MORE than `amount`. Over-crediting is never acceptable: it breaks the
+        // exact-net contract AND can push the destination past its hard per-fed cap (the
+        // allocator sized the move by cap_room). Verify the fee AT the final contract; while
+        // the prediction overshoots, shrink the invoice by the exact excess and re-verify
+        // (each pass strictly shrinks; a smaller contract can step the fee down and re-expose
+        // a smaller overshoot, hence the loop). Netting a hair UNDER is the accepted
+        // degradation (same as the fee-under-estimate slack the smokes already tolerate).
+        for _ in 0..FED_FEE_REQUOTE_PASSES {
+            let final_fee = self
+                .mc
+                .receive_fee_quote(to, grossed.contract_amount)
+                .await
+                .map_err(retryable)?;
+            let predicted = fee::predicted_net(grossed.invoice_amount, gateway_fee, final_fee);
+            if predicted.0 <= amount.0 {
+                return Ok(grossed);
+            }
+            let excess = Msat(predicted.0 - amount.0);
+            grossed = fee::shrink_invoice(grossed, gateway_fee, amount, excess);
+        }
+        // Still over after the bounded clamp: refuse to mint an over-crediting invoice this
+        // pass; the next drive re-quotes from scratch (fees may have settled by then).
+        Err(ExecError::Retryable(
+            "receive fee quote would over-credit the destination and did not converge".into(),
+        ))
     }
 
     /// Preflight a fresh CLI `DirectInflow` before it is journaled. This catches the
