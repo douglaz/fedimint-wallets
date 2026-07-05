@@ -110,7 +110,19 @@ pub fn build_snapshot(
         .iter()
         .zip(&verdicts)
         .map(|((id, probe), verdict)| FederationStatus {
-            eligible_to_fund: verdict.eligible_to_fund,
+            // An operator PIN overrides the scorer's verdict (§15.3 refinement, found by the
+            // live evacuate gate): an explicit `--spending`/`--standby` is the operator
+            // vouching for that exact fed (the same semantics that already exempt pins from
+            // scorer AUTO-designation), so a pinned fed stays an eligible evacuation
+            // DESTINATION even when the scorer rejects it structurally — otherwise a pinned
+            // standby on a scorer-rejected network (devimint is regtest) would turn every
+            // evacuation into a refusal. The §15.3 gate exists for the FALLBACK scan: money
+            // must never drain into an arbitrary scorer-rejected fed the operator never
+            // chose. Liveness/route gating (`receive_blocker`: probed_ok, reputation) still
+            // applies to pins unchanged.
+            eligible_to_fund: verdict.eligible_to_fund
+                || policy.spending_fed == Some(*id)
+                || policy.standby_fed == Some(*id),
             ..assemble_status(probe, *id)
         })
         .collect();
@@ -467,6 +479,40 @@ mod tests {
         // balance), just never designated.
         assert_eq!(snapshot.federations.len(), 3);
         assert!(snapshot.federations.iter().any(|f| f.id == fed_id(3)));
+    }
+
+    #[test]
+    fn a_pin_overrides_the_scorer_verdict_for_evacuation_eligibility() {
+        // Fed 2 is scorer-REJECTED (no lnv2). Unpinned it must stay ineligible_to_fund —
+        // the §15.3 gate that keeps the evacuation FALLBACK from draining into an
+        // arbitrary rejected fed. Pinned as standby, the operator's explicit vouch makes
+        // it a valid evacuation destination (the same pin semantics that bypass scorer
+        // auto-designation); auto-designation itself must still never pick it.
+        let probes = vec![
+            (fed_id(1), healthy_probe(5_000_000)),
+            (fed_id(2), ineligible_probe(1_000_000)),
+        ];
+        let eligible_of = |snapshot: &AllocatorSnapshot, id: FederationId| {
+            snapshot
+                .federations
+                .iter()
+                .find(|f| f.id == id)
+                .expect("fed present in snapshot")
+                .eligible_to_fund
+        };
+
+        let unpinned = build_snapshot(&probes, &TickPolicy::default(), &ScorerPolicy::default());
+        assert!(!eligible_of(&unpinned, fed_id(2)));
+
+        let pinned_policy = TickPolicy {
+            standby_fed: Some(fed_id(2)),
+            ..TickPolicy::default()
+        };
+        let pinned = build_snapshot(&probes, &pinned_policy, &ScorerPolicy::default());
+        assert!(eligible_of(&pinned, fed_id(2)));
+        // The pin vouches for the DESTINATION role only; the scorer-rejected fed is still
+        // never auto-designated as spending.
+        assert_eq!(pinned.spending_fed, Some(fed_id(1)));
     }
 
     #[test]
