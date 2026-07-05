@@ -313,15 +313,17 @@ impl MultiClient {
     /// Pay a BOLT11 invoice from `id` via lnv2. The lnv2 client is the dedup AUTHORITY
     /// (deterministic op-id): re-paying an in-flight or already-settled invoice returns
     /// [`SendOutcome::AlreadyInFlight`]/[`SendOutcome::AlreadyPaid`] carrying the ORIGINAL
-    /// op-id — never an `Err`, never a double-pay (spec §4). `custom_meta` is committed into
-    /// the operation meta.
+    /// op-id — never a double-pay (spec §4). `custom_meta` is committed into the operation
+    /// meta. A failure is a typed [`SendError`] so the caller can tell a DETERMINISTIC
+    /// rejection (expired/wrong-currency/unsupported/fee-limit — re-paying the SAME invoice
+    /// can never succeed) from a TRANSPORT fault (retry may succeed) — §15.4.
     pub async fn pay(
         &self,
         id: &FederationId,
         invoice: Invoice,
         gateway: Option<GatewayUrl>,
         custom_meta: serde_json::Value,
-    ) -> anyhow::Result<SendOutcome> {
+    ) -> Result<SendOutcome, SendError> {
         let client = self.client(id)?;
         let lnv2 = client.get_first_module::<LightningClientModule>()?;
         let bolt11 = Bolt11Invoice::from_str(&invoice.0)
@@ -648,12 +650,65 @@ pub enum SendState {
     Failed(String),
 }
 
-/// Map lnv2 `send`'s result to a [`SendOutcome`]: the two dedup errors become non-failure
-/// outcomes carrying the existing op-id; every other error is a real failure. Pure, so the
-/// dedup mapping is unit-tested without a live federation.
+/// Why an lnv2 `send` produced no [`SendOutcome`] (spec §15.4). Split so the executor can tell a
+/// DETERMINISTIC rejection — the invoice/gateway/currency is wrong, so re-paying the SAME invoice
+/// can never succeed (the move must fail terminally and a fresh occurrence re-mint) — from a
+/// TRANSPORT fault (the gateway is unreachable this attempt; a retry may succeed). Blanket-mapping
+/// every failure to `Retryable` (the old behavior) let `InvoiceExpired`/`WrongCurrency`/
+/// `FederationNotSupported`/fee-limit breaches livelock forever.
+#[derive(Debug)]
+pub enum SendError {
+    /// The federation deterministically rejected this invoice (expired / wrong currency /
+    /// unsupported / fee- or expiry-limit breach). Terminal for this invoice.
+    Rejected(String),
+    /// A transient transport / gateway-reachability fault; retry with the same invoice may succeed.
+    Transport(anyhow::Error),
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendError::Rejected(msg) => write!(f, "{msg}"),
+            SendError::Transport(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for SendError {}
+
+/// A non-`SendPaymentError` failure inside [`MultiClient::pay`] (bad invoice/gateway/module lookup)
+/// is a transport-class fault as far as the send is concerned: it never proves the invoice itself
+/// is permanently unpayable, so it stays retryable.
+impl From<anyhow::Error> for SendError {
+    fn from(e: anyhow::Error) -> Self {
+        SendError::Transport(e)
+    }
+}
+
+/// Whether a [`SendPaymentError`] is a DETERMINISTIC rejection of the invoice — re-submitting the
+/// SAME BOLT11 can never succeed (verified against `modules/fedimint-lnv2-client/src/lib.rs`'s
+/// variants). Transport/gateway-reachability and funding faults are excluded (they may clear on a
+/// retry). The dedup variants are handled as OUTCOMES before this is consulted.
+fn is_deterministic_send_rejection(e: &SendPaymentError) -> bool {
+    matches!(
+        e,
+        SendPaymentError::InvoiceMissingAmount
+            | SendPaymentError::InvoiceExpired
+            | SendPaymentError::FederationNotSupported
+            | SendPaymentError::GatewayFeeExceedsLimit
+            | SendPaymentError::GatewayExpirationExceedsLimit
+            | SendPaymentError::WrongCurrency { .. }
+    )
+}
+
+/// Map lnv2 `send`'s result to a [`SendOutcome`] or a classified [`SendError`]: the two dedup
+/// errors become non-failure outcomes carrying the existing op-id; a deterministic rejection
+/// becomes [`SendError::Rejected`] (terminal), and every other failure stays
+/// [`SendError::Transport`] (retryable). Pure, so the classification is unit-tested without a live
+/// federation.
 fn map_send_result(
     result: Result<FedimintOperationId, SendPaymentError>,
-) -> anyhow::Result<SendOutcome> {
+) -> Result<SendOutcome, SendError> {
     match result {
         Ok(op) => Ok(SendOutcome::Started(bridge_op_id(op))),
         Err(SendPaymentError::PaymentInProgress(op)) => {
@@ -662,7 +717,10 @@ fn map_send_result(
         Err(SendPaymentError::InvoiceAlreadyPaid(op)) => {
             Ok(SendOutcome::AlreadyPaid(bridge_op_id(op)))
         }
-        Err(e) => Err(anyhow::anyhow!("lnv2 send: {e}")),
+        Err(e) if is_deterministic_send_rejection(&e) => Err(SendError::Rejected(format!(
+            "lnv2 send deterministically rejected the invoice: {e}"
+        ))),
+        Err(e) => Err(SendError::Transport(anyhow::anyhow!("lnv2 send: {e}"))),
     }
 }
 
@@ -905,6 +963,46 @@ mod tests {
         // Any other send error stays a real failure (never a silent success).
         assert!(map_send_result(Err(SendPaymentError::InvoiceExpired)).is_err());
         assert!(map_send_result(Err(SendPaymentError::FederationNotSupported)).is_err());
+    }
+
+    #[test]
+    fn send_result_classifies_deterministic_rejections_distinctly_from_transport() {
+        // §15.4: the deterministic invoice-level rejections must classify as `Rejected` so the
+        // executor fails the move terminally instead of livelocking a re-drive on a dead invoice.
+        for err in [
+            SendPaymentError::InvoiceMissingAmount,
+            SendPaymentError::InvoiceExpired,
+            SendPaymentError::FederationNotSupported,
+            SendPaymentError::GatewayFeeExceedsLimit,
+            SendPaymentError::GatewayExpirationExceedsLimit,
+            SendPaymentError::WrongCurrency {
+                invoice_currency: lightning_invoice::Currency::Bitcoin,
+                federation_currency: lightning_invoice::Currency::Regtest,
+            },
+        ] {
+            assert!(
+                matches!(
+                    map_send_result(Err(err.clone())),
+                    Err(SendError::Rejected(_))
+                ),
+                "{err:?} must classify as a deterministic Rejected, not Transport"
+            );
+        }
+
+        // Transport / reachability / funding faults stay `Transport` (retry may succeed).
+        for err in [
+            SendPaymentError::FailedToConnectToGateway("reset".into()),
+            SendPaymentError::FailedToRequestBlockCount("timeout".into()),
+            SendPaymentError::FailedToFundPayment("in flight".into()),
+        ] {
+            assert!(
+                matches!(
+                    map_send_result(Err(err.clone())),
+                    Err(SendError::Transport(_))
+                ),
+                "{err:?} must stay a retryable Transport fault"
+            );
+        }
     }
 
     #[test]

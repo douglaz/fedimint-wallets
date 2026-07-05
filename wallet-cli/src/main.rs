@@ -12,6 +12,7 @@ use fedimint_core::invite_code::InviteCode;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use wallet_core::{
     Action, AllocatorDecision, ExecutionSummary, FederationId, IdempotencyKey, IntentStatus, Msat,
     Occurrence,
@@ -27,6 +28,12 @@ struct Cli {
     /// Directory holding the wallet's RocksDB and mnemonic.
     #[arg(long, default_value = "./.wallet-cli-data")]
     data_dir: PathBuf,
+
+    /// Max wall-clock SECONDS for a single executor `perform` before it is abandoned and left
+    /// Pending for the next reconcile (§15.9 — one stalled gateway must not freeze a whole tick).
+    /// `0` disables the deadline. Default 600 (10 min).
+    #[arg(long, default_value_t = 600)]
+    perform_timeout: u64,
 
     #[command(subcommand)]
     command: Command,
@@ -107,6 +114,11 @@ enum Command {
         /// auto-registered — see docs/devimint-runbook.md §4).
         #[arg(long)]
         gateway: Option<String>,
+        /// Allow the destination to exceed the hard per-fed balance cap (ADR-0018). Off by
+        /// default: an inflow that would push the destination over the cap is refused pre-mint.
+        /// Operator override only — an explicit escape hatch, never silent.
+        #[arg(long)]
+        allow_over_cap: bool,
         /// Idempotency occurrence. Reusing the same occurrence returns the same invoice; bump it
         /// to create another same-amount inflow after the first one settles or fails.
         #[arg(long, default_value_t = 0)]
@@ -145,6 +157,11 @@ enum Command {
         /// gateway is not auto-registered — see docs/devimint-runbook.md §4).
         #[arg(long)]
         gateway: Option<String>,
+        /// Allow the destination to exceed the hard per-fed balance cap (ADR-0018). Off by
+        /// default: a move that would push the destination over the cap is refused pre-mint.
+        /// Operator override only — an explicit escape hatch, never silent.
+        #[arg(long)]
+        allow_over_cap: bool,
         /// Idempotency occurrence. Reusing the same occurrence reattaches to the same move (no
         /// re-mint/re-pay); bump it to start another same-params move after the first settles.
         #[arg(long, default_value_t = 0)]
@@ -152,7 +169,16 @@ enum Command {
     },
     /// Re-drive pending intents and rebuild move records from the op-log (spec §9 resume loop):
     /// print performed/failed/skipped/awaiting counts; awaiting intent keys go to stderr.
-    Reconcile,
+    Reconcile {
+        /// Per-fed balance cap to enforce while resuming pending pre-mint intents. Use the same
+        /// value that authorized the original tick when reconciling work from `tick --per-fed-cap`.
+        #[arg(long)]
+        per_fed_cap: Option<u64>,
+        /// Resume pending intents that were originally authorized with an over-cap operator
+        /// override (`direct-inflow --allow-over-cap` / `move --allow-over-cap`).
+        #[arg(long)]
+        allow_over_cap: bool,
+    },
     /// Run ONE orchestrator tick (Phase 2 step 2.2): probe every open federation, score them,
     /// build the allocator snapshot from the standing-instruction policy, decide, and APPLY the
     /// decisions through the executor — the wallet actually rebalances/tops-up. Prints the
@@ -235,6 +261,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    // §15.9: the per-`perform` deadline threaded into every engine verb that drives money. `0`
+    // disables it.
+    let perform_timeout =
+        (cli.perform_timeout > 0).then(|| Duration::from_secs(cli.perform_timeout));
 
     tokio::fs::create_dir_all(&cli.data_dir).await?;
     let db_path = cli.data_dir.join("client.db");
@@ -263,13 +293,33 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", id.to_hex());
         }
         Command::Balance => {
+            // §15.8: a joined fed that failed to open must NOT silently drop out of the total.
+            // Print an `unavailable` row for each, label the total `(N/M federations)`, and exit
+            // non-zero when any fed is missing so a script never mistakes a partial view for whole.
+            let unopened = unopened_feds(&joined_ids, &open_ids);
             let mut total_msat = 0u64;
-            for id in &open_ids {
-                let balance = multi_client.balance(id).await?;
-                total_msat += balance.0;
-                println!("{}: {} msat", id.to_hex(), balance.0);
+            for id in &joined_ids {
+                if open_ids.contains(id) {
+                    let balance = multi_client.balance(id).await?;
+                    total_msat += balance.0;
+                    println!("{}: {} msat", id.to_hex(), balance.0);
+                } else {
+                    println!("{}: unavailable (failed to open)", id.to_hex());
+                }
             }
-            println!("total: {total_msat} msat");
+            println!(
+                "total ({}/{} federations): {total_msat} msat",
+                open_ids.len(),
+                joined_ids.len()
+            );
+            if !unopened.is_empty() {
+                anyhow::bail!(
+                    "{} joined federation(s) failed to open ({}); the total above omits them — \
+                     check stderr for the open error",
+                    unopened.len(),
+                    hex_list(&unopened)
+                );
+            }
         }
         Command::ListFeds => {
             for (id, info) in joined {
@@ -336,13 +386,20 @@ async fn main() -> anyhow::Result<()> {
             to,
             fee_cap,
             gateway,
+            allow_over_cap,
             occurrence,
         } => {
             let id = select_fed(&joined_ids, &open_ids, to.as_deref())?;
             let gateway = pick_receive_gateway(&multi_client, &id, gateway).await?;
             let amount = Msat(amount);
             let fee_cap = Msat(fee_cap.unwrap_or_else(|| default_direct_inflow_fee_cap(amount.0)));
-            let runtime = Runtime::new(multi_client.clone(), journal.clone(), gateway);
+            let runtime = Runtime::new(
+                multi_client.clone(),
+                journal.clone(),
+                gateway,
+                operator_hard_cap(allow_over_cap),
+                perform_timeout,
+            );
             let outcome = runtime
                 .direct_inflow(id, amount, fee_cap, Occurrence(occurrence))
                 .await?;
@@ -377,7 +434,15 @@ async fn main() -> anyhow::Result<()> {
                 Some(hex) => Some(select_fed(&joined_ids, &open_ids, Some(hex))?),
                 None => None,
             };
-            let runtime = Runtime::new(multi_client.clone(), journal.clone(), None);
+            // `await-move` never mints (it finalizes an existing inflow), so the cap is moot —
+            // pass `None`; the perform deadline is still threaded for consistency.
+            let runtime = Runtime::new(
+                multi_client.clone(),
+                journal.clone(),
+                None,
+                None,
+                perform_timeout,
+            );
             let key = IdempotencyKey(key);
             match runtime.await_move(&key, expected_fed).await? {
                 FinalizeOutcome::Done => println!("done"),
@@ -397,6 +462,7 @@ async fn main() -> anyhow::Result<()> {
             amount,
             fee_cap,
             gateway,
+            allow_over_cap,
             occurrence,
         } => {
             let from_id = select_fed(&joined_ids, &open_ids, Some(&from))?;
@@ -410,7 +476,13 @@ async fn main() -> anyhow::Result<()> {
             let gateway = pick_receive_gateway(&multi_client, &to_id, gateway).await?;
             let amount = Msat(amount);
             let fee_cap = Msat(fee_cap.unwrap_or_else(|| default_move_fee_cap(amount.0)));
-            let runtime = Runtime::new(multi_client.clone(), journal.clone(), gateway);
+            let runtime = Runtime::new(
+                multi_client.clone(),
+                journal.clone(),
+                gateway,
+                operator_hard_cap(allow_over_cap),
+                perform_timeout,
+            );
             let outcome = runtime
                 .do_move(from_id, to_id, amount, fee_cap, Occurrence(occurrence))
                 .await?;
@@ -434,8 +506,21 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Reconcile => {
-            let runtime = Runtime::new(multi_client.clone(), journal.clone(), None);
+        Command::Reconcile {
+            per_fed_cap,
+            allow_over_cap,
+        } => {
+            // Reconcile re-drives already-journaled intents. The intent itself does not persist
+            // cap authorization, so expose the same resume policy explicitly: default ADR-0018
+            // cap unless the operator supplies the original tick cap or the over-cap override.
+            let hard_cap = reconcile_hard_cap(per_fed_cap, allow_over_cap)?;
+            let runtime = Runtime::new(
+                multi_client.clone(),
+                journal.clone(),
+                None,
+                hard_cap,
+                perform_timeout,
+            );
             let summary = runtime.reconcile().await?;
             // Counts -> stdout (the scriptable result); awaiting keys -> stderr (handles).
             println!(
@@ -447,11 +532,16 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Tick { policy, gateway } => {
+            // §15.8: a tick must NOT drive money decisions from a partial world-view. Refuse (no
+            // action, non-zero exit) BEFORE probing if any joined fed failed to open.
+            refuse_on_partial_open(&joined_ids, &open_ids)?;
             let tick_policy = build_tick_policy(&policy, &joined_ids, &open_ids)?;
             let runtime = Runtime::new(
                 multi_client.clone(),
                 journal.clone(),
                 gateway.map(GatewayUrl),
+                Some(tick_policy.per_fed_cap),
+                perform_timeout,
             );
             let report = runtime.tick(&tick_policy).await?;
             // Decisions + the apply summary -> stdout (the scriptable result).
@@ -472,12 +562,17 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Status { policy, gateway } => {
+            // §15.8: status is the DIAGNOSTIC, so it still prints the scored view even under a
+            // partial open — but it reports the unopened feds as rows and exits non-zero.
+            let unopened = unopened_feds(&joined_ids, &open_ids);
             let tick_policy = build_tick_policy(&policy, &joined_ids, &open_ids)?;
             // Dry-run only, but the route gate must match the tick that would apply.
             let runtime = Runtime::new(
                 multi_client.clone(),
                 journal.clone(),
                 gateway.map(GatewayUrl),
+                Some(tick_policy.per_fed_cap),
+                perform_timeout,
             );
             let report = runtime.status(&tick_policy).await?;
             // The dry-run view -> stdout: designation, the per-fed scored rows, then the
@@ -490,7 +585,18 @@ async fn main() -> anyhow::Result<()> {
                     describe_scored(scored, report.spending_fed, report.standby_fed)
                 );
             }
+            for id in &unopened {
+                println!("{}: unavailable (failed to open)", id.to_hex());
+            }
             print_decisions(&report.decisions);
+            if !unopened.is_empty() {
+                anyhow::bail!(
+                    "{} joined federation(s) failed to open ({}); the scored view above covers \
+                     only the open set — repair the fed partition(s) and retry",
+                    unopened.len(),
+                    hex_list(&unopened)
+                );
+            }
         }
     }
 
@@ -778,6 +884,75 @@ fn require_open(id: &FederationId, open_feds: &[FederationId]) -> anyhow::Result
     Ok(())
 }
 
+/// Joined federations that failed to open this run (§15.8): the joined registry minus the
+/// successfully-opened set, in registry order. PURE — `open_all` is best-effort, so a joined fed
+/// that vanished from the open set would otherwise silently drop out of balance totals and every
+/// money decision. `balance`/`tick`/`status` use this to fail loudly instead.
+fn unopened_feds(joined: &[FederationId], open: &[FederationId]) -> Vec<FederationId> {
+    joined
+        .iter()
+        .copied()
+        .filter(|id| !open.contains(id))
+        .collect()
+}
+
+/// §15.8: refuse a money-driving verb (a `tick`) when any joined fed failed to open — a partial
+/// world-view must not drive money decisions, the same doctrine as `missing_pinned_feds`. The
+/// non-zero exit lets a scheduler gating on the exit code catch it; the message goes to stderr.
+fn refuse_on_partial_open(joined: &[FederationId], open: &[FederationId]) -> anyhow::Result<()> {
+    let unopened = unopened_feds(joined, open);
+    anyhow::ensure!(
+        unopened.is_empty(),
+        "tick refused: {} joined federation(s) failed to open ({}); a partial world-view must \
+         not drive money decisions — repair the fed partition(s) and retry (check stderr for the \
+         open error)",
+        unopened.len(),
+        hex_list(&unopened)
+    );
+    Ok(())
+}
+
+/// The hard per-fed balance cap for an OPERATOR verb (§15.2): the ADR-0018 v1 default unless
+/// `--allow-over-cap` was passed, in which case the cap is DISABLED (`None`) — an explicit
+/// override, never silence.
+fn operator_hard_cap(allow_over_cap: bool) -> Option<Msat> {
+    if allow_over_cap {
+        None
+    } else {
+        Some(TickPolicy::default().per_fed_cap)
+    }
+}
+
+/// The hard cap policy used while resuming already-journaled pending work. Reconcile cannot infer
+/// the cap that authorized an intent from the legacy intent shape, so callers can restate it:
+/// default ADR-0018 cap, an explicit tick cap, or the operator over-cap override.
+fn reconcile_hard_cap(
+    per_fed_cap: Option<u64>,
+    allow_over_cap: bool,
+) -> anyhow::Result<Option<Msat>> {
+    anyhow::ensure!(
+        !(allow_over_cap && per_fed_cap.is_some()),
+        "--allow-over-cap and --per-fed-cap are mutually exclusive"
+    );
+    if allow_over_cap {
+        Ok(None)
+    } else {
+        Ok(Some(
+            per_fed_cap
+                .map(Msat)
+                .unwrap_or_else(|| TickPolicy::default().per_fed_cap),
+        ))
+    }
+}
+
+/// Comma-join federation ids as hex for a diagnostic message.
+fn hex_list(ids: &[FederationId]) -> String {
+    ids.iter()
+        .map(|id| id.to_hex())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Resolve the optional CLI gateway flag. An explicit URL becomes a pinned gateway. Without one,
 /// require at least one registered lnv2 gateway and return `None`: raw `receive` passes that to
 /// lnv2's auto-selection, while `direct-inflow` pins the executor to the first registered gateway
@@ -1055,6 +1230,68 @@ mod tests {
             tick_apply_failure(&terminal_skip).expect("a terminal Failed skip must fail the tick");
         assert!(msg.contains("terminal_failed_skipped=1"), "{msg}");
         assert!(msg.contains("fresh --occurrence"), "{msg}");
+    }
+
+    #[test]
+    fn unopened_feds_is_the_joined_minus_open_set() {
+        // §15.8. The joined registry minus the successfully-opened set, in registry order.
+        let a = fed(1);
+        let b = fed(2);
+        let c = fed(3);
+        // All open -> nothing unopened.
+        assert!(unopened_feds(&[a, b, c], &[a, b, c]).is_empty());
+        // One joined fed failed to open -> reported (registry order preserved).
+        assert_eq!(unopened_feds(&[a, b, c], &[a, c]), vec![b]);
+        // Every fed failed to open (empty open set).
+        assert_eq!(unopened_feds(&[a, b], &[]), vec![a, b]);
+        // No feds joined -> nothing unopened.
+        assert!(unopened_feds(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn refuse_on_partial_open_bails_only_when_a_fed_failed_to_open() {
+        let a = fed(1);
+        let b = fed(2);
+        // A fully-open wallet drives the tick.
+        refuse_on_partial_open(&[a, b], &[a, b]).expect("all open -> tick proceeds");
+        // A partial open refuses loudly (non-zero exit) and names the missing fed.
+        let err = refuse_on_partial_open(&[a, b], &[a]).expect_err("partial open must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("tick refused"), "{msg}");
+        assert!(msg.contains(&b.to_hex()), "{msg}");
+    }
+
+    #[test]
+    fn operator_hard_cap_defaults_on_and_allow_over_cap_disables_it() {
+        // §15.2. Off by default -> the ADR-0018 v1 cap is enforced.
+        assert_eq!(
+            operator_hard_cap(false),
+            Some(TickPolicy::default().per_fed_cap)
+        );
+        // `--allow-over-cap` -> None (an explicit override, cap disabled).
+        assert_eq!(operator_hard_cap(true), None);
+    }
+
+    #[test]
+    fn reconcile_hard_cap_can_restate_the_original_resume_policy() {
+        // Default reconcile still enforces ADR-0018 on pre-mint resumes.
+        assert_eq!(
+            reconcile_hard_cap(None, false).expect("default cap"),
+            Some(TickPolicy::default().per_fed_cap)
+        );
+        // Work created by `tick --per-fed-cap` can be resumed under the same cap.
+        assert_eq!(
+            reconcile_hard_cap(Some(42), false).expect("custom cap"),
+            Some(Msat(42))
+        );
+        // Work created by an operator `--allow-over-cap` verb can be resumed without a cap.
+        assert_eq!(
+            reconcile_hard_cap(None, true).expect("allow over cap"),
+            None
+        );
+        // The two policies are intentionally exclusive: one sets a cap, the other disables it.
+        let err = reconcile_hard_cap(Some(42), true).expect_err("conflicting cap flags");
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
     }
 
     #[test]

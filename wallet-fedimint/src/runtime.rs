@@ -30,10 +30,14 @@ use crate::tick::{
     TickReport,
 };
 use crate::types::{GatewayUrl, Invoice};
+use async_trait::async_trait;
+use fedimint_core::runtime;
+use std::time::Duration;
 use std::{collections::BTreeSet, sync::Arc};
 use wallet_core::{
-    score, Action, AllocatorDecision, AllocatorSnapshot, ExecError, FederationId, IdempotencyKey,
-    IntentStatus, Journal, Msat, Occurrence, ReasonCode, ScorerPolicy,
+    score, Action, AllocatorDecision, AllocatorSnapshot, ExecError, Executor, FederationId,
+    IdempotencyKey, Intent, IntentStatus, Journal, Msat, Occurrence, PerformOutcome, ReasonCode,
+    ScorerPolicy,
 };
 
 /// The result of a [`Runtime::direct_inflow`] call: the intent's key (the durable handle the
@@ -122,11 +126,52 @@ struct TerminalReplay {
     status: IntentStatus,
 }
 
+/// Wraps an [`Executor`] so each `perform` is bounded by a wall-clock deadline (§15.9). A tick
+/// blocks on `await_send`/`await_receive` (the SDK long-polls up to 60 min/request), so one
+/// stalled gateway would otherwise freeze probing and every other decision. On timeout the perform
+/// future is DROPPED — the move engine is crash-safe (a later reconcile rebuilds the record from
+/// the op-log and reattaches, never re-minting/re-paying) — and the intent is left `Pending` via
+/// the `Retryable` path, so the tick moves on and the summary counts it.
+struct TimeoutExecutor<E> {
+    inner: E,
+    timeout: Option<Duration>,
+}
+
+impl<E> TimeoutExecutor<E> {
+    fn new(inner: E, timeout: Option<Duration>) -> Self {
+        Self { inner, timeout }
+    }
+}
+
+#[async_trait]
+impl<E: Executor> Executor for TimeoutExecutor<E> {
+    async fn perform(&self, intent: &Intent) -> Result<PerformOutcome, ExecError> {
+        match self.timeout {
+            Some(deadline) => match runtime::timeout(deadline, self.inner.perform(intent)).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(ExecError::Retryable(format!(
+                    "perform exceeded the {}s deadline for intent {}; leaving it Pending for the \
+                     next reconcile",
+                    deadline.as_secs(),
+                    intent.idempotency_key.0
+                ))),
+            },
+            None => self.inner.perform(intent).await,
+        }
+    }
+}
+
 /// The engine façade over one wallet's shared fedimint clients + journal (spec §9).
 pub struct Runtime {
     mc: Arc<MultiClient>,
     journal: Arc<FedimintJournal>,
     pinned_gateway: Option<GatewayUrl>,
+    /// The hard per-fed balance cap enforced at perform time (§15.2), threaded into the executor.
+    /// `None` disables it (the operator's `--allow-over-cap`). For a tick this is the policy's
+    /// `per_fed_cap`; for an operator verb it is the ADR-0018 default unless overridden.
+    hard_cap: Option<Msat>,
+    /// Per-`perform` wall-clock deadline (§15.9). `None` disables the deadline.
+    perform_timeout: Option<Duration>,
 }
 
 impl Runtime {
@@ -134,22 +179,36 @@ impl Runtime {
         mc: Arc<MultiClient>,
         journal: Arc<FedimintJournal>,
         pinned_gateway: Option<GatewayUrl>,
+        hard_cap: Option<Msat>,
+        perform_timeout: Option<Duration>,
     ) -> Self {
         Self {
             mc,
             journal,
             pinned_gateway,
+            hard_cap,
+            perform_timeout,
         }
     }
 
-    /// A fresh executor sharing this runtime's clients + journal + pinned gateway. Cheap
-    /// (`Arc` clones); made per call so each verb gets a `&self`-only executor.
+    /// A fresh executor sharing this runtime's clients + journal + pinned gateway + hard cap.
+    /// Cheap (`Arc` clones); made per call so each verb gets a `&self`-only executor. Used
+    /// DIRECTLY for the non-`perform` helper calls (`backfill_move_record` /
+    /// `validate_direct_inflow_amount`); the `perform`-driving paths wrap it via
+    /// [`Self::driving_executor`] to apply the tick deadline.
     fn executor(&self) -> FedimintExecutor {
         FedimintExecutor::new(
             self.mc.clone(),
             self.journal.clone(),
             self.pinned_gateway.clone(),
+            self.hard_cap,
         )
+    }
+
+    /// The executor `wallet_core::apply`/`reconcile` drive, wrapped with the §15.9 per-`perform`
+    /// deadline so one stalled gateway can never freeze the whole tick.
+    fn driving_executor(&self) -> TimeoutExecutor<FedimintExecutor> {
+        TimeoutExecutor::new(self.executor(), self.perform_timeout)
     }
 
     /// The BOLT11 surfaced for an intent (spec §7's `invoice_for`): read the persisted
@@ -209,7 +268,7 @@ impl Runtime {
             occurrence,
             idempotency_key: key.clone(),
         };
-        let executor = self.executor();
+        let executor = self.driving_executor();
         let _summary = wallet_core::apply(
             self.journal.as_ref(),
             &executor,
@@ -282,7 +341,7 @@ impl Runtime {
             occurrence,
             idempotency_key: key.clone(),
         };
-        let executor = self.executor();
+        let executor = self.driving_executor();
         let _summary = wallet_core::apply(
             self.journal.as_ref(),
             &executor,
@@ -419,7 +478,10 @@ impl Runtime {
         }
 
         // §9.4: re-drive pending() only; Failed/Permanent stay terminal, Awaiting is skipped.
-        let exec = wallet_core::reconcile(self.journal.as_ref(), &executor).await;
+        // Wrap the drive with the §15.9 per-perform deadline (the backfill above uses the raw
+        // executor, since it makes no `perform` call).
+        let driving = self.driving_executor();
+        let exec = wallet_core::reconcile(self.journal.as_ref(), &driving).await;
 
         // §9.3: surface the Awaiting set so the operator drives `await-move` for each.
         let awaiting = self.journal.awaiting().await.map_err(exec_err)?;
@@ -460,7 +522,7 @@ impl Runtime {
         anyhow::ensure!(problems.is_empty(), "tick: {}", problems.join("; "));
         self.ensure_fresh_tick_decisions(&plan.decisions, policy.occurrence)
             .await?;
-        let executor = self.executor();
+        let executor = self.driving_executor();
         let summary = wallet_core::apply(
             self.journal.as_ref(),
             &executor,
@@ -728,8 +790,11 @@ impl Runtime {
         from: FederationId,
         to: FederationId,
     ) -> Result<(), MoveRouteProblem> {
-        let gateway = match self.executor_gateway_for(&to).await {
-            Ok(gateway) => gateway,
+        // Mirror the executor's `resolve_gateway` SCAN (§15.6): the route is usable iff SOME
+        // gateway in the destination's registered set (or the single pinned gateway) serves the
+        // destination AND — for a send — the source.
+        let candidates = match self.route_gateway_candidates(&to).await {
+            Ok(candidates) => candidates,
             Err(error) => {
                 return Err(MoveRouteProblem {
                     from,
@@ -741,39 +806,59 @@ impl Runtime {
                 });
             }
         };
-
-        if let Err(e) = self.mc.validate_gateway(&to, &gateway).await {
-            return Err(MoveRouteProblem {
+        // Validate candidates in registration order, short-circuiting on the first that serves the
+        // whole route; a gateway that fails the destination never has its source checked.
+        let mut outcomes = Vec::with_capacity(candidates.len());
+        for gateway in &candidates {
+            let dest_ok = self.mc.validate_gateway(&to, gateway).await.is_ok();
+            let source_ok = dest_ok && self.mc.validate_gateway(&from, gateway).await.is_ok();
+            outcomes.push((dest_ok, source_ok));
+            if source_ok {
+                break;
+            }
+        }
+        match scan_route(&outcomes) {
+            RouteScan::Routable(_) => Ok(()),
+            // A gateway served the destination but none of those also served the source → a
+            // source-route problem (an evacuation may re-target another destination).
+            RouteScan::SourceUnserved(i) => Err(source_route_problem(
+                kind,
+                from,
+                to,
+                candidates[i].clone(),
+                "no gateway serving the destination also serves the source".into(),
+            )),
+            // No candidate served the destination at all → a destination problem.
+            RouteScan::DestinationUnserved => Err(MoveRouteProblem {
                 from,
                 to,
                 mark_unavailable: to,
-                gateway: Some(gateway),
-                error: format!("destination gateway validation failed: {e}"),
+                gateway: candidates.first().cloned(),
+                error: "no registered gateway serves the destination".into(),
                 evacuation_source_route: false,
-            });
+            }),
         }
-        if let Err(e) = self.mc.validate_gateway(&from, &gateway).await {
-            return Err(source_route_problem(kind, from, to, gateway, e.to_string()));
-        }
-        Ok(())
     }
 
-    async fn executor_gateway_for(&self, to: &FederationId) -> Result<GatewayUrl, String> {
+    /// The gateway candidates the executor would SCAN for a move into `to` (§15.6): the single
+    /// pinned gateway, or the destination's registered lnv2 set. `Err` (empty / unreadable) is a
+    /// destination-route problem the caller reports against `to`.
+    async fn route_gateway_candidates(&self, to: &FederationId) -> Result<Vec<GatewayUrl>, String> {
         if let Some(gateway) = &self.pinned_gateway {
-            return Ok(gateway.clone());
+            return Ok(vec![gateway.clone()]);
         }
-        self.mc
+        let gateways = self
+            .mc
             .gateways(to)
             .await
-            .map_err(|e| format!("listing destination gateways failed: {e}"))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                format!(
-                    "no lnv2 gateway registered for destination federation {}",
-                    to.to_hex()
-                )
-            })
+            .map_err(|e| format!("listing destination gateways failed: {e}"))?;
+        if gateways.is_empty() {
+            return Err(format!(
+                "no lnv2 gateway registered for destination federation {}",
+                to.to_hex()
+            ));
+        }
+        Ok(gateways)
     }
 
     /// Probe every OPEN federation into a `(FederationId, ProbeResult)` list, BEST-EFFORT: a fed
@@ -915,6 +1000,38 @@ fn mark_gateway_unavailable(probes: &mut [(FederationId, ProbeResult)], id: Fede
     true
 }
 
+/// The verdict of scanning a destination's gateway set for a usable route (§15.6). Given, in
+/// registration order, each candidate's `(serves_destination, serves_source)` validation outcomes
+/// (`serves_source` is `true` for a receive-only route), decide whether SOME gateway serves BOTH
+/// ends. PURE, so the "first gateway dead / second alive" and "serves only the destination" cases
+/// are unit-tested without a live gateway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteScan {
+    /// A fully-valid gateway (both ends served) was found at this index.
+    Routable(usize),
+    /// Some gateway served the destination (index given) but none of those served the source.
+    SourceUnserved(usize),
+    /// No gateway served the destination at all.
+    DestinationUnserved,
+}
+
+fn scan_route(candidates: &[(bool, bool)]) -> RouteScan {
+    let mut first_dest_ok: Option<usize> = None;
+    for (i, &(dest_ok, source_ok)) in candidates.iter().enumerate() {
+        if !dest_ok {
+            continue;
+        }
+        if source_ok {
+            return RouteScan::Routable(i);
+        }
+        first_dest_ok.get_or_insert(i);
+    }
+    match first_dest_ok {
+        Some(i) => RouteScan::SourceUnserved(i),
+        None => RouteScan::DestinationUnserved,
+    }
+}
+
 fn source_route_problem(
     kind: SendRouteKind,
     from: FederationId,
@@ -982,7 +1099,7 @@ mod tests {
         let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
         let mc = Arc::new(MultiClient::new(db.clone(), mnemonic).await);
         let journal = Arc::new(FedimintJournal::new(db));
-        (Runtime::new(mc, journal.clone(), None), journal)
+        (Runtime::new(mc, journal.clone(), None, None, None), journal)
     }
 
     fn direct_inflow_intent(key: IdempotencyKey, to: FederationId, status: IntentStatus) -> Intent {
@@ -1360,6 +1477,70 @@ mod tests {
 
         assert_eq!(problem.mark_unavailable, FED_B);
         assert!(!problem.evacuation_source_route);
+    }
+
+    #[test]
+    fn scan_route_picks_the_first_gateway_serving_the_whole_route() {
+        // §15.6. First gateway dead (serves neither), second serves both -> routable via #1.
+        assert_eq!(
+            scan_route(&[(false, false), (true, true)]),
+            RouteScan::Routable(1)
+        );
+        // A gateway serving ONLY the destination is skipped when the source needs it; with no
+        // other gateway serving the source the route is source-unserved (re-target the dest).
+        assert_eq!(scan_route(&[(true, false)]), RouteScan::SourceUnserved(0));
+        // Serves-only-dest, then a gateway serving both -> routable via the second.
+        assert_eq!(
+            scan_route(&[(true, false), (true, true)]),
+            RouteScan::Routable(1)
+        );
+        // No gateway serves the destination at all, and an empty candidate set.
+        assert_eq!(
+            scan_route(&[(false, false)]),
+            RouteScan::DestinationUnserved
+        );
+        assert_eq!(scan_route(&[]), RouteScan::DestinationUnserved);
+        // A receive-only route (source always "served") is routable on the first dest-ok gateway.
+        assert_eq!(scan_route(&[(true, true)]), RouteScan::Routable(0));
+    }
+
+    #[tokio::test]
+    async fn perform_timeout_leaves_a_stalled_intent_pending() {
+        use wallet_core::MemJournal;
+
+        // §15.9. An executor whose `perform` never resolves (a stalled gateway long-poll).
+        struct NeverResolves;
+        #[async_trait]
+        impl Executor for NeverResolves {
+            async fn perform(&self, _intent: &Intent) -> Result<PerformOutcome, ExecError> {
+                std::future::pending::<()>().await;
+                unreachable!("pending() never resolves")
+            }
+        }
+
+        let journal = MemJournal::new();
+        let decision = tick_move_decision("stall", FED_A, FED_B);
+        journal
+            .upsert(&Intent::from_decision(&decision))
+            .await
+            .expect("upsert pending intent");
+
+        // Wrap the never-resolving executor with a short deadline and drive it via reconcile.
+        let executor = TimeoutExecutor::new(NeverResolves, Some(Duration::from_millis(50)));
+        let summary = wallet_core::reconcile(&journal, &executor).await;
+
+        // The perform timed out: counted as a (retryable) failure, NOT performed, and the intent
+        // is left Pending for the next reconcile — never resurrected to a terminal status.
+        assert_eq!(summary.performed, 0);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(
+            journal
+                .get(&decision.idempotency_key)
+                .await
+                .expect("get")
+                .map(|i| i.status),
+            Some(IntentStatus::Pending)
+        );
     }
 
     #[tokio::test]
