@@ -431,7 +431,10 @@ shapes. The code is authoritative; the deltas, verified against `main`:
 - **`RefuseInflow` carries `{ fed, reason }`** (not a unit variant) and **`Cap` is
   `{ fed, reason }`** (no `limit`; it has no producer and Phase 4 §5 deletes it).
 - **`MoveMeta` is `{ move_id, role, amount, from, to }`** — no `occurrence` field (folded
-  into `move_id`), and `amount` was added post-3.A to carry the delivered net crash-safely.
+  into `move_id`), and `amount` was added post-3.A to carry the delivered net crash-safely
+  for SEND-REQUIRED moves (a receive-only `DirectInflow` accepted via the hair-under
+  fallback still records the ask today; phase4-implementation-spec §15.11 makes the
+  delivered amount unconditional).
 - **The balance type is `FedBalance`**, not `FederationBalance`.
 - `GuardianId` and guardian-overlap identity were REMOVED with ADR-0010's drop (noted in §3
   already).
