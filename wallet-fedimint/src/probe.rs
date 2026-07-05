@@ -75,20 +75,34 @@ pub struct ProbeResult {
     pub wallet_module_present: bool,
 
     // ---- Lifecycle ----
-    /// RAW PRIMARY shutdown signal: the consensus-backed `federation_expiry_timestamp`
-    /// meta as unix seconds, if the federation published one
-    /// (`client.get_meta_expiration_timestamp()`, no auth). `None` = no expiry meta.
-    /// Carried raw so [`derive_shutdown_scheduled`] stays pure and golden-testable.
+    /// RAW UNTRUSTED expiry: the MERGED-meta `federation_expiry_timestamp`
+    /// (`client.get_meta_expiration_timestamp()`, no auth) as unix seconds, if present. This is
+    /// the `LegacyMetaSource` MERGE of the config meta with the federation's `meta_override_url`,
+    /// so a single override host can OVERWRITE or forge it
+    /// (`fedimint-client-module/src/meta.rs`) — it is NOT consensus-backed. Alone it NEVER
+    /// schedules a shutdown; a CORROBORATING source must confirm it first (§15.1). `None` = no
+    /// expiry meta. Carried raw so [`derive_shutdown_scheduled`] stays pure and golden-testable.
     pub expiry_timestamp_secs: Option<u64>,
-    /// RAW SECONDARY shutdown signal: f+1 peers' public `/status` responses reported a
-    /// `federation.scheduled_shutdown` session index (per-peer reads need BFT
-    /// corroboration before driving a money-moving evacuation — see
-    /// [`status_scheduled_shutdown`]). Best-effort — a `/status` transport error reads
-    /// as `false` (no signal), never a probe failure.
+    /// RAW CORROBORATING expiry (a): the AT-JOIN consensus config meta's
+    /// `federation_expiry_timestamp` (`client.config().global.meta`), as unix seconds. The joined
+    /// config is not forgeable by the override host, so its OWN value drives the derivation when
+    /// present (a cached snapshot — catches feds that declared an expiry from the start). `None` =
+    /// the joined config declared no expiry.
+    pub config_expiry_secs: Option<u64>,
+    /// RAW CORROBORATING expiry (b): the meta MODULE's consensus value, when the federation runs a
+    /// meta module (fresh AND consensus-backed). Currently always `None` — the wallet client does
+    /// not register the meta-module (see the runner note and `challenges-round-1`); the derivation
+    /// still MODELS it so it can be wired without changing the trust logic. `None` = no signal.
+    pub meta_module_expiry_secs: Option<u64>,
+    /// RAW CORROBORATING shutdown signal (c): f+1 peers' public `/status` responses reported a
+    /// `federation.scheduled_shutdown` session index (per-peer reads need BFT corroboration before
+    /// driving a money-moving evacuation — see [`status_scheduled_shutdown`]). Best-effort — a
+    /// `/status` transport error reads as `false` (no signal), never a probe failure.
     pub status_scheduled_shutdown: bool,
-    /// The federation is winding down (do not fund it — evacuate it). DERIVED from the two
-    /// raw signals above via [`derive_shutdown_scheduled`], OR'd with the debug-only
-    /// force-shutdown seam. Kept on the result so the pure assemblers read one boolean.
+    /// The federation is winding down (do not fund it — evacuate it). DERIVED from the raw signals
+    /// above via [`derive_shutdown_scheduled`] (an UNTRUSTED override expiry never schedules on its
+    /// own — only a corroborated value does), OR'd with the debug-only force-shutdown seam. Kept on
+    /// the result so the pure assemblers read one boolean.
     pub shutdown_scheduled: bool,
 
     // ---- Balance (msat) ----
@@ -183,25 +197,42 @@ fn module_from_kind(kind: &str) -> Module {
 /// is to LEAVE before expiry, not after (ADR-0018). 24h.
 const SHUTDOWN_EVACUATION_LEAD_SECS: u64 = 86_400;
 
-/// PURE derivation of `shutdown_scheduled` from the two no-auth signals the probe reads
-/// (the `federation_expiry_timestamp` meta and the public `/status.scheduled_shutdown`)
-/// plus the wall clock. No I/O, no async — golden-tested. `true` when the guardians have
-/// SCHEDULED a shutdown, OR when the consensus expiry is within `lead_secs` of `now`
-/// (i.e. `now + lead_secs >= expiry`, which also covers an expiry already passed). A
+/// PURE derivation of `shutdown_scheduled` from the no-auth signals the probe reads plus the wall
+/// clock (§15.1). No I/O, no async — golden-tested. The MERGED-meta `override_expiry` is UNTRUSTED
+/// (a single `meta_override_url` host can forge it — `fedimint-client-module/src/meta.rs`), so it
+/// NEVER schedules a shutdown on its own; a shutdown is scheduled only when a CORROBORATING source
+/// confirms it, and the derivation uses THAT source's own value, never the merged one:
+///   - `status_scheduled` (the f+1-corroborated `/status.scheduled_shutdown`) → schedule: the
+///     shutdown FACT is peer-corroborated, so evacuate (ADR-0018 — leave before expiry). The
+///     override expiry could refine lead timing, but a corroborated schedule means go now.
+///   - `config_expiry` (the at-join consensus config meta) within `lead_secs` of `now` (also
+///     covers an already-passed expiry) → schedule, using the CONFIG value.
+///   - `meta_module_expiry` (the meta-module consensus value) within the lead window → schedule,
+///     using the META-MODULE value.
+///
+/// An uncorroborated override-only expiry does NOT schedule (the runner warns for observability). A
 /// missing/absent signal is never a shutdown.
 fn derive_shutdown_scheduled(
-    expiry_secs: Option<u64>,
+    override_expiry: Option<u64>,
+    config_expiry: Option<u64>,
+    meta_module_expiry: Option<u64>,
     status_scheduled: bool,
     now_secs: u64,
     lead_secs: u64,
 ) -> bool {
+    // (c) A peer-corroborated scheduled shutdown: evacuate now (the fact is corroborated).
     if status_scheduled {
         return true;
     }
-    match expiry_secs {
-        Some(expiry) => now_secs.saturating_add(lead_secs) >= expiry,
-        None => false,
-    }
+    // The merged override expiry is deliberately NOT consulted for the timing decision — it is
+    // reserved for lead timing under (c), where a corroborated fact already governs.
+    let _ = override_expiry;
+    // (a)/(b) A CORROBORATED expiry within `lead_secs` of `now` schedules, using that source's own
+    // value. `now + lead_secs >= expiry` also fires on an expiry already passed.
+    [config_expiry, meta_module_expiry]
+        .into_iter()
+        .flatten()
+        .any(|expiry| now_secs.saturating_add(lead_secs) >= expiry)
 }
 
 /// Test-only force-shutdown seam (Phase 3.A) — MIRRORS `executor::maybe_crash`'s
@@ -339,35 +370,65 @@ impl FedimintProbeRunner {
         // the model can later account for pending value without a balance rewrite.
         let (in_flight_msat, claimable_msat) = pending_lnv2_balances(&client).await;
 
-        // `shutdown_scheduled`: sourced from TWO no-auth, client-readable signals (both
-        // best-effort — a failed/absent read is NOT a shutdown). The pure
-        // `derive_shutdown_scheduled` below combines them with the wall clock so the
-        // derivation is golden-testable off the raw fields.
+        // `shutdown_scheduled`: the UNTRUSTED merged override expiry never schedules on its own; a
+        // source the override host cannot forge must corroborate it first (§15.1). We read every
+        // no-auth signal here (each best-effort — a failed/absent read is NOT a shutdown) and the
+        // pure `derive_shutdown_scheduled` below combines them, so the derivation is golden-testable
+        // off the raw fields.
         //
-        // PRIMARY: the consensus-backed `federation_expiry_timestamp` meta
-        // (`get_meta_expiration_timestamp`, `fedimint-client`). A missing meta is `None`
-        // (no signal) by nature — no error to swallow.
+        // UNTRUSTED: the MERGED-meta `federation_expiry_timestamp` (`get_meta_expiration_timestamp`,
+        // LegacyMetaSource = config meta OVERWRITABLE by `meta_override_url`). Read for
+        // observability + lead timing, never trusted alone.
         let expiry_timestamp_secs = client
             .get_meta_expiration_timestamp()
             .await
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs());
-        // SECONDARY: the public `/status.federation.scheduled_shutdown` session index.
-        // Best-effort — a transport error is warn-logged and treated as no signal, never a
-        // probe failure.
+        // CORROBORATOR (a): the AT-JOIN consensus config meta — the joined config the override host
+        // cannot forge. Read directly from the (already-fetched) config, NOT the merged view.
+        let config_expiry_secs = config_meta_expiry_secs(&config.global.meta);
+        // CORROBORATOR (b): the meta-MODULE consensus value. The wallet client registers only
+        // ln/mint/wallet/lnv2 (`multi_client::client_builder`), NOT the meta module, so this
+        // consensus signal is not read here — see `challenges-round-1`. `None` for now; the
+        // derivation MODELS it so wiring the meta-module client later is a one-place change.
+        let meta_module_expiry_secs = None;
+        // CORROBORATOR (c): the public `/status.federation.scheduled_shutdown`, f+1-corroborated.
+        // Best-effort — a transport error is warn-logged and treated as no signal.
         let status_scheduled_shutdown = status_scheduled_shutdown(&client, id).await;
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        // Derive from the raw signals, then OR the debug-only force-shutdown seam (a strict
-        // no-op / compiled out in release — see `forced_shutdown`).
+        // Derive from the raw signals (override-only never schedules), then OR the debug-only
+        // force-shutdown seam (a strict no-op / compiled out in release — see `forced_shutdown`).
         let shutdown_scheduled = derive_shutdown_scheduled(
             expiry_timestamp_secs,
+            config_expiry_secs,
+            meta_module_expiry_secs,
             status_scheduled_shutdown,
             now_secs,
             SHUTDOWN_EVACUATION_LEAD_SECS,
         ) || forced_shutdown(id);
+
+        // §15.1 item 2: the merged meta carries an expiry that NO corroborating source backs
+        // (absent from the at-join config meta, the meta module, and the f+1 `/status` signal), so
+        // it came from `meta_override_url` ALONE. We do NOT schedule on it (a single override host
+        // could forge it), but we WARN — an operator needs to see a federation announcing an
+        // uncorroborated expiry, whether that is a legitimate expiry declared through the wrong
+        // channel or a forged early expiry aimed at triggering a premature evacuation.
+        let override_uncorroborated = expiry_timestamp_secs.is_some()
+            && config_expiry_secs.is_none()
+            && meta_module_expiry_secs.is_none()
+            && !status_scheduled_shutdown;
+        if override_uncorroborated {
+            tracing::warn!(
+                federation = %id.to_hex(),
+                override_expiry_secs = ?expiry_timestamp_secs,
+                "probe: federation announced an expiry only via meta_override_url, uncorroborated \
+                 by config meta / meta module / f+1 /status — NOT scheduling a shutdown (§15.1); \
+                 investigate whether this is a legitimate expiry or a forged override"
+            );
+        }
 
         Ok(ProbeResult {
             guardian_count,
@@ -380,6 +441,8 @@ impl FedimintProbeRunner {
             gateway_available,
             wallet_module_present,
             expiry_timestamp_secs,
+            config_expiry_secs,
+            meta_module_expiry_secs,
             status_scheduled_shutdown,
             shutdown_scheduled,
             spendable_msat,
@@ -410,21 +473,21 @@ impl FedimintProbeRunner {
 
         match self.mc.gateways(id).await {
             Ok(gateways) => {
-                let Some(gateway) = gateways.into_iter().next() else {
-                    return false;
-                };
-                match self.mc.validate_gateway(id, &gateway).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        tracing::warn!(
+                // §15.6: ANY registered gateway that validates makes the fed routable — a stale
+                // first-registered gateway must not hide a healthy fed (the SDK's own
+                // `select_gateway` scans until responsive). Scan until one answers.
+                for gateway in &gateways {
+                    match self.mc.validate_gateway(id, gateway).await {
+                        Ok(()) => return true,
+                        Err(e) => tracing::warn!(
                             federation = %id.to_hex(),
                             gateway = %gateway.0,
                             error = ?e,
-                            "probe: default registered gateway failed routing-info validation"
-                        );
-                        false
+                            "probe: registered gateway failed routing-info validation; scanning next"
+                        ),
                     }
                 }
+                false
             }
             Err(e) => {
                 tracing::warn!(
@@ -435,6 +498,28 @@ impl FedimintProbeRunner {
                 false
             }
         }
+    }
+}
+
+/// The `federation_expiry_timestamp` in a federation's AT-JOIN consensus config meta
+/// (`config.global.meta`), as unix seconds, or `None` when absent/unparseable (§15.1 (a)). The
+/// config meta stores string values (some JSON-escaped), so accept a plain integer string OR a
+/// one-layer JSON number/quoted-number.
+fn config_meta_expiry_secs(meta: &std::collections::BTreeMap<String, String>) -> Option<u64> {
+    parse_meta_expiry_secs(meta.get("federation_expiry_timestamp")?)
+}
+
+/// Parse a meta value into a unix-seconds `u64`: a plain decimal string, or one layer of JSON
+/// (a number, or a quoted decimal string). `None` on anything else.
+fn parse_meta_expiry_secs(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return Some(secs);
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed).ok()? {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
     }
 }
 
@@ -604,6 +689,8 @@ mod tests {
         "gateway_available": true,
         "wallet_module_present": true,
         "expiry_timestamp_secs": null,
+        "config_expiry_secs": null,
+        "meta_module_expiry_secs": null,
         "status_scheduled_shutdown": false,
         "shutdown_scheduled": false,
         "spendable_msat": 1000000,
@@ -692,42 +779,88 @@ mod tests {
     }
 
     #[test]
-    fn derive_shutdown_scheduled_covers_every_signal_case() {
+    fn derive_shutdown_corroboration_table() {
+        // §15.1 golden. Columns: (override_expiry, config_expiry, meta_module_expiry, status).
         let lead = SHUTDOWN_EVACUATION_LEAD_SECS;
         let now = 1_000_000;
-        // expiry far in the future -> not yet within the lead window -> false.
-        assert!(!derive_shutdown_scheduled(
-            Some(now + 10 * lead),
-            false,
-            now,
-            lead
-        ));
-        // expiry inside the lead window (now + lead >= expiry) -> true (evacuate EARLY).
-        assert!(derive_shutdown_scheduled(
-            Some(now + lead / 2),
-            false,
-            now,
-            lead
-        ));
-        // exactly at the lead boundary is inclusive -> true.
-        assert!(derive_shutdown_scheduled(
-            Some(now + lead),
-            false,
-            now,
-            lead
-        ));
-        // expiry already passed -> true.
-        assert!(derive_shutdown_scheduled(Some(now - 1), false, now, lead));
-        // status scheduled -> true regardless of expiry (even a far-future one, or none).
-        assert!(derive_shutdown_scheduled(
-            Some(now + 10 * lead),
-            true,
-            now,
-            lead
-        ));
-        assert!(derive_shutdown_scheduled(None, true, now, lead));
-        // both signals absent -> false.
-        assert!(!derive_shutdown_scheduled(None, false, now, lead));
+        let near = now + lead / 2; // inside the lead window
+        let far = now + 10 * lead; // outside the lead window
+        let derive = |override_e, config_e, meta_e, status| {
+            derive_shutdown_scheduled(override_e, config_e, meta_e, status, now, lead)
+        };
+
+        // OVERRIDE-ONLY never schedules — whatever its value (near / already-passed / far), no
+        // corroborator means no evacuation. This is the whole point of §15.1.
+        assert!(!derive(Some(near), None, None, false), "override-only near");
+        assert!(
+            !derive(Some(now - 1), None, None, false),
+            "override-only passed"
+        );
+        assert!(!derive(Some(far), None, None, false), "override-only far");
+
+        // Each CORROBORATOR alone (with a near value) schedules; an accompanying override is inert.
+        assert!(derive(None, Some(near), None, false), "config alone");
+        assert!(
+            derive(Some(far), Some(near), None, false),
+            "config + override"
+        );
+        assert!(derive(None, None, Some(near), false), "meta-module alone");
+        assert!(
+            derive(Some(far), None, Some(near), false),
+            "meta-module + override"
+        );
+        assert!(derive(None, None, None, true), "status alone");
+        assert!(derive(Some(far), None, None, true), "status + override");
+
+        // The decision uses the CORROBORATED source's timestamp, NOT the override's: a NEAR
+        // override with a FAR config does NOT schedule (config governs)...
+        assert!(
+            !derive(Some(near), Some(far), None, false),
+            "a near override cannot force a far config"
+        );
+        // ...and a FAR override with a NEAR config DOES schedule (config governs).
+        assert!(
+            derive(Some(far), Some(near), None, false),
+            "a near config schedules despite a far override"
+        );
+
+        // A corroborator that is present but FAR-future does not schedule yet; exactly at the lead
+        // boundary is inclusive; everything absent is false.
+        assert!(
+            !derive(None, Some(far), None, false),
+            "config far -> not yet"
+        );
+        assert!(
+            derive(None, Some(now + lead), None, false),
+            "config at lead boundary"
+        );
+        assert!(!derive(None, None, None, false), "all absent");
+    }
+
+    #[test]
+    fn config_meta_expiry_parses_plain_and_json_values() {
+        use std::collections::BTreeMap;
+        // Plain decimal string.
+        assert_eq!(parse_meta_expiry_secs("1700000000"), Some(1_700_000_000));
+        // Surrounding whitespace tolerated.
+        assert_eq!(parse_meta_expiry_secs(" 42 "), Some(42));
+        // One layer of JSON (a bare number or a quoted decimal).
+        assert_eq!(parse_meta_expiry_secs("1700000000 "), Some(1_700_000_000));
+        assert_eq!(
+            parse_meta_expiry_secs("\"1700000000\""),
+            Some(1_700_000_000)
+        );
+        // Non-numeric / negative / absent -> None (never a spurious shutdown).
+        assert_eq!(parse_meta_expiry_secs("not-a-number"), None);
+        assert_eq!(parse_meta_expiry_secs("-5"), None);
+
+        let mut meta = BTreeMap::new();
+        assert_eq!(config_meta_expiry_secs(&meta), None);
+        meta.insert(
+            "federation_expiry_timestamp".to_string(),
+            "1700000000".to_string(),
+        );
+        assert_eq!(config_meta_expiry_secs(&meta), Some(1_700_000_000));
     }
 
     #[test]

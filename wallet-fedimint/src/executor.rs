@@ -36,7 +36,7 @@ use crate::move_protocol::{
     assemble_move_record, next_step, Leg, MoveMeta, MoveParams, MovePhase, MovePlan, MoveRecord,
     MoveRole, MoveStep, OpArtifact,
 };
-use crate::multi_client::{MultiClient, ReceiveState, SendOutcome, SendState};
+use crate::multi_client::{MultiClient, ReceiveState, SendError, SendOutcome, SendState};
 use crate::types::{GatewayUrl, Invoice};
 use async_trait::async_trait;
 use lightning_invoice::Bolt11Invoice;
@@ -93,6 +93,13 @@ pub struct FedimintExecutor {
     /// `mc.gateways` is empty there (runbook §4) and the CLI must supply the URL directly. A
     /// RESUMED move ignores this and reuses the gateway already pinned in its `MoveRecord`.
     pinned_gateway: Option<GatewayUrl>,
+    /// The hard per-fed balance cap (ADR-0018) enforced at PERFORM time (§15.2): a non-evacuation
+    /// inflow that would push its destination over the cap is refused pre-mint, and a fresh
+    /// evacuation is downsized to the destination's remaining cap room. `None` disables the check
+    /// (the operator's `--allow-over-cap` override). The §4.2 same-tick reservation sizes joint
+    /// moves, but its snapshot can be stale by perform time and the operator verbs consult no cap
+    /// at all — this is the belt that enforces the cap at the moment money actually moves.
+    hard_cap: Option<Msat>,
 }
 
 impl FedimintExecutor {
@@ -100,11 +107,13 @@ impl FedimintExecutor {
         mc: Arc<MultiClient>,
         journal: Arc<FedimintJournal>,
         pinned_gateway: Option<GatewayUrl>,
+        hard_cap: Option<Msat>,
     ) -> Self {
         Self {
             mc,
             journal,
             pinned_gateway,
+            hard_cap,
         }
     }
 
@@ -163,7 +172,9 @@ impl FedimintExecutor {
             &artifacts,
         ) {
             Some(gateway) => gateway,
-            None => self.resolve_gateway(&plan.to).await?,
+            // Scan for a gateway serving BOTH ends of a send-required move (§15.6); a
+            // receive-only inflow (`plan.from == None`) validates only the destination.
+            None => self.resolve_gateway(&plan.to, plan.from).await?,
         };
 
         let params = MoveParams {
@@ -178,32 +189,58 @@ impl FedimintExecutor {
         Ok(assemble_move_record(params, &artifacts, cached))
     }
 
-    /// Resolve a gateway for a FRESH move into `to` (spec §7): the explicitly pinned gateway
-    /// wins (⟦D4⟧; devimint's LDK gateway is not auto-registered, so the CLI passes it directly
-    /// — runbook §4), else the federation's first registered lnv2 gateway.
+    /// Resolve a gateway for a FRESH move into `to` (spec §7, §15.6): the explicitly pinned
+    /// gateway wins (⟦D4⟧; devimint's LDK gateway is not auto-registered, so the CLI passes it
+    /// directly — runbook §4). Otherwise SCAN the federation's registered lnv2 gateway list for
+    /// the first that VALIDATES — for a send-required move (`from == Some`) against BOTH `to` and
+    /// `from` (the shared-gateway internal swap needs both ends), for a receive-only inflow
+    /// (`from == None`) against `to` alone. A stale first-registered gateway must not make a
+    /// healthy fed unroutable (the SDK's own `select_gateway` scans until responsive).
     ///
-    /// "None available" is `Retryable`, NOT `Permanent`: a resume verb (`reconcile`/`await-move`)
+    /// "None validates" is `Retryable`, NOT `Permanent`: a resume verb (`reconcile`/`await-move`)
     /// carries no pinned gateway, so re-driving an intent that has none cached must leave it
     /// `Pending` (re-drivable once the operator re-runs `direct-inflow --gateway` to supply one),
     /// never terminally `Failed`. The fresh `direct-inflow` path never hits this — its
     /// `pick_receive_gateway` guarantees a gateway before the runtime is built.
-    async fn resolve_gateway(&self, to: &FederationId) -> Result<GatewayUrl, ExecError> {
+    async fn resolve_gateway(
+        &self,
+        to: &FederationId,
+        from: Option<FederationId>,
+    ) -> Result<GatewayUrl, ExecError> {
         if let Some(gateway) = &self.pinned_gateway {
             return Ok(gateway.clone());
         }
-        self.mc
-            .gateways(to)
-            .await
-            .map_err(retryable)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                ExecError::Retryable(format!(
-                    "no lnv2 gateway available to route a move into federation {} \
-                     (pass one explicitly — devimint does not auto-register its LDK gateway)",
-                    to.to_hex()
-                ))
-            })
+        let gateways = self.mc.gateways(to).await.map_err(retryable)?;
+        for gateway in &gateways {
+            if self.gateway_serves_route(to, from.as_ref(), gateway).await {
+                return Ok(gateway.clone());
+            }
+        }
+        Err(ExecError::Retryable(format!(
+            "no lnv2 gateway available to route a move into federation {} \
+             (scanned {} registered gateway(s); pass one explicitly — devimint does not \
+             auto-register its LDK gateway)",
+            to.to_hex(),
+            gateways.len(),
+        )))
+    }
+
+    /// Whether `gateway` can route this move (§15.6): it must serve the RECEIVE end `to`, and for
+    /// a send-required move ALSO the SEND end `from` (`routing_info` serves both). A `routing_info`
+    /// fetch failure for either end reads as "does not serve", so the scan passes over it.
+    async fn gateway_serves_route(
+        &self,
+        to: &FederationId,
+        from: Option<&FederationId>,
+        gateway: &GatewayUrl,
+    ) -> bool {
+        if self.mc.validate_gateway(to, gateway).await.is_err() {
+            return false;
+        }
+        match from {
+            Some(from) => self.mc.validate_gateway(from, gateway).await.is_ok(),
+            None => true,
+        }
     }
 
     /// Size the receive invoice via the §6 fixed point. The gateway fee comes from
@@ -387,7 +424,8 @@ impl FedimintExecutor {
         to: FederationId,
         amount: Msat,
     ) -> Result<(), ExecError> {
-        let gateway = self.resolve_gateway(&to).await?;
+        // A DirectInflow is receive-only, so validate the gateway against the destination only.
+        let gateway = self.resolve_gateway(&to, None).await?;
         let grossed = self.quote_receive_gross_up(&to, &gateway, amount).await?;
         ensure_minimum_incoming_contract(amount, grossed.contract_amount)
     }
@@ -474,6 +512,12 @@ impl FedimintExecutor {
                 "Evacuate record requires a send leg but has no source federation".into(),
             )
         })?;
+        // §15.2: an evacuation must not push its DESTINATION over the hard per-fed cap. Clamp the
+        // desired net to the destination's remaining cap room BEFORE costing; a destination already
+        // at/above the cap yields zero room, a LOUD terminal refusal (never a 0-msat move, never a
+        // wrapped-around huge room). This runs only for a FRESH evacuation (`has_move_artifact`
+        // returned early above), so a resumed, already-minted evacuation is never refused here.
+        let desired = self.clamp_desired_to_cap_room(rec, desired).await?;
         let spendable = self.mc.balance(&from).await.map_err(retryable)?;
         let Some(amount) = self
             .max_affordable_evacuation_net(
@@ -505,6 +549,52 @@ impl FedimintExecutor {
             );
         }
         rec.amount = amount;
+        Ok(())
+    }
+
+    /// Clamp a fresh evacuation's desired net to the DESTINATION's remaining hard-cap room
+    /// (§15.2). `None` cap disables the check. A destination already at/above the cap has zero
+    /// room and is a LOUD terminal refusal (an evacuation cannot legitimately overflow its
+    /// destination), never a 0-msat move.
+    async fn clamp_desired_to_cap_room(
+        &self,
+        rec: &MoveRecord,
+        desired: Msat,
+    ) -> Result<Msat, ExecError> {
+        let Some(cap) = self.hard_cap else {
+            return Ok(desired);
+        };
+        let dest = self.mc.balance(&rec.to).await.map_err(retryable)?;
+        match evacuation_cap_room(dest, cap) {
+            Some(room) => Ok(Msat(desired.0.min(room.0))),
+            None => Err(ExecError::Permanent(format!(
+                "no cap room at destination: federation {} holds {} msat at/above the per-fed cap \
+                 {} msat, so an evacuation cannot drain into it",
+                rec.to.to_hex(),
+                dest.0,
+                cap.0
+            ))),
+        }
+    }
+
+    /// Enforce the hard per-fed cap on a NON-evacuation inflow before minting (§15.2): refuse
+    /// terminally when the destination's live balance plus the inflow amount would exceed the cap.
+    /// `None` cap disables the check. An evacuation is downsized instead (see
+    /// [`Self::clamp_desired_to_cap_room`]).
+    async fn enforce_destination_cap(&self, rec: &MoveRecord) -> Result<(), ExecError> {
+        let Some(cap) = self.hard_cap else {
+            return Ok(());
+        };
+        let dest = self.mc.balance(&rec.to).await.map_err(retryable)?;
+        if would_exceed_cap(dest, rec.amount, cap) {
+            return Err(ExecError::Permanent(format!(
+                "destination would exceed the per-fed cap ({}+{} > {} msat) for federation {}",
+                dest.0,
+                rec.amount.0,
+                cap.0,
+                rec.to.to_hex()
+            )));
+        }
         Ok(())
     }
 
@@ -672,11 +762,18 @@ impl Executor for FedimintExecutor {
         // move reattaches (no re-quote, no spurious over-cap fail).
         let mut rec = self.assemble_record(intent, &plan).await?;
         self.size_fresh_evacuation(&intent.action, &mut rec).await?;
+        // §15.2: an Evacuate was downsized to its destination's cap room by
+        // `size_fresh_evacuation`; every OTHER inflow (a DirectInflow or a topping-up Move) is
+        // refused pre-mint below if it would push the destination over the cap.
+        let is_evacuate = matches!(intent.action, Action::Evacuate { .. });
 
         loop {
             match next_step(&rec) {
                 MoveStep::CreateInvoice => {
                     self.validate_move_gateway_before_receive(&rec).await?;
+                    if !is_evacuate {
+                        self.enforce_destination_cap(&rec).await?;
+                    }
                     let grossed = self.gross_up(&rec).await?;
                     let invoice_amount = grossed.invoice_amount;
                     // A send-required move may have accepted a verified hair-under solve:
@@ -771,10 +868,25 @@ impl Executor for FedimintExecutor {
                         ExecError::Permanent("Pay step reached with no source federation".into())
                     })?;
 
+                    // §15.4 belt: parse the (fixed) BOLT11 once and refuse a move whose invoice
+                    // has already EXPIRED. Paying an expired invoice can only earn a deterministic
+                    // send rejection that would otherwise reset the move to `Pending` and livelock;
+                    // fail terminally so a fresh occurrence re-mints a live invoice.
+                    let bolt11 = parse_move_invoice(&invoice)?;
+                    if bolt11.is_expired() {
+                        return Err(ExecError::Permanent(format!(
+                            "move invoice expired before the send leg could pay it (move {}); \
+                             re-run under a fresh occurrence to re-mint",
+                            rec.key.0
+                        )));
+                    }
+                    let invoice_msat = bolt11.amount_milli_satoshis().ok_or_else(|| {
+                        ExecError::Permanent("move invoice carries no amount".into())
+                    })?;
+
                     // Re-check the cap NOW (spec §6/§7). The receive cost is recovered
                     // crash-safely from the fixed invoice (`invoice_amount − amount`); the
                     // send fee is re-quoted from the (possibly changed) gateway + federation.
-                    let invoice_msat = invoice_amount_msat(&invoice)?;
                     let receive_quote = Msat(invoice_msat.saturating_sub(rec.amount.0));
                     let send_gateway_fee = self
                         .mc
@@ -790,9 +902,11 @@ impl Executor for FedimintExecutor {
                         .await
                         .map_err(retryable)?;
                     let send_quote = Msat(send_gateway_quote.0.saturating_add(send_tx_fee.0));
-                    if !fee::total_within_cap(receive_quote, send_quote, rec.fee_cap) {
-                        return Err(ExecError::Permanent("fee over cap".into()));
-                    }
+                    // §15.5: Permanent ONLY when the FIXED receive quote alone exceeds the cap; a
+                    // send re-quote spike is Retryable (a later attempt may quote lower — 15.4's
+                    // expiry belt bounds the retry horizon), so a transient spike never terminally
+                    // strands funds on a dying fed mid-evacuation.
+                    pay_step_cap_verdict(receive_quote, send_quote, rec.fee_cap)?;
 
                     let meta = MoveMeta {
                         move_id: rec.key.clone(),
@@ -808,7 +922,7 @@ impl Executor for FedimintExecutor {
                         .mc
                         .pay(&from, invoice, Some(rec.gateway.clone()), meta.to_value())
                         .await
-                        .map_err(retryable)?
+                        .map_err(map_send_error)?
                     {
                         // All three are the SAME committed send (the client dedups on the
                         // deterministic op-id): reattach, never double-pay (spec §4).
@@ -1046,15 +1160,64 @@ fn recovered_receive_only_gateway() -> GatewayUrl {
     GatewayUrl("recovered-receive-only-gateway-not-used".to_string())
 }
 
-/// The gross msat amount of a (fixed) move invoice, recovered by parsing the BOLT11 — the
-/// crash-safe input to the send-side cap re-check (spec §7). A malformed/amountless invoice
-/// is `Permanent` (it can only come from a corrupt record, not a transient fault).
-fn invoice_amount_msat(invoice: &Invoice) -> Result<u64, ExecError> {
-    let bolt11 = Bolt11Invoice::from_str(&invoice.0)
-        .map_err(|e| ExecError::Permanent(format!("parsing move invoice: {e}")))?;
-    bolt11
-        .amount_milli_satoshis()
-        .ok_or_else(|| ExecError::Permanent("move invoice carries no amount".into()))
+/// Parse a (fixed) move invoice's BOLT11 — the crash-safe input to the §7 send-side cap re-check
+/// and the §15.4 expiry belt. A malformed invoice is `Permanent` (it can only come from a corrupt
+/// record, not a transient fault).
+fn parse_move_invoice(invoice: &Invoice) -> Result<Bolt11Invoice, ExecError> {
+    Bolt11Invoice::from_str(&invoice.0)
+        .map_err(|e| ExecError::Permanent(format!("parsing move invoice: {e}")))
+}
+
+/// Whether minting `amount` into a destination already holding `dest` would push it past the hard
+/// per-fed `cap` (§15.2). SATURATING — a colossal amount can never wrap around to "fit".
+fn would_exceed_cap(dest: Msat, amount: Msat, cap: Msat) -> bool {
+    dest.0.saturating_add(amount.0) > cap.0
+}
+
+/// The destination's remaining hard-cap room for an evacuation: `cap − dest`, SATURATING (§15.2).
+/// `Some(room)` with `room > 0` bounds the evacuation net; a destination already AT/ABOVE the cap
+/// yields room 0, reported as `None` — the caller turns that into a LOUD terminal refusal, never a
+/// 0-msat move and never a wrapped-around huge room.
+fn evacuation_cap_room(dest: Msat, cap: Msat) -> Option<Msat> {
+    let room = cap.0.saturating_sub(dest.0);
+    (room > 0).then_some(Msat(room))
+}
+
+/// The §15.5 Pay-step cap verdict over the two legs. The receive quote is FIXED (the invoice is
+/// minted); the send quote is re-quoted each attempt and can transiently spike:
+///   - `Permanent` ONLY when the fixed receive quote ALONE exceeds the cap (no send re-quote can
+///     rescue it — a terminal condition);
+///   - `Retryable` when the receive fits but the total (with this attempt's send quote) does not
+///     (a later attempt may re-quote the send leg lower);
+///   - `Ok(())` when both legs fit.
+fn pay_step_cap_verdict(
+    receive_quote: Msat,
+    send_quote: Msat,
+    fee_cap: Msat,
+) -> Result<(), ExecError> {
+    if receive_quote.0 > fee_cap.0 {
+        return Err(ExecError::Permanent(format!(
+            "fee over cap: the fixed receive quote {} msat alone exceeds fee_cap {} msat",
+            receive_quote.0, fee_cap.0
+        )));
+    }
+    if !fee::total_within_cap(receive_quote, send_quote, fee_cap) {
+        return Err(ExecError::Retryable(format!(
+            "send fee quote over cap this attempt (receive {} + send {} > fee_cap {} msat); retrying",
+            receive_quote.0, send_quote.0, fee_cap.0
+        )));
+    }
+    Ok(())
+}
+
+/// Map a classified [`SendError`] from `pay` to the executor's terminal/retryable dispositions
+/// (§15.4): a deterministic `Rejected` is `Permanent` (re-driving the same invoice can never
+/// succeed — a fresh occurrence must re-mint), a `Transport` fault stays `Retryable`.
+fn map_send_error(e: SendError) -> ExecError {
+    match e {
+        SendError::Rejected(msg) => ExecError::Permanent(msg),
+        SendError::Transport(err) => ExecError::Retryable(err.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -1075,7 +1238,7 @@ mod tests {
         let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
         let mc = Arc::new(MultiClient::new(db.clone(), mnemonic).await);
         let journal = Arc::new(FedimintJournal::new(db));
-        FedimintExecutor::new(mc, journal, None)
+        FedimintExecutor::new(mc, journal, None, None)
     }
 
     fn intent(action: Action) -> Intent {
@@ -1276,6 +1439,71 @@ mod tests {
         let grossed =
             solve_gross_up(Msat(100_000), solvable, Msat(200)).expect("a sub-100% fee is solvable");
         assert!(grossed.invoice_amount.0 >= 100_000);
+    }
+
+    #[test]
+    fn destination_cap_math_refuses_over_cap_and_downsizes_evacuations() {
+        // §15.2. A non-evacuation inflow is refused pre-mint when dest + amount would exceed the
+        // cap, and permitted right up to the cap (inclusive).
+        let cap = Msat(5_000_000);
+        assert!(would_exceed_cap(Msat(4_900_000), Msat(200_000), cap));
+        assert!(!would_exceed_cap(Msat(4_800_000), Msat(200_000), cap));
+        assert!(!would_exceed_cap(Msat(0), cap, cap));
+        // SATURATING: a colossal amount can never wrap around to "fit".
+        assert!(would_exceed_cap(Msat(1), Msat(u64::MAX), cap));
+
+        // An evacuation is downsized to the destination's remaining cap room...
+        assert_eq!(
+            evacuation_cap_room(Msat(4_000_000), cap),
+            Some(Msat(1_000_000))
+        );
+        // ...and clamped to min(desired, room): a small desired stays, a large one is capped.
+        let room = evacuation_cap_room(Msat(4_000_000), cap).expect("positive room");
+        assert_eq!(500_000_u64.min(room.0), 500_000);
+        assert_eq!(9_000_000_u64.min(room.0), 1_000_000);
+        // A destination already AT or ABOVE the cap yields NO room — a loud refusal, never a
+        // 0-msat move and never a wrapped-around huge room (saturating).
+        assert_eq!(evacuation_cap_room(cap, cap), None);
+        assert_eq!(evacuation_cap_room(Msat(cap.0 + 1), cap), None);
+    }
+
+    #[test]
+    fn pay_step_cap_verdict_splits_retryable_from_permanent() {
+        // §15.5. Both legs fit -> Ok.
+        let cap = Msat(10_000);
+        assert!(pay_step_cap_verdict(Msat(3_000), Msat(4_000), cap).is_ok());
+        // The receive quote fits but the send re-quote spiked the total over cap -> Retryable
+        // (a later attempt may re-quote the send leg lower), NOT a terminal strand.
+        assert!(matches!(
+            pay_step_cap_verdict(Msat(3_000), Msat(9_000), cap),
+            Err(ExecError::Retryable(_))
+        ));
+        // The FIXED receive quote alone exceeds the cap -> Permanent (unrescuable).
+        assert!(matches!(
+            pay_step_cap_verdict(Msat(11_000), Msat(0), cap),
+            Err(ExecError::Permanent(_))
+        ));
+        // Receive exactly at the cap is fine; a send spike above it is Retryable, not Permanent.
+        assert!(matches!(
+            pay_step_cap_verdict(cap, Msat(1), cap),
+            Err(ExecError::Retryable(_))
+        ));
+    }
+
+    #[test]
+    fn deterministic_send_rejection_fails_the_move_permanently() {
+        // §15.4. A deterministic rejection from the send leg (expired / wrong-currency /
+        // unsupported / fee-limit) maps to a terminal Permanent with an actionable message — the
+        // move does NOT reset to Pending and livelock. A transport fault stays Retryable.
+        let rejected = map_send_error(SendError::Rejected(
+            "lnv2 send deterministically rejected the invoice: Invoice has expired".into(),
+        ));
+        assert!(matches!(rejected, ExecError::Permanent(msg) if msg.contains("expired")));
+
+        let transport = map_send_error(SendError::Transport(anyhow::anyhow!(
+            "connection reset by peer"
+        )));
+        assert!(matches!(transport, ExecError::Retryable(_)));
     }
 
     #[test]

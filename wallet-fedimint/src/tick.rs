@@ -373,6 +373,8 @@ mod tests {
             gateway_available: true,
             wallet_module_present: true,
             expiry_timestamp_secs: None,
+            config_expiry_secs: None,
+            meta_module_expiry_secs: None,
             status_scheduled_shutdown: false,
             shutdown_scheduled: false,
             spendable_msat,
