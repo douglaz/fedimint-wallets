@@ -4,7 +4,7 @@
 //! field names + the `DirectInflow` `from`-omission must be pinned.
 
 use wallet_core::{FederationId, IdempotencyKey, Msat};
-use wallet_fedimint::{MoveMeta, MoveRole};
+use wallet_fedimint::{move_protocol::RECEIVE_CONTRACT_QUOTED_META_KEY, MoveMeta, MoveRole};
 
 const FED_A: FederationId = FederationId([0xAA; 32]);
 const FED_B: FederationId = FederationId([0xBB; 32]);
@@ -64,6 +64,50 @@ fn move_send_meta_carries_from_and_round_trips() {
         "a Move send meta must carry its source federation"
     );
     assert_eq!(MoveMeta::from_value(&value), Some(meta));
+}
+
+#[test]
+fn receive_meta_carries_replayable_contract_quote_without_breaking_backfill_decode() {
+    let meta = MoveMeta {
+        move_id: key("move:receive-contract-quote"),
+        role: MoveRole::Receive,
+        amount: Msat(100_000),
+        from: Some(FED_A),
+        to: FED_B,
+    };
+    let value = meta.receive_value_with_contract_quote(Msat(100_450));
+
+    assert_eq!(
+        value.get(RECEIVE_CONTRACT_QUOTED_META_KEY).cloned(),
+        Some(serde_json::json!(100_450)),
+        "the receive op must durably carry the quoted contract for crash-resume verification"
+    );
+    assert_eq!(
+        MoveMeta::receive_contract_quote_from_value(&value).expect("valid quote field"),
+        Some(Msat(100_450))
+    );
+    assert_eq!(
+        MoveMeta::from_value(&value),
+        Some(meta),
+        "extra receive-only metadata must not break ordinary MoveMeta backfill"
+    );
+
+    let missing = serde_json::json!({ "move_id": "x", "role": "receive" });
+    assert_eq!(
+        MoveMeta::receive_contract_quote_from_value(&missing).expect("missing is not corrupt"),
+        None
+    );
+
+    let mut malformed = serde_json::Map::new();
+    malformed.insert(
+        RECEIVE_CONTRACT_QUOTED_META_KEY.to_string(),
+        serde_json::json!("not-a-msat"),
+    );
+    let malformed = serde_json::Value::Object(malformed);
+    assert!(
+        MoveMeta::receive_contract_quote_from_value(&malformed).is_err(),
+        "a present but undecodable quote is corrupt metadata"
+    );
 }
 
 #[test]

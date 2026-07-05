@@ -49,6 +49,15 @@ pub struct ExecutionSummary {
     /// re-driven. This is a subset of `skipped`; callers that gate money operations on success
     /// can distinguish these from benign idempotent `Done` skips.
     pub terminal_failed_skipped: usize,
+    /// Retryable failures that left the intent `Pending` for a later retry (§15.11). A SUBSET of
+    /// `failed` (kept there so existing "any failure" gating is unchanged), broken out so a
+    /// scheduler can tell "left Pending, will retry" from a terminal `Permanent`/`Unsupported`
+    /// money-op failure: `failed − retryable` is the terminal count. This counts `Retryable`
+    /// PERFORM outcomes only; a journal-I/O fault surrounding a perform (a failed
+    /// `get`/`upsert`/`set_status`) stays in `failed` alone — the journal's own status is
+    /// authoritative for whether such an intent is re-driven (`reconcile` scans `Pending`/
+    /// `Executing` directly), so this summary field never gates a retry.
+    pub retryable: usize,
 }
 
 /// The result of a successful [`Executor::perform`].
@@ -505,7 +514,10 @@ async fn drive<J: Journal, E: Executor>(
             let _ = journal
                 .set_status(&intent.idempotency_key, IntentStatus::Pending)
                 .await;
+            // Retryable: count it in `failed` (unchanged gating) AND in the `retryable` subset
+            // (§15.11), so a scheduler can tell a left-Pending retry from a terminal failure.
             summary.failed += 1;
+            summary.retryable += 1;
         }
         Err(ExecError::Permanent(reason)) => {
             tracing::warn!(

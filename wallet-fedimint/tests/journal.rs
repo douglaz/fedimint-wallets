@@ -16,6 +16,7 @@ use wallet_core::{
 };
 use wallet_fedimint::{
     FederationInfo, FedimintJournal, GatewayUrl, Invoice, MovePhase, MoveRecord, OperationId,
+    Preimage,
 };
 
 fn mem_journal() -> FedimintJournal {
@@ -54,6 +55,11 @@ fn move_record(key: &str) -> MoveRecord {
         send_op: Some(OperationId([0x09; 32])),
         phase: MovePhase::Sending,
         outcome: None,
+        // Non-None so the serde round-trip (`move_record_roundtrip`) proves the §2.3/§3 fields
+        // persist through the JSON row unchanged.
+        preimage: Some(Preimage([0x0b; 32])),
+        receive_fee_quoted: Some(Msat(150)),
+        send_fee_quoted: Some(Msat(250)),
     }
 }
 

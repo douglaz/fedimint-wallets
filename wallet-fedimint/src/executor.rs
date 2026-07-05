@@ -268,152 +268,17 @@ impl FedimintExecutor {
         amount: Msat,
         gateway_fee: fee::GatewayFee,
     ) -> Result<fee::GrossUp, ExecError> {
-        // Quote the federation fee at the net amount, solve, then VERIFY the fee at the
-        // solved contract and re-solve until the verified prediction is exact (spec §6
-        // fixed point, exit condition on the NET, not on fee equality).
-        //
-        // NEVER-OVER is the hard half of the exact-net contract: the federation fee is a
-        // STEP function of the contract amount, so a bounded loop can oscillate without
-        // settling — and an unverified exit can mint an invoice netting the recipient MORE
-        // than `amount`, breaking exact-net AND potentially pushing the destination past its
-        // hard per-fed cap (the allocator sized the move by cap_room). So each pass verifies
-        // `predicted_net` with the fee quoted AT the current solve's contract:
-        //   - exact        → done (a converged fee always lands here: the solver nets
-        //                    exactly `net` for the fee it was handed);
-        //   - a hair UNDER → remember it as a SAFE fallback (never-over holds), then keep
-        //                    re-solving for exact;
-        //   - OVER         → re-solve with the fresher fee (a full re-solve, not a linear
-        //                    invoice shrink: with a ppm gateway fee, shrinking the invoice
-        //                    by the excess only closes a fraction of the overshoot per pass).
-        // On exhaustion return the safe under-netting candidate if one was seen (a true
-        // two-step oscillation always yields one — solving with the higher fee under-nets
-        // under the lower); only a genuinely unstable quote stream errors `Retryable`.
-        let mut fed_fee = self
-            .mc
-            .receive_fee_quote(to, amount)
-            .await
-            .map_err(retryable)?;
-        let mut grossed = solve_gross_up(amount, gateway_fee, fed_fee)?;
-        let mut safe_under: Option<fee::GrossUp> = None;
-        let mut last_over_invoice: Option<u64> = None;
-        // `0..=` so EVERY solve is verified, including the one built on the final pass — a
-        // stable quote staircase that reaches its exact fixed point on the last re-solve
-        // must be accepted, not dropped to `Retryable` unverified.
-        for pass in 0..=FED_FEE_REQUOTE_PASSES {
-            let verified_fee = self
-                .mc
-                .receive_fee_quote(to, grossed.contract_amount)
+        // §15.10: the verify / re-solve / bisect loop is extracted into the free
+        // [`resolve_receive_gross_up`] generic over an async federation-fee-quote closure so it
+        // is golden-testable over scripted quote streams. Production quotes the LIVE federation
+        // fee at each candidate contract amount; behavior is byte-identical to the welded form.
+        resolve_receive_gross_up(amount, gateway_fee, |contract| async move {
+            self.mc
+                .receive_fee_quote(to, contract)
                 .await
-                .map_err(retryable)?;
-            let predicted = fee::predicted_net(grossed.invoice_amount, gateway_fee, verified_fee);
-            match predicted.0.cmp(&amount.0) {
-                std::cmp::Ordering::Equal => return Ok(grossed),
-                std::cmp::Ordering::Less => {
-                    // Never-over holds; keep as the fallback and still try for exact — a
-                    // verified hair-under solve is the ACCEPTED degradation for every path
-                    // (live feds cannot guarantee msat-exact: the claim-time fee model gap
-                    // already under-delivers a hair, which the smokes' slack tolerates;
-                    // demanding quote-time exactness would spuriously retry real inflows).
-                    // RESTATE the receive quote to the VERIFIED cost (`invoice − predicted`,
-                    // what the recipient actually pays): the solve's own `invoice − amount`
-                    // assumes the requested net was delivered and would UNDERSTATE the cost
-                    // by the shortfall — every downstream fee-cap check (DirectInflow's
-                    // receive-side cap, fresh-evacuation costing) reads this field, and an
-                    // understated quote could approve a move whose real fees exceed
-                    // `fee_cap`. Send-required moves additionally adjust `rec.amount` to
-                    // the delivered net at CreateInvoice, keeping the Pay re-check honest.
-                    safe_under = Some(fee::GrossUp {
-                        receive_quote: Msat(grossed.invoice_amount.0.saturating_sub(predicted.0)),
-                        ..grossed
-                    });
-                }
-                std::cmp::Ordering::Greater => {
-                    last_over_invoice = Some(grossed.invoice_amount.0);
-                }
-            }
-            if pass == FED_FEE_REQUOTE_PASSES {
-                break;
-            }
-            fed_fee = verified_fee;
-            grossed = solve_gross_up(amount, gateway_fee, fed_fee)?;
-        }
-        // Exactness was not reached in bounded passes. Close the remaining gap with a
-        // VERIFIED bisection over the invoice itself: each probe verifies the fee AT the
-        // candidate's own contract, so the search needs NO fee monotonicity to stay SAFE —
-        // its result is always a verified never-over invoice adjacent to a verified
-        // over-netting one (a frontier). On an adversarial non-monotone curve that frontier
-        // may not be the GLOBAL maximum never-over invoice (accepted: under-delivery stays
-        // bounded by the receive fee and is honestly restated in the quote; safety — never
-        // over — is unconditional). Seeding:
-        //   - `lo` = the best VERIFIED under-netting candidate when one was seen (returning
-        //     it outright could leave a whole fee step on the table when a verified
-        //     over-netting invoice exists to bisect toward), else `amount` (always nets
-        //     ≤ amount: fees are non-negative).
-        //   - `hi` = a verified over-netting invoice; if NO pass over-netted there is
-        //     nothing to bisect toward — return the best under candidate directly.
-        let (mut lo, mut lo_quote): (u64, Option<Msat>) = match &safe_under {
-            Some(under) => (under.invoice_amount.0, None),
-            None => (amount.0, None),
-        };
-        let Some(mut hi) = last_over_invoice else {
-            return match safe_under {
-                Some(under) => Ok(under),
-                // Unreachable for a deterministic stream (every pass returned Equal would
-                // have exited; no over and no under means no pass ran) — clean retry.
-                None => Err(ExecError::Retryable(
-                    "receive fee quotes did not converge to a never-over invoice".into(),
-                )),
-            };
-        };
-        if hi <= lo {
-            // The over candidate sits at/below the under seed (non-monotone curve): the
-            // under candidate is already the best verified frontier we can prove.
-            if let Some(under) = safe_under {
-                return Ok(under);
-            }
-            hi = lo.saturating_add(1);
-        }
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            let mid_invoice = Msat(mid);
-            let mid_contract = Msat(mid.saturating_sub(gateway_fee.on(mid_invoice).0));
-            let mid_fee = self
-                .mc
-                .receive_fee_quote(to, mid_contract)
-                .await
-                .map_err(retryable)?;
-            if fee::predicted_net(mid_invoice, gateway_fee, mid_fee).0 > amount.0 {
-                hi = mid;
-            } else {
-                lo = mid;
-                lo_quote = Some(mid_fee);
-            }
-        }
-        let invoice_amount = Msat(lo);
-        let contract_amount = Msat(lo.saturating_sub(gateway_fee.on(invoice_amount).0));
-        let fed_fee = match lo_quote {
-            Some(fed_fee) => fed_fee,
-            None => self
-                .mc
-                .receive_fee_quote(to, contract_amount)
-                .await
-                .map_err(retryable)?,
-        };
-        let predicted = fee::predicted_net(invoice_amount, gateway_fee, fed_fee);
-        if predicted.0 > amount.0 {
-            // Unreachable for a deterministic quote stream (invoice = amount cannot net over
-            // with non-negative fees); a non-deterministic stream gets a clean retry.
-            return Err(ExecError::Retryable(
-                "receive fee quotes did not converge to a never-over invoice".into(),
-            ));
-        }
-        Ok(fee::GrossUp {
-            invoice_amount,
-            contract_amount,
-            // The verified honest cost (invoice − predicted), same restatement convention
-            // as the safe-under fallback above.
-            receive_quote: Msat(lo.saturating_sub(predicted.0)),
+                .map_err(retryable)
         })
+        .await
     }
 
     /// Preflight a fresh CLI `DirectInflow` before it is journaled. This catches the
@@ -430,24 +295,45 @@ impl FedimintExecutor {
         ensure_minimum_incoming_contract(amount, grossed.contract_amount)
     }
 
-    /// Size the receive invoice via the §6 fixed point and cap-check the receive side ONCE
-    /// (spec §7 `CreateInvoice`). The gateway fee comes from `routing_info`; the federation
-    /// fee is resolved by a short async fixed point (see [`FED_FEE_REQUOTE_PASSES`]). Returns
-    /// the gross invoice amount; the invoice is then fixed (never re-quoted on resume).
+    /// Size the receive invoice via the §6 fixed point and apply the lnv2 minimum-contract guard
+    /// (spec §7 `CreateInvoice`). The gateway fee comes from `routing_info`; the federation fee is
+    /// resolved by a short async fixed point (see [`FED_FEE_REQUOTE_PASSES`]). Returns the sized
+    /// invoice; the invoice is then fixed (never re-quoted on resume). The receive-side fee-cap
+    /// check is applied by the CALLER (the `CreateInvoice` arm), which first persists the computed
+    /// `receive_fee_quoted` on the record so a "fee over cap" refusal is explained in history
+    /// (spec §2.3).
     async fn gross_up(&self, rec: &MoveRecord) -> Result<fee::GrossUp, ExecError> {
         let grossed = self
             .quote_receive_gross_up(&rec.to, &rec.gateway, rec.amount)
             .await?;
         ensure_minimum_incoming_contract(rec.amount, grossed.contract_amount)?;
-
-        // Cap-check the receive side alone (spec §6/§7): for a `DirectInflow` this is the
-        // whole check; for a `Move` the send leg is re-checked at `Pay`.
-        if !fee::total_within_cap(grossed.receive_quote, Msat(0), rec.fee_cap) {
-            return Err(ExecError::Permanent(
-                "fee over cap (receive side exceeds fee_cap)".into(),
-            ));
-        }
         Ok(grossed)
+    }
+
+    /// Re-run the §15.7 committed-contract check for a receive op recovered from the op-log.
+    /// This closes the crash window after `mc.receive` commits but before the post-receive
+    /// `MoveRecord` write: resume may skip `CreateInvoice`, so `Pay`/receive-only `Awaiting` must
+    /// verify the op's durable contract against the quoted contract stored in `custom_meta`.
+    async fn verify_recovered_receive_contract(&self, rec: &MoveRecord) -> Result<(), ExecError> {
+        let recv_op = rec.recv_op.ok_or_else(|| {
+            ExecError::Permanent("receive contract check reached with no receive op".into())
+        })?;
+        // `receive_contract_amounts` hits only the destination's LOCAL op-log, so its ONLY transient
+        // failure is the destination client not being open this pass (a later reconcile can open it).
+        // With the client open, an op-not-found / wrong-leg / malformed-quote error is durable
+        // corruption a re-drive can never clear — classify it Permanent so a poisoned intent fails
+        // loudly instead of livelocking Pending forever.
+        let (committed, quoted) = match self.mc.receive_contract_amounts(&rec.to, recv_op).await {
+            Ok(amounts) => amounts,
+            Err(e) => {
+                return Err(classify_receive_contract_read_error(
+                    e,
+                    self.mc.federations().contains(&rec.to),
+                    &rec.key.0,
+                ))
+            }
+        };
+        verify_replayable_receive_contract(committed, quoted)
     }
 
     /// For a cross-federation `Move`, prove the pinned receive gateway also serves the source
@@ -775,39 +661,52 @@ impl Executor for FedimintExecutor {
                         self.enforce_destination_cap(&rec).await?;
                     }
                     let grossed = self.gross_up(&rec).await?;
+                    // §2.3: persist the receive quote on the record BEFORE the cap check, so a
+                    // "fee over cap" refusal — which returns before any money moves — is still
+                    // explained in history (a derived-cache write; no money moves). It rides on
+                    // every subsequent `put_move` below and is stored on the refusal path too.
+                    rec.receive_fee_quoted = Some(grossed.receive_quote);
+                    // Cap-check the receive side alone (spec §6/§7): for a `DirectInflow` this is
+                    // the whole check; for a `Move` the send leg is re-checked at `Pay`. Over cap →
+                    // persist the quote first (so the refusal is in history), then refuse terminally.
+                    if !fee::total_within_cap(grossed.receive_quote, Msat(0), rec.fee_cap) {
+                        self.journal.put_move(&rec).await?;
+                        return Err(ExecError::Permanent(
+                            "fee over cap (receive side exceeds fee_cap)".into(),
+                        ));
+                    }
                     let invoice_amount = grossed.invoice_amount;
-                    // A send-required move may have accepted a verified hair-under solve:
-                    // the DELIVERED net is invoice − receive_quote. The adjustment to
-                    // `rec.amount` happens AFTER `mc.receive` commits (below), NOT here —
-                    // lowering the cached amount before the receive exists would make a
-                    // crash/transient-failure retry prefer the smaller cached amount over
-                    // the intent's ask (`assemble_move_record`) and mint a fresh invoice
-                    // for less than requested even though fees may have settled; a fresh
-                    // attempt must re-quote from the intent's full ask.
+                    // A move may have accepted a verified hair-under solve: the DELIVERED net is
+                    // invoice − receive_quote. The adjustment to `rec.amount` happens AFTER
+                    // `mc.receive` commits (below), NOT here — lowering the cached amount before
+                    // the receive exists would make a crash/transient-failure retry prefer the
+                    // smaller cached amount over the intent's ask (`assemble_move_record`) and mint
+                    // a fresh invoice for less than requested even though fees may have settled; a
+                    // fresh attempt must re-quote from the intent's full ask.
                     let delivered = Msat(
                         grossed
                             .invoice_amount
                             .0
                             .saturating_sub(grossed.receive_quote.0),
                     );
-                    // The net this move will actually deliver (== rec.amount for an exact
-                    // solve). Committed in the receive op's own MoveMeta below, so a crash
-                    // that loses the post-receive cache write still recovers the HONEST
-                    // amount from the op itself (backfill prefers recovered op metadata
-                    // over the intent's ask) — the Pay-step cap re-check can then never be
-                    // weakened by a stale higher amount.
-                    let net_amount = if rec.send_required && delivered < rec.amount {
-                        delivered
-                    } else {
-                        rec.amount
-                    };
-                    // For a `Move`, persist the chosen gateway BEFORE the non-idempotent receive
-                    // call. If the process dies after B's receive op commits but before the
-                    // invoice/op-id cache write below, backfill can recover the op but not the
-                    // gateway. This pre-op record makes the gateway authoritative on replay.
-                    if rec.send_required {
-                        self.journal.put_move(&rec).await?;
-                    }
+                    // The net this move will actually deliver (== rec.amount for an exact solve),
+                    // committed in the receive op's own MoveMeta below UNCONDITIONALLY (§15.11): the
+                    // MoveMeta amount is documented as the honest crash-safe delivered amount, so a
+                    // receive-only `DirectInflow` that settles a hair under must record `delivered`,
+                    // not the ask. A crash that loses the post-receive cache write then recovers the
+                    // HONEST amount from the op itself (backfill prefers recovered op metadata over
+                    // the intent's ask) — the Pay-step cap re-check can never be weakened by a stale
+                    // higher amount.
+                    let net_amount = delivered_move_amount(delivered, rec.amount);
+                    // Persist the record BEFORE the non-idempotent receive call — for BOTH move
+                    // shapes. If the process dies after B's receive op commits but before the
+                    // invoice/op-id cache write below, backfill recovers the op from the op-log but
+                    // NOT the executor-only facts it does not carry: for a `Move` the chosen gateway
+                    // (authoritative on replay), and for EITHER shape the §2.3 `receive_fee_quoted`
+                    // set just above. A `DirectInflow` has no later `Pay` arm to re-derive that
+                    // quote, so without this pre-op write a crash in that window would finalize its
+                    // history with the receive quote blanked.
+                    self.journal.put_move(&rec).await?;
                     let meta = MoveMeta {
                         move_id: rec.key.clone(),
                         role: MoveRole::Receive,
@@ -821,10 +720,25 @@ impl Executor for FedimintExecutor {
                             &rec.to,
                             invoice_amount,
                             Some(rec.gateway.clone()),
-                            meta.to_value(),
+                            meta.receive_value_with_contract_quote(grossed.contract_amount),
                         )
                         .await
                         .map_err(retryable)?;
+                    // §15.7 never-over TOCTOU: lnv2 re-fetches `routing_info` inside
+                    // `create_contract_and_fetch_invoice` and sizes the COMMITTED contract with the
+                    // FRESH gateway fee, so a fee DROP between our verified quote and the mint would
+                    // commit a larger contract and net the destination MORE than asked (a gateway
+                    // can time this). Read the committed contract and compare against our sized
+                    // `contract_amount`; on mismatch refuse BEFORE recording/surfacing/paying —
+                    // safe because the invoice is unpaid at this point (for a Move we are the only
+                    // payer; a DirectInflow's invoice has not been surfaced), and the orphaned
+                    // receive op simply expires unclaimed. A retry (fresh occurrence) re-quotes.
+                    let (committed_contract, quoted_contract) = self
+                        .mc
+                        .receive_contract_amounts(&rec.to, recv_op)
+                        .await
+                        .map_err(retryable)?;
+                    verify_replayable_receive_contract(committed_contract, quoted_contract)?;
                     // KILLPOINT (§5 backfill window): the receive op is now committed in the
                     // CLIENT db, but our MoveRecord (recv_op + invoice) is NOT yet persisted. A
                     // crash here forces backfill to recover the recv op by `move_id` on resume,
@@ -868,6 +782,8 @@ impl Executor for FedimintExecutor {
                         ExecError::Permanent("Pay step reached with no source federation".into())
                     })?;
 
+                    self.verify_recovered_receive_contract(&rec).await?;
+
                     // §15.4 belt: parse the (fixed) BOLT11 once and refuse a move whose invoice
                     // has already EXPIRED. Paying an expired invoice can only earn a deterministic
                     // send rejection that would otherwise reset the move to `Pending` and livelock;
@@ -902,6 +818,20 @@ impl Executor for FedimintExecutor {
                         .await
                         .map_err(retryable)?;
                     let send_quote = Msat(send_gateway_quote.0.saturating_add(send_tx_fee.0));
+                    // §2.3: persist the send quote on the record BEFORE the cap check, so the
+                    // paradigm failure this field must explain — the "fee over cap" refusal, which
+                    // returns before any send commits — is fully in history. A derived-cache write;
+                    // no money moves (the `pay` below is the only irreversible step).
+                    rec.send_fee_quoted = Some(send_quote);
+                    // §2.3: also (re)persist the receive quote here. On a cache-loss resume that
+                    // reconstructs the record from the op-log and re-drives straight into `Pay`
+                    // (skipping `CreateInvoice`, where the quote is first stored), `receive_fee_quoted`
+                    // is blanked — but the receive cost is a fact of the FIXED invoice
+                    // (`invoice − amount`, already recomputed above for the cap re-check), so restore
+                    // it and a completed move's history explains BOTH legs' fees. Equal to the value
+                    // `CreateInvoice` stored, so this never disagrees with it.
+                    rec.receive_fee_quoted = Some(receive_quote);
+                    self.journal.put_move(&rec).await?;
                     // §15.5: Permanent ONLY when the FIXED receive quote alone exceeds the cap; a
                     // send re-quote spike is Retryable (a later attempt may quote lower — 15.4's
                     // expiry belt bounds the retry horizon), so a transient spike never terminally
@@ -948,6 +878,7 @@ impl Executor for FedimintExecutor {
                     // repairs the cache so `invoice_for`/later reattaches find the already-minted
                     // invoice without a separate reconcile (spec §9.2).
                     if !rec.send_required {
+                        self.verify_recovered_receive_contract(&rec).await?;
                         self.journal.put_move(&rec).await?;
                         return Ok(PerformOutcome::Awaiting);
                     }
@@ -966,29 +897,31 @@ impl Executor for FedimintExecutor {
                         .await
                         .map_err(retryable)?
                     {
-                        SendState::Success(_preimage) => {
+                        SendState::Success(preimage) => {
+                            // §3: A's payment SETTLED — persist the preimage FIRST, BEFORE awaiting
+                            // the receive, so a crash after this point can never lose the recovery
+                            // proof for a stranded move. THEN await the receive.
+                            rec.preimage = Some(preimage);
+                            self.journal.put_move(&rec).await?;
                             let recv_op = rec.recv_op.ok_or_else(|| {
                                 ExecError::Permanent(
                                     "send settled but the record has no receive op".into(),
                                 )
                             })?;
-                            match self
+                            // Transport faults bubble as `Retryable` via `map_err(retryable)` BEFORE
+                            // this decision — only an op-TERMINAL non-`Claimed` receive strands
+                            // (spec §3): the send debited the source but the destination was never
+                            // credited (the misbehaving-gateway T4 case), which re-driving cannot
+                            // fix. `settle_after_successful_send` maps it to `Stranded` (loud,
+                            // terminal), naming the saved preimage.
+                            let receive_state = self
                                 .mc
                                 .await_receive(&rec.to, recv_op)
                                 .await
-                                .map_err(retryable)?
-                            {
-                                ReceiveState::Claimed => rec.phase = MovePhase::Settled,
-                                ReceiveState::Expired => {
-                                    rec.phase = MovePhase::Failed;
-                                    rec.outcome =
-                                        Some("send settled but receive invoice expired".into());
-                                }
-                                ReceiveState::Failed(msg) => {
-                                    rec.phase = MovePhase::Failed;
-                                    rec.outcome = Some(msg);
-                                }
-                            }
+                                .map_err(retryable)?;
+                            let (phase, outcome) = settle_after_successful_send(receive_state);
+                            rec.phase = phase;
+                            rec.outcome = outcome;
                         }
                         SendState::Refunded => {
                             rec.phase = MovePhase::Refunded;
@@ -1002,8 +935,10 @@ impl Executor for FedimintExecutor {
                     self.journal.put_move(&rec).await?;
                 }
                 MoveStep::Done => return Ok(PerformOutcome::Done),
-                // A `Refunded`/`Failed` phase is terminal (spec §7): the send self-refunded or a
-                // leg failed. Surface the recorded reason so the CLI/log names the actual cause.
+                // A `Refunded`/`Failed`/`Stranded` phase is terminal (spec §7): the send
+                // self-refunded, a leg failed, or the send settled but the receive was not credited
+                // (§3). Surface the recorded reason so the CLI/log names the actual cause — for a
+                // `Stranded` move that reason names the saved preimage.
                 MoveStep::Failed => {
                     return Err(ExecError::Permanent(
                         rec.outcome
@@ -1049,21 +984,187 @@ where
     Ok((lo >= floor).then_some(lo))
 }
 
+/// The §6 receive-side gross-up loop (spec §15.10), extracted generic over an async
+/// federation-fee-quote closure `fed_fee_quote` (contract amount → federation tx fee) so it is
+/// unit-testable over scripted quote streams WITHOUT a live `MultiClient`. Byte-identical to the
+/// welded original: production passes a closure over `MultiClient::receive_fee_quote`, tests pass
+/// a scripted stream. The `fed_fee_quote` closure owns the transport error mapping (it returns
+/// `Result<Msat, ExecError>` directly).
+///
+/// Quote the federation fee at the net amount, solve, then VERIFY the fee at the solved contract
+/// and re-solve until the verified prediction is exact (spec §6 fixed point, exit condition on the
+/// NET, not on fee equality).
+///
+/// NEVER-OVER is the hard half of the exact-net contract: the federation fee is a STEP function of
+/// the contract amount, so a bounded loop can oscillate without settling — and an unverified exit
+/// can mint an invoice netting the recipient MORE than `amount`, breaking exact-net AND potentially
+/// pushing the destination past its hard per-fed cap (the allocator sized the move by cap_room). So
+/// each pass verifies `predicted_net` with the fee quoted AT the current solve's contract:
+///
+/// - exact → done (a converged fee always lands here: the solver nets exactly `net` for the fee it
+///   was handed);
+/// - a hair UNDER → remember it as a SAFE fallback (never-over holds), then keep re-solving for
+///   exact;
+/// - OVER → re-solve with the fresher fee (a full re-solve, not a linear invoice shrink: with a ppm
+///   gateway fee, shrinking the invoice by the excess only closes a fraction of the overshoot per
+///   pass).
+///
+/// On exhaustion return the safe under-netting candidate if one was seen (a true two-step
+/// oscillation always yields one — solving with the higher fee under-nets under the lower); only a
+/// genuinely unstable quote stream errors `Retryable`.
+async fn resolve_receive_gross_up<F, Fut>(
+    amount: Msat,
+    gateway_fee: fee::GatewayFee,
+    mut fed_fee_quote: F,
+) -> Result<fee::GrossUp, ExecError>
+where
+    F: FnMut(Msat) -> Fut,
+    Fut: std::future::Future<Output = Result<Msat, ExecError>>,
+{
+    let mut fed_fee = fed_fee_quote(amount).await?;
+    let mut grossed = solve_gross_up(amount, gateway_fee, fed_fee)?;
+    let mut safe_under: Option<fee::GrossUp> = None;
+    let mut last_over_invoice: Option<u64> = None;
+    // `0..=` so EVERY solve is verified, including the one built on the final pass — a
+    // stable quote staircase that reaches its exact fixed point on the last re-solve
+    // must be accepted, not dropped to `Retryable` unverified.
+    for pass in 0..=FED_FEE_REQUOTE_PASSES {
+        let verified_fee = fed_fee_quote(grossed.contract_amount).await?;
+        let predicted = fee::predicted_net(grossed.invoice_amount, gateway_fee, verified_fee);
+        match predicted.0.cmp(&amount.0) {
+            std::cmp::Ordering::Equal => return Ok(grossed),
+            std::cmp::Ordering::Less => {
+                // Never-over holds; keep as the fallback and still try for exact — a
+                // verified hair-under solve is the ACCEPTED degradation for every path
+                // (live feds cannot guarantee msat-exact: the claim-time fee model gap
+                // already under-delivers a hair, which the smokes' slack tolerates;
+                // demanding quote-time exactness would spuriously retry real inflows).
+                // RESTATE the receive quote to the VERIFIED cost (`invoice − predicted`,
+                // what the recipient actually pays): the solve's own `invoice − amount`
+                // assumes the requested net was delivered and would UNDERSTATE the cost
+                // by the shortfall — every downstream fee-cap check (DirectInflow's
+                // receive-side cap, fresh-evacuation costing) reads this field, and an
+                // understated quote could approve a move whose real fees exceed
+                // `fee_cap`. Send-required moves additionally adjust `rec.amount` to
+                // the delivered net at CreateInvoice, keeping the Pay re-check honest.
+                safe_under = Some(fee::GrossUp {
+                    receive_quote: Msat(grossed.invoice_amount.0.saturating_sub(predicted.0)),
+                    ..grossed
+                });
+            }
+            std::cmp::Ordering::Greater => {
+                last_over_invoice = Some(grossed.invoice_amount.0);
+            }
+        }
+        if pass == FED_FEE_REQUOTE_PASSES {
+            break;
+        }
+        fed_fee = verified_fee;
+        grossed = solve_gross_up(amount, gateway_fee, fed_fee)?;
+    }
+    // Exactness was not reached in bounded passes. Close the remaining gap with a
+    // VERIFIED bisection over the invoice itself: each probe verifies the fee AT the
+    // candidate's own contract, so the search needs NO fee monotonicity to stay SAFE —
+    // its result is always a verified never-over invoice adjacent to a verified
+    // over-netting one (a frontier). On an adversarial non-monotone curve that frontier
+    // may not be the GLOBAL maximum never-over invoice (accepted: under-delivery stays
+    // bounded by the receive fee and is honestly restated in the quote; safety — never
+    // over — is unconditional). Seeding:
+    //   - `lo` = the best VERIFIED under-netting candidate when one was seen (returning
+    //     it outright could leave a whole fee step on the table when a verified
+    //     over-netting invoice exists to bisect toward), else `amount` (always nets
+    //     ≤ amount: fees are non-negative).
+    //   - `hi` = a verified over-netting invoice; if NO pass over-netted there is
+    //     nothing to bisect toward — return the best under candidate directly.
+    let (mut lo, mut lo_quote): (u64, Option<Msat>) = match &safe_under {
+        Some(under) => (under.invoice_amount.0, None),
+        None => (amount.0, None),
+    };
+    let Some(mut hi) = last_over_invoice else {
+        return match safe_under {
+            Some(under) => Ok(under),
+            // Unreachable for a deterministic stream (every pass returned Equal would
+            // have exited; no over and no under means no pass ran) — clean retry.
+            None => Err(ExecError::Retryable(
+                "receive fee quotes did not converge to a never-over invoice".into(),
+            )),
+        };
+    };
+    if hi <= lo {
+        // The over candidate sits at/below the under seed (non-monotone curve): the
+        // under candidate is already the best verified frontier we can prove.
+        if let Some(under) = safe_under {
+            return Ok(under);
+        }
+        hi = lo.saturating_add(1);
+    }
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        let mid_invoice = Msat(mid);
+        let mid_contract = Msat(mid.saturating_sub(gateway_fee.on(mid_invoice).0));
+        let mid_fee = fed_fee_quote(mid_contract).await?;
+        if fee::predicted_net(mid_invoice, gateway_fee, mid_fee).0 > amount.0 {
+            hi = mid;
+        } else {
+            lo = mid;
+            lo_quote = Some(mid_fee);
+        }
+    }
+    let invoice_amount = Msat(lo);
+    let contract_amount = Msat(lo.saturating_sub(gateway_fee.on(invoice_amount).0));
+    let fed_fee = match lo_quote {
+        Some(fed_fee) => fed_fee,
+        None => fed_fee_quote(contract_amount).await?,
+    };
+    let predicted = fee::predicted_net(invoice_amount, gateway_fee, fed_fee);
+    if predicted.0 > amount.0 {
+        // Unreachable for a deterministic quote stream (invoice = amount cannot net over
+        // with non-negative fees); a non-deterministic stream gets a clean retry.
+        return Err(ExecError::Retryable(
+            "receive fee quotes did not converge to a never-over invoice".into(),
+        ));
+    }
+    Ok(fee::GrossUp {
+        invoice_amount,
+        contract_amount,
+        // The verified honest cost (invoice − predicted), same restatement convention
+        // as the safe-under fallback above.
+        receive_quote: Msat(lo.saturating_sub(predicted.0)),
+    })
+}
+
 /// Solve the §6 receive-side fixed point for a constant federation fee, mapping the pure
-/// solver's "no solution" (a gateway advertising a ≥100% ppm receive fee) to a terminal
-/// [`ExecError::Permanent`] instead of letting the solver — or a re-drive of it — hang. Such a
-/// fee is deterministically unsolvable for this gateway, so the intent must fail terminally
-/// (the operator fixes/repins the gateway and re-runs under a fresh occurrence), never spin.
+/// solver's "no solution" to a terminal [`ExecError::Permanent`] instead of letting the solver —
+/// or a re-drive of it — hang. The `None` has two distinguishable causes (spec §15.11): a gateway
+/// advertising a ≥100% ppm receive fee (no invoice nets a positive amount), or the doubling
+/// search exhausting `u64::MAX` without clearing `net`. Either way the fee is deterministically
+/// unsolvable for this gateway, so the intent fails terminally (the operator fixes/repins the
+/// gateway and re-runs under a fresh occurrence), never spins.
 fn solve_gross_up(
     net: Msat,
     gateway_fee: fee::GatewayFee,
     fed_fee: Msat,
 ) -> Result<fee::GrossUp, ExecError> {
     fee::gross_up(net, gateway_fee, |_contract| fed_fee).ok_or_else(|| {
+        // §15.11: name the ACTUAL cause. `gross_up` returns `None` either because the gateway
+        // ppm is ≥ 100% (the recipient can never net a positive amount) or because the doubling
+        // bracket exhausted `u64::MAX` without clearing `net` — with a constant fed fee only the
+        // former can occur, but the message stays honest about both.
+        let cause = if gateway_fee.ppm >= fee::UNSOLVABLE_GATEWAY_PPM {
+            format!(
+                "gateway receive fee is {} ppm (>= 100% of the invoice)",
+                gateway_fee.ppm
+            )
+        } else {
+            format!(
+                "the receive-side fixed point did not converge below u64::MAX \
+                 (gateway {} ppm, federation fee {} msat)",
+                gateway_fee.ppm, fed_fee.0
+            )
+        };
         ExecError::Permanent(format!(
-            "gateway receive fee is {} ppm (>= 100% of the invoice); no invoice can net the \
-             requested {} msat",
-            gateway_fee.ppm, net.0
+            "{cause}; no invoice can net the requested {} msat",
+            net.0
         ))
     })
 }
@@ -1208,6 +1309,94 @@ fn pay_step_cap_verdict(
         )));
     }
     Ok(())
+}
+
+/// The §3 stranded-move outcome message: A's send SETTLED but B's receive was not credited. Names
+/// the receive-side `detail` and the durable recovery artifact (the saved preimage) so history/UI
+/// can present a debited-not-credited move honestly rather than as a silent loss.
+fn stranded_outcome(detail: &str) -> String {
+    format!(
+        "send settled but receive was not credited: {detail}; \
+         payment preimage saved on the move record"
+    )
+}
+
+/// Given a SETTLED send leg (the preimage is already persisted on the record), map the awaited
+/// receive state to the resulting terminal `(phase, outcome)` (spec §3). `Claimed` → `Settled` with
+/// no failure outcome; any op-terminal non-claim STRANDS (terminal, loud) — the send debited the
+/// source but the destination was never credited, which re-driving cannot fix. Pure so the
+/// transition is unit-testable without a live federation.
+fn settle_after_successful_send(receive: ReceiveState) -> (MovePhase, Option<String>) {
+    match receive {
+        ReceiveState::Claimed => (MovePhase::Settled, None),
+        ReceiveState::Expired => (
+            MovePhase::Stranded,
+            Some(stranded_outcome("receive invoice expired")),
+        ),
+        ReceiveState::Failed(msg) => (MovePhase::Stranded, Some(stranded_outcome(&msg))),
+    }
+}
+
+/// The §15.7 never-over TOCTOU verdict: the lnv2 mint re-fetches the gateway fee and sizes the
+/// COMMITTED contract with it, so a fee change between our verified quote and the mint shows up as
+/// `committed != quoted`. A DROP mints a LARGER contract (the destination would net MORE than
+/// asked); a strict inequality refuses either direction terminally BEFORE the invoice is surfaced
+/// or paid (the unpaid invoice expires unclaimed; a re-run re-quotes). Pure so the comparison is
+/// unit-testable without a live federation.
+fn verify_committed_receive_contract(committed: Msat, quoted: Msat) -> Result<(), ExecError> {
+    if committed != quoted {
+        return Err(ExecError::Permanent(
+            "gateway receive fee changed between quote and mint; re-run".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Classify a failure from reading the committed receive contract (§15.7 resume check). That read
+/// touches only the destination's LOCAL op-log, so the ONLY transient cause is the destination
+/// client not being open on this pass (`dest_open == false`); a later reconcile can open it, so stay
+/// `Retryable`. With the client open, an op-not-found / wrong-leg / malformed-quote error is durable
+/// corruption a re-drive can never clear, so it is `Permanent` (loud terminal) rather than a Pending
+/// livelock — the same deterministic-vs-transient split §15.4 makes for send rejections. Pure so the
+/// classification is unit-tested without a live federation.
+fn classify_receive_contract_read_error(
+    err: anyhow::Error,
+    dest_open: bool,
+    move_key: &str,
+) -> ExecError {
+    if dest_open {
+        ExecError::Permanent(format!(
+            "receive contract check failed on a durable op-log read (move {move_key}); the receive \
+             op is corrupt or missing: {err}"
+        ))
+    } else {
+        retryable(err)
+    }
+}
+
+fn verify_replayable_receive_contract(
+    committed: Msat,
+    quoted: Option<Msat>,
+) -> Result<(), ExecError> {
+    let quoted = quoted.ok_or_else(|| {
+        ExecError::Permanent(
+            "receive op is missing the quoted contract amount; re-run under a fresh occurrence"
+                .into(),
+        )
+    })?;
+    verify_committed_receive_contract(committed, quoted)
+}
+
+/// The honest net a receive actually delivers: `delivered` when the §6 fee fixed point settled a
+/// hair UNDER the ask, else the exact `ask` (§15.11). Committed UNCONDITIONALLY into the receive
+/// op's `MoveMeta.amount` — the documented crash-safe amount — so a receive-only `DirectInflow`
+/// records the delivered net, not the ask. Never over: a `delivered ≥ ask` keeps the ask.
+fn delivered_move_amount(delivered: Msat, ask: Msat) -> Msat {
+    if delivered < ask {
+        delivered
+    } else {
+        ask
+    }
 }
 
 /// Map a classified [`SendError`] from `pay` to the executor's terminal/retryable dispositions
@@ -1574,6 +1763,9 @@ mod tests {
             send_op: None,
             phase: MovePhase::Created,
             outcome: None,
+            preimage: None,
+            receive_fee_quoted: None,
+            send_fee_quoted: None,
         };
 
         assert_eq!(
@@ -1601,6 +1793,311 @@ mod tests {
             gateway_from_cache_or_recovered(Some(&cached), &plan, &key, &[]),
             Some(GatewayUrl("https://stale.example".into())),
             "once an invoice exists, the recorded gateway is part of the durable receive"
+        );
+    }
+
+    // ---- §15.10: the extracted gross-up loop, golden over scripted quote streams -----------
+    //
+    // Each fed-fee "stream" is a pure function of the CONTRACT amount (the federation fee is a
+    // step function of the contract, spec §6). `resolve_receive_gross_up` verifies every candidate
+    // against the fee at ITS OWN contract, so the SACRED invariant is: whatever invoice it accepts,
+    // the recipient nets ≤ the ask (never over). `assert_never_over` recomputes that independently.
+
+    /// Run the extracted loop against a pure `fed`-fee stream (contract → federation fee).
+    async fn resolve_with_fed<Fed: Fn(u64) -> u64>(
+        amount: Msat,
+        gw: fee::GatewayFee,
+        fed: Fed,
+    ) -> Result<fee::GrossUp, ExecError> {
+        resolve_receive_gross_up(amount, gw, |contract| {
+            let quote = fed(contract.0);
+            async move { Ok::<Msat, ExecError>(Msat(quote)) }
+        })
+        .await
+    }
+
+    /// Assert the accepted invoice is verified NEVER-OVER: recompute the recipient's net with the
+    /// fee at the returned contract and require it ≤ the ask; also check the reported contract and
+    /// receive quote are the honest derived values. Holds for ANY pure fed-fee stream by the loop's
+    /// per-candidate verification, so it is the right golden regardless of which branch was taken.
+    async fn assert_never_over<Fed: Fn(u64) -> u64 + Copy>(
+        amount: Msat,
+        gw: fee::GatewayFee,
+        fed: Fed,
+    ) -> fee::GrossUp {
+        let g = resolve_with_fed(amount, gw, fed)
+            .await
+            .expect("a pure deterministic stream always converges to a never-over invoice");
+        let net = fee::predicted_net(g.invoice_amount, gw, Msat(fed(g.contract_amount.0)));
+        assert!(
+            net.0 <= amount.0,
+            "NEVER-OVER VIOLATED: invoice {} nets {} > asked {}",
+            g.invoice_amount.0,
+            net.0,
+            amount.0
+        );
+        assert_eq!(
+            g.contract_amount,
+            Msat(g.invoice_amount.0.saturating_sub(gw.on(g.invoice_amount).0)),
+            "contract must be the gateway-reduced invoice"
+        );
+        assert_eq!(
+            g.receive_quote,
+            Msat(g.invoice_amount.0.saturating_sub(net.0)),
+            "receive_quote must be the honest cost invoice − net"
+        );
+        g
+    }
+
+    const ZERO_GW: fee::GatewayFee = fee::GatewayFee {
+        base_msat: Msat(0),
+        ppm: 0,
+    };
+
+    #[tokio::test]
+    async fn gross_up_stream_stable_converges_exactly() {
+        // A constant fee converges on the first verify (Equal): invoice = amount + fee, exact net.
+        let g = assert_never_over(Msat(100_000), ZERO_GW, |_c| 200).await;
+        assert_eq!(g.invoice_amount, Msat(100_200));
+        assert_eq!(
+            fee::predicted_net(g.invoice_amount, ZERO_GW, Msat(200)),
+            Msat(100_000)
+        );
+
+        // Same, but through a real (non-zero) gateway fee so the extraction's gateway.on() path is
+        // exercised end to end — still exactly never-over.
+        let gw = fee::GatewayFee {
+            base_msat: Msat(50),
+            ppm: 5_000,
+        };
+        let _ = assert_never_over(Msat(100_000), gw, |_c| 200).await;
+    }
+
+    #[tokio::test]
+    async fn gross_up_stream_two_step_oscillation_stays_never_over() {
+        // The fee flips high↔low across the two candidate invoices the solve ping-pongs between, so
+        // no pass reaches Equal — the loop must fall back to a verified never-over frontier.
+        let fed = |c: u64| if c <= 100_400 { 600 } else { 200 };
+        let _ = assert_never_over(Msat(100_000), ZERO_GW, fed).await;
+    }
+
+    #[tokio::test]
+    async fn gross_up_stream_staircase_converges_on_the_last_pass() {
+        // A monotone staircase that only reaches its exact fixed point on the FINAL re-solve — the
+        // `0..=PASSES` inclusive bound must accept it rather than drop to Retryable unverified.
+        let fed = |c: u64| {
+            let over = c.saturating_sub(100_000);
+            (100 + (over / 100) * 100).min(400)
+        };
+        let g = assert_never_over(Msat(100_000), ZERO_GW, fed).await;
+        // It converges EXACTLY (an Equal exit), netting the full ask.
+        assert_eq!(
+            fee::predicted_net(g.invoice_amount, ZERO_GW, Msat(fed(g.contract_amount.0))),
+            Msat(100_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn gross_up_stream_non_monotone_over_below_under_stays_never_over() {
+        // A non-monotone stream where the verified OVER candidate sits at a SMALLER invoice than the
+        // verified UNDER candidate (`hi <= lo`): the loop must fall back to the under frontier, never
+        // bisecting into an over-netting invoice.
+        let fed = |c: u64| match c {
+            100_000 => 500,
+            100_500 => 600,
+            100_600 => 100,
+            100_100 => 50,
+            100_050 => 40,
+            _ => 500,
+        };
+        let _ = assert_never_over(Msat(100_000), ZERO_GW, fed).await;
+    }
+
+    #[tokio::test]
+    async fn gross_up_stream_changing_between_pass_loop_and_bisection_stays_never_over() {
+        // The fee regime CHANGES once the pass loop exhausts and bisection begins: the pass phase
+        // (first 5 quotes: 1 seed + 4 verifies) oscillates so no Equal is reached, then the fee
+        // DROPS to a constant for the bisection. The bisection re-verifies with the CURRENT fee, so
+        // the accepted invoice is never-over under the regime it was actually verified against.
+        let calls = std::cell::Cell::new(0u64);
+        let g = resolve_receive_gross_up(Msat(100_000), ZERO_GW, |contract| {
+            let n = calls.get();
+            calls.set(n + 1);
+            let quote = if n < 5 {
+                if contract.0 <= 100_400 {
+                    600
+                } else {
+                    200
+                }
+            } else {
+                200
+            };
+            async move { Ok::<Msat, ExecError>(Msat(quote)) }
+        })
+        .await
+        .expect("a stream that changes between phases still converges to a never-over invoice");
+        // Verified against the bisection-phase fee (200), the accepted invoice nets ≤ the ask.
+        assert!(
+            fee::predicted_net(g.invoice_amount, ZERO_GW, Msat(200)).0 <= 100_000,
+            "accepted invoice {} nets over the ask under the bisection-phase fee",
+            g.invoice_amount.0
+        );
+        assert_eq!(
+            g.contract_amount,
+            Msat(
+                g.invoice_amount
+                    .0
+                    .saturating_sub(ZERO_GW.on(g.invoice_amount).0)
+            )
+        );
+    }
+
+    // ---- §15.7: never-over TOCTOU verdict on the committed contract -----------------------
+
+    #[test]
+    fn committed_contract_mismatch_is_permanent_match_proceeds() {
+        // Equal committed contract → proceeds (the gateway fee did not move between quote and mint).
+        verify_committed_receive_contract(Msat(95_000), Msat(95_000))
+            .expect("an unchanged committed contract proceeds to surface/pay");
+        verify_replayable_receive_contract(Msat(95_000), Some(Msat(95_000)))
+            .expect("a recovered unchanged receive proceeds to surface/pay");
+        // A fee DROP mints a LARGER contract than we sized → the destination would net MORE than
+        // asked → refuse terminally (do NOT surface/pay); a re-run re-quotes.
+        let over = verify_committed_receive_contract(Msat(96_000), Msat(95_000))
+            .expect_err("a larger committed contract is refused");
+        assert!(
+            matches!(&over, ExecError::Permanent(msg) if msg.contains("fee changed between quote and mint")),
+            "{over:?}"
+        );
+        // A fee RISE mints a smaller contract → still a mismatch → refused (strict equality).
+        assert!(matches!(
+            verify_committed_receive_contract(Msat(94_000), Msat(95_000)),
+            Err(ExecError::Permanent(_))
+        ));
+        let missing = verify_replayable_receive_contract(Msat(95_000), None)
+            .expect_err("a recovered receive without quoted contract metadata cannot be verified");
+        assert!(
+            matches!(&missing, ExecError::Permanent(msg) if msg.contains("missing the quoted contract amount")),
+            "{missing:?}"
+        );
+    }
+
+    #[test]
+    fn corrupt_receive_contract_read_is_permanent_open_transient_closed() {
+        // Destination client not open this pass → the read could not run for a transient reason a
+        // later reconcile can fix → Retryable (leave Pending), NOT a terminal failure.
+        let closed = classify_receive_contract_read_error(
+            anyhow::anyhow!("federation deadbeef not joined/opened"),
+            false,
+            "move-1",
+        );
+        assert!(
+            matches!(&closed, ExecError::Retryable(msg) if msg.contains("not joined/opened")),
+            "{closed:?}"
+        );
+        // Destination client IS open, yet the local op-log read failed → durable corruption
+        // (op absent / wrong leg / malformed quote) a re-drive can never clear → Permanent, so the
+        // poisoned intent fails loudly instead of livelocking Pending forever.
+        let open = classify_receive_contract_read_error(
+            anyhow::anyhow!("operation abc is not a receive operation"),
+            true,
+            "move-1",
+        );
+        assert!(
+            matches!(&open, ExecError::Permanent(msg)
+                if msg.contains("corrupt or missing") && msg.contains("move-1")),
+            "{open:?}"
+        );
+    }
+
+    // ---- §3: the Stranded transition (send settled, receive not credited) -----------------
+
+    #[test]
+    fn settle_after_send_strands_on_terminal_non_claim() {
+        // A claimed receive settles cleanly, no failure outcome.
+        assert_eq!(
+            settle_after_successful_send(ReceiveState::Claimed),
+            (MovePhase::Settled, None)
+        );
+        // An expired receive after a settled send STRANDS, naming the saved preimage.
+        let (phase, outcome) = settle_after_successful_send(ReceiveState::Expired);
+        assert_eq!(phase, MovePhase::Stranded);
+        let msg = outcome.expect("a stranded move carries an outcome");
+        assert!(msg.contains("preimage saved"), "{msg}");
+        assert!(msg.contains("receive invoice expired"), "{msg}");
+        // A failed receive strands too, carrying the failure detail plus the saved preimage.
+        let (phase, outcome) =
+            settle_after_successful_send(ReceiveState::Failed("forfeited".into()));
+        assert_eq!(phase, MovePhase::Stranded);
+        let msg = outcome.expect("a stranded move carries an outcome");
+        assert!(
+            msg.contains("preimage saved") && msg.contains("forfeited"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn successful_send_then_terminal_failed_receive_strands_with_preimage() {
+        // Mirror the `AwaitSettle` Success arm without live I/O: persist the preimage FIRST (§3),
+        // then map the op-terminal receive. A failed receive after a settled send leaves the record
+        // `Stranded`, still carrying the preimage, routed to the terminal `Failed` surface with a
+        // "preimage saved" outcome (`perform` returns `Permanent(outcome)`).
+        let mut rec = MoveRecord {
+            key: IdempotencyKey("move-strand".into()),
+            from: Some(FED_A),
+            to: FED_B,
+            amount: Msat(100_000),
+            fee_cap: Msat(2_000),
+            gateway: GatewayUrl("https://gw.example".into()),
+            send_required: true,
+            invoice: Some(Invoice("lnbc1pstrand".into())),
+            recv_op: Some(crate::types::OperationId([0x01; 32])),
+            send_op: Some(crate::types::OperationId([0x02; 32])),
+            phase: MovePhase::Sending,
+            outcome: None,
+            preimage: None,
+            receive_fee_quoted: Some(Msat(120)),
+            send_fee_quoted: Some(Msat(340)),
+        };
+        let preimage = crate::types::Preimage([0x9a; 32]);
+        rec.preimage = Some(preimage);
+        let (phase, outcome) = settle_after_successful_send(ReceiveState::Failed(
+            "gateway claimed A but never funded B".into(),
+        ));
+        rec.phase = phase;
+        rec.outcome = outcome;
+
+        assert_eq!(rec.phase, MovePhase::Stranded);
+        assert_eq!(
+            rec.preimage,
+            Some(preimage),
+            "the recovery proof is preserved"
+        );
+        assert_eq!(next_step(&rec), MoveStep::Failed);
+        let msg = rec.outcome.clone().expect("stranded outcome present");
+        assert!(msg.contains("preimage saved"), "{msg}");
+        assert!(msg.contains("never funded B"), "{msg}");
+    }
+
+    // ---- §15.11: DirectInflow hair-under records the DELIVERED net unconditionally ----------
+
+    #[test]
+    fn delivered_move_amount_records_hair_under_unconditionally() {
+        // Exact solve: the ask is delivered.
+        assert_eq!(
+            delivered_move_amount(Msat(50_000), Msat(50_000)),
+            Msat(50_000)
+        );
+        // A hair under (receive-only DirectInflow OR send-required Move alike): the DELIVERED net is
+        // committed into MoveMeta.amount, not the ask — the honest crash-safe amount (§15.11).
+        assert_eq!(
+            delivered_move_amount(Msat(49_990), Msat(50_000)),
+            Msat(49_990)
+        );
+        // Never over: a delivered ≥ ask keeps the ask (the gross-up never over-delivers).
+        assert_eq!(
+            delivered_move_amount(Msat(50_001), Msat(50_000)),
+            Msat(50_000)
         );
     }
 }

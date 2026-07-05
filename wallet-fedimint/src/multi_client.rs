@@ -505,6 +505,51 @@ impl MultiClient {
         Ok(artifacts)
     }
 
+    /// Read the durable, COMMITTED incoming-contract amount for the receive op `op` on `id`
+    /// (spec §15.7), plus the quoted contract amount the executor committed into `custom_meta`.
+    /// lnv2's `create_contract_and_fetch_invoice` re-fetches `routing_info` at mint time and
+    /// sizes `contract.commitment.amount` with the FRESH gateway fee, so a gateway-fee change
+    /// between our quote and the mint is observable ONLY from the committed contract (not from
+    /// the invoice amount we requested). The quoted amount in `custom_meta` makes the same check
+    /// replayable after a crash between receive commit and the first post-receive cache write.
+    /// Reads only the client's local op-log (no network).
+    pub async fn receive_contract_amounts(
+        &self,
+        id: &FederationId,
+        op: OperationId,
+    ) -> anyhow::Result<(Msat, Option<Msat>)> {
+        let client = self.client(id)?;
+        let fed_op = unbridge_op_id(op);
+        let entry = client
+            .operation_log()
+            .get_operation(fed_op)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no operation found for id {}", fed_op.fmt_full()))?;
+        let meta = entry.try_meta::<LightningOperationMeta>().map_err(|e| {
+            anyhow::anyhow!(
+                "operation {} is not an lnv2 lightning operation: {e}",
+                fed_op.fmt_full()
+            )
+        })?;
+        match meta {
+            LightningOperationMeta::Receive(receive) => Ok((
+                Msat(receive.contract.commitment.amount.msats),
+                MoveMeta::receive_contract_quote_from_value(&receive.custom_meta).map_err(|e| {
+                    anyhow::anyhow!(
+                        "operation {} has malformed receive contract quote metadata: {e}",
+                        fed_op.fmt_full()
+                    )
+                })?,
+            )),
+            LightningOperationMeta::Send(_) | LightningOperationMeta::LnurlReceive(_) => {
+                anyhow::bail!(
+                    "operation {} is not a receive operation; cannot read its committed contract",
+                    fed_op.fmt_full()
+                )
+            }
+        }
+    }
+
     /// Fetch the pinned gateway's `RoutingInfo` for `id`, erroring if the gateway is
     /// unreachable or does not serve this federation. Shared by the two gateway-fee getters.
     async fn routing_info_for(
