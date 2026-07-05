@@ -174,7 +174,13 @@ work — the invariant THIS phase buys is that the proof is durable and the stat
      - Standby funding (spending → standby): the surplus floor STAYS —
        `available = (spendable − target_spending_balance) − debited[src] − fee_cap` — the
        spending fed is never drained below its configured target to fund the standby.
-     - Evacuation amount: `min(spendable − debited[src] − fee_cap, cap_room_with(..))`.
+     - Evacuation amount: `min(spendable − debited[src], cap_room_with(..))` — **NO own
+       `− fee_cap` term (refinement found by the live evacuate gate, 2026-07-05):** the
+       executor's `size_fresh_evacuation` sizes evacuations for affordability (fees
+       included) at perform time, and a planning-side full-fee reserve zeroes out — refuses
+       — any evacuation of a balance at or below the fee cap, abandoning exactly the small
+       dying-fed balances evacuation exists to drain. The `amount + fee_cap` debit below
+       still bounds subsequent same-tick moves from that source conservatively.
      The `− fee_cap` term is the move's OWN fee reserve, not just prior moves': the executor
      spends up to `amount + fee_cap` from the source, so an amount chosen against the bare
      balance would either fail on insufficient funds (plain `Move` — no perform-time sizing

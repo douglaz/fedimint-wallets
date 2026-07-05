@@ -358,17 +358,21 @@ fn evacuate_decision(
 ) -> AllocatorDecision {
     match safest_other(snapshot, from, credited) {
         Some(to) => {
-            // Drain the source, reserving its own `fee_cap` and any prior outbound so the
-            // executor's `amount + fee_cap` spend never over-draws it; the destination
-            // clamp uses the reservation-aware cap room. An evacuation may leave ≤ max_fee
-            // behind when actual fees run lower — bounded, honest, and preferable to a
-            // move that cannot execute (§4.2).
+            // Drain the source, reserving any prior same-tick outbound; the destination
+            // clamp uses the reservation-aware cap room. UNLIKE the funding moves above,
+            // an evacuation does NOT pre-reserve its own `fee_cap` (§4.2 refinement, found
+            // by the live evacuate gate): the executor's `size_fresh_evacuation` sizes the
+            // evacuation for affordability — fees included — at perform time, and a full
+            // fee_cap reserve here would zero out (refuse) any evacuation of a balance at
+            // or below the fee cap, abandoning exactly the small dying-fed balances this
+            // decision exists to drain. Overdraw safety is preserved by the perform-time
+            // sizing plus the conservative `amount + fee_cap` debit recorded below for any
+            // subsequent same-tick move from this source.
             let src_available = from
                 .balance
                 .spendable
                 .0
-                .saturating_sub(reserved(debited, from.id))
-                .saturating_sub(snapshot.max_fee.0);
+                .saturating_sub(reserved(debited, from.id));
             let amount = Msat(src_available.min(cap_room_with(snapshot, to, credited)));
             if amount.0 == 0 {
                 return refuse_decision(from.id, reason, occurrence);
