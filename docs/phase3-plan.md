@@ -40,7 +40,10 @@ The pure `decide()` already emits `Action::Evacuate{from,to,amount,fee_cap,reaso
 draining the dying fed into `safest_other`, bounded by the destination's `cap_room`. What's missing:
 - **3.A.1 Sense — source the signal in the probe** (`wallet-fedimint/src/probe.rs`): replace
   `shutdown_scheduled = false` with real detection — PRIMARY `get_meta_expiration_timestamp()`
-  (true when `now > expiry - lead_time`), plus `status().scheduled_shutdown.is_some()`, plus
+  (true when `now > expiry - lead_time`; shipped as `SHUTDOWN_EVACUATION_LEAD_SECS` = 24h —
+  NOTE the 2026-07-05 review found this merged-meta signal override-controlled and
+  uncorroborated; corroboration is Phase 4 work, phase4-implementation-spec §15.1), plus
+  `status().scheduled_shutdown.is_some()`, plus
   quorum-degradation (tertiary). Keep `assemble_facts`/`assemble_status` PURE (raw signals in →
   `shutdown_scheduled` out); golden-test the assembly (expiry-in-window / scheduled / neither).
 - **3.A.2 Act — executor performs Evacuate** (`wallet-fedimint/src/executor.rs`): map `Evacuate`

@@ -19,15 +19,22 @@ either outcome (the ledger, hardening, UI, and recovery serve a single-fed walle
   crash/reconcile gate live-validated ([phase1-implementation-spec.md](./phase1-implementation-spec.md)).
 - **Phase 2 — sense + decide: COMPLETE.** probe → score → snapshot → decide → apply via
   `Runtime::tick`, two-fed exit gate passed ([phase2-plan.md](./phase2-plan.md)).
-- **Phase 3.A — Evacuate execution: IN FLIGHT** ([phase3-plan.md](./phase3-plan.md)).
+- **Phase 3.A — Evacuate execution: COMPLETE** (merged `5315df3`; live two-fed exit gate
+  passed 2026-07-04 — [phase3-plan.md](./phase3-plan.md)). 3.B discovery + 3.C triggers are
+  re-scoped into Phase 5 below.
 
 ## Sequence
 
 ### Phase 4 — engine hardening + operation ledger ([phase4-plan.md](./phase4-plan.md))
-After 3.A merges, before more automation. Fixes the 2026-07-03 review's P1s (scorer trust
-floor, send-leg fee cap, strand handling) and builds the append-only operation ledger +
-`history`/`show` ([operation-history-spec.md](./operation-history-spec.md)) — the ADR-0014
-auditability substrate every later phase writes into. **Gate:** a full devimint session is
+After 3.A (merged), before more automation. Fixes the review backlog — the 2026-07-03
+review's P1s (scorer trust floor, strand handling; the send-leg fee-quote base was already
+fixed in the 3.A merge) plus the 2026-07-05 fresh-eyes review's P1s (shutdown-signal
+corroboration, perform-time cap enforcement, evacuation-destination eligibility, the
+deterministic-send-rejection wedge, never-over TOCTOU —
+[phase4-implementation-spec.md §15](./phase4-implementation-spec.md)) — and builds the
+append-only operation ledger + `history`/`show`
+([operation-history-spec.md](./operation-history-spec.md)) — the ADR-0014 auditability
+substrate every later phase writes into. **Gate:** a full devimint session is
 reconstructible from `wallet-cli history`.
 
 ### Phase 5 — discovery + triggers (= 3.B + 3.C) — blocked on the REAL active probe
@@ -48,7 +55,8 @@ against devimint, fully recorded; a candidate failing only the active probe is n
 The locked architecture (pure Rust, Slint, thin JNI shims). First-run standing-instruction
 acknowledgement (ADR-0014 — the consent record, gating any receive); one balance +
 send/receive with QR (camera spike first — the known feasibility risk); activity screen = the
-ledger; health view (D6); instant-view/auth-to-send (ADR-0011); WorkManager tick triggers
+ledger; health view (D6 — the CEO-review decision: one unified balance + an optional health
+view, report §0.5); instant-view/auth-to-send (ADR-0011); WorkManager tick triggers
 (Doze-timing spike). **Gate:** receive → auto-allocate → pay on a real device, agent actions
 visible in the activity screen with reasons.
 

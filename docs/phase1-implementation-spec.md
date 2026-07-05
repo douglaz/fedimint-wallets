@@ -133,6 +133,8 @@ DROPPED as unfeasible in fedimint; that field + `GuardianId` were removed.) The 
 idempotency-key formatting (currently `u32`) formats `hex(FederationId)` + `Occurrence`.
 
 ### 3.1 Action (T12) — define all; Phase 1 executes `Move` + `DirectInflow`
+**(As-built differs — see §13: no `gateway`/`occurrence` fields on `Action`; the gateway
+rides on the `MoveRecord`, the occurrence in the idempotency key.)**
 ```rust
 pub enum Action {
     Move { from: FederationId, to: FederationId, amount: Msat, fee_cap: Msat, gateway: GatewayUrl, occurrence: Occurrence },
@@ -382,6 +384,14 @@ re-check each referenced Intent before returning it.
   and B nets exactly `amount` (fixed-point gross-up — the cheap-lever gate, ADR-0022). Fed
   bootstrapped once per session (runbook §6).
 
+**Gate status note (2026-07-05):** the phase-1 exit gate was declared MET (TODOS) on cases
+(a)/(b)/(c)/(f) plus the full crash-killpoint matrix. Cases **(d) restore-from-seed-mid-move
+and (e) misbehaving-gateway were consciously NOT run** and remain open obligations: (e)'s
+handling code lands in Phase 4 (`Stranded`, phase4-implementation-spec §3 — covered there at
+the executor level with a mock gateway double; a live adversarial-gateway harness is deferred
+to Phase 8's threat-model pass), and (d) is the heart of Phase 7's device-loss recovery gate
+(roadmap-to-v1.md).
+
 ## 11. Build order
 0. **Foundational `wallet-core` refactor (behavior-preserving):** async `Executor`/`Journal`
    + async `apply`/`reconcile`/`drive` + async mocks/`#[tokio::test]`; `ExecError` variants +
@@ -407,3 +417,21 @@ re-check each referenced Intent before returning it.
 - **⟦D8 (new)⟧ durability = op-log is source of truth** (move_id in `custom_meta` + startup
   backfill), NOT persist-before-act atomic writes.
 - **⟦D9 (new)⟧ `fee_cap` enforced by preflight** (routing_info + tx fee) before send.
+
+## 13. As-built deltas (2026-07-05 — read this before citing §3 shapes)
+
+This spec is the record of what was DESIGNED; the build deviated in a few load-bearing
+shapes. The code is authoritative; the deltas, verified against `main`:
+
+- **`Action` carries no `gateway` or `occurrence` fields** (`wallet-core/src/types.rs:84-123`):
+  `Move`/`Evacuate`/`DirectInflow` are `{ from?, to, amount, fee_cap }`. The gateway lives on
+  the durable `MoveRecord` (resolved by the executor and persisted before the receive —
+  §3.1's pin-once intent survives, just at a different layer), and the occurrence is embedded
+  in the `IdempotencyKey` (`allocator.rs`: `move:<from>:<to>:<occurrence>`).
+- **`RefuseInflow` carries `{ fed, reason }`** (not a unit variant) and **`Cap` is
+  `{ fed, reason }`** (no `limit`; it has no producer and Phase 4 §5 deletes it).
+- **`MoveMeta` is `{ move_id, role, amount, from, to }`** — no `occurrence` field (folded
+  into `move_id`), and `amount` was added post-3.A to carry the delivered net crash-safely.
+- **The balance type is `FedBalance`**, not `FederationBalance`.
+- `GuardianId` and guardian-overlap identity were REMOVED with ADR-0010's drop (noted in §3
+  already).

@@ -28,7 +28,12 @@ All types in `wallet-core` (pure, serde). Storage in `wallet-fedimint` next to t
 discipline, correlation-key rules); the exact field-level Rust shapes are authoritative in
 [phase4-implementation-spec.md](./phase4-implementation-spec.md) §7, which refines the
 sketch below (notably: `reason` is mandatory — user verbs carry `ReasonCode::UserInitiated`
-— and gateways are `Option`).
+— and gateways are `Option`), **and its §7/§10 REFINE this spec's write discipline and
+repair rules**: terminal immutability gains exactly one principled exception (a
+REPAIR-written terminal row carries `repaired: true` and may be superseded once by an
+AUTHORITATIVE evidence-carrying write), and the rule-5/6 negative repairs below are
+age-gated (1 hour) SOFT failures, not immediate hard ones. Where this section and the impl
+spec disagree, the impl spec wins.
 
 ```rust
 /// One row per user-meaningful operation. Append-only: a row is created once, its
@@ -81,6 +86,10 @@ pub enum OperationKind {
     Join     { fed: FederationId },
     /// Raw LN receive (user verb; journal-less today but ledger-recorded). `op_id` is
     /// None on the pre-call `Started` row (§3 rule 5) and filled post-call/by backfill.
+    /// NOTE the stated exception: this amount is the GROSS invoiced amount (impl spec §7
+    /// names it `amount_invoiced`) — the user's input, known pre-call; the NET credit is
+    /// amount − fees.receive_fee (a raw lnv2 receive deducts fees from the invoice,
+    /// unlike the exact-net DirectInflow).
     Receive  { fed: FederationId, amount: Msat, op_id: Option<OperationId>, gateway: Option<GatewayUrl> },
     /// Raw LN pay (user verb). `op_id` optional for the same pre-call reason.
     Pay      { fed: FederationId, invoice_amount: Msat, op_id: Option<OperationId>, gateway: Option<GatewayUrl> },
@@ -131,7 +140,10 @@ Rules (load-bearing):
 2. **Append-once, advance-forward, terminal-immutable.** Create on first observation
    (`Started`/`Awaiting`); update only to advance status and fill fees/op-ids/error; NEVER
    mutate a `Succeeded`/`Failed` row; NEVER delete. Re-drives/replays of the same key update
-   the one existing row (found via `0x06`), they never append duplicates.
+   the one existing row (found via `0x06`), they never append duplicates. ONE exception
+   (impl spec §7): a terminal row written by reconcile REPAIR (`repaired: true` — an
+   absence-of-evidence conclusion) may be superseded exactly once by an AUTHORITATIVE
+   evidence-carrying write; repair writes never supersede anything terminal.
 3. **`seq` orders, clocks display.** The counter increments in the row's own dbtx. Wall-clock
    comes from a `now_ms()` injected clock (testable); a bad clock degrades display, never order.
 4. **Failures and refusals are first-class rows.** A `Failed` op, a `Refusal`, an expired
@@ -143,15 +155,21 @@ Rules (load-bearing):
    `custom_meta` (extending the existing role-tag meta). Crash after the SDK call but before
    the `op_id` update → reconcile's op-log backfill re-finds the op by its `custom_meta` key
    and repairs the row (the same pattern `MoveRecord` backfill already uses). Crash before the
-   SDK call → the row stays `Started` with no matching op; reconcile marks it `Failed`
-   ("never reached the federation") rather than leaving it ambiguous — a retry is a NEW
-   attempt row (§2), so this terminal marking never blocks recovery.
+   SDK call → the row stays `Started` with no matching op; reconcile marks it soft-`Failed`
+   ("never reached the federation") — AGE-GATED (1 hour) and written as a defeasible repair
+   (`repaired: true`, rule 2's exception), per impl spec §10.3 — rather than leaving it
+   ambiguous forever. A retry is a NEW attempt row (§2), so this terminal marking never
+   blocks recovery.
 6. **`Join` repairs from the registry, and idempotent re-joins are not rows.** The CLI
    checks the federation registry first: already joined → the join verb just (re)opens the
    client, NO ledger row (nothing happened). Not joined → new `join:<fed>:<nonce>` attempt
    row pre-call, updated to terminal post-call. Reconcile repairs a stranded `Started` join
-   row from the registry (the authority on membership): fed present in the registry →
-   `Succeeded`; absent → `Failed` ("never joined").
+   row from the registry (the authority on membership), PER ATTEMPT with timestamp
+   arbitration and soft writes — the full rules live in impl spec §10.3: fed present →
+   soft-`Succeeded` for the arbitrated attempt (others soft-`Failed("superseded by a later
+   join attempt")`); absent (and > 1h old) → soft-`Failed("join did not complete —
+   federation not in the registry; re-run join")`. ("Never joined" would be dishonest —
+   local partition state may exist.)
 
 ## 4. Upstream changes this requires
 
@@ -170,8 +188,10 @@ Rules (load-bearing):
 
 ## 5. Query surface (wallet-cli; the Android activity screen reads the same API)
 
-- `wallet-cli history [--limit N] [--fed <hex>] [--actor user|agent] [--status ...] [--since <ts>] [--json]`
+- `wallet-cli history [--limit N] [--fed <hex>] [--actor user|agent] [--status ...] [--json]`
   — newest-first scan; one line per op: seq, local time, kind, amount, fees, status, reason.
+  (A `--since <ts>` filter was considered and dropped for v1 — seq + `--limit` suffice; the
+  impl spec §11 owns the exact CLI shape.)
 - `wallet-cli show <key|seq>` — the full record: both legs' op-ids, gateway, fee breakdown,
   error, timestamps, and the linked intent status.
 - Plain-text default, `--json` for scripts (ADR-0023).

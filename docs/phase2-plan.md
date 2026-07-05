@@ -33,9 +33,17 @@ SENSE (concrete, wallet-fedimint)                     DECIDE (pure, wallet-core)
 - **Trust gate (ADR-0017/0019/0020):** trust comes from OUR authenticated config fetch + OUR
   probe, then `score()` gates. Structural facts are free; empirical probes cost a round-trip.
 - **Balance cap (ADR-0018):** the allocator already enforces `per_fed_cap`; Phase 2 supplies it.
-- **Standing instruction (ADR-0009):** the policy (`per_fed_cap`, `target_spending_balance`,
+- **Standing instruction (ADR-0014):** the policy (`per_fed_cap`, `target_spending_balance`,
   `standby_target`, `max_fee`, the spending/standby designation) is the user's standing
-  instruction. V1: sensible DEFAULTS overridable by `wallet-cli` flags / a small config file.
+  instruction. V1: sensible DEFAULTS overridable by `wallet-cli` flags (as shipped, flags
+  only — the "small config file" idea remains future polish).
+  **The shipped default numbers** (`tick.rs` module constants): `target_spending_balance` =
+  100k sats, `standby_target` = 100k sats, `per_fed_cap` = 5M sats (0.05 BTC), `max_fee` =
+  50 sats per move. Rationale note: the cap must exceed `target_spending + standby_target`
+  (the tick asserts it) so it bounds ACCUMULATION without fighting the standing targets —
+  but 5M sats is ~100× the roadmap's illustrative $50–$500 balances, which sits uneasily
+  against ADR-0018's "hard, LOW cap" posture. The Phase-8 fee-vs-risk EV gate must revisit
+  this number with real data; until then it is a default, not a considered policy.
 - **Out of scope → Phase 3:** Nostr/Observer discovery of NEW candidates, the automated triggers
   (foreground/WorkManager/push), and executing `Evacuate` on a shutdown notice. Phase 2's tick is
   invoked manually (`wallet-cli tick`); it senses + decides + acts over the JOINED feds only.

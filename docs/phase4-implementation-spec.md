@@ -5,9 +5,12 @@ Detailed, buildable design for [phase4-plan.md](./phase4-plan.md), implementing
 [reviews/2026-07-03-engine-review.md](./reviews/2026-07-03-engine-review.md). SDK claims
 verified against the pin (`~/p/fedimint` @ `b108ec6`); exact citations inline.
 **Status: hardened through 19 codex passes (gpt-5.4 / xhigh) — 48 findings absorbed,
-final pass clean.** Decisions settled in §14.
+final pass clean. Updated 2026-07-05:** §2's quote-base fix LANDED with the 3.A merge
+(`5315df3`) — §2 now covers only the remaining persistence work — and §15 absorbs the
+[2026-07-05 fresh-eyes review](./reviews/2026-07-05-fresh-eyes-review.md)'s P1/P2 backlog
+into 4.A. Decisions settled in §14.
 
-**Base:** `main` AFTER Phase 3.A (Evacuate execution) merges — 3.A touches
+**Base:** `main` AFTER Phase 3.A (Evacuate execution) merged (`5315df3`) — 3.A touched
 `executor.rs`/`probe.rs`/`tick.rs`/`runtime.rs`, and this phase edits the same files. Where
 3.A changed an anchor named here, the 3.A version wins and the change applies on top.
 
@@ -27,12 +30,16 @@ the SAME dbtx as the intent transitions it describes, plus `wallet-cli history`/
 user can reconstruct exactly what happened, why, what it cost, and when, for every operation
 including failures and refusals.
 
+Part III (§15, added 2026-07-05) absorbs the fresh-eyes review into 4.A: shutdown-signal
+corroboration, perform-time cap enforcement, evacuation-destination eligibility,
+deterministic-send-rejection classification, gateway scanning, never-over TOCTOU
+verification, partial-open loudness, a tick deadline, and the solve-loop extraction.
+
 - **Exit gate:** a devimint session (join → direct-inflow → move → tick, with one forced
   failure and one refusal) is fully reconstructible from `wallet-cli history`; a fee cap set
   just under a move's true cost refuses before paying.
-- **Build order:** pure-first — scorer/allocator (§1, §4, §5) → newtype moves (§6) → ledger
-  types + `Intent` extension (§7, §8) → executor fee/strand changes (§2, §3) → journal ledger
-  integration (§9) → raw-op/join/tick recording + repair (§10) → CLI verbs (§11) → smoke.
+- **Build order:** §12 is authoritative (pure-first, Part III items interleaved where their
+  files are already open).
 
 ---
 
@@ -67,30 +74,25 @@ Goldens (extend the scorer suite): `threshold == 0` rejected; `threshold > guard
 rejected + rank 0; `3-of-100` rejected with `InvalidThreshold`; `3-of-4` (= 4 − 1) passes;
 `67-of-100` passes; the reason surfaces in `FederationVerdict.reasons`.
 
-## 2. Send-leg fee quote on the contract amount (`multi_client.rs`, `executor.rs`)
+## 2. Send-leg fee quotes — persist them (the quote-base fix LANDED in 3.A)
 
 **SDK ground truth (verified at the pin):** lnv2's outgoing contract is
 `send_fee.add_to(invoice_amount)` (`fedimint-lnv2-client/src/lib.rs:599`) — the GATEWAY fee
-is base+ppm ON THE INVOICE amount. The FEDERATION send-tx fee must be quoted on the FULL
-contract value: `send_fee_quote`'s doc says "`amount` is the full outgoing contract value
-(`send_fee.add_to(invoice_amount)`)" (`lib.rs:875-882`). Our `MultiClient::send_fee_quote`
-(`multi_client.rs:396-412`) quotes on the invoice amount instead → the federation component
-is under-estimated by the fee on the gateway-fee delta, so `fee_cap` can under-block. No
-send-side fixed point is needed (gateway on invoice; federation on contract; no circularity).
+is base+ppm ON THE INVOICE amount; the FEDERATION send-tx fee is quoted on the FULL contract
+value (`lib.rs:875-882`). No send-side fixed point is needed (gateway on invoice; federation
+on contract; no circularity).
 
-1. `MultiClient::send_fee_quote(&self, id, contract: Msat) -> anyhow::Result<Msat>` —
-   replace the `invoice: &Invoice` parameter with the explicit contract amount (the caller
-   computes it); delete the invoice parsing; quote
-   `lnv2.send_fee_quote(Amount::from_msats(contract.0))`. Fix the stale doc comment.
-2. Executor `MoveStep::Pay` arm (`executor.rs:340+`):
-   ```rust
-   let gw_cost = send_gateway_fee.on(Msat(invoice_msat)).0;        // SDK-exact component
-   let contract_msat = invoice_msat.saturating_add(gw_cost);       // lib.rs:599
-   let fed_fee = self.mc.send_fee_quote(&from, Msat(contract_msat)).await.map_err(retryable)?;
-   let send_quote = Msat(gw_cost.saturating_add(fed_fee.0));
-   ```
-   `total_within_cap(receive_quote, send_quote, rec.fee_cap)` unchanged.
-3. **Persist the quotes** on the `MoveRecord` (new fields, §3's table) — BEFORE the cap
+**Items 1–2 are DONE — landed with the 3.A merge (`5315df3`), verified 2026-07-05:**
+`MultiClient::send_fee_quote_for_amount(&self, id, amount: Msat)` quotes on an explicit
+amount (`multi_client.rs:396-405`; the old invoice-parameter method no longer exists), and
+the `MoveStep::Pay` arm computes
+`outgoing_contract_amount = invoice + send_gateway_fee.on(invoice)` and quotes the
+federation fee on it (`executor.rs:777-792`), so `fee_cap` already hard-bounds both legs.
+Do NOT add a conservative over-estimate on top — the quote is SDK-exact; stacking a margin
+would over-block.
+
+3. **The REMAINING work — persist the quotes** on the `MoveRecord` (new fields, §3's table) —
+   BEFORE the cap
    check: in the `Pay` arm, once `send_quote` is computed, set
    `rec.send_fee_quoted = Some(send_quote)` and `put_move` FIRST, THEN run
    `total_within_cap` — the paradigm failure this field must explain is precisely the
@@ -175,7 +177,10 @@ work — the invariant THIS phase buys is that the proof is durable and the stat
      - Evacuation amount: `min(spendable − debited[src] − fee_cap, cap_room_with(..))`.
      The `− fee_cap` term is the move's OWN fee reserve, not just prior moves': the executor
      spends up to `amount + fee_cap` from the source, so an amount chosen against the bare
-     balance would be emitted and then fail on insufficient funds. An evacuation may leave
+     balance would either fail on insufficient funds (plain `Move` — no perform-time sizing
+     exists for it) or be silently downsized (Evacuate — 3.A's `size_fresh_evacuation`
+     resizes at perform time; the reservation here is the planning-side complement, and the
+     two interact: a reserved amount should rarely need downsizing). An evacuation may leave
      ≤ `max_fee` behind when actual fees run lower — bounded, honest, and preferable to a
      move that cannot execute.
    - Every emitted `Move`/`Evacuate` then records `credited[to] += amount` and
@@ -293,13 +298,30 @@ pub struct FeeBreakdown {
 }
 ```
 
+`RawOpUpdate` (the enrichment payload §9.3's `record_update` also takes) is declared HERE in
+`wallet-core::ledger` — all its fields are pure:
+
+```rust
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RawOpUpdate {
+    pub op_id: Option<OperationId>,
+    pub gateway: Option<GatewayUrl>,
+    pub invoice_amount: Option<Msat>,
+    pub payment_hash: Option<[u8; 32]>,
+    pub fees: Option<FeeBreakdown>,
+}
+```
+
 Pure helpers, golden-tested in `wallet-core`:
-- `fn kind_from_action(action: &Action, rec_ops: ...) -> OperationKind` — `Action::Move` →
+- `fn kind_from_action(action: &Action) -> OperationKind` — `Action::Move` →
   `Move { evacuation: false }`, `Action::Evacuate` → `Move { evacuation: true }`,
-  `Action::DirectInflow` → `DirectInflow`, `Action::RefuseInflow` → `Refusal`.
+  `Action::DirectInflow` → `DirectInflow`, `Action::RefuseInflow` → `Refusal`. Op ids and
+  gateway start `None`; the §9.2 refresh fills them from the `0x02` move row on every
+  ledger write.
 - `fn status_from_intent(s: IntentStatus) -> OperationStatus` — `Pending|Executing →
   Started`, `Awaiting → Awaiting`, `Done → Succeeded`, `Failed → Failed`.
-- `fn advance(record, new_status, now_ms, fees, ops, error) -> Option<OperationRecord>` — the
+- `fn advance(record, new_status, now_ms, upd: Option<&RawOpUpdate>, error: Option<&str>)
+  -> Option<OperationRecord>` — the
   append-once/advance-forward/terminal-immutable rule as a PURE function: returns `None`
   (no write) ONLY when the stored record is already TERMINAL, or when the requested status
   would REGRESS (e.g. `Awaiting → Started`) — a NON-terminal row may always be ENRICHED
@@ -387,11 +409,9 @@ Public async methods on `FedimintJournal` (each one dbtx via the same helper):
   enrichment (fees/ops/gateway) applied atomically WITH the transition: the definitive
   raw-op costs are only known AT settlement, and terminal immutability forbids enriching
   afterwards, so the one terminal write is where they land — / `record_update(key,
-  upd: RawOpUpdate)` with
-  `RawOpUpdate { op_id: Option<OperationId>, gateway: Option<GatewayUrl>,
-  invoice_amount: Option<Msat>, payment_hash: Option<[u8; 32]>,
-  fees: Option<FeeBreakdown> }` (the hash is what the §10.3 dedup repair keys on — the
-  post-parse pre-call update writes it) — raw `receive`/`pay` and
+  upd: RawOpUpdate)` (`RawOpUpdate` is §7's pure `wallet-core::ledger` type; the hash is
+  what the §10.3 dedup repair keys on — the post-parse pre-call update writes it) — raw
+  `receive`/`pay` and
   `join` attempts (per-attempt keys from operation-history-spec §2; nonce generated by the
   CALLER — the CLI/runtime own randomness, the journal stays deterministic). The standalone
   path is the ONLY writer for raw rows, so it must carry the parsed `invoice_amount` (a
@@ -447,7 +467,8 @@ where §8 needs it via the same source.
 ## 10. Raw ops, join, tick, refusals (`wallet-cli/src/main.rs`, `runtime.rs`, `multi_client.rs`)
 
 1. **Raw `receive`/`pay`** (operation-history-spec §3 rule 5): the CLI generates the
-   per-attempt key — `pay:<fed>:<nonce>` / `recv:<fed>:<nonce>`, NONCE-ONLY: the key must be
+   per-attempt key — `pay:<fed>:<nonce>` / `recv:<fed>:<nonce>` (`<fed>` = lowercase-hex
+   `FederationId`, exactly as in the existing `move:`/`evac:` keys), NONCE-ONLY: the key must be
    constructible from the RAW input BEFORE parsing, because a malformed BOLT11 has no
    payment hash yet its failed attempt must still be a durable history row (the
    synchronous-error path below); dedup/grouping rides on the recorded `op_id`, not the key.
@@ -602,21 +623,31 @@ wallet-cli show <correlation-key | seq> [--json]
 
 ## 12. Build order
 
-1. §1 scorer + §4 allocator + §5 dead-surface (pure; independently landable).
-2. §6 newtype moves (mechanical; unblocks §7).
-3. §7 ledger types + §8 `Intent`/`apply` extension (pure; all suites mechanically updated).
-4. §2 fee base + §3 strand handling (`MoveRecord` fields land here).
-5. §9 journal ledger integration (goldens on `advance` matrix + MemDatabase suites).
-6. §10 recording + repair; §11 CLI verbs.
-7. §13 smoke (written, run by hand on the two-fed harness).
+1. §1 scorer + §4 allocator + §5 dead-surface + §15.3 eligibility (pure; independently
+   landable).
+2. §15.1 signal trust + §15.4 send-rejection classification + §15.5 + §15.6 (the
+   evacuation-liveness bundle) + §15.2 perform-time cap.
+3. §6 newtype moves (mechanical; unblocks §7).
+4. §7 ledger types + §8 `Intent`/`apply` extension (pure; all suites mechanically updated).
+5. §2.3 quote persistence + §3 strand handling (`MoveRecord` fields land here) + §15.7
+   TOCTOU verification + §15.10 solve-loop extraction.
+6. §9 journal ledger integration (goldens on `advance` matrix + MemDatabase suites).
+7. §10 recording + repair; §11 CLI verbs; §15.8 partial-open + §15.9 tick deadline + §15.11.
+8. §13 smoke (written, run by hand on the two-fed harness).
 
 ## 13. Tests / exit gate
 
 - **rb-lite gate (fast):** compile + clippy `-D warnings` + fmt + ALL goldens: scorer floor
   cases (§1), reservation + tie-break (§4), `advance` transition matrix + terminal
   immutability + one-row-per-key (§7/§9), `status_from_intent`/`kind_from_action`, strand
-  goldens (§3), fee arithmetic (§2). MemDatabase journal suites: same-dbtx atomicity, seq
-  monotonicity + ordering, replay-does-not-duplicate, poison tolerance of ledger scans.
+  goldens (§3), fee arithmetic (§2), and the §15 suites (corroboration table 15.1, cap
+  refusal/downsize 15.2, evacuation eligibility 15.3, send-rejection classification 15.4,
+  Retryable-vs-Permanent over-cap 15.5, gateway scan 15.6, TOCTOU mismatch 15.7, tick
+  timeout 15.9, solve-loop quote-stream goldens 15.10). MemDatabase journal suites: same-dbtx
+  atomicity, seq monotonicity + ordering, replay-does-not-duplicate, poison tolerance of
+  ledger scans. The misbehaving-gateway (Stranded) case is covered at the EXECUTOR level with
+  a mock gateway double (§3.5's golden); a live adversarial-gateway harness stays deferred to
+  Phase 8's threat-model pass — tracked, not forgotten.
 - **Deferred devimint smoke (`wallet-cli/tests/smoke_history_devimint.sh`, the 4.C exit
   gate):** two-fed harness (await-send-first pattern): join A+B → direct-inflow A →
   move A→B → tick (agent move) → one forced failure (fee cap 1 msat) → assert `history`
@@ -647,6 +678,166 @@ wallet-cli show <correlation-key | seq> [--json]
 12. The send quote persists BEFORE the cap check (§2.3), so a "fee over cap" refusal is
     fully explained in history.
 13. Stuck `Started` tick rows are repaired by reconcile after a 1-hour age threshold (§10.3).
+
+---
+
+# Part III — 2026-07-05 review absorption (4.A continued)
+
+The [fresh-eyes review](./reviews/2026-07-05-fresh-eyes-review.md) (five independent passes +
+8 adversarial verification passes; every claim below verified against code and the SDK pin)
+found six P1s. §4.2's reservation already covers the planning half of the cap problem; the
+rest lands here. Priority order per the review: 15.1 → 15.2 → 15.3/15.4 → 15.5/15.6 → 15.7+.
+
+## 15. Review fixes
+
+### 15.1 Shutdown-signal trust (`probe.rs`) — review P1-1
+`get_meta_expiration_timestamp` reads the MERGED meta: the default `LegacyMetaSource` lets
+the federation's `meta_override_url` host OVERWRITE consensus values
+(`fedimint-client-module/src/meta.rs:87`) and a failed override fetch blocks caching any new
+values (`meta.rs:85`). So today's PRIMARY evacuation trigger is forgeable and blockable by a
+single non-quorum party, uncorroborated — while the SECONDARY `/status` signal already
+requires f+1 peers.
+
+1. Treat the merged-meta expiry as UNTRUSTED input: derive `shutdown_scheduled` from it ONLY
+   when corroborated by at least one of — (a) the same key present in the at-join consensus
+   config meta (`client.config().global.meta` — catches feds that declared an expiry from the
+   start; NOT sufficient alone for post-join announcements, it is a cached snapshot), (b) the
+   meta MODULE's consensus value when the federation runs one (fresh AND consensus-backed),
+   (c) the existing f+1-corroborated `/status.scheduled_shutdown` signal.
+2. An uncorroborated override-only expiry: `tracing::warn!` (observability — the operator can
+   investigate), does NOT trigger evacuation.
+3. Fix the "consensus-backed" doc comments on `ProbeResult.expiry_timestamp_secs` and
+   `derive_shutdown_scheduled` — they are wrong today.
+4. Goldens (pure): corroboration table over (override_expiry, config_expiry, meta_module,
+   status_quorum) — override-only never schedules; each corroborator alone + override does.
+
+### 15.2 Per-fed cap enforced at PERFORM time (`executor.rs`, `runtime.rs`, `wallet-cli`) — review P1-2
+§4.2's reservation fixes same-tick joint sizing, but the snapshot can be stale by perform
+time, and the operator verbs (`do_move`/`direct_inflow`) consult NO cap at all — ADR-0018
+says the cap "must be ENFORCED", and today nothing enforces it at the moment money moves.
+
+1. `FedimintExecutor` gains `hard_cap: Option<Msat>` (constructor parameter; `None` disables).
+2. In the `CreateInvoice` arm, BEFORE minting: `let dest = self.mc.balance(&rec.to)?;
+   if dest + rec.amount > cap → ExecError::Permanent("destination would exceed the per-fed
+   cap (<dest>+<amount> > <cap>)")`. For an `Evacuate`, downsize instead (extend
+   `size_fresh_evacuation`'s clamp with `cap − dest`) — an evacuation must drain what fits,
+   not refuse.
+3. `wallet-cli` wires `DEFAULT_PER_FED_CAP` (or the tick's `--cap` value) into the executor
+   for ALL verbs; `--allow-over-cap` (operator verbs only) maps to `hard_cap: None` — an
+   explicit override, never silence.
+4. Goldens: over-cap direct-inflow refused pre-mint; evacuation downsized to cap room;
+   `--allow-over-cap` passes.
+
+### 15.3 Evacuation destinations respect the scorer (`tick.rs`, `probe.rs`, `wallet-core`) — review P1-3
+The scorer's verdict gates only spending/standby designation; `safest_other`'s fallback will
+evacuate an entire dying-fed balance into a scorer-REJECTED fed (e.g. a joined 1-of-1).
+
+1. `FederationStatus` gains `eligible_to_fund: bool`. `build_snapshot` sets it from the
+   scorer verdict it already computes per fed; `assemble_status` (probe-only callers) sets
+   `false` — snapshot assembly is the only place the verdict exists.
+2. `eligible_for_evacuation` additionally requires `fed.eligible_to_fund`.
+3. Golden: a scorer-rejected fed with a live gateway is never chosen as an evacuation
+   destination; with no vetted destination the decision degrades to `RefuseInflow` (existing
+   modeled behavior).
+
+### 15.4 Deterministic send rejections are Permanent (`multi_client.rs`, `executor.rs`) — review P1-4
+`map_send_result` collapses every non-dedup `SendPaymentError` into one `anyhow` error and
+the Pay arm blanket-maps it `Retryable` — so `InvoiceExpired` (`lnv2 lib.rs:548`),
+`WrongCurrency` (`lib.rs:552-557`), `FederationNotSupported`, and fee/expiry-limit breaches
+livelock forever (the invoice is never re-minted; the move — including an Evacuate — never
+terminates).
+
+1. `map_send_result` classifies deterministic `SendPaymentError` variants into a
+   distinguishable error (e.g. `SendOutcome`-adjacent `SendRejection(String)` or a typed
+   error the executor can match); transport/gateway-unreachable failures stay generic.
+2. The Pay arm maps classified rejections to `ExecError::Permanent` (safe: `next_step` only
+   routes to `Pay` when cache + exhaustive backfill show no send op exists — nothing is in
+   flight). A fresh occurrence retries with a fresh invoice.
+3. Belt: check `invoice.is_expired()` at the Pay step pre-call (the BOLT11 is already parsed
+   there).
+4. Goldens: classification table for `map_send_result`; executor test — expired-invoice move
+   terminally fails with an actionable message instead of resetting to `Pending`.
+
+### 15.5 Pay-step over-cap: Retryable when only the send re-quote spiked (`executor.rs`) — review P2-2
+`executor.rs:793-795` returns `Permanent("fee over cap")` on one fresh quote. The receive
+component is FIXED (invoice − amount, already cap-checked at CreateInvoice); only the send
+re-quote fluctuates — a transient spike terminally fails an Evacuate and strands funds on a
+dying fed. Change: `Permanent` only when the fixed receive quote ALONE exceeds the cap;
+otherwise `Retryable("send fee quote over cap this attempt")` — 15.4's expiry backstop bounds
+the retry horizon. Golden: receive-fits/send-spikes → Retryable; receive-alone-over →
+Permanent.
+
+### 15.6 Gateway selection scans and validates BOTH ends (`executor.rs`, `probe.rs`, `runtime.rs`) — review P2-3
+`resolve_gateway`/the probe stop at `gateways().next()`; the SDK's own `select_gateway` scans
+until responsive (`lnv2 lib.rs:481-487`). A stale first-registered gateway makes a healthy
+fed unroutable (probe: `probed_ok=false` → can't fund, can't be an evacuation destination;
+executor: default moves fail).
+
+1. `resolve_gateway`: iterate the registered set; for send-required actions validate the
+   candidate against BOTH `to` and `from` (`routing_info` serves both) and pick the first
+   fully-valid gateway; receive-only actions validate against `to`.
+2. Probe `gateway_available`: true iff ANY registered gateway validates (pinned-gateway path
+   unchanged — a pin is a request for that exact gateway).
+3. Golden/unit: first-gateway-dead second-alive → routable; gateway serving only `to` skipped
+   for a move whose `from` needs it.
+
+### 15.7 Never-over TOCTOU verification (`executor.rs`) — review P1-6 (mint window)
+The SDK re-fetches `routing_info` inside `create_contract_and_fetch_invoice` and sizes the
+contract with the FRESH gateway fee — a fee drop between our verified quote and the mint
+commits a larger contract and the destination nets MORE than asked (a gateway can time this
+deliberately). After `mc.receive` commits, read the op's committed
+`contract.commitment.amount` (durable in `ReceiveOperationMeta`) and compare against
+`grossed.contract_amount`: on mismatch, do NOT surface/pay the invoice — fail the intent
+`Permanent("gateway receive fee changed between quote and mint; re-run")`. Safe: the invoice
+is unpaid at that point (for a Move we are the only payer; a DirectInflow's invoice has not
+been surfaced), and the orphaned receive op simply expires unclaimed. A retry (fresh
+occurrence / re-run) re-quotes from scratch. The CLAIM-window drift (federation fee at claim
+vs quote) cannot be refused — it is detected by the settled-amount read-back that the ledger's
+§9.3 backfill already specifies; record delivered-vs-asked there.
+Golden/unit: mocked mismatch → Permanent, no surfacing, no pay; match → proceeds.
+
+### 15.8 Partial open fails loudly (`wallet-cli`, `runtime.rs`) — review P2-6
+`open_all` is best-effort and everything downstream silently walks the open subset: `balance`
+under-reports with exit 0, and `tick`/`status` build snapshots from the survivors (an
+unpinned fed that fails to open vanishes from the universe; all-fail → empty plan, exit 0).
+
+1. `balance`: print `<fed>: unavailable (failed to open)` for joined-but-unopened feds and
+   exit non-zero when any exists (`total` line labeled `total (N/M federations)`).
+2. `tick`: compare the joined registry against the open set BEFORE probing; any
+   joined-but-unopened fed → stderr diagnostic + exit non-zero WITHOUT acting (a partial
+   world-view must not drive money decisions — same doctrine as `missing_pinned_feds`).
+   `status`: report the unopened feds as rows, exit non-zero.
+3. Smoke assertion: a wallet with a corrupted fed partition makes `tick` exit non-zero.
+
+### 15.9 Tick deadline (`runtime.rs`) — review P2-1
+A tick blocks on `await_send`/`await_receive` (SDK long-polls up to 60 min/request) with no
+deadline — one stalled gateway freezes probing and every other decision. Wrap each
+`perform` in `tokio::time::timeout` (default 10 min, `--perform-timeout` to override);
+timeout → the intent stays `Pending` (Retryable path) and the tick moves on; the summary
+counts it. Unit: a never-resolving executor future times out and leaves the intent Pending.
+
+### 15.10 Solve-loop extraction + goldens (`executor.rs`, `fee.rs`) — review P2-4 (debt)
+`quote_receive_gross_up_with_gateway_fee` (verify passes + safe-under restatement + verified
+bisection) is welded to `MultiClient` and has ZERO unit tests — three of the five commits
+before this spec's update patched exactly this flow. Extract it generic over an async quote
+closure (`impl AsyncFnMut(Msat) -> Result<Msat, ExecError>` or a boxed-future equivalent —
+the same seam `largest_fitting_amount` already uses in sync form) and golden-test scripted
+quote streams: stable, two-step oscillation, staircase converging on the last pass,
+non-monotone (over below under), and a stream that changes between the pass loop and the
+bisection. The same extraction makes the `CreateInvoice` hair-under path testable.
+
+### 15.11 Small fixes bundled with the above (review P3s worth taking now)
+- `load_or_generate_mnemonic`: use `load_decodable_client_secret_opt` — absent → generate;
+  `Err` (corrupt row) → abort naming the decode failure (today's `if let Ok` masks corruption
+  behind a misleading "already exists, cannot overwrite" abort; no silent regeneration is
+  possible either way — the SDK refuses overwrite).
+- `solve_gross_up`'s unsolvable message: distinguish the two `None` causes (ppm ≥ 100% vs
+  doubling exhausted) instead of always blaming ppm.
+- DirectInflow hair-under: commit `delivered` into the op's `MoveMeta.amount`
+  unconditionally, not only when `send_required` (the field is documented as the honest
+  crash-safe amount; today a receive-only safe-under fallback records the ask).
+- `ExecutionSummary` gains a `retryable` counter (distinct from terminal `failed`) so
+  schedulers can tell "left Pending" from "money-op failed".
 
 ## Scope guard / non-goals
 

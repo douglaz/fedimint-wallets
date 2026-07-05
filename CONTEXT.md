@@ -35,9 +35,12 @@ _Avoid_: "primary account", "main wallet"
 A small balance the Allocator keeps in one vetted federation *other than* the
 Spending federation, so a sudden federation failure never leaves the user with
 nothing to spend. The Allocator otherwise stays concentrated (see
-[ADR-0006](./docs/adr/0006-allocator-concentrated-warm-standby.md)). Selected for
-guardian-independence from the spending federation (see
-[ADR-0010](./docs/adr/0010-warm-standby-selection.md)).
+[ADR-0006](./docs/adr/0006-allocator-concentrated-warm-standby.md)). Selection is
+best-effort diversification only — fedimint exposes no verifiable guardian
+identity, so the wallet CANNOT prove the standby is operator-independent and
+must not claim that in product copy (ADR-0010 was dropped; ADR-0006 records the
+honest posture).
+_Avoid_: "guardian-independent", "operator-independent" as a guarantee
 
 **Private** (the precise meaning of "more private than WoS/Blink"):
 (1) **No KYC** to start. (2) The provider/federation is **blind to your balance
@@ -59,7 +62,10 @@ _Avoid_: making "seed phrase backup" the default flow (it is an opt-in export)
 
 **Shutdown notice**:
 A federation's machine-readable announcement that it will cease operating (via
-federation metadata / the meta module, or a Nostr announcement). The Allocator's
+the `federation_expiry_timestamp` meta field or the public `/status` endpoint's
+`scheduled_shutdown` — ADR-0019; Nostr is discovery-only, not a shutdown
+signal, and the meta field can be served by an override host, so the probe must
+corroborate it). The Allocator's
 **primary** resilience signal: it is planned and gives a window to evacuate,
 unlike a surprise outage. Health/liveness probes are the backstop for *unplanned*
 degradation.
