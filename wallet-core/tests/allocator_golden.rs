@@ -80,11 +80,11 @@ fn self_fund_standby_is_silent_noop() {
 #[test]
 fn evacuate_on_shutdown_notice() {
     // fed 2 is the configured standby and is healthy/probed: `safest_other` picks it as
-    // the evacuation destination. `amount` is the evacuating fed's spendable MINUS its own
-    // `fee_cap` reserve (§4.2): 50_000 − 500 = 49_500, so the executor's `amount + fee_cap`
-    // spend never over-draws the source.
+    // the evacuation destination. `amount` is the evacuating fed's FULL spendable (§4.2
+    // refinement): an evacuation reserves no fee_cap of its own — the executor's
+    // `size_fresh_evacuation` sizes for affordability (fees included) at perform time.
     let snapshot = snap!([fed!(1, 50_000, true, true, true), fed!(2, 30_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 100_000, 0, 3000);
-    assert_eq!(decide(&snapshot, occ(1)), decision!(evacuate!(1, 2, 49_500), ReasonCode::ShutdownNotice, occ(1), evac_key(1, 2, 1)));
+    assert_eq!(decide(&snapshot, occ(1)), decision!(evacuate!(1, 2, 50_000), ReasonCode::ShutdownNotice, occ(1), evac_key(1, 2, 1)));
 }
 
 #[test]
@@ -183,8 +183,8 @@ fn two_evacuations_into_one_destination_share_cap_room() {
     assert_eq!(
         decisions,
         vec![
-            AllocatorDecision { action: evacuate!(1, 3, 49_500), reason: ReasonCode::ShutdownNotice, occurrence: occ(1), idempotency_key: evac_key(1, 3, 1) },
-            AllocatorDecision { action: evacuate!(2, 3, 10_500), reason: ReasonCode::ShutdownNotice, occurrence: occ(1), idempotency_key: evac_key(2, 3, 1) },
+            AllocatorDecision { action: evacuate!(1, 3, 50_000), reason: ReasonCode::ShutdownNotice, occurrence: occ(1), idempotency_key: evac_key(1, 3, 1) },
+            AllocatorDecision { action: evacuate!(2, 3, 10_000), reason: ReasonCode::ShutdownNotice, occurrence: occ(1), idempotency_key: evac_key(2, 3, 1) },
         ]
     );
     let into_dest: u64 = evac_amounts_into(&decisions, id!(3));
@@ -204,8 +204,8 @@ fn evacuation_into_standby_plus_topup_never_exceed_cap() {
     assert_eq!(
         decisions,
         vec![
-            AllocatorDecision { action: evacuate!(1, 2, 9_500), reason: ReasonCode::ShutdownNotice, occurrence: occ(1), idempotency_key: evac_key(1, 2, 1) },
-            AllocatorDecision { action: move_action!(3, 2, 20_500), reason: ReasonCode::StandbyBelowTarget, occurrence: occ(1), idempotency_key: move_key(3, 2, 1) },
+            AllocatorDecision { action: evacuate!(1, 2, 10_000), reason: ReasonCode::ShutdownNotice, occurrence: occ(1), idempotency_key: evac_key(1, 2, 1) },
+            AllocatorDecision { action: move_action!(3, 2, 20_000), reason: ReasonCode::StandbyBelowTarget, occurrence: occ(1), idempotency_key: move_key(3, 2, 1) },
             AllocatorDecision { action: refuse!(2, ReasonCode::OverCap), reason: ReasonCode::OverCap, occurrence: occ(1), idempotency_key: refuse_key(2, ReasonCode::OverCap, 1) },
         ]
     );
@@ -215,28 +215,29 @@ fn evacuation_into_standby_plus_topup_never_exceed_cap() {
 }
 
 #[test]
-fn per_source_fee_cap_reserve_prevents_overdraw() {
-    // §4.2: the tick emits two moves (two evacuations). Each source is drained by at most its
-    // balance because the per-move `fee_cap` (500) is reserved (`debited[from] += amount +
-    // fee_cap`): the emitted amount is `spendable − fee_cap`, so the executor's
-    // `amount + fee_cap` spend equals the balance exactly and never over-draws. Destination
-    // cap room is huge here so the SOURCE-side reserve is the binding constraint.
-    // (The current allocator emits at most one move per source; the `debited` accounting
-    // generalizes the non-overdraw guarantee to any number of same-source moves.)
+fn evacuations_drain_the_full_spendable_balance() {
+    // §4.2 refinement: evacuations reserve NO fee_cap of their own — each drains its full
+    // spendable and the executor's `size_fresh_evacuation` owns affordability (fees
+    // included) at perform time. The `debited` accounting (amount + fee_cap per emitted
+    // move) still conservatively bounds any SUBSEQUENT same-tick move from the same source.
     let snapshot = snap!([fed!(1, 50_000, true, true, true), fed!(2, 30_000, true, true, true), fed!(3, 0, true, false, true)], None, Some(id!(3)), 10_000_000, 0, 0, 300);
     let decisions = decide(&snapshot, occ(1));
     assert_eq!(
         decisions,
         vec![
-            AllocatorDecision { action: evacuate!(1, 3, 49_500), reason: ReasonCode::ShutdownNotice, occurrence: occ(1), idempotency_key: evac_key(1, 3, 1) },
-            AllocatorDecision { action: evacuate!(2, 3, 29_500), reason: ReasonCode::ShutdownNotice, occurrence: occ(1), idempotency_key: evac_key(2, 3, 1) },
+            AllocatorDecision { action: evacuate!(1, 3, 50_000), reason: ReasonCode::ShutdownNotice, occurrence: occ(1), idempotency_key: evac_key(1, 3, 1) },
+            AllocatorDecision { action: evacuate!(2, 3, 30_000), reason: ReasonCode::ShutdownNotice, occurrence: occ(1), idempotency_key: evac_key(2, 3, 1) },
         ]
     );
-    // Total drawn from each source = amount + fee_cap; must never exceed the source balance.
-    assert_eq!(drawn_from(&decisions, id!(1)), 50_000);
-    assert_eq!(drawn_from(&decisions, id!(2)), 30_000);
-    assert!(drawn_from(&decisions, id!(1)) <= 50_000);
-    assert!(drawn_from(&decisions, id!(2)) <= 30_000);
+}
+
+#[test]
+fn small_balance_evacuation_is_not_zeroed_by_the_fee_reserve() {
+    // Regression (live evacuate gate): a dying fed whose spendable (400) is BELOW the
+    // per-move fee cap (500) must still evacuate — the old own-fee reserve zeroed the
+    // amount and degraded the evacuation to a refusal, abandoning small balances.
+    let snapshot = snap!([fed!(1, 400, true, true, true), fed!(2, 0, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 100_000, 0, 310);
+    assert_eq!(decide(&snapshot, occ(1)), decision!(evacuate!(1, 2, 400), ReasonCode::ShutdownNotice, occ(1), evac_key(1, 2, 1)));
 }
 
 #[test]
@@ -246,7 +247,7 @@ fn tie_break_picks_lower_id_when_pinned_standby_ineligible() {
     // the SMALLEST id (fed 2) deterministically — NOT the first in `federations` order (fed 3
     // is listed first), proving the choice is order-independent.
     let snapshot = snap!([fed!(1, 50_000, true, true, true), fed!(4, 0, true, 0, false, true, false), fed!(3, 0, true, false, true), fed!(2, 0, true, false, true)], None, Some(id!(4)), 100_000, 0, 0, 400);
-    assert_eq!(decide(&snapshot, occ(1)), decision!(evacuate!(1, 2, 49_500), ReasonCode::ShutdownNotice, occ(1), evac_key(1, 2, 1)));
+    assert_eq!(decide(&snapshot, occ(1)), decision!(evacuate!(1, 2, 50_000), ReasonCode::ShutdownNotice, occ(1), evac_key(1, 2, 1)));
 }
 
 #[test]
@@ -275,12 +276,4 @@ fn move_amounts_into(decisions: &[AllocatorDecision], dest: FederationId) -> u64
     }).sum()
 }
 
-// Total drawn from `src` = Σ(amount + fee_cap) over every move sourced from it — the
-// conservative bound `debited` tracks.
-fn drawn_from(decisions: &[AllocatorDecision], src: FederationId) -> u64 {
-    decisions.iter().filter_map(|d| match &d.action {
-        Action::Move { from, amount, fee_cap, .. } | Action::Evacuate { from, amount, fee_cap, .. } if *from == src => Some(amount.0 + fee_cap.0),
-        _ => None,
-    }).sum()
-}
 }
