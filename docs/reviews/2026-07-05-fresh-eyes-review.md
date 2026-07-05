@@ -115,6 +115,9 @@ then retries with a new invoice.
 *(Doc-only — no live code defect. P1 by TIMING, not severity: this report's P1 bucket is "fix
 before or during Phase 4", and these two items actively mislead the implementation about to
 start.)*
+**[RESOLVED 2026-07-05, in the same change-set that added this report: phase4-implementation-
+spec §2 rewritten (quote-base fix marked landed), TODOS R2 checked off, phase4-plan and the
+2026-07-03 review annotated with the settled terminal-`Stranded`.]**
 1. **phase4-implementation-spec §2 + TODOS R2 describe the send-leg fee bug as live; it was fixed
    in the 3.A merge (`5315df3`).** Verified: `multi_client.rs:396-405` is now
    `send_fee_quote_for_amount(&self, id, amount: Msat)` (the invoice-parameter method no longer
@@ -261,14 +264,17 @@ the honest send cost from `SendOperationMeta.contract.amount` post-Started.)
     (terminal-immutable; hard `Failed` repairs) vs phase4-implementation-spec §7/§10 (`repaired`
     rows re-advanceable by authoritative writes; 1h-gated SOFT failures; also `--since` dropped and
     `Receive.amount` flipped net→gross). Both claim normativity. Extend the authority note or
-    update the older rules.
+    update the older rules. **[RESOLVED 2026-07-05 in the same change-set: authority note
+    extended, rules 2/5/6 updated, `--since` dropped, gross amount noted.]**
 11. **Doc status staleness batch:** roadmap says 3.A "IN FLIGHT" (merged, gate passed);
     README says "Phases 1–3 complete through sense+decide" (wrong on both ends);
     `phase2-plan.md:36` + `tick.rs:47` cite ADR-0009 (AGPL) for the standing instruction
     (ADR-0014); CONTEXT.md still instructs the forbidden ADR-0010 "guardian-independence" claim
     (ADR-0006 update); devimint-runbook's two-fed guidance predates the harness patch the smokes
     depend on; phase1 spec's `Action` shape (gateway/occurrence fields, `Cap { limit }`) doesn't
-    match `types.rs:84-123` as built.
+    match `types.rs:84-123` as built. **[RESOLVED 2026-07-05 in the same change-set — all six
+    items fixed (roadmap, README, ADR cites incl. `tick.rs:47`, CONTEXT.md, runbook, phase1
+    as-built appendix).]**
 12. **CLI operational posture:** seed stored plaintext in RocksDB with default umask, and the
     CLI has no export/restore verb — ADR-0003/ADR-0011 DO specify seed export for the product
     (Android), but wallet-cli (ADR-0023: a maintained-forever frontend) never grew the command

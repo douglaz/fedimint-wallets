@@ -698,12 +698,16 @@ values (`meta.rs:85`). So today's PRIMARY evacuation trigger is forgeable and bl
 single non-quorum party, uncorroborated — while the SECONDARY `/status` signal already
 requires f+1 peers.
 
-1. Treat the merged-meta expiry as UNTRUSTED input: derive `shutdown_scheduled` from it ONLY
-   when corroborated by at least one of — (a) the same key present in the at-join consensus
-   config meta (`client.config().global.meta` — catches feds that declared an expiry from the
-   start; NOT sufficient alone for post-join announcements, it is a cached snapshot), (b) the
-   meta MODULE's consensus value when the federation runs one (fresh AND consensus-backed),
-   (c) the existing f+1-corroborated `/status.scheduled_shutdown` signal.
+1. Treat the merged-meta expiry as UNTRUSTED input: derive `shutdown_scheduled` ONLY from a
+   CORROBORATED VALUE — key presence is not corroboration (a fed that legitimately carried
+   the key at join could otherwise have its date FORGED EARLIER by the override host). The
+   value used for derivation is the corroborating source's own value, never the merged one:
+   (a) the at-join consensus config meta (`client.config().global.meta`) carries the key →
+   use THAT timestamp (catches feds that declared an expiry from the start; a cached
+   snapshot, so not sufficient for post-join announcements); (b) the meta MODULE's consensus
+   value when the federation runs one (fresh AND consensus-backed) → use its timestamp;
+   (c) the existing f+1-corroborated `/status.scheduled_shutdown` signal → the override
+   expiry may then be used for lead timing (the shutdown fact itself is peer-corroborated).
 2. An uncorroborated override-only expiry: `tracing::warn!` (observability — the operator can
    investigate), does NOT trigger evacuation.
 3. Fix the "consensus-backed" doc comments on `ProbeResult.expiry_timestamp_secs` and
@@ -718,10 +722,14 @@ says the cap "must be ENFORCED", and today nothing enforces it at the moment mon
 
 1. `FedimintExecutor` gains `hard_cap: Option<Msat>` (constructor parameter; `None` disables).
 2. In the `CreateInvoice` arm, BEFORE minting: `let dest = self.mc.balance(&rec.to)?;
-   if dest + rec.amount > cap → ExecError::Permanent("destination would exceed the per-fed
-   cap (<dest>+<amount> > <cap>)")`. For an `Evacuate`, downsize instead (extend
-   `size_fresh_evacuation`'s clamp with `cap − dest`) — an evacuation must drain what fits,
-   not refuse.
+   if dest.0.saturating_add(rec.amount.0) > cap.0 → ExecError::Permanent("destination would
+   exceed the per-fed cap (<dest>+<amount> > <cap>)")`. For an `Evacuate`, downsize instead:
+   extend `size_fresh_evacuation`'s clamp with `cap.0.saturating_sub(dest.0)` — SATURATING,
+   like every arithmetic op in this repo: a destination already at/above the cap (stale
+   snapshot, pre-existing over-cap state, a prior `--allow-over-cap` move) yields room 0, and
+   zero room is a LOUD `Permanent` refusal ("no cap room at destination"), never a 0-msat
+   move and never a wrapped-around huge room. An evacuation must drain what fits, not refuse
+   when something fits.
 3. `wallet-cli` wires `DEFAULT_PER_FED_CAP` (or the tick's `--cap` value) into the executor
    for ALL verbs; `--allow-over-cap` (operator verbs only) maps to `hard_cap: None` — an
    explicit override, never silence.
