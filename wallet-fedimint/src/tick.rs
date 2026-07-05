@@ -44,7 +44,7 @@ const DEFAULT_PER_FED_CAP: Msat = Msat(5_000_000_000);
 /// rebalance's total (both-legs) cost; tighten it with `--max-fee`.
 const DEFAULT_MAX_FEE: Msat = Msat(50_000);
 
-/// The standing instruction for one orchestrator tick (ADR-0009). Sensible v1 defaults
+/// The standing instruction for one orchestrator tick (ADR-0014). Sensible v1 defaults
 /// (see the module constants) are provided by [`Default`]; `wallet-cli` overrides any
 /// field from a flag.
 #[derive(Clone, Debug, PartialEq, Eq)]
