@@ -13,7 +13,6 @@ fn decision(key: &str, action: Action, reason: ReasonCode) -> AllocatorDecision 
         reason,
         occurrence: Occurrence(1),
         idempotency_key: ikey(key),
-        requires_auth: false,
     }
 }
 
@@ -271,12 +270,8 @@ fn advisory_actions_are_not_executable() {
         fed: FederationId([1; 32]),
         reason: ReasonCode::OverCap,
     };
-    let cap = Action::Cap {
-        fed: FederationId([1; 32]),
-        reason: ReasonCode::OverCap,
-    };
     assert!(!refuse.is_executable());
-    assert!(!cap.is_executable());
+    assert_eq!(refuse.fee_cap(), None);
 }
 
 #[tokio::test]

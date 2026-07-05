@@ -129,7 +129,7 @@ impl MovePlan {
     ///   replay + gross-up path. LN-only: v1 validates that the destination-selected gateway
     ///   also serves the source, giving the same internal-swap route as `Move`. No peg-out.
     /// - `DirectInflow` → `Some` with `from = None`, `send_required = false` (receive-only).
-    /// - `RefuseInflow` / `Cap` → `None` (advisory policy signals, never executed).
+    /// - `RefuseInflow` → `None` (advisory policy signal, never executed).
     pub fn from_action(a: &Action) -> Option<MovePlan> {
         match a {
             // A `Move` and an `Evacuate` are the same executable send-required move (drain
@@ -165,7 +165,7 @@ impl MovePlan {
                 send_required: false,
             }),
             // Advisory policy signals are never executed — absent from the money path.
-            Action::RefuseInflow { .. } | Action::Cap { .. } => None,
+            Action::RefuseInflow { .. } => None,
         }
     }
 }

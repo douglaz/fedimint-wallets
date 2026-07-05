@@ -64,17 +64,12 @@ fn evacuate_maps_to_a_two_leg_plan() {
 
 #[test]
 fn advisory_actions_have_no_plan() {
-    // `RefuseInflow`/`Cap` are policy signals, never executed as a move.
+    // `RefuseInflow` is a policy signal, never executed as a move.
     let refuse = Action::RefuseInflow {
         fed: FED_A,
         reason: ReasonCode::OverCap,
     };
-    let cap = Action::Cap {
-        fed: FED_A,
-        reason: ReasonCode::OverCap,
-    };
     assert_eq!(MovePlan::from_action(&refuse), None);
-    assert_eq!(MovePlan::from_action(&cap), None);
 }
 
 #[test]

@@ -9,7 +9,7 @@
 //! The I/O that actually probes the live feds and drives the executor is
 //! [`crate::runtime::Runtime::tick`] / [`crate::runtime::Runtime::status`].
 //!
-//! ## Standing instruction (ADR-0009)
+//! ## Standing instruction (ADR-0014)
 //! [`TickPolicy`] is the user's standing instruction: the per-fed cap (ADR-0018), the
 //! spending/standby targets, the move fee cap, and the spending/standby designation.
 //! The designation is OPTIONAL — when the operator does not pin it, `build_snapshot`
@@ -98,9 +98,21 @@ pub fn build_snapshot(
     policy: &TickPolicy,
     scorer_policy: &ScorerPolicy,
 ) -> AllocatorSnapshot {
+    // Score every fed once (pure): the verdict both stamps `eligible_to_fund` on each
+    // status (§15.3 — the destination gate the evacuator reads) AND drives
+    // auto-designation below. `verdicts` is parallel to `probes`.
+    let verdicts: Vec<FederationVerdict> = probes
+        .iter()
+        .map(|(id, probe)| score(&assemble_facts(probe, *id), scorer_policy))
+        .collect();
+
     let federations: Vec<FederationStatus> = probes
         .iter()
-        .map(|(id, probe)| assemble_status(probe, *id))
+        .zip(&verdicts)
+        .map(|((id, probe), verdict)| FederationStatus {
+            eligible_to_fund: verdict.eligible_to_fund,
+            ..assemble_status(probe, *id)
+        })
         .collect();
 
     // Scored-eligible feds ranked for auto-designation: keep only the fundable ones
@@ -109,8 +121,8 @@ pub fn build_snapshot(
     // holding the most usable balance; id makes the choice deterministic.
     let mut eligible: Vec<(FederationId, u32, u64)> = probes
         .iter()
-        .filter_map(|(id, probe)| {
-            let verdict = score(&assemble_facts(probe, *id), scorer_policy);
+        .zip(&verdicts)
+        .filter_map(|((id, probe), verdict)| {
             verdict
                 .eligible_to_fund
                 .then_some((*id, verdict.rank_score, probe.spendable_msat))
@@ -726,7 +738,7 @@ mod tests {
         // spending fed with no usable source yields a `RefuseInflow`, which survives here.
         let advisory_count = |ds: &[AllocatorDecision]| {
             ds.iter()
-                .filter(|d| matches!(&d.action, Action::RefuseInflow { .. } | Action::Cap { .. }))
+                .filter(|d| matches!(&d.action, Action::RefuseInflow { .. }))
                 .count()
         };
         assert!(advisory_count(&decisions) > 0, "decisions: {decisions:?}");
@@ -752,7 +764,6 @@ mod tests {
             reason: ReasonCode::ShutdownNotice,
             occurrence: Occurrence(0),
             idempotency_key: wallet_core::IdempotencyKey("evac-tiny".into()),
-            requires_auth: false,
         };
         let kept = decisions_to_apply(std::slice::from_ref(&tiny));
         assert_eq!(kept, vec![tiny]);

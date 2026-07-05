@@ -156,6 +156,11 @@ pub fn assemble_status(p: &ProbeResult, id: FederationId) -> FederationStatus {
         // `healthy` tracks quorum liveness; `shutdown_notice` (above) drives the
         // separate evacuation path in the allocator.
         healthy: p.quorum_live,
+        // §15.3: the scorer verdict is the fundability gate for evacuation DESTINATIONS,
+        // and it only exists during snapshot assembly (`build_snapshot`). A probe-only
+        // caller has no verdict, so it reports `false` — fail-closed, the safe direction:
+        // an un-scored fed is never picked as an evacuation destination.
+        eligible_to_fund: false,
     }
 }
 

@@ -182,3 +182,88 @@ fn missing_observer_still_eligible() {
     let verdict = score(&facts, &ScorerPolicy::default());
     assert!(verdict.eligible_to_fund);
 }
+
+// ---- §1 threshold trust floor ----
+
+#[test]
+fn reject_zero_threshold() {
+    // §1: a 0-of-n threshold is structurally impossible; hard-reject it and surface the
+    // reason in the verdict.
+    let facts = FederationFacts {
+        threshold: 0,
+        ..healthy()
+    };
+    let verdict = score(&facts, &ScorerPolicy::default());
+    assert!(!verdict.eligible_to_fund);
+    assert!(verdict.reasons.contains(&ReasonCode::InvalidThreshold));
+}
+
+#[test]
+fn reject_threshold_above_guardian_count() {
+    // §1: m > n is impossible. Rejected, and (being ineligible) rank is forced to 0.
+    let facts = FederationFacts {
+        guardian_count: 4,
+        threshold: 5,
+        ..healthy()
+    };
+    let verdict = score(&facts, &ScorerPolicy::default());
+    assert!(!verdict.eligible_to_fund);
+    assert!(verdict.reasons.contains(&ReasonCode::InvalidThreshold));
+    assert_eq!(verdict.rank_score, 0);
+}
+
+#[test]
+fn reject_below_bft_threshold_3_of_100() {
+    // §1: 3-of-100 claims fault tolerance far weaker than fedimint's BFT bound (67-of-100).
+    // A discovered config CLAIMING this is rejected as structurally dishonest, not ranked
+    // equal to an honest 3-of-4.
+    let facts = FederationFacts {
+        guardian_count: 100,
+        threshold: 3,
+        ..healthy()
+    };
+    let verdict = score(&facts, &ScorerPolicy::default());
+    assert!(!verdict.eligible_to_fund);
+    assert!(verdict.reasons.contains(&ReasonCode::InvalidThreshold));
+}
+
+#[test]
+fn accept_bft_threshold_3_of_4() {
+    // §1: 3-of-4 is EXACTLY the BFT bound (4 − (4−1)/3 = 3). Nothing live is rejected.
+    let facts = FederationFacts {
+        guardian_count: 4,
+        threshold: 3,
+        ..healthy()
+    };
+    let verdict = score(&facts, &ScorerPolicy::default());
+    assert!(verdict.eligible_to_fund);
+    assert!(!verdict.reasons.contains(&ReasonCode::InvalidThreshold));
+}
+
+#[test]
+fn accept_bft_threshold_67_of_100() {
+    // §1: 67-of-100 is the BFT bound for 100 guardians (100 − 99/3 = 67); it passes.
+    let facts = FederationFacts {
+        guardian_count: 100,
+        threshold: 67,
+        ..healthy()
+    };
+    let verdict = score(&facts, &ScorerPolicy::default());
+    assert!(verdict.eligible_to_fund);
+    assert!(!verdict.reasons.contains(&ReasonCode::InvalidThreshold));
+    assert!(verdict.rank_score > 0);
+}
+
+#[test]
+fn zero_guardians_yields_a_verdict_without_panicking() {
+    // §1: the BFT floor is SATURATING, so it never underflows on attacker-supplied facts —
+    // guardian_count == 0 still yields a verdict (rejected by NoFaultTolerance), no panic.
+    let facts = FederationFacts {
+        guardian_count: 0,
+        threshold: 0,
+        ..healthy()
+    };
+    let verdict = score(&facts, &ScorerPolicy::default());
+    assert!(!verdict.eligible_to_fund);
+    assert!(verdict.reasons.contains(&ReasonCode::NoFaultTolerance));
+}

@@ -208,7 +208,6 @@ impl Runtime {
             reason: ReasonCode::SpendingBelowTarget,
             occurrence,
             idempotency_key: key.clone(),
-            requires_auth: false,
         };
         let executor = self.executor();
         let _summary = wallet_core::apply(
@@ -282,7 +281,6 @@ impl Runtime {
             reason: ReasonCode::SpendingBelowTarget,
             occurrence,
             idempotency_key: key.clone(),
-            requires_auth: false,
         };
         let executor = self.executor();
         let _summary = wallet_core::apply(
@@ -1033,7 +1031,6 @@ mod tests {
             reason: ReasonCode::StandbyBelowTarget,
             occurrence: Occurrence(0),
             idempotency_key: IdempotencyKey(key.to_string()),
-            requires_auth: false,
         }
     }
 
@@ -1052,7 +1049,6 @@ mod tests {
             reason: ReasonCode::ShutdownNotice,
             occurrence: Occurrence(0),
             idempotency_key: IdempotencyKey(key.to_string()),
-            requires_auth: false,
         }
     }
 
