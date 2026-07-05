@@ -40,7 +40,8 @@ SENSE (concrete, wallet-fedimint)                     DECIDE (pure, wallet-core)
   **The shipped default numbers** (`tick.rs` module constants): `target_spending_balance` =
   100k sats, `standby_target` = 100k sats, `per_fed_cap` = 5M sats (0.05 BTC), `max_fee` =
   50 sats per move. Rationale note: the cap must exceed `target_spending + standby_target`
-  (the tick asserts it) so it bounds ACCUMULATION without fighting the standing targets —
+  (a unit test asserts the DEFAULTS satisfy this; CLI-supplied values are NOT validated at
+  runtime today) so it bounds ACCUMULATION without fighting the standing targets —
   but 5M sats is ~100× the roadmap's illustrative $50–$500 balances, which sits uneasily
   against ADR-0018's "hard, LOW cap" posture. The Phase-8 fee-vs-risk EV gate must revisit
   this number with real data; until then it is a default, not a considered policy.
