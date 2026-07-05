@@ -107,9 +107,10 @@ The `Executor should be running` warning was a red herring (the executor runs fi
       up federation B (index 1), connects the LDK gateway, pegs in its B-side liquidity, and exposes
       `FED_B_INVITE` for the `--exec`. Patch saved at `docs/devimint-two-fed-harness.patch` (apply to
       `~/p/fedimint` + rebuild `devimint --release`). Reused by step 5's crash gate.
-- [ ] **wallet-cli SIGPIPE robustness (follow-up)** — `wallet-cli` panics (broken pipe) when its
-      stdout is closed early (e.g. piped to `head`, or `awk '…{exit}'` with multiple feds). Reset
-      SIGPIPE to SIG_DFL at startup (the Unix CLI convention). Worked around in the move smoke.
+- [x] **wallet-cli SIGPIPE robustness (follow-up)** — DONE (`3859425`): SIGPIPE reset to
+      SIG_DFL at startup (`wallet-cli/src/main.rs`, with rationale comment). Residual nit: two
+      single-fed smokes still keep `exit` in their balance awk (harmless today; the two-fed
+      smokes dropped it).
 - [x] **Fee-quote base discrepancy** — RESOLVED (verified vs pinned `b108ec6`): fed fee quoted on
       `contract_amount` (spec §6); the gateway ppm now FLOORS (`GatewayFee::on`) to invert
       `PaymentFee::subtract_from`. Residual: the mint-output-fee under-quote above. See memory.
@@ -128,7 +129,7 @@ every step → reconcile → exactly-once). ~90 unit tests + gates green through
 douglaz/fedimint @ `b108ec6`; the two-fed harness is `docs/devimint-two-fed-harness.patch`.
 
 Residual polish (non-blocking follow-ups, tracked above): gross-up never-under-credit (model the
-mint output fee); `wallet-cli` SIGPIPE robustness.
+mint output fee). (SIGPIPE robustness has since landed — `3859425`.)
 
 ## Phase 2 — sense + decide: COMPLETE (2026-07)
 
@@ -176,11 +177,14 @@ build plan in [docs/phase4-plan.md](./docs/phase4-plan.md); sequence in
   passes AND ranks highest. Not reachable via today's probe (threshold is derived `2f+1`), but
   the scorer is the trust boundary and 3.B's discovery assemblers will feed it
   attacker-influenced facts. Decide proportional-threshold stance too.
-- [ ] **R2 (P1, executor)** Quote send-leg fees on the outgoing-contract amount (both gateway ppm
-  and fed fee are quoted on the smaller invoice amount today), so `fee_cap` hard-bounds BOTH legs.
+- [x] **R2 (P1, executor)** ~~Quote send-leg fees on the outgoing-contract amount~~ — **the
+  quote-base fix LANDED with the 3.A merge (`5315df3`)**: `send_fee_quote_for_amount` + the
+  Pay arm's `outgoing_contract_amount`. Remaining slice (Phase 4 §2.3): persist the quotes on
+  the `MoveRecord`.
 - [ ] **R3 (P1, executor)** Success-send + failed-receive must not be terminal `Failed` with the
-  preimage discarded: persist the preimage on the `MoveRecord`, keep the claim retryable (or a
-  loud `Stranded` phase) — never a silent terminal loss.
+  preimage discarded: persist the preimage on the `MoveRecord`. SETTLED shape
+  (phase4-implementation-spec §3/§14.3): a loud TERMINAL `Stranded` phase — never a silent
+  terminal loss.
 - [ ] **R4 (P0, product)** Append-only operation ledger + `wallet-cli history`/`show` per
   [docs/operation-history-spec.md](./docs/operation-history-spec.md): timestamps, real reasons,
   actual fees, actor (user vs agent), failures + refusals recorded — today NONE of these persist
@@ -190,3 +194,25 @@ build plan in [docs/phase4-plan.md](./docs/phase4-plan.md); sequence in
   source-side trust asymmetry.
 - [ ] **R6 (P3, cleanup)** Drop dead surface: `Action::Cap` (no producer), `requires_auth`
   (always false, never read); wire `AllocatorSnapshot.now` (CLI passes real time) or drop it.
+
+## Fresh-eyes review backlog (2026-07-05) — folded into Phase 4
+
+Full findings in [docs/reviews/2026-07-05-fresh-eyes-review.md](./docs/reviews/2026-07-05-fresh-eyes-review.md);
+buildable specs in [docs/phase4-implementation-spec.md](./docs/phase4-implementation-spec.md) §15.
+
+- [ ] **R7 (P1, probe)** Shutdown expiry signal is `meta_override_url`-controlled and
+  uncorroborated — corroborate (consensus config / meta module / f+1 `/status`) before it can
+  trigger an evacuation (§15.1).
+- [ ] **R8 (P1, executor+CLI)** Per-fed cap enforced NOWHERE at perform time: same-tick joint
+  breach (R5's reservation is the planning half) AND operator `move`/`direct-inflow` consult no
+  cap at all (§15.2).
+- [ ] **R9 (P1, allocator+tick)** Evacuation fallback can target a scorer-REJECTED fed — carry
+  `eligible_to_fund` into `FederationStatus` (§15.3).
+- [ ] **R10 (P1, multi_client+executor)** Every deterministic send rejection (expired invoice,
+  `WrongCurrency`, …) is an immortal Retryable livelock — classify as `Permanent` (§15.4);
+  plus Pay-step over-cap Retryable-vs-Permanent split (§15.5).
+- [ ] **R11 (P1, executor)** Receive-side fee TOCTOU: verify the committed contract amount
+  post-mint (never-over); read back the settled amount post-claim via the ledger (§15.7).
+- [ ] **R12 (P2, executor/probe/runtime/CLI)** Gateway scan both-ends (§15.6); partial-open
+  fails loudly (§15.8); tick deadline (§15.9); solve-loop extraction + goldens (§15.10);
+  small fixes (§15.11).

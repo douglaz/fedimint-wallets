@@ -51,6 +51,9 @@ nets exactly `amount`; the **`fee_cap`/`--max-fee` promise is soft on the send l
 whose true cost exceeds the cap can pass `total_within_cap` and pay anyway.
 **Fix:** compute `contract = invoice + gateway_fee.on(invoice)` and quote the federation send
 fee on `contract`. Record the final quote (feeds the operation ledger, below).
+**[Status 2026-07-05: the quote-base fix LANDED with the 3.A merge (`5315df3`) —
+`send_fee_quote_for_amount` + the contract-amount Pay arm. Persisting the quotes remains
+(phase4-implementation-spec §2.3).]**
 
 ### 3. Send-settled + receive-failed strands funds and discards the preimage
 `wallet-fedimint/src/executor.rs:430-452`: on `SendState::Success(_preimage)` the preimage is
@@ -63,6 +66,8 @@ unreachable, but the code handles it as a reachable state and then handles it wr
 mark terminal `Failed` — either keep re-awaiting the claim (retryable; the contract is funded)
 or introduce a distinct `Stranded` phase that `reconcile` retries and the ledger/UI surfaces
 loudly. Never a silent terminal loss.
+**[Settled 2026-07-05: `Stranded` is TERMINAL with the preimage persisted — the retryable
+branch is superseded; see phase4-implementation-spec §3/§14.3.]**
 
 ---
 

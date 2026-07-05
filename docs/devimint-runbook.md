@@ -77,10 +77,18 @@ fedimint-cli module lnv2 await-receive <op_id>                  # -> "Claimed"
   syntax than `ln-invoice --amount`.
 - **`supports_lnv2()` is true by DEFAULT** (unset env → enabled); set `FM_ENABLE_MODULE_LNV2=1`
   to be explicit. (`devimint/src/util.rs:982`.)
-- **`--num-feds 2` makes two federations but only auto-joins `default-0` to fed-0.** Fed-1's
-  invite is not auto-exported and no client is joined to it; for a real two-fed test you must
-  derive fed-1's invite and `fedimint-cli join` a second client + peg it in. (Single-fed
-  self receive→send through one gateway already exercises `is_direct_swap`.)
+- **Vanilla `dev-fed` NEVER stands up a second federation — `--num-feds 2` only reserves
+  ports.** (An earlier version of this note claimed fed-1 comes up unjoined; wrong — it does
+  not come up at all.) For a real two-fed test apply the repo's harness patch:
+  `cd ~/p/fedimint && git apply <this-repo>/docs/devimint-two-fed-harness.patch`, rebuild
+  devimint `--release`, then invoke the patched binary by ABSOLUTE path
+  (`~/p/fedimint/target-nix/release/devimint`) — `add_target_dir_to_path` can resolve a
+  stale DEBUG binary even with `CARGO_PROFILE=release` — and export `FM_NUM_FEDS=2`
+  belt-and-braces. The patch stands up federation B, connects the LDK gateway to it, pegs in
+  B-side liquidity, and exposes `FED_B_INVITE` to the `--exec` script. Verify before a run:
+  `grep -c FED_B_INVITE ~/p/fedimint/devimint/src/cli.rs` (0 ⇒ the checkout was reset;
+  re-apply). (Single-fed self receive→send through one gateway already exercises
+  `is_direct_swap`.)
 - Don't `2>&1` into a var you `jq`; route logs elsewhere.
 
 ## 5. What was validated (see fedimint-mechanics.md "Live validation")
@@ -93,7 +101,8 @@ in the session scratchpad (`tv3.sh`, `lnv2swap.sh`).
 - Bootstrap the fed **once per test session/CI job** (the bring-up is the cost), then run
   many tests against it; per test use fresh client DBs + amounts. devimint dev-fed is the
   one-fsync-domain fixture.
-- Drive via `fedimint-cli` (above) or the client lib directly. For two-fed cross moves,
-  script the fed-1 join + a shared gateway connected to both.
+- Drive via `fedimint-cli` (above) or the client lib directly. For two-fed cross moves, use
+  the two-fed harness patch (see the `--num-feds` gotcha in §4); the wallet-cli smokes in
+  `wallet-cli/tests/smoke_*_devimint.sh` are the working references.
 - Crash-resume test: kill the client/process mid-operation, reopen the client, assert the
   operation completes (the executor self-resumes) and balances are exactly-once.

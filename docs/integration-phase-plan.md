@@ -1,13 +1,15 @@
 # Integration-phase architecture (locked)
 
-> **STATUS (2026-07): Phase 1 COMPLETE** (money path live-validated on devimint;
+> **STATUS (2026-07-05): Phase 1 COMPLETE** (money path live-validated on devimint;
 > crash/reconcile gate passed) — **Phase 2 COMPLETE** (probe → score → snapshot → decide →
 > apply via `Runtime::tick`; two-fed exit gate passed, see [phase2-plan.md](./phase2-plan.md)) —
-> **Phase 3 in progress** ([phase3-plan.md](./phase3-plan.md); 3.A Evacuate execution in
-> flight). Next after Phase 3.A: [phase4-plan.md](./phase4-plan.md) (hardening + operation
-> ledger), then the sequence in [roadmap-to-v1.md](./roadmap-to-v1.md). Naming drift from
+> **Phase 3.A COMPLETE** (Evacuate execution merged `5315df3`, live exit gate passed
+> 2026-07-04; 3.B/3.C re-scoped into Phase 5, see [roadmap-to-v1.md](./roadmap-to-v1.md)).
+> Next: [phase4-plan.md](./phase4-plan.md) (hardening + operation ledger; buildable spec in
+> [phase4-implementation-spec.md](./phase4-implementation-spec.md)). Naming drift from
 > reality: the durable journal shipped as `FedimintJournal` over the fedimint RocksDB
-> `Database` (NOT SQLite) — read `SqliteJournal` below as `FedimintJournal`.
+> `Database` (NOT SQLite) — read `SqliteJournal` (and the test pyramid's "real SQLite")
+> below as `FedimintJournal`.
 
 From the pure decision core (scorer + allocator + executor, all on `main`, tested) to a
 working on-device agent that actually moves ecash across federations. Source of truth: the
@@ -108,6 +110,9 @@ manages a small active set + ephemeral probe-joins, not an N-client registry.
   - **1c GATE.** Exit: a devimint test moves ecash A→B via `apply()` AND survives
     `reconcile()` (crash-at-every-step) with no double-pay, plus the misbehaving-gateway
     double + the restore-from-seed-mid-move hazard (T4). Candidate set = a bundled invite list.
+    (As-run: the move + crash matrix passed; the gateway double and seed-restore cases were
+    consciously deferred — see phase1-implementation-spec §10's gate-status note for where
+    each obligation now lives: Phase 4 `Stranded` coverage and the Phase 7 recovery gate.)
 - **Phase 2 — sense + decide.** `FedimintProbeRunner` + the facts assembler → real
   `FederationFacts` → `score()` → snapshot → `decide()` → `apply()`. Recorded-fixture parser
   tests in the fast layer. Exit: full tick vs devimint. (As built, `round_trip_ok`/
@@ -174,6 +179,8 @@ data model written pre-SDK. Corrections, to land in Phase 1b (model-from-reality
   from one flat number.
 - **Scorer:** require the LN/LNv2 module in the default policy (a fed with no LN can't
   send/receive); carry gateway-availability + consensus_version in `FederationFacts`.
+  (As-built: gateway-availability shipped; `consensus_version` was never added — nothing
+  handles federation module/consensus upgrades yet. Open item, not silently done.)
 - **Key management shapes storage from day one** — sketch seed/Keystore/Block Store/
   recovery (incl. recovery of PENDING operations, not just ecash) before client DBs land.
 
