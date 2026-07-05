@@ -386,6 +386,10 @@ impl Journal for FedimintJournal {
         &self,
         key: &IdempotencyKey,
         status: IntentStatus,
+        // §8.3: the terminal failure diagnostic. The durable ledger integration (§9, next
+        // run) writes it onto the operation row here; until then this journal accepts and
+        // ignores it — the intent-row transition is unaffected.
+        _error: Option<&str>,
     ) -> Result<(), ExecError> {
         let ikey = intent_key(key);
         let mut dbtx = self.db.begin_transaction().await;

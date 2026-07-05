@@ -35,10 +35,20 @@ use fedimint_core::runtime;
 use std::time::Duration;
 use std::{collections::BTreeSet, sync::Arc};
 use wallet_core::{
-    score, Action, AllocatorDecision, AllocatorSnapshot, ExecError, Executor, FederationId,
+    score, Action, Actor, AllocatorDecision, AllocatorSnapshot, ExecError, Executor, FederationId,
     IdempotencyKey, Intent, IntentStatus, Journal, Msat, Occurrence, PerformOutcome, ReasonCode,
     ScorerPolicy,
 };
+
+/// Wall-clock in unix millis for the ledger's `created_at_ms` (§8/§9.4). `seq` is the
+/// ordering authority; this is display material, so a pre-epoch clock degrades to `0`
+/// rather than failing a money op. The durable §9.4 injected clock is a later run's concern.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// The result of a [`Runtime::direct_inflow`] call: the intent's key (the durable handle the
 /// operator passes to `await-move`), the surfaced BOLT11 to pay (read from the persisted
@@ -265,9 +275,8 @@ impl Runtime {
                 amount,
                 fee_cap,
             },
-            // The reason is decision metadata only (never persisted on the Intent), so the
-            // exact inflow reason does not matter here.
-            reason: ReasonCode::SpendingBelowTarget,
+            // A plain operator verb (§8): the ledger records it as user-initiated.
+            reason: ReasonCode::UserInitiated,
             occurrence,
             idempotency_key: key.clone(),
         };
@@ -276,6 +285,8 @@ impl Runtime {
             self.journal.as_ref(),
             &executor,
             std::slice::from_ref(&decision),
+            Actor::User,
+            now_ms(),
         )
         .await;
 
@@ -338,9 +349,8 @@ impl Runtime {
                 amount,
                 fee_cap,
             },
-            // The reason is decision metadata only (never persisted on the Intent), so the exact
-            // move reason does not matter here.
-            reason: ReasonCode::SpendingBelowTarget,
+            // A plain operator verb (§8): the ledger records it as user-initiated.
+            reason: ReasonCode::UserInitiated,
             occurrence,
             idempotency_key: key.clone(),
         };
@@ -349,6 +359,8 @@ impl Runtime {
             self.journal.as_ref(),
             &executor,
             std::slice::from_ref(&decision),
+            Actor::User,
+            now_ms(),
         )
         .await;
 
@@ -505,7 +517,7 @@ impl Runtime {
     /// federation → build the `AllocatorSnapshot` (via `build_snapshot` — `score()` +
     /// designation) → `decide()` → `wallet_core::apply` the decisions through the
     /// [`FedimintExecutor`], which performs the resulting `Move`s AND `Evacuate`s (each a
-    /// send-required move, synchronous to `Done`). Advisory `RefuseInflow`/`Cap` decisions are
+    /// send-required move, synchronous to `Done`). Advisory `RefuseInflow` decisions are
     /// surfaced in the returned [`TickReport`] but never executed (`apply` skips them via
     /// `Action::is_executable`). As of Phase 3.A an `Evacuate` is executed like a `Move`
     /// (draining a dying fed into `safest_other`), no longer withheld from `apply`.
@@ -531,6 +543,10 @@ impl Runtime {
             self.journal.as_ref(),
             &executor,
             &decisions_to_apply(&plan.decisions),
+            Actor::Agent {
+                occurrence: policy.occurrence,
+            },
+            now_ms(),
         )
         .await;
         Ok(TickReport {
@@ -1116,6 +1132,9 @@ mod tests {
             },
             max_fee: Some(Msat(1_000)),
             status,
+            reason: ReasonCode::UserInitiated,
+            actor: Actor::User,
+            created_at_ms: 0,
         }
     }
 
@@ -1388,7 +1407,7 @@ mod tests {
         let (runtime, journal) = runtime_fixture().await;
         let decision = tick_move_decision("move-existing", FED_A, FED_B);
         journal
-            .upsert(&Intent::from_decision(&decision))
+            .upsert(&Intent::from_decision(&decision, Actor::User, 0))
             .await
             .expect("upsert existing move intent");
 
@@ -1422,7 +1441,7 @@ mod tests {
         let (runtime, journal) = runtime_fixture().await;
         let decision = tick_evacuate_decision("evac-existing", FED_A, FED_B);
         journal
-            .upsert(&Intent::from_decision(&decision))
+            .upsert(&Intent::from_decision(&decision, Actor::User, 0))
             .await
             .expect("upsert existing evacuate intent");
 
@@ -1528,7 +1547,7 @@ mod tests {
         let journal = MemJournal::new();
         let decision = tick_move_decision("stall", FED_A, FED_B);
         journal
-            .upsert(&Intent::from_decision(&decision))
+            .upsert(&Intent::from_decision(&decision, Actor::User, 0))
             .await
             .expect("upsert pending intent");
 
@@ -1554,7 +1573,7 @@ mod tests {
     async fn tick_rejects_already_terminal_same_occurrence_replays() {
         let (runtime, journal) = runtime_fixture().await;
         let decision = tick_move_decision("move-stale", FED_A, FED_B);
-        let mut done = Intent::from_decision(&decision);
+        let mut done = Intent::from_decision(&decision, Actor::User, 0);
         done.status = IntentStatus::Done;
         journal.upsert(&done).await.expect("upsert done intent");
 
@@ -1587,7 +1606,7 @@ mod tests {
         // early with the "advance --occurrence" remedy and `status` surfaces the same signal.
         let (runtime, journal) = runtime_fixture().await;
         let decision = tick_move_decision("move-failed", FED_A, FED_B);
-        let mut failed = Intent::from_decision(&decision);
+        let mut failed = Intent::from_decision(&decision, Actor::User, 0);
         failed.status = IntentStatus::Failed;
         journal.upsert(&failed).await.expect("upsert failed intent");
 
@@ -1618,7 +1637,7 @@ mod tests {
         let (runtime, journal) = runtime_fixture().await;
         let decision = tick_move_decision("move-pending", FED_A, FED_B);
         journal
-            .upsert(&Intent::from_decision(&decision))
+            .upsert(&Intent::from_decision(&decision, Actor::User, 0))
             .await
             .expect("upsert pending intent");
 
@@ -1631,6 +1650,26 @@ mod tests {
             .ensure_fresh_tick_decisions(std::slice::from_ref(&decision), Occurrence(0))
             .await
             .expect("pending same-occurrence tick remains retryable");
+    }
+
+    /// §8: the operator verbs stamp `Actor::User` + `ReasonCode::UserInitiated` on the intent
+    /// they journal (replacing the old hardcoded dummy reason). With no federation joined the
+    /// two-leg drive fails retryably and leaves the intent `Pending`, but the journaled intent
+    /// already carries the ledger identity.
+    #[tokio::test]
+    async fn user_move_intent_carries_user_actor_and_reason() {
+        let (runtime, journal) = runtime_fixture().await;
+        let outcome = runtime
+            .do_move(FED_A, FED_B, Msat(10_000), Msat(500), Occurrence(0))
+            .await
+            .expect("do_move returns even when the drive is retryable");
+        let intent = journal
+            .get(&outcome.key)
+            .await
+            .expect("get")
+            .expect("the move intent is journaled");
+        assert_eq!(intent.actor, Actor::User);
+        assert_eq!(intent.reason, ReasonCode::UserInitiated);
     }
 
     #[tokio::test]

@@ -11,8 +11,8 @@ use futures::StreamExt;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Barrier;
 use wallet_core::{
-    reconcile, Action, ExecError, Executor, FederationId, IdempotencyKey, Intent, IntentStatus,
-    Journal, MockExecutor, Msat, PerformOutcome,
+    reconcile, Action, Actor, ExecError, Executor, FederationId, IdempotencyKey, Intent,
+    IntentStatus, Journal, MockExecutor, Msat, PerformOutcome, ReasonCode,
 };
 use wallet_fedimint::{
     FederationInfo, FedimintJournal, GatewayUrl, Invoice, MovePhase, MoveRecord, OperationId,
@@ -38,6 +38,9 @@ fn intent(key: &str, status: IntentStatus) -> Intent {
         },
         max_fee: Some(Msat(2_000)),
         status,
+        reason: ReasonCode::UserInitiated,
+        actor: Actor::User,
+        created_at_ms: 0,
     }
 }
 
@@ -115,7 +118,7 @@ async fn set_status_moves_between_indexes() {
     assert!(!has_key(&journal.failed().await, "k2"));
 
     journal
-        .set_status(&i.idempotency_key, IntentStatus::Failed)
+        .set_status(&i.idempotency_key, IntentStatus::Failed, None)
         .await
         .expect("set_status");
 
@@ -350,8 +353,9 @@ impl Journal for BarrierJournal {
         &self,
         key: &IdempotencyKey,
         status: IntentStatus,
+        error: Option<&str>,
     ) -> Result<(), ExecError> {
-        self.inner.set_status(key, status).await
+        self.inner.set_status(key, status, error).await
     }
 
     async fn set_status_if(
@@ -786,7 +790,7 @@ async fn awaiting_intents_are_scannable_for_resume() {
     // Once it returns Awaiting (invoice surfaced, payer external), it leaves pending() and
     // becomes discoverable by awaiting() for subscription rehydration (spec §9.3).
     journal
-        .set_status(&key, IntentStatus::Awaiting)
+        .set_status(&key, IntentStatus::Awaiting, None)
         .await
         .expect("set awaiting");
     assert!(has_key(
@@ -798,7 +802,7 @@ async fn awaiting_intents_are_scannable_for_resume() {
 
     // The recv_op subscription finally settles it (→ Done): it leaves every index.
     journal
-        .set_status(&key, IntentStatus::Done)
+        .set_status(&key, IntentStatus::Done, None)
         .await
         .expect("set done");
     assert!(!has_key(

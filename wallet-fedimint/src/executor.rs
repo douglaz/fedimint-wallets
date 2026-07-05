@@ -631,7 +631,7 @@ impl FedimintExecutor {
 #[async_trait]
 impl Executor for FedimintExecutor {
     async fn perform(&self, intent: &Intent) -> Result<PerformOutcome, ExecError> {
-        // Only the advisory `RefuseInflow`/`Cap` actions map to `None` → `Unsupported` (§7);
+        // Only the advisory `RefuseInflow` action maps to `None` → `Unsupported` (§7);
         // `Move`/`Evacuate`/`DirectInflow` all yield an executable plan.
         let Some(plan) = MovePlan::from_action(&intent.action) else {
             return Err(ExecError::Unsupported);
@@ -1415,7 +1415,7 @@ mod tests {
     use fedimint_bip39::Mnemonic;
     use fedimint_core::db::mem_impl::MemDatabase;
     use fedimint_core::db::IRawDatabaseExt as _;
-    use wallet_core::{Action, IdempotencyKey, IntentStatus};
+    use wallet_core::{Action, Actor, IdempotencyKey, IntentStatus, ReasonCode};
 
     const FED_A: FederationId = FederationId([0xAA; 32]);
     const FED_B: FederationId = FederationId([0xBB; 32]);
@@ -1437,6 +1437,9 @@ mod tests {
             action,
             max_fee,
             status: IntentStatus::Pending,
+            reason: ReasonCode::UserInitiated,
+            actor: Actor::User,
+            created_at_ms: 0,
         }
     }
 
