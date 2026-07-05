@@ -744,9 +744,18 @@ evacuate an entire dying-fed balance into a scorer-REJECTED fed (e.g. a joined 1
    scorer verdict it already computes per fed; `assemble_status` (probe-only callers) sets
    `false` — snapshot assembly is the only place the verdict exists.
 2. `eligible_for_evacuation` additionally requires `fed.eligible_to_fund`.
-3. Golden: a scorer-rejected fed with a live gateway is never chosen as an evacuation
+3. **Pin refinement (found by the live evacuate gate, 2026-07-05):** an operator-PINNED
+   `--spending`/`--standby` fed gets `eligible_to_fund = true` regardless of the verdict —
+   an explicit pin is the operator vouching for that exact fed (the same semantics that
+   already exempt pins from scorer auto-designation), and without it a pinned standby on a
+   scorer-rejected network (devimint is regtest) turns every evacuation into a refusal. The
+   gate exists for the FALLBACK scan — money must never drain into a scorer-rejected fed
+   the operator never chose. `receive_blocker` (liveness/route) still applies to pins;
+   auto-designation still uses the raw verdict (a pin never makes a fed auto-designatable).
+4. Goldens: a scorer-rejected fed with a live gateway is never chosen as an evacuation
    destination; with no vetted destination the decision degrades to `RefuseInflow` (existing
-   modeled behavior).
+   modeled behavior); a PINNED scorer-rejected standby IS an eligible destination while the
+   same fed unpinned is not.
 
 ### 15.4 Deterministic send rejections are Permanent (`multi_client.rs`, `executor.rs`) — review P1-4
 `map_send_result` collapses every non-dedup `SendPaymentError` into one `anyhow` error and
