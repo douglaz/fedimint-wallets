@@ -6,15 +6,22 @@
 //! pure functions here: [`next_step`] (what side effect a move needs next) and
 //! [`assemble_move_record`] (rebuild the derived record from its durable sources).
 
-use crate::types::{GatewayUrl, Invoice, OperationId};
+use crate::types::{GatewayUrl, Invoice, OperationId, Preimage};
 use wallet_core::{Action, FederationId, IdempotencyKey, Msat};
 
 /// Where a move currently sits in its lifecycle (spec §3.3).
 ///
 /// `Created`/`Invoiced`/`Sending` are derivable from which op-ids/invoice are known.
-/// The terminal phases — `Settled`/`Refunded`/`Failed` — encode the SETTLEMENT outcome,
-/// which is learned by awaiting the operations, not from the presence of op-ids; they
-/// are therefore preserved across re-assembly (§5).
+/// The terminal phases — `Settled`/`Refunded`/`Failed`/`Stranded` — encode the SETTLEMENT
+/// outcome, which is learned by awaiting the operations, not from the presence of op-ids;
+/// they are therefore preserved across re-assembly (§5).
+///
+/// `Stranded` (spec §3, settled decision 3) is the misbehaving-gateway terminal: A's send
+/// SETTLED (we hold the preimage) but B's receive was NOT credited (expired/failed op). It is
+/// terminal like `Refunded`/`Failed` — an op-log-terminal receive cannot be fixed by
+/// re-driving — but DISTINCT so the ledger/UI can say "debited, not credited — payment proof
+/// saved" rather than a silent loss; the preimage on the [`MoveRecord`] is the durable
+/// recovery artifact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MovePhase {
     Created,
@@ -23,6 +30,7 @@ pub enum MovePhase {
     Settled,
     Refunded,
     Failed,
+    Stranded,
 }
 
 /// The next side effect a move needs, computed purely from a [`MoveRecord`] (spec §3.3).
@@ -57,6 +65,21 @@ pub struct MoveRecord {
     pub send_op: Option<OperationId>,
     pub phase: MovePhase,
     pub outcome: Option<String>,
+    /// The send leg's settlement preimage — proof A's payment settled (spec §3). Persisted the
+    /// instant `await_send` returns `Success`, BEFORE the receive is awaited, so a crash can
+    /// never lose the recovery artifact for a [`MovePhase::Stranded`] move. `None` until the
+    /// send settles (and for a receive-only `DirectInflow`, which has no send leg).
+    pub preimage: Option<Preimage>,
+    /// The receive-side fee quote (gateway + federation), set at `CreateInvoice` when the
+    /// invoice is sized (spec §2.3). Named QUOTED: it is the actual paid cost only when the
+    /// receive CLAIMS (the invoice is fixed); on a never-paid / refunded / stranded / cap-refused
+    /// row it is what the move WOULD have cost. `None` until the invoice is sized.
+    pub receive_fee_quoted: Option<Msat>,
+    /// The send-side fee quote (gateway + federation), set at `Pay` BEFORE the cap check (spec
+    /// §2.3), so a "fee over cap" refusal — which returns before any send commits — is still
+    /// explained in history. `None` for a receive-only `DirectInflow` and until the send is
+    /// quoted.
+    pub send_fee_quoted: Option<Msat>,
 }
 
 /// Which leg of a move an op-log artifact belongs to (spec §4). A cross-fed move spans
@@ -206,6 +229,15 @@ pub struct MoveMeta {
     pub to: FederationId,
 }
 
+/// Extra `custom_meta` key committed on RECEIVE ops for the §15.7 crash-resume TOCTOU guard.
+///
+/// It is intentionally outside [`MoveMeta`]'s core shape: send ops do not carry it, and
+/// serde ignores the key when backfill decodes the ordinary move metadata. The value is the
+/// exact contract amount the quote solver expected before minting; because it is committed
+/// atomically with the receive op, a resume after `receive` committed can still compare the
+/// durable contract against the quote before surfacing or paying the invoice.
+pub const RECEIVE_CONTRACT_QUOTED_META_KEY: &str = "receive_contract_quoted";
+
 impl MoveMeta {
     /// Serialize to the `serde_json::Value` that lnv2 `receive`/`send` commit as
     /// `custom_meta`. Infallible in practice (all fields are plain serde types).
@@ -219,6 +251,32 @@ impl MoveMeta {
     /// malformed and warns; that discrimination lives at the `backfill_ops` call site.
     pub fn from_value(value: &serde_json::Value) -> Option<MoveMeta> {
         serde_json::from_value(value.clone()).ok()
+    }
+
+    /// Serialize receive-leg metadata with the quoted contract amount needed by the §15.7
+    /// committed-contract check. Backfill still decodes the ordinary [`MoveMeta`] fields from this
+    /// value because unknown JSON keys are ignored.
+    pub fn receive_value_with_contract_quote(&self, quoted_contract: Msat) -> serde_json::Value {
+        let mut value = self.to_value();
+        let object = value
+            .as_object_mut()
+            .expect("MoveMeta serializes to a JSON object");
+        object.insert(
+            RECEIVE_CONTRACT_QUOTED_META_KEY.to_string(),
+            serde_json::to_value(quoted_contract).expect("Msat is serializable"),
+        );
+        value
+    }
+
+    /// Extract the quoted receive contract amount from `custom_meta`. Missing means the op was
+    /// not created by the §15.7-aware receive path; malformed means the op metadata is corrupt.
+    pub fn receive_contract_quote_from_value(
+        value: &serde_json::Value,
+    ) -> Result<Option<Msat>, serde_json::Error> {
+        value
+            .get(RECEIVE_CONTRACT_QUOTED_META_KEY)
+            .map(|quoted| serde_json::from_value(quoted.clone()))
+            .transpose()
     }
 }
 
@@ -251,7 +309,9 @@ pub fn next_step(rec: &MoveRecord) -> MoveStep {
     );
     match rec.phase {
         MovePhase::Settled => return MoveStep::Done,
-        MovePhase::Refunded | MovePhase::Failed => return MoveStep::Failed,
+        // `Stranded` (spec §3) shares the terminal `Failed` surface: `perform` returns
+        // `Permanent(outcome)`, naming the debited-not-credited state with its saved preimage.
+        MovePhase::Refunded | MovePhase::Failed | MovePhase::Stranded => return MoveStep::Failed,
         MovePhase::Created | MovePhase::Invoiced | MovePhase::Sending => {}
     }
     if rec.invoice.is_none() && rec.send_op.is_none() {
@@ -330,6 +390,12 @@ pub fn assemble_move_record(
     let cached_send_op = cached.as_ref().and_then(|c| c.send_op);
     let cached_phase = cached.as_ref().map(|c| c.phase);
     let cached_outcome = cached.as_ref().and_then(|c| c.outcome.clone());
+    // The preimage and the fee quotes are executor-persisted facts that op artifacts do NOT
+    // carry (the op-log has no notion of our fee_cap accounting or the settled preimage), so
+    // like `outcome` they survive re-assembly only via the cache (spec §2.3/§3).
+    let cached_preimage = cached.as_ref().and_then(|c| c.preimage);
+    let cached_receive_fee_quoted = cached.as_ref().and_then(|c| c.receive_fee_quoted);
+    let cached_send_fee_quoted = cached.as_ref().and_then(|c| c.send_fee_quoted);
     let mut artifact_amount = None;
 
     for artifact in artifacts.iter().filter(|a| a.move_id == params.key) {
@@ -391,6 +457,9 @@ pub fn assemble_move_record(
         send_op,
         phase,
         outcome: cached_outcome,
+        preimage: cached_preimage,
+        receive_fee_quoted: cached_receive_fee_quoted,
+        send_fee_quoted: cached_send_fee_quoted,
     }
 }
 
@@ -399,7 +468,11 @@ pub fn assemble_move_record(
 /// not carry) is preserved: re-deriving from op-ids alone must not un-settle a finished
 /// move.
 fn derive_phase(cached: Option<MovePhase>, has_invoice: bool, has_send_op: bool) -> MovePhase {
-    if let Some(phase @ (MovePhase::Settled | MovePhase::Refunded | MovePhase::Failed)) = cached {
+    if let Some(
+        phase
+        @ (MovePhase::Settled | MovePhase::Refunded | MovePhase::Failed | MovePhase::Stranded),
+    ) = cached
+    {
         return phase;
     }
     match (has_invoice, has_send_op) {

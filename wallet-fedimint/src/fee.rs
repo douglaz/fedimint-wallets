@@ -72,8 +72,10 @@ pub struct GrossUp {
 /// amount however large the invoice. [`gross_up`] returns `None` at or above this rate rather
 /// than searching to `u64::MAX` on a broken/hostile gateway's advertised fee (spec §6). This
 /// is the exact convergence boundary: a base fee and the (bounded) federation fee are constant
-/// offsets that only grow the invoice, so any `ppm < 1_000_000` is solvable.
-const UNSOLVABLE_GATEWAY_PPM: u64 = 1_000_000;
+/// offsets that only grow the invoice, so any `ppm < 1_000_000` is solvable. Public so the
+/// executor's `solve_gross_up` can tell this cause apart from a doubling-exhausted `None`
+/// (spec §15.11) when it explains an unsolvable receive.
+pub const UNSOLVABLE_GATEWAY_PPM: u64 = 1_000_000;
 
 /// Solve the §6 receive-side fixed point: find the smallest `invoice_amount` such that,
 /// after the gateway's cut and the federation's tx fee, the recipient nets EXACTLY `net`

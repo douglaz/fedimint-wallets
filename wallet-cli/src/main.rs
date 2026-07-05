@@ -168,7 +168,7 @@ enum Command {
         occurrence: u64,
     },
     /// Re-drive pending intents and rebuild move records from the op-log (spec §9 resume loop):
-    /// print performed/failed/skipped/awaiting counts; awaiting intent keys go to stderr.
+    /// print performed/failed/skipped/retryable/awaiting counts; awaiting intent keys go to stderr.
     Reconcile {
         /// Per-fed balance cap to enforce while resuming pending pre-mint intents. Use the same
         /// value that authorized the original tick when reconciling work from `tick --per-fed-cap`.
@@ -522,10 +522,16 @@ async fn main() -> anyhow::Result<()> {
                 perform_timeout,
             );
             let summary = runtime.reconcile().await?;
-            // Counts -> stdout (the scriptable result); awaiting keys -> stderr (handles).
+            // Counts -> stdout (the scriptable result); awaiting keys -> stderr (handles). §15.11:
+            // `retryable` is the subset of `failed` left Pending for a later pass, so a scheduler
+            // looping reconcile can tell a transient retry from a terminal `failed − retryable`.
             println!(
-                "performed={} failed={} skipped={} awaiting={}",
-                summary.performed, summary.failed, summary.skipped, summary.awaiting
+                "performed={} failed={} skipped={} retryable={} awaiting={}",
+                summary.performed,
+                summary.failed,
+                summary.skipped,
+                summary.retryable,
+                summary.awaiting
             );
             for key in &summary.awaiting_keys {
                 eprintln!("awaiting: {}", key.0);
@@ -547,11 +553,12 @@ async fn main() -> anyhow::Result<()> {
             // Decisions + the apply summary -> stdout (the scriptable result).
             print_decisions(&report.decisions);
             println!(
-                "performed={} skipped={} failed={} terminal_failed_skipped={}",
+                "performed={} skipped={} failed={} terminal_failed_skipped={} retryable={}",
                 report.summary.performed,
                 report.summary.skipped,
                 report.summary.failed,
-                report.summary.terminal_failed_skipped
+                report.summary.terminal_failed_skipped,
+                report.summary.retryable
             );
             // A tick IS a money operation: if any decision failed to apply, exit NON-ZERO — the
             // same stance `move`/`await-move`/`direct-inflow` take — so a scheduled caller gating
@@ -675,14 +682,17 @@ fn tick_apply_failure(summary: &ExecutionSummary) -> Option<String> {
     (summary.failed > 0 || summary.terminal_failed_skipped > 0).then(|| {
         format!(
             "tick: {} decision(s) did not apply (performed={} skipped={} failed={} \
-             terminal_failed_skipped={}); check stderr for per-intent reasons. Retryable failures \
-             can be re-driven with reconcile or the same --occurrence; terminal Failed intents \
-             require correcting the input/route and starting a fresh --occurrence",
+             terminal_failed_skipped={} retryable={}); check stderr for per-intent reasons. \
+             Retryable failures ({} of failed) can be re-driven with reconcile or the same \
+             --occurrence; terminal Failed intents require correcting the input/route and \
+             starting a fresh --occurrence",
             summary.failed + summary.terminal_failed_skipped,
             summary.performed,
             summary.skipped,
             summary.failed,
-            summary.terminal_failed_skipped
+            summary.terminal_failed_skipped,
+            summary.retryable,
+            summary.retryable
         )
     })
 }
@@ -1023,13 +1033,25 @@ fn hex_nibble(c: u8) -> anyhow::Result<u8> {
 /// Load the wallet's mnemonic from `db`, or generate + persist a new one. Mirrors
 /// `fedimint-cli`'s own `load_or_generate_mnemonic`, verified against
 /// `~/p/fedimint/fedimint-cli/src/lib.rs`.
+///
+/// §15.11: use `load_decodable_client_secret_opt`, which cleanly separates the three cases —
+/// ABSENT (`Ok(None)`) → first run, generate + persist; PRESENT + decodable (`Ok(Some)`) → reuse;
+/// PRESENT but corrupt (`Err`) → ABORT naming the decode failure. The old `if let Ok(..)` form
+/// collapsed the last two, so a corrupt row fell through to the generate path and surfaced only as
+/// a misleading "already exists, cannot overwrite" abort from the SDK's overwrite guard (no silent
+/// regeneration is possible either way — the SDK refuses to overwrite an existing secret).
 async fn load_or_generate_mnemonic(db: &Database) -> anyhow::Result<Mnemonic> {
-    if let Ok(entropy) = Client::load_decodable_client_secret::<Vec<u8>>(db).await {
-        return Ok(Mnemonic::from_entropy(&entropy)?);
+    match Client::load_decodable_client_secret_opt::<Vec<u8>>(db).await {
+        Ok(Some(entropy)) => Ok(Mnemonic::from_entropy(&entropy)?),
+        Ok(None) => {
+            let mnemonic = Bip39RootSecretStrategy::<12>::random(&mut rand::thread_rng());
+            Client::store_encodable_client_secret(db, mnemonic.to_entropy()).await?;
+            Ok(mnemonic)
+        }
+        Err(e) => {
+            Err(e.context("wallet client secret is present in the database but failed to decode"))
+        }
     }
-    let mnemonic = Bip39RootSecretStrategy::<12>::random(&mut rand::thread_rng());
-    Client::store_encodable_client_secret(db, mnemonic.to_entropy()).await?;
-    Ok(mnemonic)
 }
 
 #[cfg(test)]
@@ -1038,6 +1060,49 @@ mod tests {
 
     fn fed(byte: u8) -> FederationId {
         FederationId([byte; 32])
+    }
+
+    /// §15.11: a PRESENT-but-corrupt client-secret row must abort NAMING the decode failure, never
+    /// fall through to the generate path (where the SDK's overwrite guard would surface a
+    /// misleading "already exists" error). Store a 64-byte fixed array — its consensus encoding is
+    /// 64 raw bytes with no length prefix, so reading it back as a length-prefixed `Vec<u8>` leaves
+    /// trailing bytes and the whole-buffer decode fails: exactly the corrupt-row case.
+    #[tokio::test]
+    async fn corrupt_client_secret_row_aborts_naming_the_decode_failure() {
+        use fedimint_core::db::mem_impl::MemDatabase;
+        use fedimint_core::db::IRawDatabaseExt as _;
+
+        let db = MemDatabase::new().into_database();
+        Client::store_encodable_client_secret(&db, [0u8; 64])
+            .await
+            .expect("store a raw-array secret that is not a valid Vec<u8> encoding");
+
+        let err = load_or_generate_mnemonic(&db)
+            .await
+            .expect_err("a corrupt secret row must abort, not regenerate");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to decode") || msg.to_lowercase().contains("decod"),
+            "the abort must name the decode failure, got: {msg}"
+        );
+    }
+
+    /// The absent-row case: a fresh database has no secret, so the helper generates + persists one
+    /// and returns it (the normal first-run path, distinct from the corrupt-row abort above).
+    #[tokio::test]
+    async fn absent_client_secret_row_generates_a_fresh_mnemonic() {
+        use fedimint_core::db::mem_impl::MemDatabase;
+        use fedimint_core::db::IRawDatabaseExt as _;
+
+        let db = MemDatabase::new().into_database();
+        let first = load_or_generate_mnemonic(&db)
+            .await
+            .expect("absent row generates a fresh mnemonic");
+        // Persisted: a second load returns the SAME mnemonic (not a fresh one).
+        let second = load_or_generate_mnemonic(&db)
+            .await
+            .expect("the generated secret is reused on the next load");
+        assert_eq!(first.to_entropy(), second.to_entropy());
     }
 
     #[test]
@@ -1203,21 +1268,25 @@ mod tests {
             skipped: 1,
             failed: 0,
             terminal_failed_skipped: 0,
+            retryable: 0,
         };
         assert!(tick_apply_failure(&clean).is_none());
 
         // Any failed decision (a retryable `Pending` OR a permanent `Failed`, both counted as
         // `failed` by `apply`) must produce a non-zero-exit message, matching the money-op
-        // exit-code convention `move`/`await-move`/`direct-inflow` already follow.
+        // exit-code convention `move`/`await-move`/`direct-inflow` already follow. Here the single
+        // failure is retryable, so the message surfaces the `retryable` sub-count (§15.11).
         let failed = ExecutionSummary {
             performed: 1,
             skipped: 0,
             failed: 1,
             terminal_failed_skipped: 0,
+            retryable: 1,
         };
         let msg = tick_apply_failure(&failed).expect("a failed decision must fail the tick");
         assert!(msg.contains("did not apply"), "{msg}");
         assert!(msg.contains("failed=1"), "{msg}");
+        assert!(msg.contains("retryable=1"), "{msg}");
         assert!(msg.contains("Retryable failures"), "{msg}");
 
         let terminal_skip = ExecutionSummary {
@@ -1225,6 +1294,7 @@ mod tests {
             skipped: 1,
             failed: 0,
             terminal_failed_skipped: 1,
+            retryable: 0,
         };
         let msg =
             tick_apply_failure(&terminal_skip).expect("a terminal Failed skip must fail the tick");

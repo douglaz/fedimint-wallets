@@ -75,12 +75,15 @@ pub enum FinalizeOutcome {
 /// Counts + keys from a [`Runtime::reconcile`] pass (spec §9). `performed`/`failed`/`skipped`
 /// come from the `wallet_core::reconcile` re-drive of pending intents; `awaiting` is the set of
 /// `DirectInflow` intents whose external payer has not settled — reported (not re-driven) so the
-/// operator can `await-move` each.
+/// operator can `await-move` each. `retryable` is the §15.11 subset of `failed` that was left
+/// `Pending` for a later retry (a transient timeout/transport fault), so a scheduler driving
+/// `reconcile` in a loop can tell "will clear on a later pass" from a terminal `failed − retryable`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReconcileSummary {
     pub performed: usize,
     pub failed: usize,
     pub skipped: usize,
+    pub retryable: usize,
     pub awaiting: usize,
     pub awaiting_keys: Vec<IdempotencyKey>,
 }
@@ -489,6 +492,7 @@ impl Runtime {
             performed: exec.performed,
             failed: exec.failed,
             skipped: exec.skipped,
+            retryable: exec.retryable,
             awaiting: awaiting.len(),
             awaiting_keys: awaiting
                 .into_iter()
@@ -1134,6 +1138,9 @@ mod tests {
             send_op: None,
             phase,
             outcome: outcome.map(str::to_string),
+            preimage: None,
+            receive_fee_quoted: None,
+            send_fee_quoted: None,
         }
     }
 

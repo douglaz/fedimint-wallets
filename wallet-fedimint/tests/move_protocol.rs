@@ -7,7 +7,7 @@
 use wallet_core::{FederationId, IdempotencyKey, Msat};
 use wallet_fedimint::{
     assemble_move_record, next_step, GatewayUrl, Invoice, Leg, MoveParams, MovePhase, MoveRecord,
-    MoveStep, OpArtifact, OperationId,
+    MoveStep, OpArtifact, OperationId, Preimage,
 };
 
 const FED_A: FederationId = FederationId([0xAA; 32]);
@@ -49,6 +49,9 @@ fn fresh_move(k: &str) -> MoveRecord {
         send_op: None,
         phase: MovePhase::Created,
         outcome: None,
+        preimage: None,
+        receive_fee_quoted: None,
+        send_fee_quoted: None,
     }
 }
 
@@ -153,6 +156,9 @@ fn direct_inflow_skips_pay() {
         send_op: None,
         phase: MovePhase::Created,
         outcome: None,
+        preimage: None,
+        receive_fee_quoted: None,
+        send_fee_quoted: None,
     };
     assert_eq!(next_step(&rec), MoveStep::CreateInvoice);
 
@@ -184,6 +190,11 @@ fn terminal_phases() {
     assert_eq!(next_step(&rec), MoveStep::Failed);
 
     rec.phase = MovePhase::Refunded;
+    assert_eq!(next_step(&rec), MoveStep::Failed);
+
+    // §3: `Stranded` (send settled, receive not credited) is terminal — it routes to the same
+    // `Failed` surface (`perform` returns `Permanent(outcome)`), NOT back to a step.
+    rec.phase = MovePhase::Stranded;
     assert_eq!(next_step(&rec), MoveStep::Failed);
 
     // A terminal phase is decided FIRST: even a record missing its invoice does not
@@ -308,6 +319,9 @@ fn assemble_does_not_blank_existing_leg() {
         send_op: Some(SEND_OP),
         phase: MovePhase::Sending,
         outcome: None,
+        preimage: None,
+        receive_fee_quoted: None,
+        send_fee_quoted: None,
     };
     let params = MoveParams {
         key: k.clone(),
@@ -370,6 +384,9 @@ fn assemble_preserves_cached_terminal_phase() {
         (MovePhase::Settled, MoveStep::Done),
         (MovePhase::Failed, MoveStep::Failed),
         (MovePhase::Refunded, MoveStep::Failed),
+        // §3: `Stranded` is a terminal phase, so `derive_phase` (via `assemble_move_record`)
+        // must preserve it and `next_step` route it to the terminal `Failed` surface.
+        (MovePhase::Stranded, MoveStep::Failed),
     ] {
         let k = key(&format!("move-terminal-{phase:?}"));
         let cached = MoveRecord {
@@ -385,6 +402,9 @@ fn assemble_preserves_cached_terminal_phase() {
             send_op: Some(SEND_OP),
             phase,
             outcome: Some(format!("{phase:?}")),
+            preimage: None,
+            receive_fee_quoted: None,
+            send_fee_quoted: None,
         };
         let params = MoveParams {
             key: k,
@@ -403,6 +423,68 @@ fn assemble_preserves_cached_terminal_phase() {
         assert_eq!(rec.send_op, Some(SEND_OP));
         assert_eq!(rec.fee_cap, Msat(777));
     }
+}
+
+/// §2.3/§3: the preimage and the two fee quotes are executor-persisted facts that op
+/// artifacts do NOT carry, so — like the terminal `outcome` — they must survive re-assembly
+/// via the cache. A `Stranded` record carrying its saved preimage and both quotes, re-assembled
+/// with a fresh backfill of its receive+send artifacts, must keep all three (else a resume would
+/// lose the recovery proof and the history's fee accounting).
+#[test]
+fn assemble_keeps_cached_preimage_and_fee_quotes() {
+    let k = key("move-preimage-fees");
+    let cached = MoveRecord {
+        key: k.clone(),
+        from: Some(FED_A),
+        to: FED_B,
+        amount: Msat(100_000),
+        fee_cap: Msat(2_000),
+        gateway: gateway(),
+        send_required: true,
+        invoice: Some(invoice()),
+        recv_op: Some(RECV_OP),
+        send_op: Some(SEND_OP),
+        phase: MovePhase::Stranded,
+        outcome: Some("send settled but receive was not credited".to_string()),
+        preimage: Some(Preimage([0x5c; 32])),
+        receive_fee_quoted: Some(Msat(120)),
+        send_fee_quoted: Some(Msat(340)),
+    };
+    let params = MoveParams {
+        key: k.clone(),
+        from: Some(FED_A),
+        to: FED_B,
+        amount: Msat(100_000),
+        fee_cap: Msat(2_000),
+        gateway: gateway(),
+        send_required: true,
+    };
+    // A fresh backfill re-supplies both op legs but NOT the preimage/fee quotes.
+    let artifacts = vec![
+        OpArtifact {
+            move_id: k.clone(),
+            leg: Leg::Receive,
+            op_id: RECV_OP,
+            amount: Msat(100_000),
+            invoice: Some(invoice()),
+        },
+        OpArtifact {
+            move_id: k,
+            leg: Leg::Send,
+            op_id: SEND_OP,
+            amount: Msat(100_000),
+            invoice: None,
+        },
+    ];
+
+    let rec = assemble_move_record(params, &artifacts, Some(cached));
+
+    assert_eq!(rec.preimage, Some(Preimage([0x5c; 32])));
+    assert_eq!(rec.receive_fee_quoted, Some(Msat(120)));
+    assert_eq!(rec.send_fee_quoted, Some(Msat(340)));
+    // The terminal phase is preserved alongside them, so the move stays terminal on resume.
+    assert_eq!(rec.phase, MovePhase::Stranded);
+    assert_eq!(next_step(&rec), MoveStep::Failed);
 }
 
 /// A fresh `Evacuate` may be sized DOWN by the executor (reserving the fees the dying
@@ -437,6 +519,9 @@ fn assemble_keeps_cached_downsized_amount() {
         send_op: None,
         phase: MovePhase::Created,
         outcome: None,
+        preimage: None,
+        receive_fee_quoted: None,
+        send_fee_quoted: None,
     };
 
     // The exact crash window: the receive op committed (backfill recovers it), but the
@@ -537,6 +622,9 @@ fn assemble_partial_backfill_send_leg_does_not_blank_receive() {
         send_op: None,
         phase: MovePhase::Invoiced,
         outcome: None,
+        preimage: None,
+        receive_fee_quoted: None,
+        send_fee_quoted: None,
     };
     let params = MoveParams {
         key: k.clone(),
@@ -650,6 +738,9 @@ fn assemble_invoice_less_receive_artifact_never_half_states() {
         send_op: None,
         phase: MovePhase::Invoiced,
         outcome: None,
+        preimage: None,
+        receive_fee_quoted: None,
+        send_fee_quoted: None,
     };
     let rec = assemble_move_record(params(), &bad_receive(), Some(cached));
     assert_eq!(rec.recv_op, Some(RECV_OP));

@@ -46,6 +46,24 @@ fn counts(performed: usize, skipped: usize, failed: usize) -> ExecutionSummary {
         skipped,
         failed,
         terminal_failed_skipped: 0,
+        retryable: 0,
+    }
+}
+
+/// Like [`counts`] but with the §15.11 `retryable` sub-count set (`retryable` is a subset of
+/// `failed`, so a purely-retryable pass is `counts_with_retryable(p, s, failed, failed)`).
+fn counts_with_retryable(
+    performed: usize,
+    skipped: usize,
+    failed: usize,
+    retryable: usize,
+) -> ExecutionSummary {
+    ExecutionSummary {
+        performed,
+        skipped,
+        failed,
+        terminal_failed_skipped: 0,
+        retryable,
     }
 }
 
@@ -60,6 +78,7 @@ fn counts_with_terminal_failed_skipped(
         skipped,
         failed,
         terminal_failed_skipped,
+        retryable: 0,
     }
 }
 
@@ -461,9 +480,11 @@ async fn retryable_failure_stays_pending_and_reconcile_retries() {
     let executor = MockExecutor::new();
     executor.fail_retryable(key);
 
+    // §15.11: a retryable failure counts in `failed` AND in the `retryable` sub-count, so a
+    // scheduler can tell "left Pending, will retry" apart from a terminal money-op failure.
     assert_eq!(
         apply(&journal, &executor, &decisions).await,
-        counts(0, 0, 1)
+        counts_with_retryable(0, 0, 1, 1)
     );
     // A Retryable error leaves the intent Pending (NOT Failed), so reconcile retries it.
     assert_eq!(
@@ -666,6 +687,7 @@ async fn concurrent_drive_performs_once() {
         skipped: a.skipped + b.skipped,
         failed: a.failed + b.failed,
         terminal_failed_skipped: a.terminal_failed_skipped + b.terminal_failed_skipped,
+        retryable: a.retryable + b.retryable,
     };
     assert_eq!(
         combined,
