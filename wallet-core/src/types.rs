@@ -47,6 +47,11 @@ pub struct IdempotencyKey(pub String);
 /// Structured per-federation balance (T13), at msat granularity. The allocator
 /// decides on `spendable`; the other fields exist so the model can later account for
 /// fees/caps/retries without another balance-shape rewrite.
+///
+/// `in_flight`/`claimable`/`reserved_fee` are carried but not yet read by `decide()`
+/// (§5.4): a conscious shape-stability trade-off — keeping them here means the later
+/// fee/cap/retry accounting does not force another balance-shape rewrite. A fresh probe
+/// sets them to zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FedBalance {
     pub spendable: Msat,
@@ -63,10 +68,21 @@ pub struct FederationStatus {
     pub reputation: i32,
     pub shutdown_notice: bool,
     pub healthy: bool,
+    /// The scorer's fundability verdict for this fed (§15.3): whether it passed the
+    /// structural + probe gate. Snapshot assembly (`build_snapshot`) is the only place
+    /// the verdict exists, so probe-only assemblers set it `false`. Gates evacuation
+    /// DESTINATIONS (`eligible_for_evacuation`) — the allocator will not drain a dying
+    /// fed into a scorer-rejected one (e.g. a joined 1-of-1) just because it is reachable.
+    pub eligible_to_fund: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AllocatorSnapshot {
+    /// Every probed federation, one status each. Iteration order is SIGNIFICANT and must
+    /// be STABLE across ticks: `decide()` walks it in order to emit evacuation/refusal
+    /// decisions, so the order feeds decision ordering. (The one place order does NOT
+    /// decide the outcome is `safest_other`'s fallback, which picks the smallest
+    /// `FederationId` among eligibles rather than the first in this vec — §4.1.)
     pub federations: Vec<FederationStatus>,
     pub spending_fed: Option<FederationId>,
     pub standby_fed: Option<FederationId>,
@@ -108,15 +124,10 @@ pub enum Action {
         amount: Msat,
         fee_cap: Msat,
     },
-    /// Advisory: do not route the next inflow to `fed`. Never becomes an executor
-    /// `Intent` (see `Action::is_executable`).
+    /// Advisory: do not route the next inflow to `fed` / do not cap allocation here.
+    /// Never becomes an executor `Intent` (see `Action::is_executable`); the ledger's
+    /// `Refusal` kind records the concept.
     RefuseInflow {
-        fed: FederationId,
-        reason: ReasonCode,
-    },
-    /// Advisory: cap further allocation into `fed`. Never becomes an executor
-    /// `Intent`.
-    Cap {
         fed: FederationId,
         reason: ReasonCode,
     },
@@ -124,7 +135,7 @@ pub enum Action {
 
 impl Action {
     /// Whether `apply()` should create an executor `Intent` for this action.
-    /// `RefuseInflow`/`Cap` are policy signals (recorded/surfaced only), not work.
+    /// `RefuseInflow` is a policy signal (recorded/surfaced only), not work.
     pub fn is_executable(&self) -> bool {
         matches!(
             self,
@@ -141,7 +152,7 @@ impl Action {
             Action::Move { fee_cap, .. }
             | Action::Evacuate { fee_cap, .. }
             | Action::DirectInflow { fee_cap, .. } => Some(*fee_cap),
-            Action::RefuseInflow { .. } | Action::Cap { .. } => None,
+            Action::RefuseInflow { .. } => None,
         }
     }
 }
@@ -164,5 +175,4 @@ pub struct AllocatorDecision {
     /// The epoch stamped into `idempotency_key` (T10): see `allocator::decide`.
     pub occurrence: Occurrence,
     pub idempotency_key: IdempotencyKey,
-    pub requires_auth: bool,
 }

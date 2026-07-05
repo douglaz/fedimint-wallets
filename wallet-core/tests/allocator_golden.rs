@@ -10,14 +10,16 @@ macro_rules! balance {
     };
 }
 macro_rules! fed {
-    ($id:expr, $balance:expr, $probed:expr, $shutdown:expr, $healthy:expr) => { fed!($id, $balance, $probed, 0, $shutdown, $healthy) };
-    ($id:expr, $balance:expr, $probed:expr, $reputation:expr, $shutdown:expr, $healthy:expr) => { FederationStatus { id: id!($id), balance: balance!($balance), probed_ok: $probed, reputation: $reputation, shutdown_notice: $shutdown, healthy: $healthy } };
+    // eligible_to_fund defaults to true (a healthy, scorer-eligible fed); the 7-arg form sets it.
+    ($id:expr, $balance:expr, $probed:expr, $shutdown:expr, $healthy:expr) => { fed!($id, $balance, $probed, 0, $shutdown, $healthy, true) };
+    ($id:expr, $balance:expr, $probed:expr, $reputation:expr, $shutdown:expr, $healthy:expr) => { fed!($id, $balance, $probed, $reputation, $shutdown, $healthy, true) };
+    ($id:expr, $balance:expr, $probed:expr, $reputation:expr, $shutdown:expr, $healthy:expr, $elig:expr) => { FederationStatus { id: id!($id), balance: balance!($balance), probed_ok: $probed, reputation: $reputation, shutdown_notice: $shutdown, healthy: $healthy, eligible_to_fund: $elig } };
 }
 macro_rules! snap {
     ([$($fed:expr),*], $spending:expr, $standby:expr, $cap:expr, $target:expr, $standby_target:expr, $now:expr) => { AllocatorSnapshot { federations: vec![$($fed),*], spending_fed: $spending, standby_fed: $standby, per_fed_cap: msat!($cap), target_spending_balance: msat!($target), standby_target: msat!($standby_target), max_fee: msat!(500), now: $now } };
 }
 macro_rules! decision {
-    ($action:expr, $reason:expr, $occurrence:expr, $key:expr) => { vec![AllocatorDecision { action: $action, reason: $reason, occurrence: $occurrence, idempotency_key: $key, requires_auth: false }] };
+    ($action:expr, $reason:expr, $occurrence:expr, $key:expr) => { vec![AllocatorDecision { action: $action, reason: $reason, occurrence: $occurrence, idempotency_key: $key }] };
 }
 macro_rules! move_action {
     ($from:expr, $to:expr, $amount:expr) => { Action::Move { from: id!($from), to: id!($to), amount: msat!($amount), fee_cap: msat!(500) } };
@@ -78,9 +80,11 @@ fn self_fund_standby_is_silent_noop() {
 #[test]
 fn evacuate_on_shutdown_notice() {
     // fed 2 is the configured standby and is healthy/probed: `safest_other` picks it as
-    // the evacuation destination; `amount` is the evacuating fed's own spendable balance.
+    // the evacuation destination. `amount` is the evacuating fed's spendable MINUS its own
+    // `fee_cap` reserve (§4.2): 50_000 − 500 = 49_500, so the executor's `amount + fee_cap`
+    // spend never over-draws the source.
     let snapshot = snap!([fed!(1, 50_000, true, true, true), fed!(2, 30_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 100_000, 0, 3000);
-    assert_eq!(decide(&snapshot, occ(1)), decision!(evacuate!(1, 2, 50_000), ReasonCode::ShutdownNotice, occ(1), evac_key(1, 2, 1)));
+    assert_eq!(decide(&snapshot, occ(1)), decision!(evacuate!(1, 2, 49_500), ReasonCode::ShutdownNotice, occ(1), evac_key(1, 2, 1)));
 }
 
 #[test]
@@ -121,15 +125,16 @@ fn low_reputation_blocks_receive() {
 
 #[test]
 fn cap_and_liquidity_refusals_do_not_collide() {
-    // cap_room=40k, want=50k, available=10k: both OverCap and
-    // SpendingBelowTarget are true policy signals for the same destination.
+    // cap_room=40k, want=50k. The source (fed 2) has 10k spendable, and the TopUp reserves
+    // its own fee_cap (500), so available=9_500 (§4.2). Both OverCap and SpendingBelowTarget
+    // remain true policy signals for the same destination.
     let snapshot = snap!([fed!(1, 60_000, true, false, true), fed!(2, 10_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 110_000, 0, 9000);
     assert_eq!(
         decide(&snapshot, occ(1)),
         vec![
-            AllocatorDecision { action: move_action!(2, 1, 10_000), reason: ReasonCode::SpendingBelowTarget, occurrence: occ(1), idempotency_key: move_key(2, 1, 1), requires_auth: false },
-            AllocatorDecision { action: refuse!(1, ReasonCode::OverCap), reason: ReasonCode::OverCap, occurrence: occ(1), idempotency_key: refuse_key(1, ReasonCode::OverCap, 1), requires_auth: false },
-            AllocatorDecision { action: refuse!(1, ReasonCode::SpendingBelowTarget), reason: ReasonCode::SpendingBelowTarget, occurrence: occ(1), idempotency_key: refuse_key(1, ReasonCode::SpendingBelowTarget, 1), requires_auth: false },
+            AllocatorDecision { action: move_action!(2, 1, 9_500), reason: ReasonCode::SpendingBelowTarget, occurrence: occ(1), idempotency_key: move_key(2, 1, 1) },
+            AllocatorDecision { action: refuse!(1, ReasonCode::OverCap), reason: ReasonCode::OverCap, occurrence: occ(1), idempotency_key: refuse_key(1, ReasonCode::OverCap, 1) },
+            AllocatorDecision { action: refuse!(1, ReasonCode::SpendingBelowTarget), reason: ReasonCode::SpendingBelowTarget, occurrence: occ(1), idempotency_key: refuse_key(1, ReasonCode::SpendingBelowTarget, 1) },
         ]
     );
 }
@@ -164,5 +169,118 @@ fn occurrence_is_stamped_into_the_idempotency_key() {
     assert_ne!(first[0].idempotency_key, second[0].idempotency_key);
     assert_eq!(first[0].idempotency_key, move_key(2, 1, 1));
     assert_eq!(second[0].idempotency_key, move_key(2, 1, 2));
+}
+
+// ---- §4.2 per-tick reservation + §4.1 tie-break + §15.3 eligibility goldens ----
+
+#[test]
+fn two_evacuations_into_one_destination_share_cap_room() {
+    // §4.2: two shutting-down feds evacuate into the same healthy destination (fed 3). The
+    // `credited` reservation makes the SECOND evacuation see the first's pending inbound, so
+    // the two amounts sum to EXACTLY fed 3's cap room and fill it to the cap — never past.
+    let snapshot = snap!([fed!(1, 50_000, true, true, true), fed!(2, 50_000, true, true, true), fed!(3, 40_000, true, false, true)], None, Some(id!(3)), 100_000, 0, 0, 100);
+    let decisions = decide(&snapshot, occ(1));
+    assert_eq!(
+        decisions,
+        vec![
+            AllocatorDecision { action: evacuate!(1, 3, 49_500), reason: ReasonCode::ShutdownNotice, occurrence: occ(1), idempotency_key: evac_key(1, 3, 1) },
+            AllocatorDecision { action: evacuate!(2, 3, 10_500), reason: ReasonCode::ShutdownNotice, occurrence: occ(1), idempotency_key: evac_key(2, 3, 1) },
+        ]
+    );
+    let into_dest: u64 = evac_amounts_into(&decisions, id!(3));
+    let cap_room = 100_000 - 40_000;
+    assert!(into_dest <= cap_room, "evacuations must fit the destination cap room");
+    assert_eq!(40_000 + into_dest, 100_000, "destination is filled to the cap, never over");
+}
+
+#[test]
+fn evacuation_into_standby_plus_topup_never_exceed_cap() {
+    // §4.2: fed 1 evacuates into the standby (fed 2) while fed 2 is ALSO topped up from the
+    // spending surplus (fed 3) in the same tick. The `credited` reservation makes the
+    // standby-funding move see the evacuation's pending inbound, so their joint credit fills
+    // fed 2 to exactly the cap and the residual want is refused as OverCap.
+    let snapshot = snap!([fed!(1, 10_000, true, true, true), fed!(2, 70_000, true, false, true), fed!(3, 100_000, true, false, true)], Some(id!(3)), Some(id!(2)), 100_000, 50_000, 100_000, 200);
+    let decisions = decide(&snapshot, occ(1));
+    assert_eq!(
+        decisions,
+        vec![
+            AllocatorDecision { action: evacuate!(1, 2, 9_500), reason: ReasonCode::ShutdownNotice, occurrence: occ(1), idempotency_key: evac_key(1, 2, 1) },
+            AllocatorDecision { action: move_action!(3, 2, 20_500), reason: ReasonCode::StandbyBelowTarget, occurrence: occ(1), idempotency_key: move_key(3, 2, 1) },
+            AllocatorDecision { action: refuse!(2, ReasonCode::OverCap), reason: ReasonCode::OverCap, occurrence: occ(1), idempotency_key: refuse_key(2, ReasonCode::OverCap, 1) },
+        ]
+    );
+    let into_standby: u64 = evac_amounts_into(&decisions, id!(2)) + move_amounts_into(&decisions, id!(2));
+    assert!(70_000 + into_standby <= 100_000, "evacuation + top-up must not exceed the cap");
+    assert_eq!(70_000 + into_standby, 100_000);
+}
+
+#[test]
+fn per_source_fee_cap_reserve_prevents_overdraw() {
+    // §4.2: the tick emits two moves (two evacuations). Each source is drained by at most its
+    // balance because the per-move `fee_cap` (500) is reserved (`debited[from] += amount +
+    // fee_cap`): the emitted amount is `spendable − fee_cap`, so the executor's
+    // `amount + fee_cap` spend equals the balance exactly and never over-draws. Destination
+    // cap room is huge here so the SOURCE-side reserve is the binding constraint.
+    // (The current allocator emits at most one move per source; the `debited` accounting
+    // generalizes the non-overdraw guarantee to any number of same-source moves.)
+    let snapshot = snap!([fed!(1, 50_000, true, true, true), fed!(2, 30_000, true, true, true), fed!(3, 0, true, false, true)], None, Some(id!(3)), 10_000_000, 0, 0, 300);
+    let decisions = decide(&snapshot, occ(1));
+    assert_eq!(
+        decisions,
+        vec![
+            AllocatorDecision { action: evacuate!(1, 3, 49_500), reason: ReasonCode::ShutdownNotice, occurrence: occ(1), idempotency_key: evac_key(1, 3, 1) },
+            AllocatorDecision { action: evacuate!(2, 3, 29_500), reason: ReasonCode::ShutdownNotice, occurrence: occ(1), idempotency_key: evac_key(2, 3, 1) },
+        ]
+    );
+    // Total drawn from each source = amount + fee_cap; must never exceed the source balance.
+    assert_eq!(drawn_from(&decisions, id!(1)), 50_000);
+    assert_eq!(drawn_from(&decisions, id!(2)), 30_000);
+    assert!(drawn_from(&decisions, id!(1)) <= 50_000);
+    assert!(drawn_from(&decisions, id!(2)) <= 30_000);
+}
+
+#[test]
+fn tie_break_picks_lower_id_when_pinned_standby_ineligible() {
+    // §4.1: the pinned standby (fed 4) is scorer-ineligible, so the fallback runs. Two
+    // eligible destinations tie (fed 2 and fed 3, identical but for id); `safest_other` picks
+    // the SMALLEST id (fed 2) deterministically — NOT the first in `federations` order (fed 3
+    // is listed first), proving the choice is order-independent.
+    let snapshot = snap!([fed!(1, 50_000, true, true, true), fed!(4, 0, true, 0, false, true, false), fed!(3, 0, true, false, true), fed!(2, 0, true, false, true)], None, Some(id!(4)), 100_000, 0, 0, 400);
+    assert_eq!(decide(&snapshot, occ(1)), decision!(evacuate!(1, 2, 49_500), ReasonCode::ShutdownNotice, occ(1), evac_key(1, 2, 1)));
+}
+
+#[test]
+fn scorer_rejected_fed_is_never_an_evacuation_destination() {
+    // §15.3: fed 2 has a live gateway (probed_ok, healthy) and cap room, but the scorer
+    // rejected it (`eligible_to_fund = false`, e.g. a joined 1-of-1). It must NEVER be chosen
+    // as an evacuation destination; with no vetted destination the shutdown condition degrades
+    // to an advisory RefuseInflow rather than draining fed 1 into a distrusted fed.
+    let snapshot = snap!([fed!(1, 50_000, true, true, true), fed!(2, 40_000, true, 0, false, true, false)], None, Some(id!(2)), 100_000, 100_000, 0, 500);
+    assert_eq!(decide(&snapshot, occ(1)), decision!(refuse!(1, ReasonCode::ShutdownNotice), ReasonCode::ShutdownNotice, occ(1), refuse_key(1, ReasonCode::ShutdownNotice, 1)));
+}
+
+// Sum of `Evacuate` amounts targeting `dest` across the emitted decisions.
+fn evac_amounts_into(decisions: &[AllocatorDecision], dest: FederationId) -> u64 {
+    decisions.iter().filter_map(|d| match &d.action {
+        Action::Evacuate { to, amount, .. } if *to == dest => Some(amount.0),
+        _ => None,
+    }).sum()
+}
+
+// Sum of `Move` amounts targeting `dest` across the emitted decisions.
+fn move_amounts_into(decisions: &[AllocatorDecision], dest: FederationId) -> u64 {
+    decisions.iter().filter_map(|d| match &d.action {
+        Action::Move { to, amount, .. } if *to == dest => Some(amount.0),
+        _ => None,
+    }).sum()
+}
+
+// Total drawn from `src` = Σ(amount + fee_cap) over every move sourced from it — the
+// conservative bound `debited` tracks.
+fn drawn_from(decisions: &[AllocatorDecision], src: FederationId) -> u64 {
+    decisions.iter().filter_map(|d| match &d.action {
+        Action::Move { from, amount, fee_cap, .. } | Action::Evacuate { from, amount, fee_cap, .. } if *from == src => Some(amount.0 + fee_cap.0),
+        _ => None,
+    }).sum()
 }
 }

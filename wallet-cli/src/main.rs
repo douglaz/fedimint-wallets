@@ -504,7 +504,18 @@ fn build_tick_policy(
     joined_ids: &[FederationId],
     open_ids: &[FederationId],
 ) -> anyhow::Result<TickPolicy> {
-    let mut policy = TickPolicy::default();
+    // §5.3: make the snapshot's clock honest for any future time-aware `decide()` logic.
+    // Unix SECONDS from the wall clock; a pre-epoch clock degrades to 0 rather than
+    // failing the tick. (The probe sources its own `now` for shutdown derivation — this
+    // is independent of that.)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut policy = TickPolicy {
+        now,
+        ..TickPolicy::default()
+    };
     if let Some(v) = flags.per_fed_cap {
         policy.per_fed_cap = Msat(v);
     }
@@ -571,7 +582,7 @@ fn tick_apply_failure(summary: &ExecutionSummary) -> Option<String> {
 }
 
 /// A one-line human description of an allocator decision (its action + reason). The advisory
-/// `RefuseInflow`/`Cap` actions are surfaced here even though `apply` never executes them.
+/// `RefuseInflow` action is surfaced here even though `apply` never executes it.
 fn describe_decision(decision: &AllocatorDecision) -> String {
     match &decision.action {
         Action::Move {
@@ -614,7 +625,6 @@ fn describe_decision(decision: &AllocatorDecision) -> String {
         Action::RefuseInflow { fed, reason } => {
             format!("refuse-inflow {} (reason {reason:?})", fed.to_hex())
         }
-        Action::Cap { fed, reason } => format!("cap {} (reason {reason:?})", fed.to_hex()),
     }
 }
 

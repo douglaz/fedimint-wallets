@@ -89,6 +89,12 @@ pub enum ReasonCode {
     ShutdownScheduled,
     LowObserverUptime,
     NoLnv2,
+    /// The claimed `m`-of-`n` threshold is structurally dishonest: `m == 0`,
+    /// `m > n`, or `m` below the BFT bound `n − (n−1)/3`. The scorer is the trust
+    /// boundary (§1) and later discovery assemblers will feed it attacker-influenced
+    /// facts, so a config claiming a weaker-than-BFT threshold (e.g. 3-of-100) is
+    /// rejected rather than ranked equal to an honest 3-of-4.
+    InvalidThreshold,
 }
 
 /// The scorer's verdict for one federation.
@@ -121,6 +127,21 @@ pub fn score(facts: &FederationFacts, policy: &ScorerPolicy) -> FederationVerdic
     } else if facts.guardian_count < policy.min_guardians || facts.threshold < policy.min_threshold
     {
         reasons.push(ReasonCode::TooFewGuardians);
+        floor_ok = false;
+    }
+
+    // Threshold trust floor (§1): the m-of-n threshold must be structurally honest.
+    // Reject a nonsensical bound (m == 0 or m > n) and any threshold below fedimint's
+    // own BFT bound `n − (n−1)/3` (the SDK's `NumPeers::threshold`). Every real
+    // federation satisfies this exactly, so nothing live is rejected; a discovered
+    // config CLAIMING a weaker threshold is rejected as dishonest. `bft_threshold` is
+    // SATURATING so this check still executes (never panics) for attacker-supplied
+    // facts including `guardian_count == 0`.
+    if facts.threshold == 0
+        || facts.threshold > facts.guardian_count
+        || facts.threshold < bft_threshold(facts.guardian_count)
+    {
+        reasons.push(ReasonCode::InvalidThreshold);
         floor_ok = false;
     }
 
@@ -176,10 +197,22 @@ pub fn score(facts: &FederationFacts, policy: &ScorerPolicy) -> FederationVerdic
     }
 }
 
+/// Fedimint's own BFT threshold for `n` guardians: `n − f` with `f = (n−1)/3`
+/// (`NumPeers::threshold`). SATURATING so it never panics on attacker-supplied facts
+/// (`n == 0` yields `0`); the structural floor rejects `n == 0` via `NoFaultTolerance`.
+fn bft_threshold(n: u32) -> u32 {
+    n.saturating_sub(n.saturating_sub(1) / 3)
+}
+
 /// Deterministic integer rank for an eligible federation. May push `LowObserverUptime`.
 fn rank(facts: &FederationFacts, reasons: &mut Vec<ReasonCode>) -> u32 {
-    // Structural strength: the m-of-n threshold is the security parameter.
-    let mut score = facts.threshold.saturating_mul(STRUCTURAL_WEIGHT);
+    // Structural strength: the m-of-n threshold is the security parameter. Clamp the
+    // term to `guardian_count` (defense-in-depth — the structural floor already rejects
+    // `threshold > guardian_count`, so an eligible fed can never reach here with one).
+    let mut score = facts
+        .threshold
+        .min(facts.guardian_count)
+        .saturating_mul(STRUCTURAL_WEIGHT);
 
     // A quotable peg-out path is extra own-probe confidence.
     if facts.peg_out_quotable {
