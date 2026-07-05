@@ -1,4 +1,5 @@
-use crate::types::{Action, AllocatorDecision, IdempotencyKey, Msat};
+use crate::ledger::Actor;
+use crate::types::{Action, AllocatorDecision, IdempotencyKey, Msat, ReasonCode};
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
@@ -23,15 +24,27 @@ pub struct Intent {
     /// only for advisory actions, which are never executed.
     pub max_fee: Option<Msat>,
     pub status: IntentStatus,
+    /// The allocator reason this intent carries into the ledger (§8) — no longer dropped.
+    /// User verbs carry [`ReasonCode::UserInitiated`].
+    pub reason: ReasonCode,
+    /// Who initiated the intent (§8): `Agent` for a tick, `User` for an operator verb.
+    pub actor: Actor,
+    /// Unix millis at which the intent was first created — the ledger's `created_at_ms`.
+    pub created_at_ms: u64,
 }
 
 impl Intent {
-    pub fn from_decision(decision: &AllocatorDecision) -> Self {
+    /// Build a `Pending` intent from a decision, stamping the ledger identity §8 threads:
+    /// the decision's `reason`, the initiating `actor`, and the creation clock `now_ms`.
+    pub fn from_decision(decision: &AllocatorDecision, actor: Actor, now_ms: u64) -> Self {
         Self {
             idempotency_key: decision.idempotency_key.clone(),
             action: decision.action.clone(),
             max_fee: decision.action.fee_cap(),
             status: IntentStatus::Pending,
+            reason: decision.reason,
+            actor,
+            created_at_ms: now_ms,
         }
     }
 }
@@ -93,8 +106,16 @@ pub enum ExecError {
 pub trait Journal: Send + Sync {
     async fn upsert(&self, intent: &Intent) -> Result<(), ExecError>;
     async fn get(&self, key: &IdempotencyKey) -> Result<Option<Intent>, ExecError>;
-    async fn set_status(&self, key: &IdempotencyKey, status: IntentStatus)
-        -> Result<(), ExecError>;
+    /// Set the intent's status, carrying the terminal failure diagnostic (§8.3): `drive`
+    /// passes the [`ExecError`] string on the `Permanent`/`Unsupported` paths and `None`
+    /// elsewhere. A durable journal (§9, later run) records it as the ledger row's `error`
+    /// when the executor never reached a terminal `MoveRecord.outcome` to source it from.
+    async fn set_status(
+        &self,
+        key: &IdempotencyKey,
+        status: IntentStatus,
+        error: Option<&str>,
+    ) -> Result<(), ExecError>;
     /// The single-writer claim (spec §2): atomically, if the stored intent's status ==
     /// `expected`, set it to `new` (moving the pending index in the same transaction for
     /// durable impls) and return `Ok(true)`; otherwise make no change and return `Ok(false)`.
@@ -214,6 +235,9 @@ impl Journal for MemJournal {
         &self,
         key: &IdempotencyKey,
         status: IntentStatus,
+        // The failure diagnostic is durable-ledger material (§9); the in-memory test journal
+        // has no ledger, so it accepts and ignores it.
+        _error: Option<&str>,
     ) -> Result<(), ExecError> {
         self.intents
             .lock()
@@ -359,13 +383,15 @@ pub async fn apply<J: Journal, E: Executor>(
     journal: &J,
     executor: &E,
     decisions: &[AllocatorDecision],
+    actor: Actor,
+    now_ms: u64,
 ) -> ExecutionSummary {
     let mut summary = ExecutionSummary::default();
     let mut seen = BTreeSet::new();
 
     for decision in decisions {
-        // Advisory actions (`RefuseInflow`/`Cap`) are policy signals, not work: never
-        // journal an Intent for them.
+        // Advisory actions (`RefuseInflow`) are policy signals, not work: never journal an
+        // Intent for them.
         if !decision.action.is_executable() {
             summary.skipped += 1;
             continue;
@@ -412,7 +438,7 @@ pub async fn apply<J: Journal, E: Executor>(
                 drive(journal, executor, &intent, &mut summary).await;
             }
             None => {
-                let intent = Intent::from_decision(decision);
+                let intent = Intent::from_decision(decision, actor, now_ms);
                 if journal.upsert(&intent).await.is_err() {
                     summary.failed += 1;
                     continue;
@@ -495,7 +521,7 @@ async fn drive<J: Journal, E: Executor>(
                 PerformOutcome::Awaiting => IntentStatus::Awaiting,
             };
             if journal
-                .set_status(&intent.idempotency_key, next)
+                .set_status(&intent.idempotency_key, next, None)
                 .await
                 .is_ok()
             {
@@ -510,9 +536,10 @@ async fn drive<J: Journal, E: Executor>(
                 reason = %reason,
                 "executor perform failed retryably"
             );
-            // Leave the intent Pending so the next reconcile retries it (NOT Failed).
+            // Leave the intent Pending so the next reconcile retries it (NOT Failed). A
+            // retry is not a terminal failure, so no ledger `error` string is threaded (§8.3).
             let _ = journal
-                .set_status(&intent.idempotency_key, IntentStatus::Pending)
+                .set_status(&intent.idempotency_key, IntentStatus::Pending, None)
                 .await;
             // Retryable: count it in `failed` (unchanged gating) AND in the `retryable` subset
             // (§15.11), so a scheduler can tell a left-Pending retry from a terminal failure.
@@ -525,8 +552,11 @@ async fn drive<J: Journal, E: Executor>(
                 reason = %reason,
                 "executor perform failed permanently"
             );
+            // Thread the diagnostic to the ledger's `error` (§8.3): several permanent
+            // failures never reach a terminal `MoveRecord.outcome`, so this is the only
+            // source for the row's error.
             let _ = journal
-                .set_status(&intent.idempotency_key, IntentStatus::Failed)
+                .set_status(&intent.idempotency_key, IntentStatus::Failed, Some(&reason))
                 .await;
             summary.failed += 1;
         }
@@ -536,7 +566,11 @@ async fn drive<J: Journal, E: Executor>(
                 "executor action unsupported"
             );
             let _ = journal
-                .set_status(&intent.idempotency_key, IntentStatus::Failed)
+                .set_status(
+                    &intent.idempotency_key,
+                    IntentStatus::Failed,
+                    Some("executor does not support this action"),
+                )
                 .await;
             summary.failed += 1;
         }

@@ -53,6 +53,8 @@ fn reason_tag(reason: ReasonCode) -> &'static str {
         ReasonCode::OverCap => "over_cap",
         ReasonCode::NotProbed => "not_probed",
         ReasonCode::LowReputation => "low_reputation",
+        ReasonCode::UserInitiated => "user_initiated",
+        ReasonCode::StandingInstruction => "standing_instruction",
     }
 }
 fn refuse_key(fed: u8, reason: ReasonCode, occurrence: u64) -> IdempotencyKey {

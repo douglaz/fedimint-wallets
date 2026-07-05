@@ -102,6 +102,7 @@ impl Journal for GetFailsJournal {
         &self,
         _key: &IdempotencyKey,
         _status: IntentStatus,
+        _error: Option<&str>,
     ) -> Result<(), ExecError> {
         unreachable!("apply must not drive when get fails")
     }
@@ -148,8 +149,9 @@ impl Journal for BarrierJournal {
         &self,
         key: &IdempotencyKey,
         status: IntentStatus,
+        error: Option<&str>,
     ) -> Result<(), ExecError> {
-        self.inner.set_status(key, status).await
+        self.inner.set_status(key, status, error).await
     }
 
     async fn set_status_if(
@@ -194,8 +196,9 @@ impl Journal for DelayedPendingJournal {
         &self,
         key: &IdempotencyKey,
         status: IntentStatus,
+        error: Option<&str>,
     ) -> Result<(), ExecError> {
-        self.inner.set_status(key, status).await
+        self.inner.set_status(key, status, error).await
     }
 
     async fn set_status_if(
@@ -301,7 +304,7 @@ async fn apply_fresh_decision_journals_and_performs_once() {
     let executor = MockExecutor::new();
 
     assert_eq!(
-        apply(&journal, &executor, &decisions).await,
+        apply(&journal, &executor, &decisions, Actor::User, 0).await,
         counts(1, 0, 0)
     );
     assert_eq!(executor.performed_keys(), vec![ikey(key)]);
@@ -334,7 +337,7 @@ async fn apply_direct_inflow_journals_with_its_fee_cap() {
     let executor = MockExecutor::new();
 
     assert_eq!(
-        apply(&journal, &executor, &decisions).await,
+        apply(&journal, &executor, &decisions, Actor::User, 0).await,
         counts(1, 0, 0)
     );
     let intent = journal
@@ -356,7 +359,7 @@ async fn apply_skips_advisory_decisions_with_no_intent() {
     let executor = MockExecutor::new();
 
     assert_eq!(
-        apply(&journal, &executor, &decisions).await,
+        apply(&journal, &executor, &decisions, Actor::User, 0).await,
         counts(0, 1, 0)
     );
     assert_eq!(journal.get(&ikey(key)).await.expect("get"), None);
@@ -370,9 +373,14 @@ async fn applying_same_decisions_twice_performs_only_once() {
     let journal = MemJournal::new();
     let executor = MockExecutor::new();
 
-    assert_eq!(apply(&journal, &executor, &decisions).await.performed, 1);
     assert_eq!(
-        apply(&journal, &executor, &decisions).await,
+        apply(&journal, &executor, &decisions, Actor::User, 0)
+            .await
+            .performed,
+        1
+    );
+    assert_eq!(
+        apply(&journal, &executor, &decisions, Actor::User, 0).await,
         counts(0, 1, 0)
     );
     assert_eq!(executor.performed_keys(), vec![ikey(key)]);
@@ -391,7 +399,7 @@ async fn apply_redrives_stored_pending_intent_without_refreshing_fields() {
         },
         ReasonCode::SpendingBelowTarget,
     );
-    let stored_intent = Intent::from_decision(&old_decision);
+    let stored_intent = Intent::from_decision(&old_decision, Actor::User, 0);
 
     let new_decision = decision(
         key,
@@ -408,7 +416,7 @@ async fn apply_redrives_stored_pending_intent_without_refreshing_fields() {
     journal.upsert(&stored_intent).await.unwrap();
 
     assert_eq!(
-        apply(&journal, &executor, &[new_decision]).await,
+        apply(&journal, &executor, &[new_decision], Actor::User, 0).await,
         counts(1, 0, 0)
     );
     let intent = journal
@@ -429,7 +437,7 @@ async fn apply_get_error_does_not_create_fresh_intent() {
     let executor = MockExecutor::new();
 
     assert_eq!(
-        apply(&journal, &executor, &decisions).await,
+        apply(&journal, &executor, &decisions, Actor::User, 0).await,
         counts(0, 0, 1)
     );
     assert_eq!(*journal.upserts.lock().expect("mutex poisoned"), 0);
@@ -444,7 +452,7 @@ async fn duplicate_keys_in_one_apply_are_performed_once() {
     let executor = MockExecutor::new();
 
     assert_eq!(
-        apply(&journal, &executor, &decisions).await,
+        apply(&journal, &executor, &decisions, Actor::User, 0).await,
         counts(1, 1, 0)
     );
     assert_eq!(executor.performed_keys(), vec![ikey(key)]);
@@ -457,7 +465,7 @@ async fn duplicate_keys_in_one_apply_are_performed_once() {
 #[tokio::test]
 async fn reconcile_redrives_executing_intent_after_crash() {
     let key = "move:1:2:42";
-    let mut intent = Intent::from_decision(&move_decision(key, 42));
+    let mut intent = Intent::from_decision(&move_decision(key, 42), Actor::User, 0);
     intent.status = IntentStatus::Executing;
 
     let journal = MemJournal::new();
@@ -483,7 +491,7 @@ async fn retryable_failure_stays_pending_and_reconcile_retries() {
     // §15.11: a retryable failure counts in `failed` AND in the `retryable` sub-count, so a
     // scheduler can tell "left Pending, will retry" apart from a terminal money-op failure.
     assert_eq!(
-        apply(&journal, &executor, &decisions).await,
+        apply(&journal, &executor, &decisions, Actor::User, 0).await,
         counts_with_retryable(0, 0, 1, 1)
     );
     // A Retryable error leaves the intent Pending (NOT Failed), so reconcile retries it.
@@ -511,7 +519,7 @@ async fn permanent_failure_is_terminal_and_reconcile_does_not_redrive() {
     executor.fail_permanent(key);
 
     assert_eq!(
-        apply(&journal, &executor, &decisions).await,
+        apply(&journal, &executor, &decisions, Actor::User, 0).await,
         counts(0, 0, 1)
     );
     assert_eq!(
@@ -533,7 +541,7 @@ async fn permanent_failure_is_terminal_and_reconcile_does_not_redrive() {
 #[tokio::test]
 async fn apply_skips_decision_when_key_is_already_done() {
     let key = "move:1:2:42";
-    let mut intent = Intent::from_decision(&move_decision(key, 42));
+    let mut intent = Intent::from_decision(&move_decision(key, 42), Actor::User, 0);
     intent.status = IntentStatus::Done;
 
     let journal = MemJournal::new();
@@ -541,7 +549,14 @@ async fn apply_skips_decision_when_key_is_already_done() {
     journal.upsert(&intent).await.unwrap();
 
     assert_eq!(
-        apply(&journal, &executor, &[move_decision(key, 42)]).await,
+        apply(
+            &journal,
+            &executor,
+            &[move_decision(key, 42)],
+            Actor::User,
+            0
+        )
+        .await,
         counts(0, 1, 0)
     );
     assert!(executor.performed_keys().is_empty());
@@ -564,7 +579,7 @@ async fn apply_does_not_resurrect_failed_intent() {
         },
         ReasonCode::SpendingBelowTarget,
     );
-    let mut failed_intent = Intent::from_decision(&old_decision);
+    let mut failed_intent = Intent::from_decision(&old_decision, Actor::User, 0);
     failed_intent.status = IntentStatus::Failed;
 
     let new_decision = decision(
@@ -584,7 +599,7 @@ async fn apply_does_not_resurrect_failed_intent() {
     // A fresh allocator tick with the same key must NOT reset Failed back to Pending,
     // nor refresh its fields nor re-perform it (§2: apply treats Failed as terminal).
     assert_eq!(
-        apply(&journal, &executor, &[new_decision]).await,
+        apply(&journal, &executor, &[new_decision], Actor::User, 0).await,
         counts_with_terminal_failed_skipped(0, 1, 0, 1)
     );
     let intent = journal
@@ -607,7 +622,7 @@ async fn awaiting_outcome_leaves_intent_awaiting_and_is_not_redriven() {
 
     // Ok(Awaiting): the effect ran (invoice minted) but the external payer hasn't paid.
     assert_eq!(
-        apply(&journal, &executor, &decisions).await,
+        apply(&journal, &executor, &decisions, Actor::User, 0).await,
         counts(1, 0, 0)
     );
     assert_eq!(
@@ -629,7 +644,7 @@ async fn awaiting_outcome_leaves_intent_awaiting_and_is_not_redriven() {
 #[tokio::test]
 async fn awaiting_replay_after_crash_preserves_awaiting_status() {
     let key = "directinflow:to=2:42";
-    let mut intent = Intent::from_decision(&move_decision(key, 42));
+    let mut intent = Intent::from_decision(&move_decision(key, 42), Actor::User, 0);
     intent.status = IntentStatus::Executing;
 
     let journal = MemJournal::new();
@@ -666,7 +681,7 @@ async fn awaiting_replay_after_crash_preserves_awaiting_status() {
 #[tokio::test]
 async fn concurrent_drive_performs_once() {
     let key = "move:1:2:42";
-    let intent = Intent::from_decision(&move_decision(key, 42));
+    let intent = Intent::from_decision(&move_decision(key, 42), Actor::User, 0);
     let inner = MemJournal::new();
     inner.upsert(&intent).await.unwrap();
     let journal = Arc::new(BarrierJournal {
@@ -708,7 +723,7 @@ async fn concurrent_drive_performs_once() {
 #[tokio::test]
 async fn concurrent_executing_drive_skips_in_flight_perform() {
     let key = "executing-race:1";
-    let mut intent = Intent::from_decision(&move_decision(key, 42));
+    let mut intent = Intent::from_decision(&move_decision(key, 42), Actor::User, 0);
     intent.status = IntentStatus::Executing;
 
     let journal = Arc::new(MemJournal::new());
@@ -743,7 +758,7 @@ async fn concurrent_executing_drive_skips_in_flight_perform() {
 #[tokio::test]
 async fn concurrent_executing_stale_snapshot_skips_after_completion() {
     let key = "executing-stale:1";
-    let mut intent = Intent::from_decision(&move_decision(key, 42));
+    let mut intent = Intent::from_decision(&move_decision(key, 42), Actor::User, 0);
     intent.status = IntentStatus::Executing;
 
     let journal = Arc::new(MemJournal::new());
@@ -789,7 +804,7 @@ async fn concurrent_executing_stale_snapshot_skips_after_completion() {
 #[tokio::test]
 async fn set_status_if_cas() {
     let key = ikey("move:1:2:42");
-    let intent = Intent::from_decision(&move_decision("move:1:2:42", 42));
+    let intent = Intent::from_decision(&move_decision("move:1:2:42", 42), Actor::User, 0);
     let journal = MemJournal::new();
     journal.upsert(&intent).await.unwrap();
 
@@ -824,4 +839,167 @@ async fn set_status_if_cas() {
             .await,
         Ok(false)
     );
+}
+
+/// §8: an `apply`'d decision yields an `Intent` carrying the actor, the decision's reason, and
+/// the creation clock — the ledger identity that used to be dropped.
+#[tokio::test]
+async fn apply_stamps_actor_reason_and_created_at() {
+    let key = "move:1:2:42";
+    let decision = decision(
+        key,
+        Action::Move {
+            from: FederationId([1; 32]),
+            to: FederationId([2; 32]),
+            amount: Msat(42),
+            fee_cap: Msat(7),
+        },
+        ReasonCode::StandbyBelowTarget,
+    );
+    let journal = MemJournal::new();
+    let executor = MockExecutor::new();
+
+    let actor = Actor::Agent {
+        occurrence: Occurrence(9),
+    };
+    apply(&journal, &executor, &[decision], actor, 1_700_000_000_123).await;
+
+    let intent = journal
+        .get(&ikey(key))
+        .await
+        .expect("get")
+        .expect("intent journaled");
+    assert_eq!(intent.actor, actor);
+    assert_eq!(intent.reason, ReasonCode::StandbyBelowTarget);
+    assert_eq!(intent.created_at_ms, 1_700_000_000_123);
+}
+
+/// A `Journal` wrapper over [`MemJournal`] that records every `(status, error)` passed to
+/// `set_status`, so a test can assert `drive` threads the executor's diagnostic (§8.3).
+#[derive(Default)]
+struct RecordingJournal {
+    inner: MemJournal,
+    set_status_calls: Mutex<Vec<(IntentStatus, Option<String>)>>,
+}
+
+#[async_trait]
+impl Journal for RecordingJournal {
+    async fn upsert(&self, intent: &Intent) -> Result<(), ExecError> {
+        self.inner.upsert(intent).await
+    }
+
+    async fn get(&self, key: &IdempotencyKey) -> Result<Option<Intent>, ExecError> {
+        self.inner.get(key).await
+    }
+
+    async fn set_status(
+        &self,
+        key: &IdempotencyKey,
+        status: IntentStatus,
+        error: Option<&str>,
+    ) -> Result<(), ExecError> {
+        self.set_status_calls
+            .lock()
+            .expect("mutex poisoned")
+            .push((status, error.map(str::to_owned)));
+        self.inner.set_status(key, status, error).await
+    }
+
+    async fn set_status_if(
+        &self,
+        key: &IdempotencyKey,
+        expected: IntentStatus,
+        new: IntentStatus,
+    ) -> Result<bool, ExecError> {
+        self.inner.set_status_if(key, expected, new).await
+    }
+
+    async fn pending(&self) -> Vec<Intent> {
+        self.inner.pending().await
+    }
+
+    async fn failed(&self) -> Vec<Intent> {
+        self.inner.failed().await
+    }
+}
+
+struct UnsupportedExecutor;
+
+#[async_trait]
+impl Executor for UnsupportedExecutor {
+    async fn perform(&self, _intent: &Intent) -> Result<PerformOutcome, ExecError> {
+        Err(ExecError::Unsupported)
+    }
+}
+
+/// §8.3: `drive` passes the `ExecError` diagnostic to `set_status` on the `Permanent` and
+/// `Unsupported` paths and `None` on the retryable/success paths.
+#[tokio::test]
+async fn drive_threads_permanent_error_to_set_status() {
+    let key = "move:1:2:42";
+    let journal = RecordingJournal::default();
+    let executor = MockExecutor::new();
+    executor.fail_permanent(key);
+
+    apply(
+        &journal,
+        &executor,
+        &[move_decision(key, 42)],
+        Actor::User,
+        0,
+    )
+    .await;
+
+    let calls = journal.set_status_calls.lock().expect("mutex poisoned");
+    // The Pending→Executing claim goes through `set_status_if`, not `set_status`; the only
+    // `set_status` here is the terminal Failed write, which must carry the diagnostic.
+    assert_eq!(
+        *calls,
+        vec![(IntentStatus::Failed, Some("injected".to_string()))]
+    );
+}
+
+#[tokio::test]
+async fn drive_threads_unsupported_error_to_set_status() {
+    let key = "move:1:2:42";
+    let journal = RecordingJournal::default();
+    let executor = UnsupportedExecutor;
+
+    apply(
+        &journal,
+        &executor,
+        &[move_decision(key, 42)],
+        Actor::User,
+        0,
+    )
+    .await;
+
+    let calls = journal.set_status_calls.lock().expect("mutex poisoned");
+    assert_eq!(
+        *calls,
+        vec![(
+            IntentStatus::Failed,
+            Some("executor does not support this action".to_string())
+        )]
+    );
+}
+
+/// The success path threads `None` — no failure to report.
+#[tokio::test]
+async fn drive_threads_no_error_on_success() {
+    let key = "move:1:2:42";
+    let journal = RecordingJournal::default();
+    let executor = MockExecutor::new();
+
+    apply(
+        &journal,
+        &executor,
+        &[move_decision(key, 42)],
+        Actor::User,
+        0,
+    )
+    .await;
+
+    let calls = journal.set_status_calls.lock().expect("mutex poisoned");
+    assert_eq!(*calls, vec![(IntentStatus::Done, None)]);
 }

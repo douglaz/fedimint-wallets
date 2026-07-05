@@ -166,6 +166,14 @@ pub enum ReasonCode {
     OverCap,
     NotProbed,
     LowReputation,
+    /// A plain user verb (`direct-inflow`/`move`): the operator initiated it directly, so
+    /// there is no allocator reason. Mandatory-but-honest (§8) — the ledger's `reason` is
+    /// always present.
+    UserInitiated,
+    /// A `Tick` ledger row: the run exists because the standing instruction executed. The
+    /// run's individual decisions carry their OWN reasons on their own rows — a tick has no
+    /// single allocator reason.
+    StandingInstruction,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -176,3 +184,40 @@ pub struct AllocatorDecision {
     pub occurrence: Occurrence,
     pub idempotency_key: IdempotencyKey,
 }
+
+// --- Identity newtypes (spec §6) ---
+//
+// Pure data wrappers with serde derives and no fedimint SDK dependency. They live in
+// `wallet-core` because the ledger types ([`crate::ledger`]) reference `OperationId`/
+// `GatewayUrl` and must be pure + golden-testable here; `wallet-fedimint` re-exports them
+// (its `types.rs`) so its public API is unchanged. Each doc line records how the value
+// parses into its fedimint counterpart in `wallet-fedimint`, so the intent stays
+// unambiguous without pulling the SDK into `wallet-core`.
+
+/// A fedimint operation's 32-byte identity. Bridges `fedimint_core::core::OperationId`. The
+/// deterministic op-id is the client's own send-dedup anchor, so it is the durable handle
+/// recorded on a `MoveRecord` (in `wallet-fedimint`).
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct OperationId(pub [u8; 32]);
+
+/// A Lightning payment preimage (32 bytes) — proof a send leg settled.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct Preimage(pub [u8; 32]);
+
+/// A gateway endpoint URL. Parses to a fedimint `SafeUrl` via `SafeUrl::parse(&self.0)` in
+/// `wallet-fedimint`. Pinned on the durable `MoveRecord` so a resumed move never reselects a
+/// different gateway after a crash (P2-7: it lives on the record, NOT the intent).
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct GatewayUrl(pub String);
+
+/// A BOLT11 invoice string. Parses to a `Bolt11Invoice` via `FromStr` in `wallet-fedimint`.
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct Invoice(pub String);
