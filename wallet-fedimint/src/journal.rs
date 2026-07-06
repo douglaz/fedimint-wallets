@@ -1746,14 +1746,27 @@ fn probe_key(id: &FederationId) -> Vec<u8> {
 pub fn prune_probe_attempts(attempts: Vec<ProbeAttempt>, now_ms: u64) -> Vec<ProbeAttempt> {
     let default_ttl_ms = ProbePolicy::default().ttl_ms;
     let newest = attempts.len().checked_sub(1);
-    let newest_success = attempts.iter().rposition(|a| a.ok);
+    // `probe_verdict` qualifies a stale success by its SOURCE, so retaining only ONE
+    // whole-fed newest success would let a later success from a different source evict the
+    // stale success that proves an older pass for the ORIGINAL source — turning that pair's
+    // aged-out `Expired` into a false `NeverProbed`. Keep the newest success PER distinct
+    // source instead (bounded by the joined-fed count, small): every source that ever
+    // round-tripped keeps its Expired evidence. (A weaker smoke probe evicting a stronger
+    // older success from the SAME source is a shrink-only test artifact, not retained.)
+    let mut newest_success_by_source: std::collections::BTreeMap<FederationId, usize> =
+        std::collections::BTreeMap::new();
+    for (i, a) in attempts.iter().enumerate() {
+        if a.ok {
+            newest_success_by_source.insert(a.from, i);
+        }
+    }
     let mut kept: Vec<ProbeAttempt> = attempts
         .into_iter()
         .enumerate()
         .filter(|(i, a)| {
             now_ms.saturating_sub(a.at_ms) <= default_ttl_ms
                 || Some(*i) == newest
-                || Some(*i) == newest_success
+                || newest_success_by_source.get(&a.from) == Some(i)
         })
         .map(|(_, a)| a)
         .collect();
