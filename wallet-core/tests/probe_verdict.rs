@@ -97,11 +97,14 @@ fn success_at_exactly_ttl_is_still_visible() {
 
 #[test]
 fn stale_pass_reads_expired_never_probed_only_without_any_success() {
-    // A retained stale success (outside the window) is the evidence that a pass existed:
-    // Expired, never NeverProbed.
+    // A retained stale QUALIFYING success (outside the window) is the evidence a trusted
+    // pair round-trip existed: Expired, never NeverProbed.
     assert_eq!(verdict(&[ok(30 * 24)]), V::Expired);
     // Only stale FAILURES: the negative signal has aged past the whole evidence window.
     assert_eq!(verdict(&[fail(30 * 24)]), V::NeverProbed);
+    // A stale success that never QUALIFIED for this pair (a different source) is NOT
+    // expired evidence — status must not overstate a pass that never gated this source.
+    assert_eq!(verdict(&[ok_from(30 * 24, fed(0xB))]), V::NeverProbed);
 }
 
 #[test]

@@ -344,7 +344,7 @@ async fn begin_refuses_to_clobber_a_live_session() {
     let err = journal
         .begin_probe_session(&fed(2), &session("nonce-second"))
         .await
-        .expect_err("a second begin over a live session must refuse");
+        .expect_err("a DIFFERENT-nonce begin over a live session must refuse");
     assert!(
         format!("{err:?}").contains("in-flight probe"),
         "the refusal names the live probe: {err:?}"
@@ -356,7 +356,22 @@ async fn begin_refuses_to_clobber_a_live_session() {
         .await
         .expect("read")
         .expect("row");
-    assert_eq!(record.in_flight, Some(first));
+    assert_eq!(record.in_flight, Some(first.clone()));
+
+    // A SAME-nonce re-write is the legitimate in-place update (persisting `out_net_msat`
+    // after sizing leg OUT, or a resume re-deriving its own session): it is allowed.
+    let mut updated = first;
+    updated.out_net_msat = Some(13_000);
+    journal
+        .begin_probe_session(&fed(2), &updated)
+        .await
+        .expect("same-nonce update is allowed");
+    let record = journal
+        .probe_record(&fed(2))
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(record.in_flight, Some(updated));
 }
 
 #[tokio::test]
