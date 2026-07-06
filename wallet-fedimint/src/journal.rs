@@ -48,8 +48,8 @@ use std::sync::Arc;
 use wallet_core::{
     advance, kind_from_action, status_from_intent, Action, Actor, AllocatorDecision, ExecError,
     FederationId, FeeBreakdown, GatewayUrl, IdempotencyKey, Intent, IntentStatus, Journal, Msat,
-    Occurrence, OperationId, OperationKind, OperationRecord, OperationStatus, RawOpUpdate,
-    ReasonCode, WriteKind,
+    Occurrence, OperationId, OperationKind, OperationRecord, OperationStatus, ProbeAttempt,
+    ProbePolicy, RawOpUpdate, ReasonCode, WriteKind,
 };
 
 /// The app-state partition prefix (spec §4/§8). Clients live at `[0x01, ..]`, see
@@ -65,6 +65,7 @@ const TAG_PENDING_INDEX: u8 = 0x04;
 const TAG_LEDGER_ROW: u8 = 0x05; // `0x05 ++ be64(seq)` → JSON row v1(OperationRecord)
 const TAG_LEDGER_KEY_INDEX: u8 = 0x06; // `0x06 ++ correlation_key_utf8` → be64(seq)
 const TAG_LEDGER_COUNTER: u8 = 0x07; // `0x07` (single key) → be64(next_seq)
+const TAG_PROBE: u8 = 0x08; // `0x08 ++ fed_id` → JSON row v1(ProbeRecord) (phase 5 §5.0.4)
 
 /// Rows older than this are eligible for reconcile's NEGATIVE-inference repairs (§10.3): a
 /// fresh non-terminal row may belong to an operation still in flight in another process, so
@@ -108,6 +109,47 @@ pub struct FederationListReport {
     pub federations: Vec<(FederationId, FederationInfo)>,
     pub skipped_rows: usize,
 }
+
+/// Durable per-fed ACTIVE-probe state (phase 5 §5.0.4): the bounded attempt history the
+/// pure `probe_verdict` evaluates, plus the in-flight session identity a crashed probe
+/// resumes from. One `0x08` row per federation, upserted in its own dbtx.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProbeRecord {
+    pub attempts: Vec<ProbeAttempt>,
+    pub in_flight: Option<ProbeSession>,
+}
+
+/// The durable probe IDENTITY (§5.0.4), written BEFORE leg IN is journaled. A `move:`
+/// intent key is deterministic from `(from, to, amount, fee_cap, occurrence =
+/// nonce-derived u64)`, so leg IN's key is reconstructible from the session alone; the
+/// session is UPDATED with `out_net_msat` after sizing and BEFORE leg OUT is journaled,
+/// after which both keys are reconstructible. Cleared in the SAME atomic write that
+/// records the finished attempt ([`FedimintJournal::record_probe_outcome`]).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProbeSession {
+    /// 32 lowercase-hex chars; also names the umbrella `probe:<fed-hex>:<nonce>` row.
+    pub nonce: String,
+    /// The probe's source federation — resolved per §5.0.7 and FIXED for the session.
+    pub from: FederationId,
+    pub amount_msat: u64,
+    pub leg_fee_cap_msat: u64,
+    /// The candidate's spendable balance BEFORE leg IN — the no-sweep BASELINE (§5.0.4):
+    /// a sized-but-unjournaled leg OUT may start only while
+    /// `C.spendable ≥ baseline + delivered_in`, so redeeming can never touch funds that
+    /// are not the probe's own delta.
+    pub c_spendable_before_in_msat: u64,
+    /// Leg OUT's sized net, persisted after the affordability search and before leg OUT
+    /// is journaled. A resume NEVER re-sizes: it drives with exactly this value.
+    pub out_net_msat: Option<u64>,
+    pub started_at_ms: u64,
+}
+
+/// Hard backstop on retained probe attempts per fed (§5.0.4): time-aware retention keeps
+/// every sub-default-`ttl` attempt (plus the newest success and newest attempt regardless
+/// of age), bounded by this many newest rows. At the scheduler's few-probes-per-day
+/// cadence this holds years; only a script hammering `probe` can hit it (self-inflicted —
+/// the ledger keeps the full narrative regardless).
+pub const PROBE_HISTORY_CAP: usize = 256;
 
 /// Durable [`wallet_core::Journal`] over a fedimint [`Database`], isolated to prefix `[0x00]`.
 #[derive(Clone, Debug)]
@@ -679,6 +721,166 @@ impl FedimintJournal {
             Some(bytes) => Ok(Some(decode_row_result("ledger row", &row_key, &bytes)?)),
             None => Ok(None),
         }
+    }
+
+    // --- active-probe state (phase 5 §5.0.4) ---
+
+    /// Read a federation's `0x08` probe row. TARGETED getter that FAILS CLOSED on an
+    /// undecodable row (like `get`/`get_move`/`operation`): it decides whether a probe
+    /// session is in flight, and a swallowed corrupt row would restart a probe that is
+    /// already live, spending twice. Only SCANS are poison-tolerant.
+    pub async fn probe_record(&self, fed: &FederationId) -> Result<Option<ProbeRecord>, ExecError> {
+        let raw_key = probe_key(fed);
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        let Some(bytes) = dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? else {
+            return Ok(None);
+        };
+        Ok(Some(decode_row_result("probe record", &raw_key, &bytes)?))
+    }
+
+    /// Write (or update) the fed's in-flight [`ProbeSession`] — the fresh path's opening
+    /// write, and the sizing update that persists `out_net_msat` before leg OUT is
+    /// journaled. Read-modify-write in one dbtx; fails closed on a corrupt row.
+    pub async fn begin_probe_session(
+        &self,
+        fed: &FederationId,
+        session: &ProbeSession,
+    ) -> Result<(), ExecError> {
+        let raw_key = probe_key(fed);
+        let mut dbtx = self.db.begin_transaction().await;
+        let mut rec = match dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? {
+            Some(bytes) => decode_row_result::<ProbeRecord>("probe record", &raw_key, &bytes)?,
+            None => ProbeRecord::default(),
+        };
+        // A fresh session must never clobber a live one (§5.0.5: resume runs FIRST, so a
+        // caller reaching here with `in_flight` already set skipped the resume path).
+        // Overwriting would orphan the prior session's legs + umbrella row — the exact
+        // divergence the atomic outcome write exists to prevent. Refuse instead.
+        if rec.in_flight.is_some() {
+            return Err(ExecError::Permanent(format!(
+                "begin_probe_session: federation {} already has an in-flight probe; \
+                 resume it before starting a new one",
+                fed.to_hex()
+            )));
+        }
+        rec.in_flight = Some(session.clone());
+        dbtx.raw_insert_bytes(&raw_key, &encode_row(&rec)?)
+            .await
+            .map_err(db_err)?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    /// The ONE terminal write for every probe exit after a session exists (§5.0.4), in ONE
+    /// dbtx: clear `in_flight`, terminalize the umbrella `probe:` ledger row (create-or-
+    /// advance — a crash between the session write and `record_started` leaves no row, and
+    /// the resumed outcome must still land as history), and append the attempt when
+    /// `attempt` is `Some` (leg outcomes; `None` for the no-attempt terminal exits, which
+    /// ALSO clear their session here — a stale session must never survive a terminal exit).
+    /// All parts commit or fail together, so the verdict history, the session, and
+    /// `history`'s umbrella row can never disagree.
+    ///
+    /// `session_nonce` must match the currently in-flight session; otherwise this is a
+    /// replay/stale finalizer and no history or ledger row is touched (`Ok(false)`).
+    ///
+    /// `kind` is the [`OperationKind::Probe`] with its FINAL `cost_msat` — used whole on
+    /// the create path, and its cost is copied onto an advanced existing row (§5.0.5:
+    /// cost is filled at terminalization). `Ok(true)` means the matching session was
+    /// terminalized.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_probe_outcome(
+        &self,
+        fed: &FederationId,
+        session_nonce: &str,
+        attempt: Option<ProbeAttempt>,
+        umbrella_key: &IdempotencyKey,
+        kind: OperationKind,
+        actor: Actor,
+        status: OperationStatus,
+        error: Option<&str>,
+    ) -> Result<bool, ExecError> {
+        let now = self.now_ms();
+        let raw_key = probe_key(fed);
+        let mut dbtx = self.db.begin_transaction().await;
+
+        // Probe row: clear only the matching session, append + prune the attempt history.
+        // A duplicate/out-of-order finalizer for an already-cleared nonce is an idempotent
+        // replay; a different nonce belongs to a newer live probe and must not be cleared.
+        let mut rec = match dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? {
+            Some(bytes) => decode_row_result::<ProbeRecord>("probe record", &raw_key, &bytes)?,
+            None => ProbeRecord::default(),
+        };
+        match rec.in_flight.as_ref() {
+            Some(session) if session.nonce == session_nonce => {}
+            Some(session) => {
+                tracing::warn!(
+                    federation = %fed.to_hex(),
+                    expected_nonce = %session_nonce,
+                    active_nonce = %session.nonce,
+                    "journal: ignoring stale probe outcome for a different active session"
+                );
+                return Ok(false);
+            }
+            None => {
+                tracing::warn!(
+                    federation = %fed.to_hex(),
+                    expected_nonce = %session_nonce,
+                    "journal: ignoring duplicate probe outcome for an already-cleared session"
+                );
+                return Ok(false);
+            }
+        }
+        rec.in_flight = None;
+        if let Some(attempt) = attempt {
+            rec.attempts.push(attempt);
+            rec.attempts = prune_probe_attempts(std::mem::take(&mut rec.attempts), now);
+        }
+        dbtx.raw_insert_bytes(&raw_key, &encode_row(&rec)?)
+            .await
+            .map_err(db_err)?;
+
+        // Umbrella ledger row, same dbtx: create-or-advance to the terminal status, with
+        // the final cost stamped onto the kind.
+        let error_owned = error.map(str::to_owned);
+        ledger_upsert_in(&mut dbtx, umbrella_key, |existing, seq| match existing {
+            Some(existing) => {
+                let mut next = advance(
+                    &existing,
+                    status,
+                    now,
+                    None,
+                    error_owned.as_deref(),
+                    WriteKind::Authoritative,
+                )?;
+                if let (
+                    OperationKind::Probe { cost_msat, .. },
+                    OperationKind::Probe {
+                        cost_msat: final_cost,
+                        ..
+                    },
+                ) = (&mut next.kind, &kind)
+                {
+                    *cost_msat = *final_cost;
+                }
+                Some(next)
+            }
+            None => Some(OperationRecord {
+                seq,
+                correlation_key: umbrella_key.clone(),
+                kind,
+                actor,
+                reason: ReasonCode::ActiveProbe,
+                status,
+                created_at_ms: now,
+                updated_at_ms: now,
+                fees: FeeBreakdown::default(),
+                error: error_owned,
+                repaired: false,
+            }),
+        })
+        .await?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(true)
     }
 
     // --- reconcile repair (spec §10.3) ---
@@ -1522,6 +1724,37 @@ fn move_key(key: &IdempotencyKey) -> Vec<u8> {
 
 fn federation_key(id: &FederationId) -> Vec<u8> {
     tagged(TAG_FEDERATION, &id.0)
+}
+
+fn probe_key(id: &FederationId) -> Vec<u8> {
+    tagged(TAG_PROBE, &id.0)
+}
+
+/// §5.0.4 TIME-AWARE probe-attempt retention (a count-only cap could truncate the very
+/// successes the 24h `min_span` needs whenever probes run more often than span/cap). Keep
+/// every attempt younger than the DEFAULT `ttl_ms` — exactly the verdict's PASS-evaluation
+/// window, so pruning can never flip a pass — PLUS the newest SUCCESS and the newest
+/// attempt regardless of age (the evidence distinguishing `Expired` from `NeverProbed`
+/// after a long quiet spell), bounded by the newest [`PROBE_HISTORY_CAP`] rows. `attempts`
+/// is chronological (append order); the result preserves that order. Pure, so retention is
+/// unit-tested without a database.
+pub fn prune_probe_attempts(attempts: Vec<ProbeAttempt>, now_ms: u64) -> Vec<ProbeAttempt> {
+    let default_ttl_ms = ProbePolicy::default().ttl_ms;
+    let newest = attempts.len().checked_sub(1);
+    let newest_success = attempts.iter().rposition(|a| a.ok);
+    let mut kept: Vec<ProbeAttempt> = attempts
+        .into_iter()
+        .enumerate()
+        .filter(|(i, a)| {
+            now_ms.saturating_sub(a.at_ms) <= default_ttl_ms
+                || Some(*i) == newest
+                || Some(*i) == newest_success
+        })
+        .map(|(_, a)| a)
+        .collect();
+    // The hard backstop wins over the keep rules: retain only the newest CAP rows.
+    let excess = kept.len().saturating_sub(PROBE_HISTORY_CAP);
+    kept.split_off(excess)
 }
 
 fn tagged(tag: u8, id_bytes: &[u8]) -> Vec<u8> {

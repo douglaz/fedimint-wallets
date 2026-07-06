@@ -143,6 +143,10 @@ pub fn assemble_facts(p: &ProbeResult, id: FederationId) -> FederationFacts {
         // (ADR-0020). The sense layer never fabricates it, so it is always `None`
         // here — a missing prior is never a rejection, it just adds no rank bonus.
         observer: None,
+        // The ACTIVE probe verdict (§5.0.6) is journal + designation material, not sense
+        // material: the tick/status assembler fills it from `probe_record` against the
+        // snapshot's designated spending fed. The sense layer never fabricates it.
+        active_probe: None,
     }
 }
 

@@ -128,6 +128,19 @@ pub enum OperationKind {
     Refusal {
         fed: FederationId,
     },
+    /// The active probe's UMBRELLA row (phase 5 §5.0.5), keyed `probe:<fed-hex>:<nonce>`:
+    /// one row per probe INVOCATION, terminalized when the attempt records (the two leg
+    /// moves carry their own `move:` rows). `from` names the probing source so pair-scoped
+    /// failures with no move intent still name it in `history`; `cost_msat` is filled at
+    /// terminalization with the wallet's NET OUTFLOW from the source — leg IN's total debit
+    /// minus leg OUT's credit (`None` when no money moved). On a hostile candidate that is
+    /// fees + the WHOLE delivered amount: the honest exposure number a probe budget sums.
+    Probe {
+        fed: FederationId,
+        from: FederationId,
+        amount_msat: Msat,
+        cost_msat: Option<Msat>,
+    },
     Tick {
         occurrence: Occurrence,
         decisions: u32,
@@ -313,8 +326,10 @@ pub fn advance(
 /// (§9.2), not from this update, so only its gateway is touched here.
 fn enrich_kind(kind: &mut OperationKind, upd: &RawOpUpdate) {
     match kind {
-        OperationKind::Join { .. } | OperationKind::Refusal { .. } | OperationKind::Tick { .. } => {
-        }
+        OperationKind::Join { .. }
+        | OperationKind::Refusal { .. }
+        | OperationKind::Tick { .. }
+        | OperationKind::Probe { .. } => {}
         OperationKind::Receive { op_id, gateway, .. } => {
             fill(op_id, upd.op_id);
             fill_gateway(gateway, &upd.gateway);

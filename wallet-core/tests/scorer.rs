@@ -19,6 +19,7 @@ fn healthy() -> FederationFacts {
         shutdown_scheduled: false,
         has_lnv2: true,
         observer: None,
+        active_probe: None,
     }
 }
 

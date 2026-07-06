@@ -14,9 +14,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use wallet_core::{
-    Action, Actor, AllocatorDecision, ExecutionSummary, FederationId, FeeBreakdown, IdempotencyKey,
-    IntentStatus, Journal, Msat, Occurrence, OperationKind, OperationRecord, OperationStatus,
-    RawOpUpdate, ReasonCode,
+    Action, ActiveProbeVerdict, Actor, AllocatorDecision, ExecutionSummary, FederationId,
+    FeeBreakdown, IdempotencyKey, IntentStatus, Journal, Msat, Occurrence, OperationKind,
+    OperationRecord, OperationStatus, ProbePolicy, RawOpUpdate, ReasonCode,
 };
 use wallet_fedimint::{
     parse_invoice, FedimintJournal, FinalizeOutcome, GatewayUrl, Invoice, LedgerRepairOracle,
@@ -176,6 +176,36 @@ enum Command {
         /// re-mint/re-pay); bump it to start another same-params move after the first settles.
         #[arg(long, default_value_t = 0)]
         occurrence: u64,
+    },
+    /// Actively probe a candidate federation (phase 5 §5.0.7): run ONE sats-spending
+    /// two-leg round trip (mint `--amount` on <fed> from the source, redeem the delta
+    /// back) through the ordinary move machinery, record the attempt in the durable
+    /// verdict history, and print `attempt:` + `verdict:` to stdout (keys/diagnostics go
+    /// to stderr). Exits non-zero on a failed attempt — a probe IS a money op. A crashed
+    /// probe resumes on the next invocation of `probe` for the same federation.
+    Probe {
+        /// The candidate federation to probe (hex id).
+        fed: String,
+        /// The spending federation to probe FROM (hex id). When omitted: with exactly TWO
+        /// joined federations of which <fed> is one, the other is used; otherwise refused.
+        #[arg(long)]
+        from: Option<String>,
+        /// Probe amount in millisatoshis (default 20000 = 20 sats).
+        #[arg(long)]
+        amount: Option<u64>,
+        /// PER-LEG fee cap in millisatoshis (default 10000 = 10 sats).
+        #[arg(long)]
+        fee_cap: Option<u64>,
+        /// Successes required for a `passed` verdict (default 3).
+        #[arg(long)]
+        min_successes: Option<u32>,
+        /// Seconds the qualifying successes must span (default 24h). SHRINK-ONLY: a value
+        /// above the default is rejected (durable retention cannot back a larger window).
+        #[arg(long)]
+        min_span_secs: Option<u64>,
+        /// Seconds before the newest success goes stale (default 7d). SHRINK-ONLY.
+        #[arg(long)]
+        ttl_secs: Option<u64>,
     },
     /// Re-drive pending intents and rebuild move records from the op-log (spec §9 resume loop):
     /// print performed/failed/skipped/retryable/awaiting counts; awaiting intent keys go to stderr.
@@ -756,7 +786,15 @@ async fn main() -> anyhow::Result<()> {
                 perform_timeout,
             );
             let outcome = runtime
-                .do_move(from_id, to_id, amount, fee_cap, Occurrence(occurrence))
+                .do_move(
+                    from_id,
+                    to_id,
+                    amount,
+                    fee_cap,
+                    Occurrence(occurrence),
+                    ReasonCode::UserInitiated,
+                    Actor::User,
+                )
                 .await?;
             // done/failed -> stdout (the scriptable result); the move key -> stderr (the handle).
             match outcome.status {
@@ -776,6 +814,56 @@ async fn main() -> anyhow::Result<()> {
                         status_label(status)
                     );
                 }
+            }
+        }
+        Command::Probe {
+            fed,
+            from,
+            amount,
+            fee_cap,
+            min_successes,
+            min_span_secs,
+            ttl_secs,
+        } => {
+            // Parse-only — deliberately NOT `select_fed`: a not-joined candidate must
+            // still reach the runtime's preflight so the refusal lands in `history`
+            // (§5.0.5 — a failed probe invocation is never invisible).
+            let candidate = parse_fed_id(&fed)?;
+            let source = probe_source(&journal, &joined_ids, candidate, from.as_deref()).await?;
+            let policy =
+                build_probe_policy(amount, fee_cap, min_successes, min_span_secs, ttl_secs)?;
+            // Probes ride the ordinary move machinery: no pinned gateway (the route
+            // resolves from the registered set) and the ADR-0018 hard cap enforced
+            // verbatim — probe legs never bypass it (§5.0.5).
+            let runtime = Runtime::new(
+                multi_client.clone(),
+                journal.clone(),
+                None,
+                operator_hard_cap(false),
+                perform_timeout,
+            );
+            let report = runtime
+                .active_probe(candidate, source, &policy, Actor::User)
+                .await?;
+            // Keys/diagnostics -> stderr; the scriptable attempt/verdict lines -> stdout.
+            eprintln!("in_key: {}", report.in_key.0);
+            if let Some(out_key) = &report.out_key {
+                eprintln!("out_key: {}", out_key.0);
+            }
+            eprintln!(
+                "verdict_before: {}",
+                active_probe_label(report.verdict_before)
+            );
+            if report.attempt.ok {
+                println!("attempt: ok");
+                println!("verdict: {}", active_probe_label(report.verdict_after));
+            } else {
+                println!(
+                    "attempt: failed {}",
+                    report.attempt.error.as_deref().unwrap_or("(no diagnostic)")
+                );
+                println!("verdict: {}", active_probe_label(report.verdict_after));
+                anyhow::bail!("probe attempt failed (a probe is a money operation)");
             }
         }
         Command::Reconcile {
@@ -1102,15 +1190,128 @@ fn describe_scored(
         ""
     };
     format!(
-        "{}{role} eligible={} rank={} spendable={} msat probed_ok={} healthy={} reasons={:?}",
+        "{}{role} eligible={} rank={} spendable={} msat probed_ok={} healthy={} active_probe={} \
+         reasons={:?}",
         scored.id.to_hex(),
         scored.verdict.eligible_to_fund,
         scored.verdict.rank_score,
         scored.status.balance.spendable.0,
         scored.status.probed_ok,
         scored.status.healthy,
+        scored.active_probe.map_or("-", active_probe_label),
         scored.verdict.reasons,
     )
+}
+
+/// The stable lowercase label for an active-probe verdict (§5.0.6's
+/// `active_probe=passed|never|expired|…` vocabulary).
+fn active_probe_label(verdict: ActiveProbeVerdict) -> &'static str {
+    match verdict {
+        ActiveProbeVerdict::Passed => "passed",
+        ActiveProbeVerdict::NeverProbed => "never",
+        ActiveProbeVerdict::Insufficient => "insufficient",
+        ActiveProbeVerdict::Expired => "expired",
+        ActiveProbeVerdict::Failed => "failed",
+        ActiveProbeVerdict::FailedSinceLastPass => "failed-since-pass",
+    }
+}
+
+/// §5.0.7 source resolution when `--from` is omitted: exactly TWO joined federations of
+/// which the candidate is one ⇒ the other (the common probe topology); anything else is
+/// refused — deterministic, and deliberately NOT coupled to the tick's designation logic
+/// (a probe must not silently ride whatever auto-designation picked this run).
+/// Resolve the probe's spending federation `S` (§5.0.7), RESUME-AWARE: an in-flight probe
+/// carries its own fixed source, so a resume must reuse it rather than re-infer — otherwise a
+/// two-fed inference (or a different `--from`) could point the resumed legs at the wrong
+/// source. Precedence: an in-flight session's `from` (a resume — the session's source is
+/// authoritative and any conflicting `--from` is refused) → an explicit `--from` → the
+/// two-fed auto-rule.
+async fn probe_source(
+    journal: &FedimintJournal,
+    joined: &[FederationId],
+    candidate: FederationId,
+    from: Option<&str>,
+) -> anyhow::Result<FederationId> {
+    let explicit = from.map(parse_fed_id).transpose()?;
+
+    if let Some(session) = journal
+        .probe_record(&candidate)
+        .await
+        .map_err(ledger_err)?
+        .and_then(|rec| rec.in_flight)
+    {
+        if let Some(explicit) = explicit {
+            anyhow::ensure!(
+                explicit == session.from,
+                "federation {} has an in-flight probe from {}; --from {} conflicts — omit \
+                 --from to resume it, or let it finish first",
+                candidate.to_hex(),
+                session.from.to_hex(),
+                explicit.to_hex()
+            );
+        }
+        return Ok(session.from);
+    }
+
+    if let Some(explicit) = explicit {
+        return Ok(explicit);
+    }
+    if let [a, b] = joined {
+        if *a == candidate {
+            return Ok(*b);
+        }
+        if *b == candidate {
+            return Ok(*a);
+        }
+    }
+    anyhow::bail!(
+        "cannot infer the probe source: pass --from <spending-fed-hex> (auto-resolution \
+         applies only when exactly two federations are joined and <fed> is one of them)"
+    )
+}
+
+/// Build the probe [`ProbePolicy`] from the §5.0.7 flags. The verdict-window flags exist
+/// so a smoke can SHRINK the window and are clamped SHRINK-ONLY: `--ttl-secs` /
+/// `--min-span-secs` above their defaults are rejected — §5.0.4's durable retention keeps
+/// only sub-default-`ttl` attempts (plus the newest success/attempt), so a larger window
+/// could not be computed from the history it advertises.
+fn build_probe_policy(
+    amount: Option<u64>,
+    fee_cap: Option<u64>,
+    min_successes: Option<u32>,
+    min_span_secs: Option<u64>,
+    ttl_secs: Option<u64>,
+) -> anyhow::Result<ProbePolicy> {
+    let defaults = ProbePolicy::default();
+    let min_span_ms = min_span_secs.map(|s| s.saturating_mul(1000));
+    let ttl_ms = ttl_secs.map(|s| s.saturating_mul(1000));
+    if let Some(ttl) = ttl_ms {
+        anyhow::ensure!(
+            ttl <= defaults.ttl_ms,
+            "--ttl-secs {} exceeds the default {}s: durable probe retention keeps only \
+             attempts younger than the default ttl (plus the newest success/attempt), so a \
+             larger verdict window cannot be computed from stored history (shrink-only)",
+            ttl / 1000,
+            defaults.ttl_ms / 1000
+        );
+    }
+    if let Some(span) = min_span_ms {
+        anyhow::ensure!(
+            span <= defaults.min_span_ms,
+            "--min-span-secs {} exceeds the default {}s: durable probe retention is sized \
+             to the default verdict window, so a larger span cannot be computed from stored \
+             history (shrink-only)",
+            span / 1000,
+            defaults.min_span_ms / 1000
+        );
+    }
+    Ok(ProbePolicy {
+        amount_msat: amount.unwrap_or(defaults.amount_msat),
+        leg_fee_cap_msat: fee_cap.unwrap_or(defaults.leg_fee_cap_msat),
+        min_successes: min_successes.unwrap_or(defaults.min_successes),
+        min_span_ms: min_span_ms.unwrap_or(defaults.min_span_ms),
+        ttl_ms: ttl_ms.unwrap_or(defaults.ttl_ms),
+    })
 }
 
 /// A federation id as hex, or the literal `none` for an undesignated slot.
@@ -1704,6 +1905,9 @@ fn record_involves_fed(record: &OperationRecord, fed: FederationId) -> bool {
         OperationKind::Receive { fed: f, .. } | OperationKind::Pay { fed: f, .. } => *f == fed,
         OperationKind::DirectInflow { to, .. } => *to == fed,
         OperationKind::Move { from, to, .. } => *from == fed || *to == fed,
+        // Either endpoint matches, so `history --fed <source>` stays complete even for a
+        // pair-scoped route failure whose move intents never existed (§5.0.5).
+        OperationKind::Probe { fed: f, from, .. } => *f == fed || *from == fed,
         OperationKind::Tick { .. } => false,
     }
 }
@@ -1797,6 +2001,16 @@ fn print_kind_details(kind: &OperationKind) {
             println!("recv_op: {}", opt_op(recv_op));
             println!("gateway: {}", opt_gw(gateway));
         }
+        OperationKind::Probe {
+            fed,
+            from,
+            cost_msat,
+            amount_msat: _,
+        } => {
+            println!("fed: {}", fed.to_hex());
+            println!("from: {}", from.to_hex());
+            println!("cost_msat: {}", opt_msat(*cost_msat));
+        }
         OperationKind::Tick {
             occurrence,
             decisions,
@@ -1827,6 +2041,7 @@ fn kind_and_amount(kind: &OperationKind) -> (&'static str, Option<Msat>) {
             Some(*amount),
         ),
         OperationKind::Refusal { .. } => ("refusal", None),
+        OperationKind::Probe { amount_msat, .. } => ("probe", Some(*amount_msat)),
         OperationKind::Tick { .. } => ("tick", None),
     }
 }
@@ -1860,6 +2075,7 @@ fn reason_tag(reason: ReasonCode) -> &'static str {
         ReasonCode::LowReputation => "low_reputation",
         ReasonCode::UserInitiated => "user_initiated",
         ReasonCode::StandingInstruction => "standing_instruction",
+        ReasonCode::ActiveProbe => "active_probe",
     }
 }
 
@@ -2407,5 +2623,73 @@ mod tests {
             op(7)
         )
         .is_err());
+    }
+
+    fn probe_session_from(source: FederationId) -> wallet_fedimint::ProbeSession {
+        wallet_fedimint::ProbeSession {
+            nonce: "0123456789abcdef0123456789abcdef".to_string(),
+            from: source,
+            amount_msat: 20_000,
+            leg_fee_cap_msat: 10_000,
+            c_spendable_before_in_msat: 0,
+            out_net_msat: None,
+            started_at_ms: 1,
+        }
+    }
+
+    /// §5.0.7: an in-flight probe's source is authoritative — a resume must reuse it and never
+    /// re-infer, so a two-fed auto-rule (or a conflicting `--from`) cannot repoint the resumed
+    /// legs at the wrong source.
+    #[tokio::test]
+    async fn probe_source_prefers_the_in_flight_session_then_explicit_then_auto() {
+        use fedimint_core::db::mem_impl::MemDatabase;
+        use fedimint_core::db::IRawDatabaseExt as _;
+
+        let (a, b, c) = (fed(1), fed(2), fed(3));
+        let journal = FedimintJournal::new(MemDatabase::new().into_database());
+
+        // No session: explicit --from wins.
+        assert_eq!(
+            probe_source(&journal, &[a, b, c], c, Some(&a.to_hex()))
+                .await
+                .expect("explicit source"),
+            a
+        );
+        // No session, no --from, exactly two joined: infer the other one.
+        assert_eq!(
+            probe_source(&journal, &[a, c], c, None)
+                .await
+                .expect("two-fed inference"),
+            a
+        );
+        // No session, no --from, three joined: refuse.
+        assert!(probe_source(&journal, &[a, b, c], c, None).await.is_err());
+
+        // An in-flight probe of `c` from `b`: a resume uses the session's source...
+        journal
+            .begin_probe_session(&c, &probe_session_from(b))
+            .await
+            .expect("begin session");
+        assert_eq!(
+            probe_source(&journal, &[a, c], c, None)
+                .await
+                .expect("resume ignores the two-fed rule"),
+            b,
+            "the two-fed auto-rule must not override an in-flight session's source"
+        );
+        // ...and a conflicting --from is refused rather than silently repointing the legs.
+        assert!(
+            probe_source(&journal, &[a, c], c, Some(&a.to_hex()))
+                .await
+                .is_err(),
+            "a --from conflicting with the in-flight session must refuse"
+        );
+        // A matching --from is accepted.
+        assert_eq!(
+            probe_source(&journal, &[a, c], c, Some(&b.to_hex()))
+                .await
+                .expect("matching --from"),
+            b
+        );
     }
 }

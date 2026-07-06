@@ -11,6 +11,7 @@
 //!
 //! This is pure Rust: no I/O, no async, no networking, no floats. Facts are GIVEN.
 
+use crate::probe::ActiveProbeVerdict;
 use crate::FederationId;
 
 /// Fedimint consensus module kinds we care about for fundability.
@@ -56,6 +57,11 @@ pub struct FederationFacts {
     pub has_lnv2: bool,
     // Untrusted prior, used only behind the gate (ADR-0020):
     pub observer: Option<ObserverPrior>,
+    /// The ACTIVE probe verdict (phase 5 §5.0.6), evaluated against the snapshot's
+    /// designated SPENDING fed (the pair 5.1's gate must trust). `None` = never probed /
+    /// no designated source — never a rejection by itself. 5.0 surfaces it only; the
+    /// scorer deliberately does NOT read it (the `Discovered`-fed gate is 5.1's wire-up).
+    pub active_probe: Option<ActiveProbeVerdict>,
 }
 
 /// Tunable structural floor. `Default` is the v1 policy.
