@@ -51,11 +51,12 @@ A probe of candidate federation `C` from spending federation `S`:
 Both legs are ordinary intents: journaled, idempotent, resumable by `reconcile`, and
 recorded in the operation ledger — a probe is user-auditable history, not a side channel.
 
-**Failure taxonomy (recorded verbatim on the attempt):** leg-IN failure = "cannot route/
-mint/claim" (candidate unusable, no funds at risk beyond fees); leg-OUT failure =
-"REDEEMABILITY failure" (the damning one — bounded loss = what leg IN landed); a
-`Stranded` leg is its own recorded outcome (the §3 machinery already preserves the
-preimage). ANY failed leg ⇒ the attempt is FAILED; there are no partial passes.
+**Failure taxonomy:** ANY failed leg ⇒ the probe FAILED; there are no partial passes.
+Whether the failure DEMOTES the candidate is a separate, attribution-scoped question —
+see 5.0.3's scoping rule: candidate-refused mint (leg IN) and candidate-refused pay
+(leg OUT — the damning REDEEMABILITY failure, bounded loss = what leg IN landed) demote;
+source, gateway, and ambiguous faults (incl. a `Stranded` leg — the §3 machinery already
+preserves the preimage) are umbrella-row history only.
 
 ### 5.0.2 Amounts, fees, cost (SDK-floored)
 
@@ -141,15 +142,24 @@ When the suffix is empty because the newest attempt failed after a prior qualify
 newest older than `ttl_ms` = `Expired`; suffix too short/narrow = `Insufficient`. Only
 `Passed` ever gates IN.
 
-**Scoping rule — the verdict measures the CANDIDATE's honesty, not pair reachability.**
-Attempts enter the history only when the candidate's OWN behavior was exercised: a
-leg-IN or leg-OUT move failure (C refused to mint / claim / redeem) demotes GLOBALLY —
-those are properties of C regardless of which source probed. A NO-SHARED-ROUTE preflight
-failure is a (source, candidate) PAIR property: it gets the umbrella ledger row (5.0.5 —
-the audit trail keeps it, with the source named) but NO `ProbeAttempt` — it must not
-demote C for sources that can reach it, and reachability is already enforced per-move by
-the route preflight at funding time. A success via ANY source counts (mint+redeem was
-proven).
+**Scoping rule — the verdict measures the CANDIDATE's honesty; only
+candidate-ATTRIBUTABLE outcomes enter the history.** A SUCCESS (both legs settled) via
+any source counts — mint+redeem was proven. A FAILURE becomes a demoting attempt ONLY
+when the candidate itself refused: leg IN's invoice-mint/claim refused ON `C`
+(`CreateInvoice`-on-C failure, C's contract never claimable), or leg OUT's pay refused
+BY `C` (a classified send rejection from C — the redeemability core). Everything else
+is recorded on the umbrella row ONLY (verbatim, source named) and writes NO attempt:
+NO-SHARED-ROUTE preflight failures (a (source, candidate) pair property — must not
+demote C for sources that can reach it; per-move route preflights own reachability at
+funding time), SOURCE-side failures (S refusing leg OUT's mint or leg IN's pay is S's
+fault), and GATEWAY/AMBIGUOUS faults (a `Stranded` leg — send settled, receive never
+credited — cannot distinguish a thieving gateway from a broken candidate, so it must
+not demote). Safety is preserved without demotion because NO-ATTEMPT ≠ PASS: a probe
+that failed for any reason yields no success either, so the candidate simply does not
+progress toward `Passed`. The runtime classifies from what the move machinery already
+exposes (the failing step + the Phase-4 error taxonomy: classified send rejections,
+`Stranded`, expiry); when attribution is genuinely unclear, the fault is AMBIGUOUS and
+does not demote.
 
 ### 5.0.4 Durable probe state (journal tag `0x08`)
 
@@ -159,7 +169,9 @@ proven).
   full narrative). One row per fed, upserted in its own dbtx.
 - `ProbeSession { nonce: String /* 32 hex chars */, from: FederationId /* the probe's
   source — resolved per 5.0.7 and fixed for the session */,
-  amount_msat: u64, leg_fee_cap_msat: u64, out_net_msat: Option<u64>,
+  amount_msat: u64, leg_fee_cap_msat: u64,
+  c_spendable_before_in_msat: u64 /* the candidate's balance BEFORE leg IN — the
+  no-sweep baseline */, out_net_msat: Option<u64>,
   started_at_ms: u64 }` — the durable probe IDENTITY, written BEFORE leg IN is
   journaled. A `move:` intent key is deterministic from
   `(from, to, amount, fee_cap, occurrence = nonce-derived u64)`, so leg IN's key is
@@ -172,10 +184,13 @@ proven).
   drive/settle leg IN, then size, persist, proceed; `out_net_msat: Some(n)` + `journal.get(out_key)` is `None` ⇒ sized
   but the intent was never journaled (the crash window between the session update and
   `do_move`) — RE-CHECK the no-sweep precondition first: leg OUT may start (with
-  EXACTLY the persisted `n`; never re-size) only while `C.spendable ≥ delivered_in` —
-  ecash is fungible, so as long as the full delta is still present, drawing `n ≤
-  delivered_in` provably cannot touch pre-existing funds; if something spent from `C`
-  between crash and resume (`spendable < delivered_in`), redeeming would sweep funds
+  EXACTLY the persisted `n`; never re-size) only while
+  `C.spendable ≥ c_spendable_before_in + delivered_in` — the session's pre-probe
+  BASELINE plus the delta. (Checking against the delta alone is fooled by pre-existing
+  funds: C held 100, delta 20, user spends 15 → spendable 105 still exceeds 20 while a
+  third of the delta is gone.) Ecash is fungible, so with baseline + delta intact,
+  drawing `n ≤ delivered_in` provably cannot touch pre-existing funds; anything below
+  the threshold means redeeming could sweep funds
   that are not the probe's — ABORT as INCONCLUSIVE instead via
   `record_probe_outcome(fed, None, …, Failed("probe delta consumed before redemption;
   inconclusive"))` — session cleared atomically, NO attempt, no demotion. No such guard is needed before DRIVING an already-journaled leg OUT —
@@ -215,19 +230,25 @@ source federation, per 5.0.7):
    longer hold and would misclassify a recoverable probe as a new local error — and no
    NEW umbrella row is created: the resumed attempt terminalizes its ORIGINAL row (the
    umbrella key is `probe:<fed>:<nonce>` and the nonce lives in the session).
-1. **Preflight (fresh probes only):** candidate is joined + open (else a clean
-   diagnostic); candidate ≠ `from`; `from` holds ≥ `amount + leg fee cap`; the
-   CANDIDATE has ADR-0018 cap room ≥ `amount` (the source needs none — see the cap note
-   below); the existing move-route preflight validates a shared gateway serves both
-   directions. The umbrella `probe:` ledger row is `record_started` at the TOP of the
-   fresh path — before the preflight checks — exactly like Phase 4's raw-op recorded
-   window, so every fresh invocation is history, however it ends. A NO-SHARED-ROUTE failure terminalizes the umbrella row
-   `Failed` with the verbatim route error but writes NO `ProbeAttempt` — pair
+1. **Session, then umbrella, then preflight (fresh probes only):** the fresh path
+   opens by writing the SESSION (nonce chosen; `c_spendable_before_in` sampled) and
+   THEN `record_started` on the umbrella `probe:` row — session-first, because step 0
+   can only resume what a session names: a crash between the two leaves a session
+   whose umbrella row does not exist yet, and `record_probe_outcome`'s ledger write is
+   create-or-advance (the Phase-4 helper creates an absent row), so the resumed
+   outcome still lands as history; the opposite order would strand a permanent
+   `Started` row no resume could ever find. Then the preflight: candidate is joined +
+   open (else a clean diagnostic); candidate ≠ `from`; `from` holds ≥ `amount + leg
+   fee cap`; the CANDIDATE has ADR-0018 cap room ≥ `amount` (the source needs none —
+   see the cap note below); the existing move-route preflight validates a shared
+   gateway serves both directions. A NO-SHARED-ROUTE failure exits via
+   `record_probe_outcome(fed, None, …, Failed(<verbatim route error>))` — pair
    reachability, not candidate honesty (5.0.3's scoping rule). LOCAL faults
    (insufficient balance, infeasible policy, insufficient candidate cap room, not
-   joined) ALSO terminalize the umbrella row `Failed` with their diagnostic — a failed
-   `probe` invocation must never be invisible in `history` (the Phase 4 auditability
-   contract) — while writing no attempt (no demotion either way).
+   joined) exit the SAME way with their diagnostic — a failed `probe` invocation must
+   never be invisible in `history` (the Phase 4 auditability contract), and every
+   terminal exit after the session exists clears it atomically — while writing no
+   attempt (no demotion either way).
 
    **ADR-0018 cap interplay (explicit):** probe legs do NOT bypass the hard per-fed cap
    — the executor's perform-time enforcement and the evacuation-sizing clamp apply
@@ -237,7 +258,8 @@ source federation, per 5.0.7):
    no upfront room check: leg IN debits `from` by `amount + fees` BEFORE leg OUT
    returns strictly less than that, so the return leg always fits the room leg IN just
    created — even a source AT its cap probes without ever breaching ADR-0018.
-2. **Session begin:** write the NEW session (5.0.4) before journaling leg IN.
+2. *(Session already written in step 1 — fresh probes reach here with a durable
+   identity.)*
 3. **Leg IN** = `do_move(from → C, amount, leg_fee_cap, occurrence = probe nonce)`.
 4. **Post-IN feasibility re-check:** the sizing search runs with budget = leg IN's
    DELIVERED net (which may sit a verified hair under `amount`). If no out move whose
@@ -322,8 +344,12 @@ on a failed attempt (a probe IS a money op). `status` gains the per-fed verdict 
   insufficient balance, insufficient candidate cap room) terminalize the umbrella row
   `Failed` with the diagnostic and write NO attempt; no-shared-route does the same with
   the route error (also no attempt — the verdict history is untouched either way, per
-  5.0.3's scoping rule); resume drives non-terminal legs across every session state
-  (pre-leg-IN, mid-IN, sized-but-unjournaled OUT, mid-OUT).
+  5.0.3's scoping rule); FAULT ATTRIBUTION: a candidate-refused mint (leg IN) and a
+  candidate-refused pay (leg OUT) each write a demoting attempt, while a source-side
+  failure, a `Stranded` leg, and an ambiguous error write umbrella-only outcomes (no
+  demotion — asserted against the verdict); resume drives non-terminal legs across
+  every session state (session-only pre-umbrella, pre-leg-IN, mid-IN,
+  sized-but-unjournaled OUT with the baseline no-sweep guard, mid-OUT).
 - **Devimint smoke (`smoke_probe_devimint.sh`, the 5.0 exit gate):** two-fed harness —
   `wallet-cli probe B` runs the live round trip. Mid-probe, B's delta equals the
   PERSISTED DELIVERED net (the executor's verified hair-under is a healthy outcome —
