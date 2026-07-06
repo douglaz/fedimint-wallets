@@ -176,22 +176,26 @@ proven).
   ecash is fungible, so as long as the full delta is still present, drawing `n ≤
   delivered_in` provably cannot touch pre-existing funds; if something spent from `C`
   between crash and resume (`spendable < delivered_in`), redeeming would sweep funds
-  that are not the probe's — ABORT as INCONCLUSIVE instead (umbrella row
-  `Failed("probe delta consumed before redemption; inconclusive")`, NO attempt, no
-  demotion). No such guard is needed before DRIVING an already-journaled leg OUT —
+  that are not the probe's — ABORT as INCONCLUSIVE instead via
+  `record_probe_outcome(fed, None, …, Failed("probe delta consumed before redemption;
+  inconclusive"))` — session cleared atomically, NO attempt, no demotion. No such guard is needed before DRIVING an already-journaled leg OUT —
   once the out intent exists, the money path owns it like any other move.
   `Some(intent)` ⇒ drive it. The session is cleared in the
   same atomic write that records the finished attempt.
-- `FedimintJournal::{record_probe_attempt(fed, attempt, umbrella_key, status, error),
-  begin_probe_session(fed, session), probe_record(fed)}`. `probe_record` is a TARGETED
-  getter and FAILS CLOSED on an undecodable row (like `get`/`get_move`/`operation`) —
-  it decides whether a session is in flight, and a swallowed corrupt row would restart
-  a probe that is already live, spending twice. Only SCANS are poison-tolerant. `record_probe_attempt` performs THREE writes in ONE dbtx: append
-  the attempt, clear `in_flight`, terminalize the umbrella `probe:` ledger row — they
-  commit or fail together (the same discipline as the intent/ledger integration). A
-  crash can therefore never leave the verdict history disagreeing with `history`'s
-  umbrella row, and once `in_flight` clears, no repair handle is needed because
-  everything the repair would fix was written atomically with the clear.
+- `FedimintJournal::{record_probe_outcome(fed, attempt: Option<ProbeAttempt>,
+  umbrella_key, status, error), begin_probe_session(fed, session), probe_record(fed)}`.
+  `probe_record` is a TARGETED getter and FAILS CLOSED on an undecodable row (like
+  `get`/`get_move`/`operation`) — it decides whether a session is in flight, and a
+  swallowed corrupt row would restart a probe that is already live, spending twice.
+  Only SCANS are poison-tolerant. `record_probe_outcome` is the ONE terminal write for
+  every exit after a session exists, in ONE dbtx: clear `in_flight`, terminalize the
+  umbrella `probe:` ledger row, and append the attempt when `attempt` is `Some` (leg
+  outcomes) — `None` for the no-attempt terminal exits (the post-IN feasibility abort
+  and the inconclusive no-sweep abort ALSO clear their session this way; a stale
+  session must never survive a terminal exit, or later probes would treat an
+  already-terminal failure as crash recovery). All parts commit or fail together (the
+  same discipline as the intent/ledger integration), so the verdict history, the
+  session, and `history`'s umbrella row can never disagree.
 - The attempt is recorded AFTER the round trip resolves either way (both legs settled,
   or a leg terminally failed). A crash mid-probe leaves the legs' own intents to
   `reconcile` (they self-resume like any move); the next `probe` invocation finds the
@@ -203,13 +207,21 @@ proven).
 `Runtime::active_probe(candidate, from, policy) -> ProbeReport` (`from` = the resolved
 source federation, per 5.0.7):
 
-1. **Preflight:** candidate is joined + open (else a clean diagnostic); candidate ≠
-   `from`; `from` holds ≥ `amount + leg fee cap`; the CANDIDATE has ADR-0018 cap room
-   ≥ `amount` (the source needs none — see the cap note below);
-   the existing move-route preflight validates a shared gateway serves both directions.
-   The umbrella `probe:` ledger row is `record_started` FIRST — before any preflight
-   check — exactly like Phase 4's raw-op recorded window, so EVERY probe invocation is
-   history, however it ends. A NO-SHARED-ROUTE failure terminalizes the umbrella row
+0. **Resume FIRST — before any fresh-probe work.** Read `probe_record(candidate)`; if
+   `in_flight` exists, this invocation IS the crash recovery: reconstruct the leg keys,
+   drive per 5.0.4's disambiguation, record the outcome (which clears the session), and
+   RETURN. The fresh-probe preflight below must NOT run for a resume — leg IN may
+   already have debited `from` and credited `C`, so fresh-probe balance/cap checks no
+   longer hold and would misclassify a recoverable probe as a new local error — and no
+   NEW umbrella row is created: the resumed attempt terminalizes its ORIGINAL row (the
+   umbrella key is `probe:<fed>:<nonce>` and the nonce lives in the session).
+1. **Preflight (fresh probes only):** candidate is joined + open (else a clean
+   diagnostic); candidate ≠ `from`; `from` holds ≥ `amount + leg fee cap`; the
+   CANDIDATE has ADR-0018 cap room ≥ `amount` (the source needs none — see the cap note
+   below); the existing move-route preflight validates a shared gateway serves both
+   directions. The umbrella `probe:` ledger row is `record_started` at the TOP of the
+   fresh path — before the preflight checks — exactly like Phase 4's raw-op recorded
+   window, so every fresh invocation is history, however it ends. A NO-SHARED-ROUTE failure terminalizes the umbrella row
    `Failed` with the verbatim route error but writes NO `ProbeAttempt` — pair
    reachability, not candidate honesty (5.0.3's scoping rule). LOCAL faults
    (insufficient balance, infeasible policy, insufficient candidate cap room, not
@@ -225,24 +237,21 @@ source federation, per 5.0.7):
    no upfront room check: leg IN debits `from` by `amount + fees` BEFORE leg OUT
    returns strictly less than that, so the return leg always fits the room leg IN just
    created — even a source AT its cap probes without ever breaching ADR-0018.
-2. **Resume check:** if the fed's `ProbeRecord.in_flight` session exists, reconstruct
-   both leg keys from it, DRIVE any non-terminal leg (reconcile semantics) instead of
-   starting fresh, then record the attempt from the legs' terminal states and clear the
-   session (the crash-window repair). A fresh probe begins by writing a NEW session
-   (5.0.4) before journaling leg IN.
+2. **Session begin:** write the NEW session (5.0.4) before journaling leg IN.
 3. **Leg IN** = `do_move(from → C, amount, leg_fee_cap, occurrence = probe nonce)`.
 4. **Post-IN feasibility re-check:** the sizing search runs with budget = leg IN's
    DELIVERED net (which may sit a verified hair under `amount`). If no out move whose
    CONTRACT clears the 5-sat floor is affordable within the leg fee cap from that
    budget (the floor binds the contract, not the net — 5.0.2), this is a LOCAL
-   PARAMETER/FEE-ENVIRONMENT error, NOT a redeemability failure: abort with a
-   diagnostic naming the delivered amount and the shortfall, terminalize the umbrella
-   row `Failed(<that diagnostic>)`, write NO attempt (no demotion). (Under the 5.0.2
+   PARAMETER/FEE-ENVIRONMENT error, NOT a redeemability failure: abort via
+   `record_probe_outcome(fed, None, …, Failed(<diagnostic naming the delivered amount
+   and the shortfall>))` — session cleared, umbrella terminal, NO attempt (no
+   demotion). (Under the 5.0.2
    DEFAULTS this branch is nearly unreachable — delivered hair-under is msats — but
    overrides can reach it and it must be defined, not undefined.)
 5. **Leg OUT** = size with budget = delivered-in, persist `out_net_msat`, then
    `do_move(C → from, out_net, leg_fee_cap, same nonce)`.
-6. Record the attempt (5.0.4) + return a `ProbeReport { verdict_before, attempt,
+6. Record the outcome via `record_probe_outcome` (5.0.4 — attempt `Some`, session cleared) + return a `ProbeReport { verdict_before, attempt,
    verdict_after, in_key, out_key }`.
 
 Keys/ledger: every ATTEMPT gets an umbrella ledger row —
