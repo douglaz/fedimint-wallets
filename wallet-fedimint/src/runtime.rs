@@ -594,6 +594,17 @@ impl Runtime {
                     .await
                 {
                     Ok(Some(sized)) => {
+                        // First `out_net_msat` fill. Two callers racing this window (both
+                        // re-sizing, both journaling a leg OUT against the same delta) is a
+                        // CONCURRENCY hazard the wallet's SINGLE-WRITER architecture forecloses
+                        // in v1: the RocksDB store is opened under an exclusive `db.lock` (a
+                        // second process blocks at open) and the probe verb runs synchronously.
+                        // The crash-then-resume case is sequential (a dead process holds no
+                        // lock; the resume is the only live writer and journals ONE leg). This
+                        // is the SAME concurrency precondition §5.0.1's no-sweep isolation rests
+                        // on — Phase 6's long-running app must revisit the whole probe under a
+                        // per-probe reservation, not a lone CAS here (which would be false
+                        // safety while the balance sampling + no-sweep guard share the exposure).
                         session.out_net_msat = Some(sized.0);
                         self.journal
                             .begin_probe_session(&candidate, &session)
@@ -1886,6 +1897,22 @@ fn probe_local_faults(
                 cap.0
             ));
         }
+        // Leg OUT mints BACK into the source, which runs the same ADR-0018 perform-time cap
+        // enforcement. Leg IN first debits the source by `amount + fees` and leg OUT credits
+        // back strictly less, so an untouched source ENDING ≤ its start means a source that
+        // starts AT-OR-BELOW the cap can never breach it on the return leg. But a source
+        // already ABOVE the cap (a transient inbound) would spend leg IN and then fail leg
+        // OUT umbrella-only with "destination would exceed the per-fed cap" — a GUARANTEED
+        // inconclusive spend. Refuse it here as a LOCAL fault before any money moves.
+        if source_spendable.0 > cap.0 {
+            return Err(format!(
+                "probe source {} holds {} msat, already above the per-fed cap {} msat: the \
+                 return leg would breach it — reduce the source below the cap first",
+                source.to_hex(),
+                source_spendable.0,
+                cap.0
+            ));
+        }
     }
     Ok(())
 }
@@ -2885,6 +2912,20 @@ mod tests {
         )
         .expect_err("capped candidate");
         assert!(err.contains("insufficient candidate cap room"), "{err}");
+        // Source ALREADY above the cap: leg OUT would breach it -> refuse before any spend
+        // (a guaranteed inconclusive probe otherwise). Source has amount + fee headroom and
+        // the candidate has room, so ONLY the over-cap source triggers this.
+        let err = probe_local_faults(
+            FED_B,
+            FED_A,
+            Msat(1_100_000),
+            Msat(0),
+            Msat(20_000),
+            Msat(10_000),
+            Some(Msat(1_000_000)),
+        )
+        .expect_err("over-cap source");
+        assert!(err.contains("already above the per-fed cap"), "{err}");
         // No hard cap disables the room check.
         assert_eq!(
             probe_local_faults(

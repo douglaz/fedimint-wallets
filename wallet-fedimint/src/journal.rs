@@ -1746,18 +1746,29 @@ fn probe_key(id: &FederationId) -> Vec<u8> {
 pub fn prune_probe_attempts(attempts: Vec<ProbeAttempt>, now_ms: u64) -> Vec<ProbeAttempt> {
     let default_ttl_ms = ProbePolicy::default().ttl_ms;
     let newest = attempts.len().checked_sub(1);
-    // `probe_verdict` qualifies a stale success by its SOURCE, so retaining only ONE
-    // whole-fed newest success would let a later success from a different source evict the
-    // stale success that proves an older pass for the ORIGINAL source — turning that pair's
-    // aged-out `Expired` into a false `NeverProbed`. Keep the newest success PER distinct
-    // source instead (bounded by the joined-fed count, small): every source that ever
-    // round-tripped keeps its Expired evidence. (A weaker smoke probe evicting a stronger
-    // older success from the SAME source is a shrink-only test artifact, not retained.)
+    // `probe_verdict` qualifies a stale success by its SOURCE and STRENGTH (amount ≥,
+    // fee cap ≤ the evaluating policy), so retaining only ONE whole-fed newest success
+    // would let a later success from a different source — or a weaker `--amount`/`--fee-cap`
+    // smoke probe from the SAME source — evict the stale success that proves an older
+    // DEFAULT-sized pass, turning that pair's aged-out `Expired` into a false `NeverProbed`.
+    // Keep, per source: (a) the newest success (any strength) AND (b) the newest success
+    // that qualifies under the DEFAULT policy — the strength `status`/gating actually
+    // evaluate. Both are bounded by the joined-fed count (small).
+    let default_policy = ProbePolicy::default();
+    let default_qualifies = |a: &ProbeAttempt| {
+        a.ok && a.amount_msat >= default_policy.amount_msat
+            && a.leg_fee_cap_msat <= default_policy.leg_fee_cap_msat
+    };
     let mut newest_success_by_source: std::collections::BTreeMap<FederationId, usize> =
+        std::collections::BTreeMap::new();
+    let mut newest_default_success_by_source: std::collections::BTreeMap<FederationId, usize> =
         std::collections::BTreeMap::new();
     for (i, a) in attempts.iter().enumerate() {
         if a.ok {
             newest_success_by_source.insert(a.from, i);
+        }
+        if default_qualifies(a) {
+            newest_default_success_by_source.insert(a.from, i);
         }
     }
     let mut kept: Vec<ProbeAttempt> = attempts
@@ -1767,6 +1778,7 @@ pub fn prune_probe_attempts(attempts: Vec<ProbeAttempt>, now_ms: u64) -> Vec<Pro
             now_ms.saturating_sub(a.at_ms) <= default_ttl_ms
                 || Some(*i) == newest
                 || newest_success_by_source.get(&a.from) == Some(i)
+                || newest_default_success_by_source.get(&a.from) == Some(i)
         })
         .map(|(_, a)| a)
         .collect();

@@ -298,10 +298,15 @@ source federation, per 5.0.7):
    — the executor's perform-time enforcement and the evacuation-sizing clamp apply
    verbatim. The preflight requires cap room ≥ `amount` on the CANDIDATE only;
    insufficient candidate room is a LOCAL condition (umbrella row Failed, no attempt,
-   no demotion) — a fed sitting near its cap is not a dishonest fed. The SOURCE needs
-   no upfront room check: leg IN debits `from` by `amount + fees` BEFORE leg OUT
-   returns strictly less than that, so the return leg always fits the room leg IN just
-   created — even a source AT its cap probes without ever breaching ADR-0018.
+   no demotion) — a fed sitting near its cap is not a dishonest fed. The SOURCE needs a
+   preflight `spendable ≤ per_fed_cap` check: leg OUT mints BACK into `from`, running the
+   same perform-time cap enforcement. Leg IN first debits `from` by `amount + fees` and
+   leg OUT credits back strictly less, so a source that starts AT-OR-BELOW the cap ends
+   below it and never breaches — but a source ALREADY ABOVE the cap (a transient inbound)
+   would spend leg IN and then fail leg OUT umbrella-only with "destination would exceed
+   the per-fed cap", a GUARANTEED inconclusive spend. Refuse an over-cap source as a
+   LOCAL fault before any money moves. (An earlier draft claimed the source needed no
+   check — true only while `from ≤ cap`, which this preflight now enforces.)
 2. *(Session already written in step 1 — fresh probes reach here with a durable
    identity.)*
 3. **Leg IN** = `do_move(from → C, amount, leg_fee_cap, occurrence = probe nonce)`.
