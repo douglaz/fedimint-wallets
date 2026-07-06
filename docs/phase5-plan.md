@@ -164,9 +164,14 @@ does not demote.
 ### 5.0.4 Durable probe state (journal tag `0x08`)
 
 - `0x08 ++ fed_id` → JSON v1 `ProbeRecord { attempts: Vec<ProbeAttempt>,
-  in_flight: Option<ProbeSession> }` — attempts bounded to the NEWEST
-  `PROBE_HISTORY_CAP = 32` (older ones are superseded evidence; the ledger keeps the
-  full narrative). One row per fed, upserted in its own dbtx.
+  in_flight: Option<ProbeSession> }` — retention is TIME-AWARE, not count-only (a
+  count-only cap could truncate the very successes the 24h `min_span` needs whenever
+  probes run more often than span/cap): keep every attempt younger than the DEFAULT
+  `ttl_ms` (older ones cannot affect any default-policy verdict) up to a hard bound of
+  `PROBE_HISTORY_CAP = 256` newest (a runaway manual cadence self-truncates; 5.2's
+  scheduler probes a candidate a few times per DAY, nowhere near the bound). The
+  ledger keeps the full narrative regardless. One row per fed, upserted in its own
+  dbtx.
 - `ProbeSession { nonce: String /* 32 hex chars */, from: FederationId /* the probe's
   source — resolved per 5.0.7 and fixed for the session */,
   amount_msat: u64, leg_fee_cap_msat: u64,
@@ -178,9 +183,14 @@ does not demote.
   reconstructible from the session alone; leg OUT's amount is SIZED at runtime, so the
   session is UPDATED with `out_net_msat` after sizing and BEFORE leg OUT is journaled —
   after that write both keys are reconstructible. Resume disambiguation is total:
-  `out_net_msat: None` + `journal.get(in_key)` is `None` ⇒ the crash hit the window
-  between the session write and leg IN's journaling — NOTHING has happened; start leg
-  IN now with the session's own parameters; `out_net_msat: None` + leg IN journaled ⇒
+  `out_net_msat: None` + `journal.get(in_key)` is `None` ⇒ the crash hit before leg IN
+  was journaled — NOTHING has moved, so this is still a FRESH probe in every sense
+  that matters: re-enter the fresh path AT THE PREFLIGHT (reusing the session and its
+  umbrella row — never minting new ones) rather than starting leg IN blind; the world
+  may have changed since the session was written (the candidate could now be at cap,
+  the route gone), and skipping the preflight would convert what should be an
+  umbrella-only local refusal into an in-leg failure that could demote an honest
+  federation; `out_net_msat: None` + leg IN journaled ⇒
   drive/settle leg IN, then size, persist, proceed; `out_net_msat: Some(n)` + `journal.get(out_key)` is `None` ⇒ sized
   but the intent was never journaled (the crash window between the session update and
   `do_move`) — RE-CHECK the no-sweep precondition first: leg OUT may start (with
@@ -334,7 +344,9 @@ on a failed attempt (a probe IS a money op). `status` gains the per-fed verdict 
   (pre-failure successes never count); a trailing failure after a qualifying pass is
   `FailedSinceLastPass`; a NON-QUALIFYING success (amount below the policy's, or fee cap
   above it) never counts toward `Passed` but its failure still demotes.
-- **Journal (MemDatabase):** attempt rows bound at 32 newest; `probe_record` FAILS
+- **Journal (MemDatabase):** retention keeps sub-`ttl` attempts and enforces the 256
+  hard bound (a dense success run inside 24h is never truncated below `min_span`'s
+  evidence); `probe_record` FAILS
   CLOSED on a corrupt row (never "no session" from garbage); session lifecycle (begin
   writes `in_flight`; `record_probe_attempt` clears it + appends the attempt +
   terminalizes the umbrella row in ONE dbtx — crash between them impossible by
@@ -375,7 +387,8 @@ on a failed attempt (a probe IS a money op). `status` gains the per-fed verdict 
    (so pre-move candidate faults stay in the audit trail), one facts field, one CLI verb.
 2. Leg OUT (redeemability) is REQUIRED for a pass — mint-only proves too little.
 3. A post-pass failure demotes immediately; passes must be rebuilt as a sustained window.
-4. Probe attempts are durable and bounded (32); the ledger holds the full narrative.
+4. Probe attempts are durable with time-aware retention (sub-`ttl`, hard-capped at
+   256); the ledger holds the full narrative.
 5. 5.0 computes and surfaces the verdict but gates nothing; 5.1 wires the gate for
    discovered feds only. User-joined rebalancing is unchanged.
 6. Probe residue on the candidate (fees + sizing hair) is accepted, counted, and visible;
