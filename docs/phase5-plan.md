@@ -43,7 +43,16 @@ A probe of candidate federation `C` from spending federation `S`:
    `out_net + out fees ≤ delivered_in` by construction (the search budget), so
    pre-existing funds are untouched and the residual on `C` = `delivered_in − out_net −
    fees`, bounded by fees + sizing hair (< the leg's fee cap), stays OUR ecash, and is
-   counted in `balance`. (Leg IN's delivered net is durable — the move's `MoveMeta.
+   counted in `balance`. **This isolation rests on the wallet's SINGLE-WRITER
+   architecture, stated explicitly:** the store is opened under an exclusive `db.lock`
+   (a second process blocks before it can act) and the probe verb runs both legs
+   SYNCHRONOUSLY in one process, so nothing else can spend from `C` between the legs
+   in v1 — ecash is not segregated per-probe, and WITHOUT that serialization a
+   concurrent spend from an already-funded `C` could consume the delta and leave leg
+   OUT redeeming pre-existing funds. Phase 6's long-running app introduces exactly
+   that concurrency: the probe MUST be revisited there (a per-probe reservation, or
+   serializing probes against other `C`-spending ops) — flagged as a Phase-6
+   precondition, not silently assumed away. (Leg IN's delivered net is durable — the move's `MoveMeta.
    amount` / ledger row — so the budget survives a crash.) Proves **REDEEMABILITY** —
    the actual risk a metadata-only score can never see: a federation that mints but
    will not redeem.
@@ -292,9 +301,13 @@ Keys/ledger: every ATTEMPT gets an umbrella ledger row —
 Succeeded/`Failed(<verbatim error>)` when the attempt records. `from` makes pair-scoped
 failures (no shared route — NO move intent ever exists) name their source in
 `history`/`show` and keeps `history --fed <source>` complete; `cost_msat` is filled at
-terminalization with the rolled-up two-leg cost (both legs' persisted fee quotes;
-`None` when no money moved), so 5.2's budget accounting can enforce BOTH attempts/week
-and sats/week by summing this one row kind without re-correlating the move rows. The
+terminalization with the wallet's NET OUTFLOW FROM `S` — total S debit for leg IN minus
+total S credit from leg OUT (`None` when no money moved). On a clean pass that equals
+fees + the small residue; on a hostile/failed probe where leg OUT never redeems it
+equals fees + the WHOLE delivered amount — the honest exposure number (fees-only would
+let an unattended scheduler burn `amount_msat` per hostile candidate while "within
+budget"). 5.2's sats/week budget sums exactly this field, and attempts/week counts the
+rows — one row kind, no re-correlation of the move rows. The
 two moves additionally carry their ordinary `move:` intent keys (occurrence = the probe
 nonce-derived u64, so probes never collide with user moves); all three rows carry
 `reason: ReasonCode::ActiveProbe` (new variant + `reason_tag "active_probe"`) — note
@@ -327,10 +340,14 @@ wallet-cli probe <fed-hex> [--from <spending-fed-hex>]
 feds ⇒ `S` = the other one (the common probe topology); otherwise the verb refuses with
 "pass --from" — deterministic, and deliberately NOT coupled to the tick's designation
 logic (a probe must not silently ride whatever auto-designation picked this run).
-The five flags override the five `ProbePolicy` fields (defaults per 5.0.2/5.0.3); the
-verdict flags exist chiefly so the smoke can shrink the window — production callers use
-the defaults, and `status` computes its verdict column with the DEFAULT policy (the
-policy is not persisted; it parameterizes a pure function over durable attempts).
+The five flags override the five `ProbePolicy` fields (defaults per 5.0.2/5.0.3). The
+verdict flags exist so the smoke can SHRINK the window and are clamped SHRINK-ONLY:
+`--ttl-secs` and `--min-span-secs` above their defaults are REJECTED with a diagnostic
+naming the retention rule (5.0.4 retains sub-default-`ttl` attempts only, so a larger
+window could not be computed from the durable history it advertises). Production
+callers use the defaults, and `status` computes its verdict column with the DEFAULT
+policy (the policy is not persisted; it parameterizes a pure function over durable
+attempts).
 Runs one attempt synchronously; prints `attempt: ok|failed <leg+error>` and
 `verdict: <verdict>` to stdout (scriptable), keys/diagnostics to stderr; exits non-zero
 on a failed attempt (a probe IS a money op). `status` gains the per-fed verdict column.
