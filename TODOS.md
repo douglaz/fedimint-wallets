@@ -172,7 +172,7 @@ Full findings in [docs/reviews/2026-07-03-engine-review.md](./docs/reviews/2026-
 build plan in [docs/phase4-plan.md](./docs/phase4-plan.md); sequence in
 [docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md).
 
-- [ ] **R1 (P2, scorer — must land before 3.B)** Reject `threshold == 0 || threshold >
+- [x] **R1 (P2, scorer)** DONE (`703b776`) — InvalidThreshold floor + BFT bound + rank clamp. Reject `threshold == 0 || threshold >
   guardian_count` in the structural floor + clamp the rank term — an impossible-quorum config
   passes AND ranks highest. Not reachable via today's probe (threshold is derived `2f+1`), but
   the scorer is the trust boundary and 3.B's discovery assemblers will feed it
@@ -181,18 +181,18 @@ build plan in [docs/phase4-plan.md](./docs/phase4-plan.md); sequence in
   quote-base fix LANDED with the 3.A merge (`5315df3`)**: `send_fee_quote_for_amount` + the
   Pay arm's `outgoing_contract_amount`. Remaining slice (Phase 4 §2.3): persist the quotes on
   the `MoveRecord`.
-- [ ] **R3 (P1, executor)** Success-send + failed-receive must not be terminal `Failed` with the
+- [x] **R3 (P1, executor)** DONE (`25615a8`) — terminal `Stranded` with the preimage persisted first. Success-send + failed-receive must not be terminal `Failed` with the
   preimage discarded: persist the preimage on the `MoveRecord`. SETTLED shape
   (phase4-implementation-spec §3/§14.3): a loud TERMINAL `Stranded` phase — never a silent
   terminal loss.
-- [ ] **R4 (P0, product)** Append-only operation ledger + `wallet-cli history`/`show` per
+- [x] **R4 (P0, product)** DONE (`602d8c1` + `5b29292`; 4.C smoke PASSED live 2026-07-06) — append-only operation ledger + `wallet-cli history`/`show` per
   [docs/operation-history-spec.md](./docs/operation-history-spec.md): timestamps, real reasons,
   actual fees, actor (user vs agent), failures + refusals recorded — today NONE of these persist
   and completed ops are unscannable. This is the ADR-0014 auditability substrate.
-- [ ] **R5 (P2, allocator)** `Ord` tie-break in `safest_other`; per-tick cap/balance reservation
+- [x] **R5 (P2, allocator)** DONE (`703b776`, evacuation-sizing refinement `5366503`) — tie-break + per-tick reservation
   (two evacuations can jointly over-fill one destination at N>=3); document the deliberate
   source-side trust asymmetry.
-- [ ] **R6 (P3, cleanup)** Drop dead surface: `Action::Cap` (no producer), `requires_auth`
+- [x] **R6 (P3, cleanup)** DONE (`703b776`) — `Action::Cap` + `requires_auth` deleted, `snapshot.now` wired. Drop dead surface: `Action::Cap` (no producer), `requires_auth`
   (always false, never read); wire `AllocatorSnapshot.now` (CLI passes real time) or drop it.
 
 ## Fresh-eyes review backlog (2026-07-05) — folded into Phase 4
@@ -200,19 +200,19 @@ build plan in [docs/phase4-plan.md](./docs/phase4-plan.md); sequence in
 Full findings in [docs/reviews/2026-07-05-fresh-eyes-review.md](./docs/reviews/2026-07-05-fresh-eyes-review.md);
 buildable specs in [docs/phase4-implementation-spec.md](./docs/phase4-implementation-spec.md) §15.
 
-- [ ] **R7 (P1, probe)** Shutdown expiry signal is `meta_override_url`-controlled and
+- [x] **R7 (P1, probe)** DONE (`991ac74`) — corroborated-value derivation. Shutdown expiry signal is `meta_override_url`-controlled and
   uncorroborated — corroborate (consensus config / meta module / f+1 `/status`) before it can
   trigger an evacuation (§15.1).
-- [ ] **R8 (P1, executor+CLI)** Per-fed cap enforced NOWHERE at perform time: same-tick joint
+- [x] **R8 (P1, executor+CLI)** DONE (`703b776` planning + `991ac74` perform-time). Per-fed cap enforced NOWHERE at perform time: same-tick joint
   breach (R5's reservation is the planning half) AND operator `move`/`direct-inflow` consult no
   cap at all (§15.2).
-- [ ] **R9 (P1, allocator+tick)** Evacuation fallback can target a scorer-REJECTED fed — carry
+- [x] **R9 (P1, allocator+tick)** DONE (`703b776`, pin-override `a53c889`). Evacuation fallback can target a scorer-REJECTED fed — carry
   `eligible_to_fund` into `FederationStatus` (§15.3).
-- [ ] **R10 (P1, multi_client+executor)** Every deterministic send rejection (expired invoice,
+- [x] **R10 (P1, multi_client+executor)** DONE (`991ac74`). Every deterministic send rejection (expired invoice,
   `WrongCurrency`, …) is an immortal Retryable livelock — classify as `Permanent` (§15.4);
   plus Pay-step over-cap Retryable-vs-Permanent split (§15.5).
-- [ ] **R11 (P1, executor)** Receive-side fee TOCTOU: verify the committed contract amount
+- [x] **R11 (P1, executor)** DONE (`25615a8` mint-window verification; claim-window read-back via the ledger's settlement backfill `5b29292`). Receive-side fee TOCTOU: verify the committed contract amount
   post-mint (never-over); read back the settled amount post-claim via the ledger (§15.7).
-- [ ] **R12 (P2, executor/probe/runtime/CLI)** Gateway scan both-ends (§15.6); partial-open
+- [x] **R12 (P2, executor/probe/runtime/CLI)** DONE (`991ac74` + `25615a8`). Gateway scan both-ends (§15.6); partial-open
   fails loudly (§15.8); tick deadline (§15.9); solve-loop extraction + goldens (§15.10);
   small fixes (§15.11).

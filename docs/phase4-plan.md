@@ -1,5 +1,16 @@
 # Phase 4 plan — engine hardening + the operation ledger
 
+> **STATUS: PHASE 4 COMPLETE (2026-07-06).** 4.A hardening landed across three reviewed
+> runs plus two live-gate fixes (evacuation pin-override + the small-balance fee-reserve
+> regression — both caught by the live evacuate smoke, which then PASSED); 4.B ledger
+> landed in two reviewed runs plus two checkpoint fixes (settlement-definitive fee
+> semantics; blank-op `--key` verification). **Both exit gates passed live on the two-fed
+> harness:** `smoke_evacuate_devimint.sh` (never-over evacuation on the shutdown signal)
+> and `smoke_history_devimint.sh` (4.C — the full session reconstructible from
+> `wallet-cli history`/`show`, incl. an explained fee-cap refusal and agent/refusal rows).
+> All six 2026-07-05 review P1s are closed in code. Next: Phase 5
+> ([roadmap-to-v1.md](./roadmap-to-v1.md)).
+
 Sequenced from the 2026-07-03 review ([reviews/2026-07-03-engine-review.md](./reviews/2026-07-03-engine-review.md)).
 Runs **after Phase 3.A (Evacuate execution) merges** — 4.A edits the same files 3.A has in
 flight — and **before 3.B (discovery) / 3.C (triggers)**: the fixes close money-path holes the

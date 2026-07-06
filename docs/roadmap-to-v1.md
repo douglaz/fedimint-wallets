@@ -22,6 +22,9 @@ either outcome (the ledger, hardening, UI, and recovery serve a single-fed walle
 - **Phase 3.A — Evacuate execution: COMPLETE** (merged `5315df3`; live two-fed exit gate
   passed 2026-07-04 — [phase3-plan.md](./phase3-plan.md)). 3.B discovery + 3.C triggers are
   re-scoped into Phase 5 below.
+- **Phase 4 — hardening + operation ledger: COMPLETE (2026-07-06)** — all six 2026-07-05
+  review P1s closed; the append-only ledger + `history`/`show` shipped; both live exit
+  gates passed ([phase4-plan.md](./phase4-plan.md)).
 
 ## Sequence
 
