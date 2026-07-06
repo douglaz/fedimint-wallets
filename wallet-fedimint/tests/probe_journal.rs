@@ -128,6 +128,37 @@ fn retention_keeps_the_newest_stale_success_per_source() {
 }
 
 #[test]
+fn retention_keeps_a_default_sized_pass_through_a_later_smoke_probe() {
+    // From ONE source: an older DEFAULT-sized (qualifying) success, then a newer WEAKER
+    // smoke probe (smaller amount). Retention must keep BOTH — the newest success (the
+    // smoke) AND the newest default-qualifying success (the older pass) — so once both age
+    // out, `status` under the default policy still reads Expired, not NeverProbed.
+    let default_ok = |at: u64| ProbeAttempt {
+        at_ms: at,
+        ok: true,
+        from: fed(1),
+        amount_msat: 20_000,
+        leg_fee_cap_msat: 10_000,
+        error: None,
+    };
+    let smoke_ok = |at: u64| ProbeAttempt {
+        amount_msat: 5_000, // below the default -> non-qualifying under the default policy
+        ..default_ok(at)
+    };
+    let older_default = default_ok(NOW - 20 * DAY);
+    let newer_smoke = smoke_ok(NOW - 10 * DAY);
+    let kept = prune_probe_attempts(vec![older_default.clone(), newer_smoke.clone()], NOW);
+    assert!(
+        kept.contains(&older_default),
+        "a weaker smoke probe must not evict the older DEFAULT-sized pass's Expired evidence"
+    );
+    assert_eq!(
+        probe_verdict(&kept, fed(1), NOW, &ProbePolicy::default()),
+        ActiveProbeVerdict::Expired
+    );
+}
+
+#[test]
 fn retention_enforces_the_hard_bound_of_256_newest() {
     // 300 fresh (in-window) attempts: the count backstop wins, keeping the newest 256.
     let attempts: Vec<ProbeAttempt> = (0..300u64).map(|i| attempt(NOW - 300 + i, true)).collect();
