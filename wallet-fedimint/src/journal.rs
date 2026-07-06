@@ -752,16 +752,21 @@ impl FedimintJournal {
             Some(bytes) => decode_row_result::<ProbeRecord>("probe record", &raw_key, &bytes)?,
             None => ProbeRecord::default(),
         };
-        // A fresh session must never clobber a live one (§5.0.5: resume runs FIRST, so a
-        // caller reaching here with `in_flight` already set skipped the resume path).
-        // Overwriting would orphan the prior session's legs + umbrella row — the exact
-        // divergence the atomic outcome write exists to prevent. Refuse instead.
-        if rec.in_flight.is_some() {
-            return Err(ExecError::Permanent(format!(
-                "begin_probe_session: federation {} already has an in-flight probe; \
-                 resume it before starting a new one",
-                fed.to_hex()
-            )));
+        // A FRESH probe (a new nonce) must never clobber a DIFFERENT live session
+        // (§5.0.5: resume runs FIRST, so a fresh caller reaching here with another
+        // probe's `in_flight` set skipped resume) — overwriting would orphan the prior
+        // session's legs + umbrella row. A SAME-nonce write is the legitimate in-place
+        // update (persisting `out_net_msat` after sizing leg OUT, or a resume re-deriving
+        // its own session), so it is allowed.
+        if let Some(existing) = &rec.in_flight {
+            if existing.nonce != session.nonce {
+                return Err(ExecError::Permanent(format!(
+                    "begin_probe_session: federation {} already has a different in-flight \
+                     probe ({}); resume or finish it before starting a new one",
+                    fed.to_hex(),
+                    existing.nonce
+                )));
+            }
         }
         rec.in_flight = Some(session.clone());
         dbtx.raw_insert_bytes(&raw_key, &encode_row(&rec)?)

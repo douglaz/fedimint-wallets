@@ -827,8 +827,13 @@ async fn main() -> anyhow::Result<()> {
         } => {
             // Parse-only — deliberately NOT `select_fed`: a not-joined candidate must
             // still reach the runtime's preflight so the refusal lands in `history`
-            // (§5.0.5 — a failed probe invocation is never invisible).
+            // (§5.0.5 — a candidate-scoped failed probe is never invisible).
             let candidate = parse_fed_id(&fed)?;
+            // Source resolution is a PRE-IDENTITY usage error, not a probe attempt: the
+            // umbrella row is `Probe { fed, from, .. }`, so with no resolvable `from` there
+            // is no probe to record. It bails to stderr with a non-zero exit (visible to the
+            // operator) — distinct from a candidate-scoped fault, which carries a full
+            // identity and IS recorded by the runtime.
             let source = probe_source(&journal, &joined_ids, candidate, from.as_deref()).await?;
             let policy =
                 build_probe_policy(amount, fee_cap, min_successes, min_span_secs, ttl_secs)?;

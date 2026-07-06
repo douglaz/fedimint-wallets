@@ -81,10 +81,11 @@ pub enum ActiveProbeVerdict {
 /// The §5.0.3 verdict over a bounded attempt history. Rules (each a golden):
 ///
 /// - WINDOW: attempts older than `ttl_ms` are ignored entirely (ADR-0017's "sustained"
-///   pass is RECENT evidence). An empty window with a retained stale SUCCESS is
-///   [`Expired`](ActiveProbeVerdict::Expired) (success evidence aged out); empty
-///   history — or only stale failures, the negative signal having aged past the whole
-///   evidence window — is [`NeverProbed`](ActiveProbeVerdict::NeverProbed).
+///   pass is RECENT evidence). An empty window is [`Expired`](ActiveProbeVerdict::Expired)
+///   ONLY when a QUALIFYING success (this source+policy) aged out of it; a stale
+///   non-qualifying success (another source, smaller amount, looser fee cap) or only stale
+///   failures reads as [`NeverProbed`](ActiveProbeVerdict::NeverProbed) — `status` must not
+///   overstate evidence that never gated this pair.
 /// - SUFFIX: within the window only the CONTIGUOUS SUCCESS SUFFIX counts — the successes
 ///   strictly after the most recent failure ("a fresh sustained window rebuilds" is
 ///   literal).
@@ -117,7 +118,12 @@ pub fn probe_verdict(
     let window_start = sorted.partition_point(|a| now_ms.saturating_sub(a.at_ms) > policy.ttl_ms);
     let window = &sorted[window_start..];
     if window.is_empty() {
-        return if sorted.iter().any(|a| a.ok) {
+        // `Expired` means QUALIFYING success evidence (for this source+policy) aged out of
+        // the window — the pair once round-tripped a trusted-size probe. A stale success
+        // that never qualified (another source, or a smaller-amount / looser-fee-cap smoke
+        // probe) is NOT expired evidence for this source/policy; treat it as never probed
+        // so `status` does not overstate prior evidence.
+        return if sorted.iter().any(|a| qualifies(a, source, policy)) {
             ActiveProbeVerdict::Expired
         } else {
             ActiveProbeVerdict::NeverProbed
