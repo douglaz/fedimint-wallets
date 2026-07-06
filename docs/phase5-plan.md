@@ -132,19 +132,27 @@ pub struct ProbePolicy {
 }
 pub enum ActiveProbeVerdict { Passed, NeverProbed, Insufficient, Expired, FailedSinceLastPass }
 
-pub fn probe_verdict(attempts: &[ProbeAttempt], now_ms: u64, policy: &ProbePolicy) -> ActiveProbeVerdict
+pub fn probe_verdict(attempts: &[ProbeAttempt], source: FederationId, now_ms: u64,
+                     policy: &ProbePolicy) -> ActiveProbeVerdict
 ```
 
-Rules (each a golden). Only the CONTIGUOUS SUCCESS SUFFIX counts — the successes strictly
+Rules (each a golden). The verdict evaluates a WINDOW: attempts older than `ttl_ms`
+are ignored entirely (ADR-0017's "sustained" pass is RECENT evidence — and this aligns
+the verdict exactly with 5.0.4's retention, so pruning can never change a verdict).
+Within the window, only the CONTIGUOUS SUCCESS SUFFIX counts — the successes strictly
 AFTER the most recent failure (any failure discards everything before it from
 consideration; "a fresh sustained window rebuilds" is literal) — and within that suffix
-only QUALIFYING successes count: `attempt.amount_msat ≥ policy.amount_msat AND
-attempt.leg_fee_cap_msat ≤ policy.leg_fee_cap_msat` (at least the trusted size, at most
-the trusted fee looseness — a probe that needed a looser fee cap exercised a WEAKER
-guarantee; a non-qualifying CLI-override probe is still recorded and still demotes on
-failure, it just cannot count TOWARD `Passed`). `Passed` iff, over the qualifying suffix: (a) it holds
+only QUALIFYING successes count: `attempt.from == source AND attempt.amount_msat ≥
+policy.amount_msat AND attempt.leg_fee_cap_msat ≤ policy.leg_fee_cap_msat`. The SOURCE
+condition makes a pass PAIR-PROVEN: a success proves mint+redeem+route for the probing
+source only, and gating funding from `B` on an `A→C` pass would send the allocator into
+moves whose route preflight can never succeed (routing is a (source, candidate)
+property in this engine — and pair-scoped route failures are deliberately excluded from
+history, so a stale source-agnostic `Passed` could never self-clear). Failures still
+count REGARDLESS of source: candidate dishonesty generalizes; routability does not.
+`Passed` iff, over the qualifying suffix: (a) it holds
 ≥ `min_successes` successes, (b) its oldest and newest span ≥ `min_span_ms`, and (c) its
-newest is younger than `ttl_ms`. So
+newest is younger than `ttl_ms` (implied by the window). So
 `success, failure, success×3` passes only when the LAST three alone satisfy count+span.
 When the suffix is empty because the newest attempt failed after a prior qualifying pass
 = `FailedSinceLastPass` (immediate demotion); empty history = `NeverProbed`; suffix
@@ -152,8 +160,9 @@ newest older than `ttl_ms` = `Expired`; suffix too short/narrow = `Insufficient`
 `Passed` ever gates IN.
 
 **Scoping rule — the verdict measures the CANDIDATE's honesty; only
-candidate-ATTRIBUTABLE outcomes enter the history.** A SUCCESS (both legs settled) via
-any source counts — mint+redeem was proven. A FAILURE becomes a demoting attempt ONLY
+candidate-ATTRIBUTABLE outcomes enter the history.** A SUCCESS (both legs settled)
+enters the history and counts toward `Passed` for ITS OWN source (pair-proven — see
+the qualifying rule above). A FAILURE becomes a demoting attempt ONLY
 when the candidate itself refused: leg IN's invoice-mint/claim refused ON `C`
 (`CreateInvoice`-on-C failure, C's contract never claimable), or leg OUT's pay refused
 BY `C` (a classified send rejection from C — the redeemability core). Everything else
@@ -176,7 +185,8 @@ does not demote.
   in_flight: Option<ProbeSession> }` — retention is TIME-AWARE, not count-only (a
   count-only cap could truncate the very successes the 24h `min_span` needs whenever
   probes run more often than span/cap): keep every attempt younger than the DEFAULT
-  `ttl_ms` (older ones cannot affect any default-policy verdict) up to a hard bound of
+  `ttl_ms` — which is exactly the verdict's evaluation window (5.0.3), so pruning can
+  never flip a verdict — up to a hard bound of
   `PROBE_HISTORY_CAP = 256` newest (a runaway manual cadence self-truncates; 5.2's
   scheduler probes a candidate a few times per DAY, nowhere near the bound). The
   ledger keeps the full narrative regardless. One row per fed, upserted in its own
@@ -320,8 +330,10 @@ probe as one umbrella row plus up to two explained moves.
 ### 5.0.6 Scorer/status surfacing (gating wire-up lands in 5.1)
 
 - `FederationFacts` gains `active_probe: Option<ActiveProbeVerdict>` (`None` = never
-  probed — never a rejection by itself in 5.0).
-- The tick/status assembler fills it from `probe_history` + `probe_verdict`.
+  probed — never a rejection by itself in 5.0). The verdict is SOURCE-RELATIVE: the
+  assembler evaluates it against the snapshot's designated SPENDING fed (the fed that
+  would fund the candidate — exactly the pair 5.1's gate must trust).
+- The tick/status assembler fills it from `probe_record` + `probe_verdict(…, spending)`.
 - `wallet-cli status` prints the verdict per fed (`active_probe=passed|never|expired|…`).
 - **5.0 does NOT change fundability:** user-joined feds keep today's behavior (the
   roadmap's explicit stance — the cheap proxy is fine while the wallet only rebalances
@@ -356,7 +368,11 @@ on a failed attempt (a probe IS a money op). `status` gains the per-fed verdict 
 
 - **Pure goldens:** the full `probe_verdict` table — never/insufficient-count/
   insufficient-span/expired/failed-since-pass/passed; boundary cases (exactly
-  `min_successes`, exactly `ttl`); the suffix rule specifically:
+  `min_successes`, exactly `ttl`); the WINDOW rule (a success just past `ttl` is
+  invisible: successes at 8d/2d/1h with a 7d ttl are `Insufficient`, not `Passed`);
+  SOURCE scoping (an `A→C` pass gates `C` for `A` only — evaluated for `B` the same
+  history is `Insufficient`; a candidate-fault failure recorded from ANY source demotes
+  the verdict for ALL sources); the suffix rule specifically:
   `success, failure, success×3` passes iff the last three alone satisfy count+span
   (pre-failure successes never count); a trailing failure after a qualifying pass is
   `FailedSinceLastPass`; a NON-QUALIFYING success (amount below the policy's, or fee cap
