@@ -45,9 +45,10 @@ Today's probe facts are cheap proxies (`round_trip_ok` ⇐ gateway availability,
 `peg_out_quotable` ⇐ wallet-module presence). That is fine while the wallet only rebalances
 between feds the USER joined, but ADR-0017's trust gate for funding a DISCOVERED federation is
 the empirical, sats-spending probe. So Phase 5 starts with **5.0: the real active probe** (a
-small self-receive → claim round-trip on the candidate, TTL-cached, tiered behind the free
-structural checks per the integration plan) — discovery-driven auto-funding is BLOCKED on it;
-until then discovered feds are surface/manual-join only. Then the candidate universe
+small two-leg round-trip MOVE — mint on the candidate, then redeem back to the spending fed,
+proving REDEEMABILITY; TTL-cached sustained-window verdict, tiered behind the free structural
+checks — buildable spec in [phase5-plan.md](./phase5-plan.md) §5.0) — discovery-driven
+auto-funding is BLOCKED on it; until then discovered feds are surface/manual-join only. Then the candidate universe
 (`ObserverClient` + Nostr kind-38173, untrusted, probe-gated per ADR-0017/0019/0020) and the
 self-running loop (`wallet-cli watch`: interval + reactive `federation_expiry_timestamp`
 subscription; probe TTL cache). Every agent action lands in the ledger from day one.
