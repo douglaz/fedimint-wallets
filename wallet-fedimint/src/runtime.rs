@@ -482,16 +482,29 @@ impl Runtime {
         let occurrence = occurrence_from_nonce(&session.nonce)?;
         let amount = Msat(session.amount_msat);
         let leg_fee_cap = Msat(session.leg_fee_cap_msat);
+        // The MONEY params are the SESSION's, not the caller's flags: a resume runs the
+        // legs with the stored amount/fee_cap, so the verdict must qualify the resulting
+        // attempt against those same values — otherwise an operator changing `--amount` on
+        // resume would judge the just-spent attempt against thresholds it was never run
+        // with (flipping it qualifying/non-qualifying). On a FRESH probe the session was
+        // built FROM these same flags, so this is a no-op there. The verdict-WINDOW fields
+        // (min_successes/span/ttl) stay the caller's.
+        let effective_policy = ProbePolicy {
+            amount_msat: session.amount_msat,
+            leg_fee_cap_msat: session.leg_fee_cap_msat,
+            ..policy.clone()
+        };
         let run = ProbeRun {
             candidate,
             source: session.from,
             actor,
-            verdict_before: probe_verdict(&attempts_before, session.from, now_ms(), policy),
+            verdict_before: probe_verdict(&attempts_before, session.from, now_ms(), &effective_policy),
             nonce: session.nonce.clone(),
             umbrella_key: probe_umbrella_key(&candidate, &session.nonce),
             amount,
             leg_fee_cap,
             in_key: move_key(&session.from, &candidate, amount, leg_fee_cap, occurrence),
+            effective_policy,
         };
 
         // §5.0.5 step 1 — umbrella row then preflight, for a FRESH probe or a pre-leg-IN
@@ -548,7 +561,7 @@ impl Runtime {
             Some(IntentStatus::Done) => {}
             Some(IntentStatus::Failed) => {
                 return self
-                    .finish_probe_failed_leg(&run, policy, ProbeLeg::In, &run.in_key, None, None)
+                    .finish_probe_failed_leg(&run, ProbeLeg::In, &run.in_key, None, None)
                     .await;
             }
             other => anyhow::bail!(
@@ -662,7 +675,6 @@ impl Runtime {
                 return self
                     .finish_probe_failed_leg(
                         &run,
-                        policy,
                         ProbeLeg::Out,
                         &out_key,
                         Some(&in_rec),
@@ -707,7 +719,7 @@ impl Runtime {
         Ok(ProbeReport {
             verdict_before: run.verdict_before,
             attempt,
-            verdict_after: probe_verdict(&after, run.source, now_ms(), policy),
+            verdict_after: probe_verdict(&after, run.source, now_ms(), &run.effective_policy),
             in_key: run.in_key,
             out_key: Some(out_key),
         })
@@ -796,7 +808,6 @@ impl Runtime {
     async fn finish_probe_failed_leg(
         &self,
         run: &ProbeRun,
-        policy: &ProbePolicy,
         leg: ProbeLeg,
         leg_key: &IdempotencyKey,
         in_rec: Option<&MoveRecord>,
@@ -842,7 +853,7 @@ impl Runtime {
                 Ok(ProbeReport {
                     verdict_before: run.verdict_before,
                     attempt,
-                    verdict_after: probe_verdict(&after, run.source, now_ms(), policy),
+                    verdict_after: probe_verdict(&after, run.source, now_ms(), &run.effective_policy),
                     in_key: run.in_key.clone(),
                     out_key,
                 })
@@ -1185,6 +1196,10 @@ impl Runtime {
         let mut scored = Vec::with_capacity(plan.raw_probes.len());
         for (id, probe) in &plan.raw_probes {
             let active_probe = match spending {
+                // The designated spending fed cannot probe ITSELF (a probe is a candidate
+                // pair): leave its own row's verdict `None`/`-` rather than reporting a
+                // bogus self-probe `never`/stale state on one of status's key rows.
+                Some(source) if source == *id => None,
                 Some(source) => match self.journal.probe_record(id).await {
                     Ok(record) => Some(probe_verdict(
                         &record.map(|r| r.attempts).unwrap_or_default(),
@@ -1647,6 +1662,9 @@ struct ProbeRun {
     amount: Msat,
     leg_fee_cap: Msat,
     in_key: IdempotencyKey,
+    /// The policy the legs actually run under — money fields locked to the session, so a
+    /// resumed attempt is judged against the parameters it was spent with (not the flags).
+    effective_policy: ProbePolicy,
 }
 
 /// Which probe leg a move drives: IN mints on the candidate (S → C), OUT redeems back
@@ -1736,6 +1754,7 @@ const NON_CANDIDATE_SIGNATURES: &[&str] = &[
     "receive contract check failed",    // corruption
     "parsing move invoice",             // corruption
     "move invoice expired before the send leg", // §15.4 expiry belt (timing)
+    "move invoice carries no amount",   // malformed/corrupt return invoice (source-side, not C)
     "reached with no",                  // internal invariant breaches
     "executor does not support this action",
 ];
