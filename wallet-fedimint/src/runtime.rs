@@ -1780,13 +1780,17 @@ fn probe_cost(in_rec: Option<&MoveRecord>, out_rec: Option<&MoveRecord>) -> Opti
     Some(Msat(debit.saturating_sub(credit)))
 }
 
-/// §5.0.4's no-sweep precondition: leg OUT may start only while the candidate still
-/// holds the pre-probe BASELINE plus the delivered delta. Ecash is fungible, so with
-/// baseline + delta intact, drawing `out_net ≤ delivered_in` provably cannot touch
-/// pre-existing funds; checking the delta alone is fooled by them (C held 100, delta 20,
-/// 15 spent → spendable 105 still exceeds 20 while a third of the delta is gone).
+/// §5.0.4's no-sweep precondition for the sized-but-unjournaled leg-OUT RESUME window:
+/// leg OUT may start only when the candidate holds EXACTLY the pre-probe baseline plus
+/// the delivered delta. Leg IN credits C exactly `delivered_in` (never-over; fees are
+/// paid by the source), so an untouched C sits at exactly `baseline + delivered_in`. A
+/// `>=` check is fooled by SPEND-THEN-REPLENISH: C held 100, delta 20 (→120); spend 15
+/// (→105), then an unrelated inflow of 20 (→125) — `125 >= 120` passes though 15 sats of
+/// the redemption would now come from other funds. Any deviation (below OR above) means
+/// intervening activity touched C between the crash and this resume, so the delta's
+/// provenance is no longer certain: abort INCONCLUSIVE (§5.0.4) rather than risk a sweep.
 fn no_sweep_ok(c_spendable: Msat, baseline: Msat, delivered_in: Msat) -> bool {
-    c_spendable.0 >= baseline.0.saturating_add(delivered_in.0)
+    c_spendable.0 == baseline.0.saturating_add(delivered_in.0)
 }
 
 /// Leg OUT's effective cap: the operator's per-leg cap still bounds fees, but the
@@ -2803,13 +2807,15 @@ mod tests {
 
     #[test]
     fn no_sweep_guard_requires_baseline_plus_delta() {
-        // Baseline 100, delta 20: intact holdings pass…
+        // Baseline 100, delta 20: an EXACTLY untouched candidate (120) passes…
         assert!(no_sweep_ok(Msat(120), Msat(100), Msat(20)));
-        assert!(no_sweep_ok(Msat(125), Msat(100), Msat(20)));
-        // …but the §5.0.4 counterexample fails: 15 spent leaves 105, which still exceeds
-        // the delta alone (a delta-only check would be fooled) yet not baseline + delta.
+        // …a plain 15-sat spend (105) fails — still exceeds the delta alone (a delta-only
+        // check would be fooled) yet not baseline + delta…
         assert!(!no_sweep_ok(Msat(105), Msat(100), Msat(20)));
         assert!(!no_sweep_ok(Msat(119), Msat(100), Msat(20)));
+        // …and SPEND-THEN-REPLENISH (spend 15, receive 20 unrelated -> 125) also fails:
+        // `>=` would pass, but 15 sats of a redemption would now be pre-existing funds.
+        assert!(!no_sweep_ok(Msat(125), Msat(100), Msat(20)));
     }
 
     #[test]

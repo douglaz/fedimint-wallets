@@ -91,6 +91,43 @@ fn retention_keeps_a_lone_stale_success_and_attempt_forever() {
 }
 
 #[test]
+fn retention_keeps_the_newest_stale_success_per_source() {
+    // `probe_verdict` qualifies a stale success by its SOURCE, so retention must keep the
+    // newest stale success for EACH source — a newer success from a DIFFERENT source must
+    // not evict the older source's Expired evidence. Two stale successes from distinct
+    // sources: BOTH survive.
+    let from_a = |ok: bool, at: u64| ProbeAttempt {
+        at_ms: at,
+        ok,
+        from: fed(1),
+        amount_msat: 20_000,
+        leg_fee_cap_msat: 10_000,
+        error: (!ok).then(|| "x".to_string()),
+    };
+    let from_b = |ok: bool, at: u64| ProbeAttempt {
+        from: fed(9),
+        ..from_a(ok, at)
+    };
+    let older_a = from_a(true, NOW - 20 * DAY);
+    let newer_b = from_b(true, NOW - 10 * DAY);
+    let kept = prune_probe_attempts(vec![older_a.clone(), newer_b.clone()], NOW);
+    assert!(
+        kept.contains(&older_a),
+        "the older source-A stale success must survive a newer source-B success"
+    );
+    assert!(kept.contains(&newer_b));
+    // Each still reads Expired for its own source (a qualifying pair round-trip aged out).
+    assert_eq!(
+        probe_verdict(&kept, fed(1), NOW, &ProbePolicy::default()),
+        ActiveProbeVerdict::Expired
+    );
+    assert_eq!(
+        probe_verdict(&kept, fed(9), NOW, &ProbePolicy::default()),
+        ActiveProbeVerdict::Expired
+    );
+}
+
+#[test]
 fn retention_enforces_the_hard_bound_of_256_newest() {
     // 300 fresh (in-window) attempts: the count backstop wins, keeping the newest 256.
     let attempts: Vec<ProbeAttempt> = (0..300u64).map(|i| attempt(NOW - 300 + i, true)).collect();
