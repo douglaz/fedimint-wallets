@@ -341,6 +341,7 @@ fn reason_tag(reason: ReasonCode) -> &'static str {
         ReasonCode::LowReputation => "low_reputation",
         ReasonCode::UserInitiated => "user_initiated",
         ReasonCode::StandingInstruction => "standing_instruction",
+        ReasonCode::ActiveProbe => "active_probe",
     }
 }
 

@@ -21,7 +21,7 @@
 //! resolves through — a resumed move reuses the gateway already recorded in its `MoveRecord`.
 
 use crate::executor::FedimintExecutor;
-use crate::journal::FedimintJournal;
+use crate::journal::{FedimintJournal, OperationRef, ProbeSession};
 use crate::move_protocol::{MovePhase, MoveRecord};
 use crate::multi_client::{MultiClient, ReceiveState};
 use crate::probe::{assemble_facts, assemble_status, FedimintProbeRunner, ProbeResult};
@@ -35,9 +35,10 @@ use fedimint_core::runtime;
 use std::time::Duration;
 use std::{collections::BTreeSet, sync::Arc};
 use wallet_core::{
-    score, Action, Actor, AllocatorDecision, AllocatorSnapshot, ExecError, ExecutionSummary,
-    Executor, FederationId, IdempotencyKey, Intent, IntentStatus, Journal, Msat, Occurrence,
-    OperationStatus, PerformOutcome, ReasonCode, ScorerPolicy,
+    probe_verdict, score, Action, ActiveProbeVerdict, Actor, AllocatorDecision, AllocatorSnapshot,
+    ExecError, ExecutionSummary, Executor, FederationId, IdempotencyKey, Intent, IntentStatus,
+    Journal, Msat, Occurrence, OperationKind, OperationStatus, PerformOutcome, ProbeAttempt,
+    ProbePolicy, ReasonCode, ScorerPolicy,
 };
 
 /// Wall-clock in unix millis for the ledger's `created_at_ms` (§8/§9.4). `seq` is the
@@ -347,6 +348,11 @@ impl Runtime {
     /// and never re-mints or re-pays. A transient fault leaves the intent `Pending` (re-drivable
     /// by `reconcile` or a same-occurrence re-run with `--gateway`); a `Permanent` fault (fee
     /// over cap, refund/failed settlement) leaves it `Failed`, its reason on the `MoveRecord`.
+    ///
+    /// `reason`/`actor` are the ledger provenance (§8 / phase 5 §5.0.5): the CLI `move` verb
+    /// passes `UserInitiated`/`User`; [`Self::active_probe`] threads `ActiveProbe` plus its
+    /// caller's actor so both probe legs are explained in `history`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn do_move(
         &self,
         from: FederationId,
@@ -354,6 +360,8 @@ impl Runtime {
         amount: Msat,
         fee_cap: Msat,
         occurrence: Occurrence,
+        reason: ReasonCode,
+        actor: Actor,
     ) -> anyhow::Result<MoveOutcome> {
         let key = move_key(&from, &to, amount, fee_cap, occurrence);
         let decision = AllocatorDecision {
@@ -363,8 +371,7 @@ impl Runtime {
                 amount,
                 fee_cap,
             },
-            // A plain operator verb (§8): the ledger records it as user-initiated.
-            reason: ReasonCode::UserInitiated,
+            reason,
             occurrence,
             idempotency_key: key.clone(),
         };
@@ -373,7 +380,7 @@ impl Runtime {
             self.journal.as_ref(),
             &executor,
             std::slice::from_ref(&decision),
-            Actor::User,
+            actor,
             now_ms(),
         )
         .await;
@@ -395,6 +402,492 @@ impl Runtime {
             status,
             outcome,
         })
+    }
+
+    /// Run ONE active probe of `candidate` from spending federation `from` (phase 5
+    /// §5.0.5): a two-leg, exact-net round trip on the real money path — leg IN mints
+    /// `policy.amount_msat` on the candidate through the ordinary `Move` machinery, leg
+    /// OUT redeems the affordably-sized delta back, and the finished attempt lands in the
+    /// durable `0x08` history the pure [`probe_verdict`] evaluates.
+    ///
+    /// Ok = an ATTEMPT was recorded (a clean pass, or a demoting candidate-fault
+    /// failure). Every other exit is an error: the no-attempt terminal exits (preflight/
+    /// local/no-route/inconclusive — umbrella row `Failed`, session cleared, no demotion)
+    /// and the transient still-pending legs (session RETAINED; a re-run of `probe`
+    /// resumes it — step 0 below).
+    pub async fn active_probe(
+        &self,
+        candidate: FederationId,
+        from: FederationId,
+        policy: &ProbePolicy,
+        actor: Actor,
+    ) -> anyhow::Result<ProbeReport> {
+        let record = self
+            .journal
+            .probe_record(&candidate)
+            .await
+            .map_err(exec_err)?;
+        let attempts_before = record
+            .as_ref()
+            .map(|r| r.attempts.clone())
+            .unwrap_or_default();
+
+        // §5.0.5 step 0: resume FIRST — an in-flight session owns this invocation (its
+        // parameters, including `from`, are fixed); the fresh path below must not run.
+        let (mut session, resuming) = match record.and_then(|r| r.in_flight) {
+            Some(session) => {
+                if session.from != from {
+                    tracing::warn!(
+                        session_from = %session.from.to_hex(),
+                        requested_from = %from.to_hex(),
+                        "probe: resuming the in-flight session; its recorded source wins"
+                    );
+                }
+                (session, true)
+            }
+            None => {
+                // Fresh probe: sample the no-sweep BASELINE before anything else. An
+                // unopened candidate reads 0 — safe, because the preflight below refuses
+                // it before any money path (leg OUT, the only baseline consumer, is
+                // unreachable); an OPEN candidate whose read fails bails here, pre-session
+                // (nothing durable written yet), rather than record a too-low baseline
+                // that would weaken the §5.0.4 guard.
+                let baseline = if self.mc.federations().contains(&candidate) {
+                    self.mc
+                        .balance(&candidate)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("probe: sampling the candidate baseline failed: {e}")
+                        })?
+                        .0
+                } else {
+                    0
+                };
+                let session = ProbeSession {
+                    nonce: ledger_nonce(),
+                    from,
+                    amount_msat: policy.amount_msat,
+                    leg_fee_cap_msat: policy.leg_fee_cap_msat,
+                    c_spendable_before_in_msat: baseline,
+                    out_net_msat: None,
+                    started_at_ms: now_ms(),
+                };
+                self.journal
+                    .begin_probe_session(&candidate, &session)
+                    .await
+                    .map_err(exec_err)?;
+                (session, false)
+            }
+        };
+        let occurrence = occurrence_from_nonce(&session.nonce)?;
+        let amount = Msat(session.amount_msat);
+        let leg_fee_cap = Msat(session.leg_fee_cap_msat);
+        let run = ProbeRun {
+            candidate,
+            source: session.from,
+            actor,
+            verdict_before: probe_verdict(&attempts_before, session.from, now_ms(), policy),
+            nonce: session.nonce.clone(),
+            umbrella_key: probe_umbrella_key(&candidate, &session.nonce),
+            amount,
+            leg_fee_cap,
+            in_key: move_key(&session.from, &candidate, amount, leg_fee_cap, occurrence),
+        };
+
+        // §5.0.5 step 1 — umbrella row then preflight, for a FRESH probe or a pre-leg-IN
+        // resume ONLY (both re-enter here; §5.0.4's disambiguation): once leg IN is
+        // journaled money may have moved, so fresh-probe balance/cap checks no longer hold
+        // and would misclassify a recoverable probe as a new local error.
+        let leg_in_journaled = self
+            .journal
+            .get(&run.in_key)
+            .await
+            .map_err(exec_err)?
+            .is_some();
+        if session.out_net_msat.is_none() && !leg_in_journaled {
+            if resuming {
+                tracing::info!(
+                    candidate = %candidate.to_hex(),
+                    "probe: resuming a pre-leg-IN session; re-running the preflight"
+                );
+            }
+            // Session-first, umbrella second (§5.0.5): `record_started` is idempotent, so
+            // a pre-umbrella resume recreates the row here; recording must succeed before
+            // any money moves (the phase-4 auditability contract).
+            self.journal
+                .record_started(
+                    &run.umbrella_key,
+                    probe_kind(&run, None),
+                    actor,
+                    ReasonCode::ActiveProbe,
+                    now_ms(),
+                    None,
+                )
+                .await
+                .map_err(exec_err)?;
+            if let Err(diagnostic) = self.probe_preflight(&session, candidate).await {
+                self.finish_probe_no_attempt(&run, &diagnostic, None)
+                    .await?;
+                anyhow::bail!("probe preflight failed: {diagnostic}");
+            }
+        }
+
+        // §5.0.5 step 3 — leg IN (journals the intent; a resume reattaches idempotently).
+        let in_outcome = self
+            .do_move(
+                run.source,
+                candidate,
+                run.amount,
+                run.leg_fee_cap,
+                occurrence,
+                ReasonCode::ActiveProbe,
+                actor,
+            )
+            .await?;
+        match in_outcome.status {
+            Some(IntentStatus::Done) => {}
+            Some(IntentStatus::Failed) => {
+                return self
+                    .finish_probe_failed_leg(&run, policy, ProbeLeg::In, &run.in_key, None, None)
+                    .await;
+            }
+            other => anyhow::bail!(
+                "probe leg IN {} did not settle (status {}); transient — re-run `probe` to \
+                 resume (session retained)",
+                run.in_key.0,
+                intent_status_label_opt(other)
+            ),
+        }
+        let in_rec = self
+            .journal
+            .get_move(&run.in_key)
+            .await
+            .map_err(exec_err)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("probe leg IN settled but its move record is missing")
+            })?;
+        // Leg IN's DELIVERED net (possibly a verified hair under the ask) — durable on the
+        // move record, so the sizing budget survives a crash.
+        let delivered_in = in_rec.amount;
+
+        // §5.0.5 steps 4-5 — size leg OUT with budget = the delivered net, persist the
+        // sized amount BEFORE journaling leg OUT (a resume never re-sizes).
+        let out_net = match session.out_net_msat {
+            Some(persisted) => Msat(persisted),
+            None => {
+                match self
+                    .executor()
+                    .size_probe_leg_out(candidate, run.source, delivered_in, run.leg_fee_cap)
+                    .await
+                {
+                    Ok(Some(sized)) => {
+                        session.out_net_msat = Some(sized.0);
+                        self.journal
+                            .begin_probe_session(&candidate, &session)
+                            .await
+                            .map_err(exec_err)?;
+                        sized
+                    }
+                    Ok(None) => {
+                        // The post-IN feasibility abort: a LOCAL parameter/fee-environment
+                        // error, NOT a redeemability failure (§5.0.5 step 4).
+                        let diagnostic = format!(
+                            "probe leg OUT infeasible: the delivered {} msat cannot afford any \
+                             redeem whose contract clears the lnv2 minimum within the {} msat \
+                             leg fee cap (shortfall is parametric, not a redeemability failure)",
+                            delivered_in.0, run.leg_fee_cap.0
+                        );
+                        self.finish_probe_no_attempt(
+                            &run,
+                            &diagnostic,
+                            probe_cost(Some(&in_rec), None),
+                        )
+                        .await?;
+                        anyhow::bail!("{diagnostic}");
+                    }
+                    Err(e) => anyhow::bail!(
+                        "probe leg OUT sizing failed transiently ({e:?}); re-run `probe` to \
+                         resume (session retained)"
+                    ),
+                }
+            }
+        };
+        let out_fee_cap = probe_out_fee_cap(delivered_in, out_net, run.leg_fee_cap);
+        let out_key = move_key(&candidate, &run.source, out_net, out_fee_cap, occurrence);
+
+        // §5.0.4 no-sweep guard on the not-yet-journaled window (trivially true on the
+        // fresh path; load-bearing on a sized-but-unjournaled resume): leg OUT may start
+        // only while the candidate still holds baseline + delta. Once the out intent is
+        // journaled the money path owns it like any other move — no guard before DRIVING.
+        if self
+            .journal
+            .get(&out_key)
+            .await
+            .map_err(exec_err)?
+            .is_none()
+        {
+            let c_spendable = self.mc.balance(&candidate).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "probe: reading the candidate balance for the no-sweep check failed \
+                     transiently ({e}); re-run `probe` to resume (session retained)"
+                )
+            })?;
+            if !no_sweep_ok(
+                c_spendable,
+                Msat(session.c_spendable_before_in_msat),
+                delivered_in,
+            ) {
+                let diagnostic = "probe delta consumed before redemption; inconclusive";
+                self.finish_probe_no_attempt(&run, diagnostic, probe_cost(Some(&in_rec), None))
+                    .await?;
+                anyhow::bail!("{diagnostic}");
+            }
+        }
+
+        // Leg OUT — sized exactly, same nonce-derived occurrence.
+        let out_outcome = self
+            .do_move(
+                candidate,
+                run.source,
+                out_net,
+                out_fee_cap,
+                occurrence,
+                ReasonCode::ActiveProbe,
+                actor,
+            )
+            .await?;
+        match out_outcome.status {
+            Some(IntentStatus::Done) => {}
+            Some(IntentStatus::Failed) => {
+                return self
+                    .finish_probe_failed_leg(
+                        &run,
+                        policy,
+                        ProbeLeg::Out,
+                        &out_key,
+                        Some(&in_rec),
+                        Some(out_key.clone()),
+                    )
+                    .await;
+            }
+            other => anyhow::bail!(
+                "probe leg OUT {} did not settle (status {}); transient — re-run `probe` to \
+                 resume (session retained)",
+                out_key.0,
+                intent_status_label_opt(other)
+            ),
+        }
+
+        // §5.0.5 step 6 — both legs settled: ONE atomic outcome write (attempt appended,
+        // session cleared, umbrella row Succeeded with the S-net-outflow cost).
+        let out_rec = self.journal.get_move(&out_key).await.map_err(exec_err)?;
+        let cost = probe_cost(Some(&in_rec), out_rec.as_ref());
+        let attempt = ProbeAttempt {
+            at_ms: now_ms(),
+            ok: true,
+            from: run.source,
+            amount_msat: run.amount.0,
+            leg_fee_cap_msat: run.leg_fee_cap.0,
+            error: None,
+        };
+        self.journal
+            .record_probe_outcome(
+                &candidate,
+                &run.nonce,
+                Some(attempt.clone()),
+                &run.umbrella_key,
+                probe_kind(&run, cost),
+                actor,
+                OperationStatus::Succeeded,
+                None,
+            )
+            .await
+            .map_err(exec_err)?;
+        let after = self.probe_attempts(&candidate).await?;
+        Ok(ProbeReport {
+            verdict_before: run.verdict_before,
+            attempt,
+            verdict_after: probe_verdict(&after, run.source, now_ms(), policy),
+            in_key: run.in_key,
+            out_key: Some(out_key),
+        })
+    }
+
+    /// The §5.0.5 step-1 preflight for a fresh (or pre-leg-IN resumed) probe. `Err`
+    /// carries the LOCAL / no-shared-route diagnostic that terminalizes the umbrella row
+    /// with NO attempt (neither demotes — §5.0.3's scoping rule).
+    async fn probe_preflight(
+        &self,
+        session: &ProbeSession,
+        candidate: FederationId,
+    ) -> Result<(), String> {
+        let open = self.mc.federations();
+        if !open.contains(&candidate) {
+            return Err(format!(
+                "candidate federation {} is not joined/open",
+                candidate.to_hex()
+            ));
+        }
+        if !open.contains(&session.from) {
+            return Err(format!(
+                "source federation {} is not joined/open",
+                session.from.to_hex()
+            ));
+        }
+        let source_spendable = self
+            .mc
+            .balance(&session.from)
+            .await
+            .map_err(|e| format!("reading the source balance failed: {e}"))?;
+        let candidate_spendable = self
+            .mc
+            .balance(&candidate)
+            .await
+            .map_err(|e| format!("reading the candidate balance failed: {e}"))?;
+        probe_local_faults(
+            candidate,
+            session.from,
+            source_spendable,
+            candidate_spendable,
+            Msat(session.amount_msat),
+            Msat(session.leg_fee_cap_msat),
+            self.hard_cap,
+        )?;
+        // The existing move-route preflight in BOTH directions (§15.6): leg IN proves
+        // S -> C and leg OUT must be known routable before money lands on C. The
+        // verbatim route error is the umbrella diagnostic — pair reachability, never
+        // candidate honesty.
+        self.validate_executor_move_route(SendRouteKind::Move, session.from, candidate)
+            .await
+            .map_err(|problem| problem.error)?;
+        self.validate_executor_move_route(SendRouteKind::Move, candidate, session.from)
+            .await
+            .map_err(|problem| problem.error)
+    }
+
+    /// Terminalize a probe with NO attempt (§5.0.5's local/route/inconclusive exits):
+    /// session cleared + umbrella row `Failed` in one dbtx, verdict history untouched.
+    async fn finish_probe_no_attempt(
+        &self,
+        run: &ProbeRun,
+        diagnostic: &str,
+        cost: Option<Msat>,
+    ) -> anyhow::Result<()> {
+        self.journal
+            .record_probe_outcome(
+                &run.candidate,
+                &run.nonce,
+                None,
+                &run.umbrella_key,
+                probe_kind(run, cost),
+                run.actor,
+                OperationStatus::Failed,
+                Some(diagnostic),
+            )
+            .await
+            .map_err(exec_err)
+            .map(|_| ())
+    }
+
+    /// Terminalize a probe whose leg FAILED (§5.0.3's fault attribution): a
+    /// candidate-attributable failure records a DEMOTING attempt and returns the report;
+    /// source/gateway/ambiguous/local faults record an umbrella-only outcome (no attempt,
+    /// no demotion) and surface as an error.
+    async fn finish_probe_failed_leg(
+        &self,
+        run: &ProbeRun,
+        policy: &ProbePolicy,
+        leg: ProbeLeg,
+        leg_key: &IdempotencyKey,
+        in_rec: Option<&MoveRecord>,
+        out_key: Option<IdempotencyKey>,
+    ) -> anyhow::Result<ProbeReport> {
+        let (leg_rec, diagnostic) = self.leg_failure_details(leg_key).await.map_err(|e| {
+            anyhow::anyhow!(
+                "probe leg {} {} failed, but reading its diagnostic failed ({e:?}); \
+                 re-run `probe` to resume (session retained)",
+                leg.label(),
+                leg_key.0
+            )
+        })?;
+        let error_text = format!("probe leg {} failed: {diagnostic}", leg.label());
+        let cost = match leg {
+            ProbeLeg::In => probe_cost(leg_rec.as_ref(), None),
+            ProbeLeg::Out => probe_cost(in_rec, leg_rec.as_ref()),
+        };
+        match classify_leg_failure(leg, leg_rec.as_ref(), &diagnostic) {
+            LegFault::Candidate => {
+                let attempt = ProbeAttempt {
+                    at_ms: now_ms(),
+                    ok: false,
+                    from: run.source,
+                    amount_msat: run.amount.0,
+                    leg_fee_cap_msat: run.leg_fee_cap.0,
+                    error: Some(error_text.clone()),
+                };
+                self.journal
+                    .record_probe_outcome(
+                        &run.candidate,
+                        &run.nonce,
+                        Some(attempt.clone()),
+                        &run.umbrella_key,
+                        probe_kind(run, cost),
+                        run.actor,
+                        OperationStatus::Failed,
+                        Some(&error_text),
+                    )
+                    .await
+                    .map_err(exec_err)?;
+                let after = self.probe_attempts(&run.candidate).await?;
+                Ok(ProbeReport {
+                    verdict_before: run.verdict_before,
+                    attempt,
+                    verdict_after: probe_verdict(&after, run.source, now_ms(), policy),
+                    in_key: run.in_key.clone(),
+                    out_key,
+                })
+            }
+            LegFault::UmbrellaOnly => {
+                self.finish_probe_no_attempt(run, &error_text, cost).await?;
+                anyhow::bail!(
+                    "{error_text} (not candidate-attributable; recorded on the probe's \
+                     umbrella ledger row only — no demotion)"
+                );
+            }
+        }
+    }
+
+    /// A failed leg's `(move record, diagnostic)`: the record's terminal `outcome` first,
+    /// else the ledger row's `error` (the §8.3 threaded executor diagnostic — several
+    /// permanent failures never reach a terminal `MoveRecord.outcome`).
+    async fn leg_failure_details(
+        &self,
+        key: &IdempotencyKey,
+    ) -> Result<(Option<MoveRecord>, String), ExecError> {
+        let rec = self.journal.get_move(key).await?;
+        if let Some(outcome) = rec.as_ref().and_then(|r| r.outcome.clone()) {
+            return Ok((rec, outcome));
+        }
+        let ledger_error = self
+            .journal
+            .operation(&OperationRef::Key(key.clone()))
+            .await?
+            .and_then(|row| row.error);
+        Ok((
+            rec,
+            ledger_error.unwrap_or_else(|| "move failed with no recorded diagnostic".to_string()),
+        ))
+    }
+
+    /// The fed's retained probe attempts (empty when never probed).
+    async fn probe_attempts(&self, fed: &FederationId) -> anyhow::Result<Vec<ProbeAttempt>> {
+        Ok(self
+            .journal
+            .probe_record(fed)
+            .await
+            .map_err(exec_err)?
+            .map(|r| r.attempts)
+            .unwrap_or_default())
     }
 
     /// Finalize an `Awaiting` `DirectInflow` (spec §9.5): reattach to its `recv_op` (rebuilt
@@ -683,15 +1176,42 @@ impl Runtime {
             ),
             _ => {}
         }
-        let scored = plan
-            .raw_probes
-            .iter()
-            .map(|(id, probe)| ScoredFed {
+        // §5.0.6: the ACTIVE-probe verdict is SOURCE-RELATIVE — evaluated against the
+        // snapshot's designated SPENDING fed (the fed that would fund the candidate),
+        // always with the DEFAULT policy (the CLI's shrink-only overrides never reach the
+        // production surface). Filled onto the facts (the field 5.1's gate reads) and the
+        // scored row (the `status` display); the scorer itself ignores it in 5.0.
+        let spending = plan.snapshot.spending_fed;
+        let mut scored = Vec::with_capacity(plan.raw_probes.len());
+        for (id, probe) in &plan.raw_probes {
+            let active_probe = match spending {
+                Some(source) => match self.journal.probe_record(id).await {
+                    Ok(record) => Some(probe_verdict(
+                        &record.map(|r| r.attempts).unwrap_or_default(),
+                        source,
+                        now_ms(),
+                        &ProbePolicy::default(),
+                    )),
+                    Err(e) => {
+                        tracing::warn!(
+                            federation = %id.to_hex(),
+                            error = ?e,
+                            "status: unreadable probe record; omitting the active-probe verdict"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            let mut facts = assemble_facts(probe, *id);
+            facts.active_probe = active_probe;
+            scored.push(ScoredFed {
                 id: *id,
-                verdict: score(&assemble_facts(probe, *id), &scorer_policy),
+                verdict: score(&facts, &scorer_policy),
                 status: assemble_status(probe, *id),
-            })
-            .collect();
+                active_probe,
+            });
+        }
         Ok(StatusReport {
             scored,
             spending_fed: plan.snapshot.spending_fed,
@@ -1101,6 +1621,254 @@ fn move_key(
         fee_cap.0,
         occurrence.0
     ))
+}
+
+/// The §5.0.5 probe report: the verdicts around ONE recorded attempt plus the leg keys.
+/// Returned only when an attempt was recorded (a pass, or a demoting candidate-fault
+/// failure); no-attempt terminal exits and transient still-pending legs are errors.
+#[derive(Clone, Debug)]
+pub struct ProbeReport {
+    pub verdict_before: ActiveProbeVerdict,
+    pub attempt: ProbeAttempt,
+    pub verdict_after: ActiveProbeVerdict,
+    pub in_key: IdempotencyKey,
+    /// `None` when the probe never reached leg OUT (a leg-IN failure).
+    pub out_key: Option<IdempotencyKey>,
+}
+
+/// One probe invocation's fixed identity, threaded through the §5.0.5 exits.
+struct ProbeRun {
+    candidate: FederationId,
+    source: FederationId,
+    actor: Actor,
+    verdict_before: ActiveProbeVerdict,
+    nonce: String,
+    umbrella_key: IdempotencyKey,
+    amount: Msat,
+    leg_fee_cap: Msat,
+    in_key: IdempotencyKey,
+}
+
+/// Which probe leg a move drives: IN mints on the candidate (S → C), OUT redeems back
+/// (C → S). Decides fault attribution — each step's HOST differs per leg.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeLeg {
+    In,
+    Out,
+}
+
+impl ProbeLeg {
+    fn label(self) -> &'static str {
+        match self {
+            ProbeLeg::In => "IN",
+            ProbeLeg::Out => "OUT",
+        }
+    }
+}
+
+/// §5.0.3's fault attribution verdict for a failed leg.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegFault {
+    /// The candidate itself refused (mint on leg IN / pay on leg OUT): a DEMOTING attempt.
+    Candidate,
+    /// Source, gateway, ambiguous, or local-parametric: umbrella row only, no attempt.
+    /// Safety holds without demotion because NO-ATTEMPT ≠ PASS — the candidate simply
+    /// does not progress toward `Passed`.
+    UmbrellaOnly,
+}
+
+/// Classify a failed probe leg from what the move machinery already exposes (§5.0.3):
+/// the failing STEP (derived from which artifacts the move record holds), the terminal
+/// settlement phase, and the executor's diagnostic. PURE, unit-tested. Demotes ONLY on a
+/// candidate-hosted step's failure that is not a recognized local/gateway/corruption
+/// signature — when attribution is genuinely unclear, the fault is AMBIGUOUS and does
+/// not demote.
+fn classify_leg_failure(leg: ProbeLeg, rec: Option<&MoveRecord>, error: &str) -> LegFault {
+    match rec.map(|r| r.phase) {
+        // A `Stranded` leg (send settled, receive never credited) cannot distinguish a
+        // thieving gateway from a broken candidate; `Refunded` failed downstream and made
+        // the payer whole. Neither demotes.
+        Some(MovePhase::Stranded) | Some(MovePhase::Refunded) => return LegFault::UmbrellaOnly,
+        // The send leg reached a terminal FAILED settlement: the PAYER owns it. Leg OUT's
+        // payer is the candidate — the redeemability core.
+        Some(MovePhase::Failed) => {
+            return if leg == ProbeLeg::Out {
+                LegFault::Candidate
+            } else {
+                LegFault::UmbrellaOnly
+            };
+        }
+        _ => {}
+    }
+    // No terminal settlement phase: a Permanent executor error mid-step. Which step, from
+    // the record's artifacts (`next_step`'s own derivation): no invoice and no send op =
+    // `CreateInvoice` (runs on the move's DESTINATION); invoice without a send op = `Pay`
+    // (runs on the move's SOURCE); both present = an await-step oddity (ambiguous).
+    let has_invoice = rec.is_some_and(|r| r.invoice.is_some());
+    let has_send_op = rec.is_some_and(|r| r.send_op.is_some());
+    let candidate_hosted_step = if !has_invoice && !has_send_op {
+        leg == ProbeLeg::In // mint hosted on C ⇔ the move's destination is C ⇔ leg IN
+    } else if !has_send_op {
+        leg == ProbeLeg::Out // pay hosted on C ⇔ the move's source is C ⇔ leg OUT
+    } else {
+        return LegFault::UmbrellaOnly;
+    };
+    if candidate_hosted_step && !is_known_non_candidate_error(error) {
+        LegFault::Candidate
+    } else {
+        LegFault::UmbrellaOnly
+    }
+}
+
+/// Error signatures OUR OWN machinery produces for local-parametric, fee-environment,
+/// gateway-TOCTOU, expiry, and corruption faults — never candidate dishonesty, so they
+/// must not demote even when they surface on a candidate-hosted step (§5.0.2/§5.0.3).
+/// These are free-text couplings to diagnostics emitted in the executors; the test
+/// `non_candidate_signatures_match_an_emit_site` pins each one to its emitting source
+/// so a reworded diagnostic cannot silently start demoting candidates.
+const NON_CANDIDATE_SIGNATURES: &[&str] = &[
+    "fee over cap",                     // receive-side + pay-step cap refusals (local)
+    "lnv2 requires at least",           // minimum-incoming-contract refusal (parametric)
+    "no invoice can net the requested", // unsolvable gross-up (local/fee environment)
+    "destination would exceed the per-fed cap", // ADR-0018 local cap refusal
+    "gateway receive fee changed between quote and mint", // §15.7 TOCTOU (gateway-timed)
+    "receive op is missing the quoted contract amount", // corruption
+    "receive contract check failed",    // corruption
+    "parsing move invoice",             // corruption
+    "move invoice expired before the send leg", // §15.4 expiry belt (timing)
+    "reached with no",                  // internal invariant breaches
+    "executor does not support this action",
+];
+
+fn is_known_non_candidate_error(error: &str) -> bool {
+    if NON_CANDIDATE_SIGNATURES
+        .iter()
+        .any(|sig| error.contains(sig))
+    {
+        return true;
+    }
+
+    // Pinned SDK b108ec6 exposes these as deterministic send rejections
+    // (`modules/fedimint-lnv2-client/src/lib.rs:1231-1249`). They are gateway
+    // limits or a timing race around an already-minted invoice, not evidence that
+    // the candidate federation refuses redemption.
+    error.contains("lnv2 send deterministically rejected the invoice:")
+        && (error.contains("Gateway fee exceeds the allowed limit")
+            || error.contains("Gateway expiration time exceeds the allowed limit")
+            || error.contains("Invoice has expired"))
+}
+
+/// §5.0.5: the wallet's NET OUTFLOW FROM the source — leg IN's total S debit (the
+/// delivered net + both leg-IN fee quotes; the send settled iff the phase is `Settled`
+/// or `Stranded`) minus leg OUT's S credit (its delivered net, iff `Settled`). `None`
+/// when no money left the source (leg IN never settled its send, or refunded whole). On
+/// a clean pass this is fees + the small residue; on a hostile candidate whose leg OUT
+/// never redeems it is fees + the WHOLE delivered amount — the honest exposure number.
+fn probe_cost(in_rec: Option<&MoveRecord>, out_rec: Option<&MoveRecord>) -> Option<Msat> {
+    let debit = in_rec.and_then(|r| match r.phase {
+        MovePhase::Settled | MovePhase::Stranded => Some(
+            r.amount
+                .0
+                .saturating_add(r.receive_fee_quoted.map_or(0, |f| f.0))
+                .saturating_add(r.send_fee_quoted.map_or(0, |f| f.0)),
+        ),
+        _ => None,
+    })?;
+    let credit = out_rec
+        .and_then(|r| (r.phase == MovePhase::Settled).then_some(r.amount.0))
+        .unwrap_or(0);
+    Some(Msat(debit.saturating_sub(credit)))
+}
+
+/// §5.0.4's no-sweep precondition: leg OUT may start only while the candidate still
+/// holds the pre-probe BASELINE plus the delivered delta. Ecash is fungible, so with
+/// baseline + delta intact, drawing `out_net ≤ delivered_in` provably cannot touch
+/// pre-existing funds; checking the delta alone is fooled by them (C held 100, delta 20,
+/// 15 spent → spendable 105 still exceeds 20 while a third of the delta is gone).
+fn no_sweep_ok(c_spendable: Msat, baseline: Msat, delivered_in: Msat) -> bool {
+    c_spendable.0 >= baseline.0.saturating_add(delivered_in.0)
+}
+
+/// Leg OUT's effective cap: the operator's per-leg cap still bounds fees, but the
+/// return leg must also prove `out_net + actual drive-time fees <= delivered_in`.
+/// The executor re-quotes send fees at `Pay`, so using the remaining delivered delta
+/// as the move's fee cap keeps a fee spike from spending pre-probe candidate funds.
+fn probe_out_fee_cap(delivered_in: Msat, out_net: Msat, leg_fee_cap: Msat) -> Msat {
+    Msat(leg_fee_cap.0.min(delivered_in.0.saturating_sub(out_net.0)))
+}
+
+/// The probe's umbrella [`OperationKind`] (§5.0.5), with `cost_msat` = the terminal cost
+/// (or `None` on `record_started` / no-money exits).
+fn probe_kind(run: &ProbeRun, cost_msat: Option<Msat>) -> OperationKind {
+    OperationKind::Probe {
+        fed: run.candidate,
+        from: run.source,
+        amount_msat: run.amount,
+        cost_msat,
+    }
+}
+
+/// The umbrella ledger key `probe:<fed-hex>:<nonce>` (§5.0.5).
+fn probe_umbrella_key(fed: &FederationId, nonce: &str) -> IdempotencyKey {
+    IdempotencyKey(format!("probe:{}:{nonce}", fed.to_hex()))
+}
+
+/// The nonce-derived occurrence embedded in both probe legs' `move:` keys (§5.0.5): the
+/// keys stay reconstructible from the session alone, and a 64-bit random head never
+/// collides with user moves' small occurrence integers.
+fn occurrence_from_nonce(nonce: &str) -> anyhow::Result<Occurrence> {
+    let head = nonce
+        .get(..16)
+        .ok_or_else(|| anyhow::anyhow!("probe session nonce {nonce:?} is too short"))?;
+    let value = u64::from_str_radix(head, 16)
+        .map_err(|e| anyhow::anyhow!("probe session nonce {nonce:?} is not hex: {e}"))?;
+    Ok(Occurrence(value))
+}
+
+/// The §5.0.5 LOCAL preflight faults, pure over sampled balances: self-probe, a source
+/// too poor to fund `amount + leg fee cap`, a candidate without ADR-0018 cap room for
+/// `amount`. The SOURCE needs no cap-room check: leg IN debits it by strictly more than
+/// leg OUT returns, so the return always fits the room leg IN just created.
+fn probe_local_faults(
+    candidate: FederationId,
+    source: FederationId,
+    source_spendable: Msat,
+    candidate_spendable: Msat,
+    amount: Msat,
+    leg_fee_cap: Msat,
+    hard_cap: Option<Msat>,
+) -> Result<(), String> {
+    if candidate == source {
+        return Err(format!(
+            "cannot probe federation {} from itself",
+            candidate.to_hex()
+        ));
+    }
+    let needed = amount.0.saturating_add(leg_fee_cap.0);
+    if source_spendable.0 < needed {
+        return Err(format!(
+            "insufficient source balance: {} holds {} msat, below amount + leg fee cap = {needed} msat",
+            source.to_hex(),
+            source_spendable.0
+        ));
+    }
+    if let Some(cap) = hard_cap {
+        if candidate_spendable.0.saturating_add(amount.0) > cap.0 {
+            return Err(format!(
+                "insufficient candidate cap room: {} holds {} msat and the {} msat probe amount \
+                 would exceed the per-fed cap {} msat",
+                candidate.to_hex(),
+                candidate_spendable.0,
+                amount.0,
+                cap.0
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn intent_status_label_opt(status: Option<IntentStatus>) -> &'static str {
+    status.map_or("absent", intent_status_label)
 }
 
 fn mark_gateway_unavailable(probes: &mut [(FederationId, ProbeResult)], id: FederationId) -> bool {
@@ -1812,7 +2580,15 @@ mod tests {
     async fn user_move_intent_carries_user_actor_and_reason() {
         let (runtime, journal) = runtime_fixture().await;
         let outcome = runtime
-            .do_move(FED_A, FED_B, Msat(10_000), Msat(500), Occurrence(0))
+            .do_move(
+                FED_A,
+                FED_B,
+                Msat(10_000),
+                Msat(500),
+                Occurrence(0),
+                ReasonCode::UserInitiated,
+                Actor::User,
+            )
             .await
             .expect("do_move returns even when the drive is retryable");
         let intent = journal
@@ -1822,6 +2598,293 @@ mod tests {
             .expect("the move intent is journaled");
         assert_eq!(intent.actor, Actor::User);
         assert_eq!(intent.reason, ReasonCode::UserInitiated);
+    }
+
+    // ---- phase 5 §5.0.8: the pure probe pieces --------------------------------------
+
+    /// A leg move record with the given phase/artifacts, for the classification table.
+    fn probe_leg_rec(phase: MovePhase, invoice: bool, send_op: bool) -> MoveRecord {
+        MoveRecord {
+            key: IdempotencyKey("move:leg".into()),
+            from: Some(FED_A),
+            to: FED_B,
+            amount: Msat(20_000),
+            fee_cap: Msat(10_000),
+            gateway: GatewayUrl("https://gw.example".into()),
+            send_required: true,
+            invoice: invoice.then(|| Invoice("lnbc1pexample".into())),
+            recv_op: invoice.then_some(crate::types::OperationId([0x07; 32])),
+            send_op: send_op.then_some(crate::types::OperationId([0x09; 32])),
+            phase,
+            outcome: None,
+            preimage: None,
+            receive_fee_quoted: Some(Msat(300)),
+            send_fee_quoted: Some(Msat(200)),
+        }
+    }
+
+    #[test]
+    fn probe_out_fee_cap_never_allows_return_debit_above_delivered_delta() {
+        assert_eq!(
+            probe_out_fee_cap(Msat(19_500), Msat(15_000), Msat(10_000)),
+            Msat(4_500),
+            "leg OUT can spend at most delivered_in - out_net in fees"
+        );
+        assert_eq!(
+            probe_out_fee_cap(Msat(30_000), Msat(15_000), Msat(10_000)),
+            Msat(10_000),
+            "the operator's leg fee cap still bounds the return leg"
+        );
+        assert_eq!(
+            probe_out_fee_cap(Msat(15_000), Msat(16_000), Msat(10_000)),
+            Msat(0),
+            "a corrupt oversized out_net cannot mint extra fee budget"
+        );
+    }
+
+    #[test]
+    fn classification_table_demotes_only_candidate_refused_legs() {
+        use ProbeLeg::{In, Out};
+        let rejected = "lnv2 send deterministically rejected the invoice: FederationNotSupported";
+        // Terminal settlement phases: Stranded/Refunded never demote; a terminal FAILED
+        // send demotes only when the payer is the candidate (leg OUT).
+        for leg in [In, Out] {
+            let rec = probe_leg_rec(MovePhase::Stranded, true, true);
+            assert_eq!(
+                classify_leg_failure(leg, Some(&rec), "x"),
+                LegFault::UmbrellaOnly
+            );
+            let rec = probe_leg_rec(MovePhase::Refunded, true, true);
+            assert_eq!(
+                classify_leg_failure(leg, Some(&rec), "x"),
+                LegFault::UmbrellaOnly
+            );
+        }
+        let failed = probe_leg_rec(MovePhase::Failed, true, true);
+        assert_eq!(
+            classify_leg_failure(Out, Some(&failed), rejected),
+            LegFault::Candidate
+        );
+        assert_eq!(
+            classify_leg_failure(In, Some(&failed), rejected),
+            LegFault::UmbrellaOnly,
+            "leg IN's payer is the SOURCE — its send failure never demotes the candidate"
+        );
+
+        // CreateInvoice step (no artifacts): hosted on the destination — the candidate
+        // for leg IN only, and only for a non-local error.
+        assert_eq!(
+            classify_leg_failure(In, None, "the federation refused to mint"),
+            LegFault::Candidate
+        );
+        assert_eq!(
+            classify_leg_failure(In, None, "fee over cap (receive side exceeds fee_cap)"),
+            LegFault::UmbrellaOnly,
+            "§5.0.2: a parametric refusal must not demote"
+        );
+        assert_eq!(
+            classify_leg_failure(
+                In,
+                None,
+                "gateway receive fee changed between quote and mint; re-run"
+            ),
+            LegFault::UmbrellaOnly,
+            "the §15.7 TOCTOU refusal is gateway-timed, not candidate dishonesty"
+        );
+        assert_eq!(
+            classify_leg_failure(
+                In,
+                None,
+                "destination would exceed the per-fed cap (999+20000 > 1000 msat) for federation x"
+            ),
+            LegFault::UmbrellaOnly,
+            "the ADR-0018 cap refusal is local policy, not candidate dishonesty"
+        );
+        assert_eq!(
+            classify_leg_failure(Out, None, "anything at all"),
+            LegFault::UmbrellaOnly,
+            "leg OUT's mint is hosted on the SOURCE"
+        );
+
+        // Pay step (invoice, no send op): hosted on the source of the move — the
+        // candidate for leg OUT only, and only for a non-local error.
+        let at_pay = probe_leg_rec(MovePhase::Invoiced, true, false);
+        assert_eq!(
+            classify_leg_failure(Out, Some(&at_pay), rejected),
+            LegFault::Candidate
+        );
+        assert_eq!(
+            classify_leg_failure(
+                Out,
+                Some(&at_pay),
+                "fee over cap: the fixed receive quote 900 msat alone exceeds fee_cap 500 msat"
+            ),
+            LegFault::UmbrellaOnly
+        );
+        assert_eq!(
+            classify_leg_failure(
+                Out,
+                Some(&at_pay),
+                "move invoice expired before the send leg could pay it (move x); re-run"
+            ),
+            LegFault::UmbrellaOnly,
+            "the §15.4 expiry belt is a timing artifact"
+        );
+        for sdk_rejection in [
+            "lnv2 send deterministically rejected the invoice: Gateway fee exceeds the allowed limit",
+            "lnv2 send deterministically rejected the invoice: Gateway expiration time exceeds the allowed limit",
+            "lnv2 send deterministically rejected the invoice: Invoice has expired",
+        ] {
+            assert_eq!(
+                classify_leg_failure(Out, Some(&at_pay), sdk_rejection),
+                LegFault::UmbrellaOnly,
+                "{sdk_rejection} is gateway-parametric/timing, not candidate dishonesty"
+            );
+        }
+        assert_eq!(
+            classify_leg_failure(In, Some(&at_pay), rejected),
+            LegFault::UmbrellaOnly,
+            "leg IN's pay is hosted on the SOURCE"
+        );
+
+        // Both artifacts present without a terminal phase: an await-step oddity —
+        // genuinely unclear attribution never demotes.
+        let odd = probe_leg_rec(MovePhase::Sending, true, true);
+        assert_eq!(
+            classify_leg_failure(Out, Some(&odd), "x"),
+            LegFault::UmbrellaOnly
+        );
+    }
+
+    #[test]
+    fn non_candidate_signatures_match_an_emit_site() {
+        // `is_known_non_candidate_error` matches free text emitted by the executors. If
+        // an emit site rewords its diagnostic without updating the signature list, a
+        // local/gateway fault on a candidate-hosted step silently turns into a wrongful
+        // demotion — pin every signature to a source that still emits it.
+        let emitting_sources = [
+            include_str!("executor.rs"),
+            include_str!("../../wallet-core/src/executor.rs"),
+        ];
+        for sig in NON_CANDIDATE_SIGNATURES {
+            assert!(
+                emitting_sources.iter().any(|src| src.contains(sig)),
+                "signature {sig:?} no longer appears in any emitting source; update \
+                 NON_CANDIDATE_SIGNATURES together with the reworded diagnostic"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_cost_is_the_source_net_outflow() {
+        let settled_in = probe_leg_rec(MovePhase::Settled, true, true);
+        let mut settled_out = probe_leg_rec(MovePhase::Settled, true, true);
+        settled_out.amount = Msat(15_000);
+        // Clean pass: (20_000 + 300 + 200) − 15_000 = fees + residue.
+        assert_eq!(
+            probe_cost(Some(&settled_in), Some(&settled_out)),
+            Some(Msat(5_500))
+        );
+        // Leg OUT never redeemed: the WHOLE delivered amount + fees is the exposure.
+        assert_eq!(probe_cost(Some(&settled_in), None), Some(Msat(20_500)));
+        let failed_out = probe_leg_rec(MovePhase::Failed, true, true);
+        assert_eq!(
+            probe_cost(Some(&settled_in), Some(&failed_out)),
+            Some(Msat(20_500))
+        );
+        // A STRANDED leg IN still debited the source in full.
+        let stranded_in = probe_leg_rec(MovePhase::Stranded, true, true);
+        assert_eq!(probe_cost(Some(&stranded_in), None), Some(Msat(20_500)));
+        // No settled send on leg IN = no money left the source.
+        let refunded_in = probe_leg_rec(MovePhase::Refunded, true, true);
+        assert_eq!(probe_cost(Some(&refunded_in), None), None);
+        assert_eq!(probe_cost(None, None), None);
+    }
+
+    #[test]
+    fn no_sweep_guard_requires_baseline_plus_delta() {
+        // Baseline 100, delta 20: intact holdings pass…
+        assert!(no_sweep_ok(Msat(120), Msat(100), Msat(20)));
+        assert!(no_sweep_ok(Msat(125), Msat(100), Msat(20)));
+        // …but the §5.0.4 counterexample fails: 15 spent leaves 105, which still exceeds
+        // the delta alone (a delta-only check would be fooled) yet not baseline + delta.
+        assert!(!no_sweep_ok(Msat(105), Msat(100), Msat(20)));
+        assert!(!no_sweep_ok(Msat(119), Msat(100), Msat(20)));
+    }
+
+    #[test]
+    fn probe_local_faults_reject_self_probe_poor_source_and_capped_candidate() {
+        let ok = probe_local_faults(
+            FED_B,
+            FED_A,
+            Msat(30_000),
+            Msat(0),
+            Msat(20_000),
+            Msat(10_000),
+            Some(Msat(1_000_000)),
+        );
+        assert_eq!(ok, Ok(()));
+        // Self-probe.
+        let err = probe_local_faults(
+            FED_A,
+            FED_A,
+            Msat(30_000),
+            Msat(0),
+            Msat(20_000),
+            Msat(10_000),
+            None,
+        )
+        .expect_err("self-probe");
+        assert!(err.contains("from itself"), "{err}");
+        // Source short of amount + leg fee cap.
+        let err = probe_local_faults(
+            FED_B,
+            FED_A,
+            Msat(29_999),
+            Msat(0),
+            Msat(20_000),
+            Msat(10_000),
+            None,
+        )
+        .expect_err("poor source");
+        assert!(err.contains("insufficient source balance"), "{err}");
+        // Candidate without cap room for the probe amount.
+        let err = probe_local_faults(
+            FED_B,
+            FED_A,
+            Msat(30_000),
+            Msat(990_000),
+            Msat(20_000),
+            Msat(10_000),
+            Some(Msat(1_000_000)),
+        )
+        .expect_err("capped candidate");
+        assert!(err.contains("insufficient candidate cap room"), "{err}");
+        // No hard cap disables the room check.
+        assert_eq!(
+            probe_local_faults(
+                FED_B,
+                FED_A,
+                Msat(30_000),
+                Msat(990_000),
+                Msat(20_000),
+                Msat(10_000),
+                None,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn occurrence_and_umbrella_key_derive_from_the_session_nonce() {
+        let occ = occurrence_from_nonce("000000000000002a0000000000000000").expect("valid nonce");
+        assert_eq!(occ, Occurrence(42));
+        occurrence_from_nonce("shorty").expect_err("too-short nonce");
+        occurrence_from_nonce("zzzzzzzzzzzzzzzz0000000000000000").expect_err("non-hex nonce");
+        assert_eq!(
+            probe_umbrella_key(&FED_A, "0011").0,
+            format!("probe:{}:0011", FED_A.to_hex())
+        );
     }
 
     #[tokio::test]

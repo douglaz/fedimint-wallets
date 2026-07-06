@@ -170,6 +170,10 @@ pub enum ReasonCode {
     /// there is no allocator reason. Mandatory-but-honest (§8) — the ledger's `reason` is
     /// always present.
     UserInitiated,
+    /// An active-probe row (phase 5 §5.0.5): the umbrella `probe:` row and both probe leg
+    /// moves carry this, so `history` explains every probe as one audited operation family
+    /// (reason tag `"active_probe"`).
+    ActiveProbe,
     /// A `Tick` ledger row: the run exists because the standing instruction executed. The
     /// run's individual decisions carry their OWN reasons on their own rows — a tick has no
     /// single allocator reason.

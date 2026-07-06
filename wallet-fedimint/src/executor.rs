@@ -541,6 +541,29 @@ impl FedimintExecutor {
         Ok(found.map(Msat))
     }
 
+    /// Phase 5 §5.0.5 sizing seam: the largest net a probe's leg OUT (`from` = the
+    /// candidate, `to` = the probing source) can redeem within `budget` — leg IN's
+    /// DELIVERED net, NOT the candidate's live balance — and the per-leg `fee_cap`. This
+    /// is the `size_fresh_evacuation` affordability search reused without the shutdown
+    /// reason: sizing finds `out_net` using only the delivered delta as spendable budget.
+    /// The runtime then drives the return leg with the remaining-delta fee cap
+    /// (`delivered_in - out_net`) so the Pay-step re-quote cannot spend pre-existing
+    /// candidate funds. Resolves the same gateway a fresh `from → to` move would (pinned
+    /// gateway first, else the destination's registered set). `Ok(None)` = no out move
+    /// whose CONTRACT clears the lnv2 floor is affordable from this budget (the caller's
+    /// §5.0.5 step-4 local abort).
+    pub(crate) async fn size_probe_leg_out(
+        &self,
+        from: FederationId,
+        to: FederationId,
+        budget: Msat,
+        fee_cap: Msat,
+    ) -> Result<Option<Msat>, ExecError> {
+        let gateway = self.resolve_gateway(&to, Some(from)).await?;
+        self.max_affordable_evacuation_net(&from, &to, &gateway, budget, fee_cap, budget)
+            .await
+    }
+
     async fn fresh_send_required_gateway_fees(
         &self,
         from: &FederationId,

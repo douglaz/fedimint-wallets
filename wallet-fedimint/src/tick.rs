@@ -20,8 +20,8 @@
 
 use crate::probe::{assemble_facts, assemble_status, ProbeResult};
 use wallet_core::{
-    score, Action, AllocatorDecision, AllocatorSnapshot, ExecutionSummary, FederationId,
-    FederationStatus, FederationVerdict, Msat, Occurrence, ScorerPolicy,
+    score, Action, ActiveProbeVerdict, AllocatorDecision, AllocatorSnapshot, ExecutionSummary,
+    FederationId, FederationStatus, FederationVerdict, Msat, Occurrence, ScorerPolicy,
 };
 
 // ---- v1 default standing instruction (documented) --------------------------------
@@ -340,6 +340,11 @@ pub struct ScoredFed {
     pub id: FederationId,
     pub verdict: FederationVerdict,
     pub status: FederationStatus,
+    /// The ACTIVE-probe verdict against the snapshot's designated spending fed (phase 5
+    /// §5.0.6), computed with the DEFAULT `ProbePolicy`. `None` when no spending fed is
+    /// designated (nothing to evaluate the pair against). Display + 5.1-gate material;
+    /// 5.0 gates nothing on it.
+    pub active_probe: Option<ActiveProbeVerdict>,
 }
 
 /// The result of [`crate::runtime::Runtime::tick`]: the decisions the allocator produced

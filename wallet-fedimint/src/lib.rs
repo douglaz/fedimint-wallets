@@ -48,8 +48,9 @@ pub mod types;
 pub use executor::FedimintExecutor;
 pub use fee::{gross_up, predicted_net, total_within_cap, GatewayFee, GrossUp};
 pub use journal::{
-    FederationInfo, FederationListReport, FedimintJournal, LedgerRepairOracle, OperationRef,
-    RawOpObservation, RawTerminal, RepairSummary,
+    prune_probe_attempts, FederationInfo, FederationListReport, FedimintJournal,
+    LedgerRepairOracle, OperationRef, ProbeRecord, ProbeSession, RawOpObservation, RawTerminal,
+    RepairSummary, PROBE_HISTORY_CAP,
 };
 pub use move_protocol::{
     assemble_move_record, next_step, Leg, MoveMeta, MoveParams, MovePhase, MovePlan, MoveRecord,
@@ -59,6 +60,8 @@ pub use multi_client::{
     parse_invoice, InvoiceDetails, JoinOutcome, MultiClient, ReceiveState, SendOutcome, SendState,
 };
 pub use probe::{assemble_facts, assemble_status, FedimintProbeRunner, ProbeResult};
-pub use runtime::{DirectInflowOutcome, FinalizeOutcome, MoveOutcome, ReconcileSummary, Runtime};
+pub use runtime::{
+    DirectInflowOutcome, FinalizeOutcome, MoveOutcome, ProbeReport, ReconcileSummary, Runtime,
+};
 pub use tick::{build_snapshot, ScoredFed, StatusReport, TickPolicy, TickReport};
 pub use types::{GatewayUrl, Invoice, OperationId, Preimage};
