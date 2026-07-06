@@ -5,11 +5,15 @@
 //! gross-up, `MoveRecord`/`Action` wiring, op-log backfill — lands on top in step 4b.
 
 use crate::fee::GatewayFee;
-use crate::journal::{FederationInfo, FedimintJournal};
+use crate::journal::{
+    FederationInfo, FedimintJournal, LedgerRepairOracle, RawOpObservation, RawTerminal,
+};
 use crate::move_protocol::{Leg, MoveMeta, OpArtifact};
 use crate::types::{GatewayUrl, Invoice, OperationId, Preimage};
+use async_trait::async_trait;
 use fedimint_bip39::{Bip39RootSecretStrategy, Mnemonic};
 use fedimint_client::db::ChronologicalOperationLogKey;
+use fedimint_client::module::oplog::UpdateStreamOrOutcome;
 use fedimint_client::secret::RootSecretStrategy as _;
 use fedimint_client::{Client, ClientBuilder, ClientHandleArc, RootSecret};
 use fedimint_connectors::ConnectorRegistry;
@@ -23,16 +27,16 @@ use fedimint_lnv2_client::common::gateway_api::{PaymentFee, RoutingInfo};
 use fedimint_lnv2_client::common::{Bolt11InvoiceDescription, LightningInvoice};
 use fedimint_lnv2_client::{
     FinalReceiveOperationState, FinalSendOperationState, LightningClientModule,
-    LightningOperationMeta, SendPaymentError,
+    LightningOperationMeta, ReceiveOperationState, SendOperationState, SendPaymentError,
 };
 use futures::lock::Mutex;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use lightning_invoice::Bolt11Invoice;
 use std::collections::BTreeMap;
 use std::str::FromStr as _;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use wallet_core::{FederationId, Msat};
+use wallet_core::{ExecError, FederationId, FeeBreakdown, IdempotencyKey, Msat};
 
 /// Tag byte for a per-federation client partition (spec §4 "Storage"): client `i` lives
 /// at `[CLIENT_PREFIX_TAG] ++ u32_le(db_prefix)`, exactly 5 bytes. Fixed-length is
@@ -83,17 +87,17 @@ impl MultiClient {
     /// Join `invite`'s federation, assigning it the next `db_prefix` and persisting a
     /// [`FederationInfo`] row. Idempotent: a federation already joined (in-memory, or
     /// recorded in the journal from a previous run) is opened instead of re-joined.
-    pub async fn join(&self, invite: InviteCode) -> anyhow::Result<FederationId> {
+    pub async fn join(&self, invite: InviteCode) -> anyhow::Result<JoinOutcome> {
         let id = bridge_federation_id(invite.federation_id());
 
         if self.has_client(&id) {
-            return Ok(id);
+            return Ok(JoinOutcome::opened(id));
         }
 
         let _join_guard = self.join_lock.lock().await;
 
         if self.has_client(&id) {
-            return Ok(id);
+            return Ok(JoinOutcome::opened(id));
         }
         if let Some(info) = self
             .journal
@@ -101,7 +105,8 @@ impl MultiClient {
             .await
             .map_err(|e| anyhow::anyhow!("reading federation registry: {e:?}"))?
         {
-            return self.open_one(&info).await;
+            // Registered on a previous run (or by a concurrent process): open, don't re-join.
+            return Ok(JoinOutcome::opened(self.open_one(&info).await?));
         }
 
         let db_prefix = self.next_db_prefix().await?;
@@ -134,7 +139,10 @@ impl MultiClient {
             .write()
             .expect("client map lock poisoned")
             .insert(joined_id, client);
-        Ok(joined_id)
+        Ok(JoinOutcome {
+            id: joined_id,
+            newly_joined: true,
+        })
     }
 
     /// Open every already-joined federation, BEST-EFFORT: a federation whose client fails
@@ -668,6 +676,47 @@ pub enum SendOutcome {
     AlreadyPaid(OperationId),
 }
 
+/// The outcome of [`MultiClient::join`] (spec §10.2): the federation id, plus whether THIS
+/// call performed a fresh join (`true`) or found the federation already registered/open
+/// (`false` — the idempotent fast path, or the concurrent-registration window). The ledger
+/// recording terminalizes the pre-written `join:` row truthfully on this discriminator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JoinOutcome {
+    pub id: FederationId,
+    pub newly_joined: bool,
+}
+
+impl JoinOutcome {
+    /// The federation was already known: this call opened (not joined) it.
+    fn opened(id: FederationId) -> Self {
+        Self {
+            id,
+            newly_joined: false,
+        }
+    }
+}
+
+/// The parsed BOLT11 details a raw `pay` ledger row needs BEFORE the SDK call (§10.1): the
+/// invoice amount (`None` for a zero-amount invoice) and its 32-byte payment hash — the durable
+/// link reconcile's dedup repair keys on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvoiceDetails {
+    pub amount: Option<Msat>,
+    pub payment_hash: [u8; 32],
+}
+
+/// Parse a BOLT11 invoice into its ledger-relevant [`InvoiceDetails`]. A parse failure is the
+/// synchronous-error path (§10.1): the pre-written `Started` row is terminalized `Failed` with
+/// this error, so even a malformed invoice leaves a durable history row.
+pub fn parse_invoice(invoice: &Invoice) -> anyhow::Result<InvoiceDetails> {
+    let bolt11 =
+        Bolt11Invoice::from_str(&invoice.0).map_err(|e| anyhow::anyhow!("parsing invoice: {e}"))?;
+    Ok(InvoiceDetails {
+        amount: bolt11.amount_milli_satoshis().map(Msat),
+        payment_hash: bolt11.payment_hash().to_byte_array(),
+    })
+}
+
 /// The final state of a receive leg (`await_final_receive_operation_state`).
 ///
 /// NOTE: `Claimed` carries no amount. The underlying `FinalReceiveOperationState::Claimed`
@@ -787,6 +836,277 @@ fn map_send_state(state: FinalSendOperationState) -> SendState {
             SendState::Failed("send failed (programming error or malicious federation)".into())
         }
     }
+}
+
+// --- reconcile-repair oracle (spec §10.3): live op-log evidence for raw pay/recv rows -------
+
+impl MultiClient {
+    /// Page `fed`'s op-log newest-first and return the op-id of the FIRST lnv2 op whose meta
+    /// satisfies `pred` (§10.3 repair search; reuses the `backfill_ops` pagination).
+    async fn find_op_matching(
+        &self,
+        fed: &FederationId,
+        mut pred: impl FnMut(&LightningOperationMeta) -> bool,
+    ) -> anyhow::Result<Option<OperationId>> {
+        let client = self.client(fed)?;
+        let log = client.operation_log();
+        let mut last_seen: Option<ChronologicalOperationLogKey> = None;
+        loop {
+            let page = log
+                .paginate_operations_rev(BACKFILL_PAGE_SIZE, last_seen)
+                .await;
+            let page_len = page.len();
+            if let Some((key, _)) = page.last() {
+                last_seen = Some(*key);
+            }
+            for (key, entry) in page {
+                let Ok(meta) = entry.try_meta::<LightningOperationMeta>() else {
+                    continue;
+                };
+                if pred(&meta) {
+                    return Ok(Some(bridge_op_id(key.operation_id)));
+                }
+            }
+            if page_len < BACKFILL_PAGE_SIZE {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    /// Non-blocking read of `fed_op`'s send-leg terminal state (§10.3): a cached outcome maps to
+    /// a terminal; an uncached stream is polled only for updates already available now. A genuinely
+    /// in-flight op yields `None`, so reconcile leaves it `Awaiting` for a later pass rather than
+    /// blocking on the update stream.
+    async fn observe_send_terminal(
+        &self,
+        client: &ClientHandleArc,
+        fed_op: FedimintOperationId,
+    ) -> anyhow::Result<Option<RawTerminal>> {
+        let lnv2 = client.get_first_module::<LightningClientModule>()?;
+        Ok(ready_terminal_from_updates(
+            lnv2.subscribe_send_operation_state_updates(fed_op).await?,
+            send_terminal,
+        ))
+    }
+
+    /// Non-blocking read of `fed_op`'s receive-leg terminal state (§10.3). See
+    /// [`Self::observe_send_terminal`].
+    async fn observe_receive_terminal(
+        &self,
+        client: &ClientHandleArc,
+        fed_op: FedimintOperationId,
+    ) -> anyhow::Result<Option<RawTerminal>> {
+        let lnv2 = client.get_first_module::<LightningClientModule>()?;
+        Ok(ready_terminal_from_updates(
+            lnv2.subscribe_receive_operation_state_updates(fed_op)
+                .await?,
+            receive_terminal,
+        ))
+    }
+}
+
+#[async_trait]
+impl LedgerRepairOracle for MultiClient {
+    async fn find_op_by_correlation_key(
+        &self,
+        fed: FederationId,
+        key: &IdempotencyKey,
+    ) -> Result<Option<OperationId>, ExecError> {
+        let key = key.0.clone();
+        self.find_op_matching(&fed, |meta| {
+            meta_custom(meta)
+                .and_then(|c| c.get("correlation_key"))
+                .and_then(|v| v.as_str())
+                == Some(key.as_str())
+        })
+        .await
+        .map_err(oracle_retryable)
+    }
+
+    async fn find_send_op_by_payment_hash(
+        &self,
+        fed: FederationId,
+        hash: [u8; 32],
+    ) -> Result<Option<OperationId>, ExecError> {
+        self.find_op_matching(&fed, |meta| match meta {
+            LightningOperationMeta::Send(send) => {
+                let LightningInvoice::Bolt11(bolt11) = &send.invoice;
+                bolt11.payment_hash().to_byte_array() == hash
+            }
+            _ => false,
+        })
+        .await
+        .map_err(oracle_retryable)
+    }
+
+    async fn observe_op(
+        &self,
+        fed: FederationId,
+        op: OperationId,
+    ) -> Result<RawOpObservation, ExecError> {
+        let client = self.client(&fed).map_err(oracle_retryable)?;
+        let fed_op = unbridge_op_id(op);
+        let entry = client
+            .operation_log()
+            .get_operation(fed_op)
+            .await
+            .ok_or_else(|| {
+                ExecError::Retryable(format!("no operation for id {}", fed_op.fmt_full()))
+            })?;
+        let meta = entry.try_meta::<LightningOperationMeta>().map_err(|e| {
+            ExecError::Permanent(format!("op {} is not an lnv2 op: {e}", fed_op.fmt_full()))
+        })?;
+        match meta {
+            LightningOperationMeta::Send(send) => {
+                let LightningInvoice::Bolt11(bolt11) = &send.invoice;
+                let invoice_amount = bolt11.amount_milli_satoshis().map(Msat);
+                let payment_hash = Some(bolt11.payment_hash().to_byte_array());
+                let gateway = Some(bridge_gateway_url(send.gateway.clone()));
+                // Definitive send fee (§9.3): exact gateway component (contract − invoice) plus
+                // the federation send-tx fee quote on the funded contract. The fee is display-only
+                // enrichment; the TERMINAL state is what makes repair truthful, so a fee-quote
+                // failure (guardians unreachable, spent-down wallet) must NOT abort terminalizing a
+                // settled op — degrade the fee to missing (§10.3) instead of leaving the row stuck.
+                let contract = send.contract.amount.msats;
+                let gateway_component = contract.saturating_sub(invoice_amount.map_or(0, |m| m.0));
+                let send_fee_quoted = self
+                    .send_fee_quote_for_amount(&fed, Msat(contract))
+                    .await
+                    .ok()
+                    .map(|fed_fee| Msat(gateway_component.saturating_add(fed_fee.0)));
+                let terminal = self
+                    .observe_send_terminal(&client, fed_op)
+                    .await
+                    .map_err(oracle_retryable)?;
+                Ok(RawOpObservation {
+                    terminal,
+                    gateway,
+                    fees: FeeBreakdown {
+                        fee_cap: None,
+                        receive_fee: None,
+                        send_fee_quoted,
+                    },
+                    invoice_amount,
+                    payment_hash,
+                })
+            }
+            LightningOperationMeta::Receive(receive) => {
+                let LightningInvoice::Bolt11(bolt11) = &receive.invoice;
+                let amount_invoiced = bolt11.amount_milli_satoshis().map(Msat);
+                let gateway = Some(bridge_gateway_url(receive.gateway.clone()));
+                // Definitive receive fee (§9.3): exact gateway deduction (invoice − contract)
+                // plus the federation claim-fee quote on the post-gateway contract. As on the send
+                // leg, the fee is display-only enrichment — a quote failure degrades it to missing
+                // rather than aborting terminalization of a settled receive (§10.3).
+                let contract = receive.contract.commitment.amount.msats;
+                let gateway_deduction = amount_invoiced.map_or(0, |m| m.0).saturating_sub(contract);
+                let receive_fee = self
+                    .receive_fee_quote(&fed, Msat(contract))
+                    .await
+                    .ok()
+                    .map(|fed_fee| Msat(gateway_deduction.saturating_add(fed_fee.0)));
+                let terminal = self
+                    .observe_receive_terminal(&client, fed_op)
+                    .await
+                    .map_err(oracle_retryable)?;
+                Ok(RawOpObservation {
+                    terminal,
+                    gateway,
+                    fees: FeeBreakdown {
+                        fee_cap: None,
+                        receive_fee,
+                        send_fee_quoted: None,
+                    },
+                    invoice_amount: amount_invoiced,
+                    payment_hash: None,
+                })
+            }
+            LightningOperationMeta::LnurlReceive(_) => Err(ExecError::Permanent(format!(
+                "op {} is an LNURL receive, not a raw move op",
+                fed_op.fmt_full()
+            ))),
+        }
+    }
+}
+
+/// The `custom_meta` on an lnv2 op's meta (both raw legs carry one; an LNURL receive does not).
+fn meta_custom(meta: &LightningOperationMeta) -> Option<&serde_json::Value> {
+    match meta {
+        LightningOperationMeta::Send(send) => Some(&send.custom_meta),
+        LightningOperationMeta::Receive(receive) => Some(&receive.custom_meta),
+        LightningOperationMeta::LnurlReceive(_) => None,
+    }
+}
+
+/// A cached send outcome → a [`RawTerminal`]; a non-terminal streaming state (never actually
+/// cached as an outcome) is treated defensively as in-flight (`None`).
+fn send_terminal(state: SendOperationState) -> Option<RawTerminal> {
+    match state {
+        SendOperationState::Success(_) => Some(RawTerminal {
+            succeeded: true,
+            error: None,
+        }),
+        SendOperationState::Refunded => Some(RawTerminal {
+            succeeded: false,
+            error: Some("send refunded".into()),
+        }),
+        SendOperationState::Failure => Some(RawTerminal {
+            succeeded: false,
+            error: Some("send failed (programming error or malicious federation)".into()),
+        }),
+        SendOperationState::Funding
+        | SendOperationState::Funded
+        | SendOperationState::Refunding => None,
+    }
+}
+
+/// A cached receive outcome → a [`RawTerminal`]; a non-terminal streaming state is in-flight.
+fn receive_terminal(state: ReceiveOperationState) -> Option<RawTerminal> {
+    match state {
+        ReceiveOperationState::Claimed => Some(RawTerminal {
+            succeeded: true,
+            error: None,
+        }),
+        ReceiveOperationState::Expired => Some(RawTerminal {
+            succeeded: false,
+            error: Some("receive expired".into()),
+        }),
+        ReceiveOperationState::Failure => Some(RawTerminal {
+            succeeded: false,
+            error: Some("receive failed (programming error or malicious federation)".into()),
+        }),
+        ReceiveOperationState::Pending | ReceiveOperationState::Claiming => None,
+    }
+}
+
+/// Return a terminal outcome from a cached lnv2 outcome or from updates already queued on an
+/// uncached stream. Never waits for a future update: repair is allowed to observe, not subscribe.
+fn ready_terminal_from_updates<U>(
+    updates: UpdateStreamOrOutcome<U>,
+    terminal: impl Fn(U) -> Option<RawTerminal>,
+) -> Option<RawTerminal>
+where
+    U: 'static,
+{
+    match updates {
+        UpdateStreamOrOutcome::Outcome(state) => terminal(state),
+        UpdateStreamOrOutcome::UpdateStream(mut stream) => loop {
+            match stream.next().now_or_never() {
+                Some(Some(state)) => {
+                    if let Some(terminal) = terminal(state) {
+                        return Some(terminal);
+                    }
+                }
+                Some(None) | None => return None,
+            }
+        },
+    }
+}
+
+/// Op-log I/O faults during repair are transient (a later reconcile retries); never terminal.
+fn oracle_retryable(e: anyhow::Error) -> ExecError {
+    ExecError::Retryable(e.to_string())
 }
 
 /// Which lnv2 leg an operation is. `await_final_{receive,send}_operation_state` each dispatch
@@ -1048,6 +1368,50 @@ mod tests {
                 "{err:?} must stay a retryable Transport fault"
             );
         }
+    }
+
+    #[test]
+    fn ready_terminal_reads_an_uncached_ready_final_update() {
+        let stream: futures::stream::BoxStream<'static, SendOperationState> = Box::pin(
+            futures::stream::iter([SendOperationState::Success([7u8; 32])]),
+        );
+
+        let terminal =
+            ready_terminal_from_updates(UpdateStreamOrOutcome::UpdateStream(stream), send_terminal)
+                .expect("ready final update should repair the row");
+
+        assert!(terminal.succeeded);
+        assert_eq!(terminal.error, None);
+    }
+
+    #[test]
+    fn ready_terminal_drains_ready_nonterminal_prefix_without_waiting() {
+        let stream: futures::stream::BoxStream<'static, SendOperationState> =
+            Box::pin(futures::stream::iter([
+                SendOperationState::Funding,
+                SendOperationState::Refunded,
+            ]));
+
+        let terminal =
+            ready_terminal_from_updates(UpdateStreamOrOutcome::UpdateStream(stream), send_terminal)
+                .expect("ready terminal after a ready prefix should repair the row");
+
+        assert!(!terminal.succeeded);
+        assert_eq!(terminal.error.as_deref(), Some("send refunded"));
+    }
+
+    #[test]
+    fn ready_terminal_leaves_pending_stream_in_flight() {
+        let stream: futures::stream::BoxStream<'static, ReceiveOperationState> =
+            Box::pin(futures::stream::pending());
+
+        assert_eq!(
+            ready_terminal_from_updates(
+                UpdateStreamOrOutcome::UpdateStream(stream),
+                receive_terminal,
+            ),
+            None
+        );
     }
 
     #[test]

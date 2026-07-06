@@ -3,7 +3,7 @@
 //! parses arguments, drives the engine, and formats output. No interactive prompts (the
 //! engine assumes no UI).
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use fedimint_bip39::{Bip39RootSecretStrategy, Mnemonic};
 use fedimint_client::secret::RootSecretStrategy as _;
 use fedimint_client::Client;
@@ -14,12 +14,14 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use wallet_core::{
-    Action, AllocatorDecision, ExecutionSummary, FederationId, IdempotencyKey, IntentStatus, Msat,
-    Occurrence,
+    Action, Actor, AllocatorDecision, ExecutionSummary, FederationId, FeeBreakdown, IdempotencyKey,
+    IntentStatus, Journal, Msat, Occurrence, OperationKind, OperationRecord, OperationStatus,
+    RawOpUpdate, ReasonCode,
 };
 use wallet_fedimint::{
-    FedimintJournal, FinalizeOutcome, GatewayUrl, Invoice, MoveOutcome, MultiClient, OperationId,
-    ReceiveState, Runtime, ScoredFed, SendOutcome, SendState, TickPolicy,
+    parse_invoice, FedimintJournal, FinalizeOutcome, GatewayUrl, Invoice, LedgerRepairOracle,
+    MoveOutcome, MultiClient, OperationId, OperationRef, ReceiveState, Runtime, ScoredFed,
+    SendOutcome, SendState, TickPolicy,
 };
 
 #[derive(Parser)]
@@ -85,6 +87,10 @@ enum Command {
         /// The federation the receive was created on (hex id).
         #[arg(long)]
         fed: String,
+        /// The correlation key printed by `receive` (`key: …`). When given, the ledger row is
+        /// advanced to its terminal state here; without it, reconcile repair advances it later.
+        #[arg(long)]
+        key: Option<String>,
     },
     /// Block until a send operation reaches a final state, then print it
     /// (success <preimage> / refunded / failed).
@@ -94,6 +100,10 @@ enum Command {
         /// The federation the payment was sent from (hex id).
         #[arg(long)]
         fed: String,
+        /// The correlation key printed by `pay` (`key: …`). When given, the ledger row is
+        /// advanced to its terminal state here; without it, reconcile repair advances it later.
+        #[arg(long)]
+        key: Option<String>,
     },
     /// Route an inflow to a chosen federation via the executor (spec §6/§7): size + cap-check
     /// the receive invoice so the wallet nets EXACTLY `amount`, print the BOLT11 to stdout and
@@ -208,6 +218,52 @@ enum Command {
         #[arg(long)]
         gateway: Option<String>,
     },
+    /// Print the operation ledger newest-first (§11): one TAB-separated row per operation
+    /// (`seq  updated_at  kind  status  amount_msat  recv_fee_msat  send_fee_quoted_msat  actor
+    /// reason  key`; unknown fields = `-`). Offline — journal scan only. Filters apply before
+    /// `--limit`.
+    History {
+        /// Maximum rows to print (after filters), newest-first.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Filter to operations involving this federation (hex id).
+        #[arg(long)]
+        fed: Option<String>,
+        /// Filter by initiator.
+        #[arg(long, value_enum)]
+        actor: Option<ActorFilter>,
+        /// Filter by status.
+        #[arg(long, value_enum)]
+        status: Option<StatusFilter>,
+        /// Emit one JSON `OperationRecord` per line (JSONL) instead of the TSV table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one operation's full record + its live linked intent status (§11). Offline. Resolve
+    /// by correlation key or by numeric seq.
+    Show {
+        /// A correlation key (e.g. `pay:…`) OR a numeric seq.
+        reference: String,
+        /// Emit the raw `OperationRecord` as JSON instead of the multi-line view.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `--actor` filter for `history` (spec §11).
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ActorFilter {
+    User,
+    Agent,
+}
+
+/// `--status` filter for `history` (spec §11).
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum StatusFilter {
+    Started,
+    Awaiting,
+    Succeeded,
+    Failed,
 }
 
 /// The standing-instruction (ADR-0009) flags shared by `tick` and `status`. Every numeric flag
@@ -274,6 +330,24 @@ async fn main() -> anyhow::Result<()> {
         .into();
 
     let journal = Arc::new(FedimintJournal::new(db.clone()));
+
+    // §11: `history`/`show` are OFFLINE journal scans and MUST work with only the journal open.
+    // Dispatch them BEFORE any wallet-client setup — `load_or_generate_mnemonic` would persist a
+    // fresh seed and `MultiClient::open_all` reaches the network to resume each federation's state
+    // machines, both of which defeat "read-only, never touches the network" (and a corrupt/absent
+    // client secret must not block a diagnostic ledger read).
+    let command = match cli.command {
+        Command::History {
+            limit,
+            fed,
+            actor,
+            status,
+            json,
+        } => return run_history(&journal, limit, fed, actor, status, json).await,
+        Command::Show { reference, json } => return run_show(&journal, reference, json).await,
+        other => other,
+    };
+
     let mnemonic = load_or_generate_mnemonic(&db).await?;
     let multi_client = Arc::new(MultiClient::new(db, mnemonic).await);
 
@@ -286,11 +360,64 @@ async fn main() -> anyhow::Result<()> {
     multi_client.open_all(&infos).await?;
     let open_ids = multi_client.federations();
 
-    match cli.command {
+    match command {
         Command::Join { invite } => {
             let invite = InviteCode::from_str(&invite)?;
-            let id = multi_client.join(invite).await?;
-            println!("{}", id.to_hex());
+            let fed_id = {
+                use fedimint_core::BitcoinHash as _;
+                FederationId(invite.federation_id().0.to_byte_array())
+            };
+            // §10.2: check the membership registry FIRST — an already-joined fed is (re)opened
+            // only, with NO ledger row (the idempotent fast path; nothing happened).
+            let already = journal
+                .get_federation(&fed_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("reading federation registry: {e:?}"))?
+                .is_some();
+            if already {
+                let outcome = multi_client.join(invite).await?;
+                println!("{}", outcome.id.to_hex());
+            } else {
+                // A fresh join: write the `Started` attempt row BEFORE the join, then terminalize
+                // truthfully — `newly_joined` distinguishes a real membership from the
+                // concurrent-registration window (the pre-written row cannot be un-written).
+                let key = IdempotencyKey(format!("join:{}:{}", fed_id.to_hex(), cli_nonce()));
+                journal
+                    .record_started(
+                        &key,
+                        OperationKind::Join { fed: fed_id },
+                        Actor::User,
+                        ReasonCode::UserInitiated,
+                        cli_now_ms(),
+                        None,
+                    )
+                    .await
+                    .map_err(ledger_err)?;
+                let outcome = match multi_client.join(invite).await {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        let _ = journal
+                            .record_terminal(
+                                &key,
+                                OperationStatus::Failed,
+                                cli_now_ms(),
+                                Some(&e.to_string()),
+                                None,
+                            )
+                            .await;
+                        return Err(e);
+                    }
+                };
+                let note = (!outcome.newly_joined)
+                    .then_some("already joined (concurrent/prior); no-op re-open");
+                note_ledger(
+                    journal
+                        .record_terminal(&key, OperationStatus::Succeeded, cli_now_ms(), note, None)
+                        .await,
+                );
+                println!("{}", outcome.id.to_hex());
+                eprintln!("key: {}", key.0);
+            }
         }
         Command::Balance => {
             // §15.8: a joined fed that failed to open must NOT silently drop out of the total.
@@ -337,15 +464,50 @@ async fn main() -> anyhow::Result<()> {
             gateway,
         } => {
             let id = select_fed(&joined_ids, &open_ids, to.as_deref())?;
-            let gateway = pick_receive_gateway(&multi_client, &id, gateway).await?;
-            // The move-coordination meta (a `move_id`) lands in step 4b; for now just tag the role.
-            let meta = serde_json::json!({ "role": "receive" });
-            let (invoice, op) = multi_client
-                .receive(&id, Msat(amount), gateway, meta)
-                .await?;
-            // Invoice -> stdout (the payable result); op id -> stderr (diagnostic handle).
+            let amount = Msat(amount);
+            // §10.1: open the recorded window BEFORE gateway resolution — a nonce-only per-attempt
+            // key, so the row exists even if the (below) resolution/SDK call fails synchronously.
+            let key = IdempotencyKey(format!("recv:{}:{}", id.to_hex(), cli_nonce()));
+            journal
+                .record_started(
+                    &key,
+                    OperationKind::Receive {
+                        fed: id,
+                        amount_invoiced: amount,
+                        op_id: None,
+                        gateway: None,
+                    },
+                    Actor::User,
+                    ReasonCode::UserInitiated,
+                    cli_now_ms(),
+                    None,
+                )
+                .await
+                .map_err(ledger_err)?;
+            // `pick_receive_gateway` bails on no-registered-gateway — inside the window, so it
+            // lands a `Failed` row (§10.1).
+            let sdk_gateway = match pick_receive_gateway(&multi_client, &id, gateway).await {
+                Ok(g) => g,
+                Err(e) => return fail_raw_row(&journal, &key, e).await,
+            };
+            // Two-stage fee capture (§9.3): a pre-call best-effort ESTIMATE against a concrete
+            // gateway (the `gateway` field stays None — the auto-selected choice is unknown).
+            if let Some(fee) =
+                estimate_receive_fee(&multi_client, &id, amount, sdk_gateway.clone()).await
+            {
+                note_ledger(journal.record_update(&key, receive_fee_upd(fee)).await);
+            }
+            let meta = serde_json::json!({ "role": "receive", "correlation_key": key.0 });
+            let (invoice, op) = match multi_client.receive(&id, amount, sdk_gateway, meta).await {
+                Ok(result) => result,
+                Err(e) => return fail_raw_row(&journal, &key, e).await,
+            };
+            // The op id advances the row `Started → Awaiting` (the federation accepted the op).
+            note_ledger(journal.record_update(&key, op_id_upd(op)).await);
+            // Invoice -> stdout (the payable result); op id + key -> stderr (diagnostic handles).
             println!("{}", invoice.0);
             eprintln!("operation_id: {}", to_hex(&op.0));
+            eprintln!("key: {}", key.0);
         }
         Command::Pay {
             invoice,
@@ -353,29 +515,139 @@ async fn main() -> anyhow::Result<()> {
             gateway,
         } => {
             let id = select_fed(&joined_ids, &open_ids, fed.as_deref())?;
-            let meta = serde_json::json!({ "role": "send" });
-            let outcome = multi_client
-                .pay(&id, Invoice(invoice), gateway.map(GatewayUrl), meta)
-                .await?;
+            // §10.1: the window opens BEFORE parsing — a malformed BOLT11 has no payment hash,
+            // yet its failed attempt must still be a durable row.
+            let key = IdempotencyKey(format!("pay:{}:{}", id.to_hex(), cli_nonce()));
+            journal
+                .record_started(
+                    &key,
+                    OperationKind::Pay {
+                        fed: id,
+                        invoice_amount: None,
+                        payment_hash: None,
+                        op_id: None,
+                        gateway: None,
+                    },
+                    Actor::User,
+                    ReasonCode::UserInitiated,
+                    cli_now_ms(),
+                    None,
+                )
+                .await
+                .map_err(ledger_err)?;
+            let invoice = Invoice(invoice);
+            // Parse (amount + payment hash) — a parse failure is the synchronous-error path.
+            let details = match parse_invoice(&invoice) {
+                Ok(details) => details,
+                Err(e) => return fail_raw_row(&journal, &key, e).await,
+            };
+            // Post-parse `record_update` (amount + hash, durable BEFORE the SDK call) plus a
+            // best-effort send-fee estimate (§9.3 / §10.1).
+            let send_fee = estimate_send_fee(
+                &multi_client,
+                &id,
+                &invoice,
+                gateway.clone().map(GatewayUrl),
+            )
+            .await;
+            journal
+                .record_update(
+                    &key,
+                    pay_parse_upd(details.amount, details.payment_hash, send_fee),
+                )
+                .await
+                .map_err(ledger_err)?;
+            let meta = serde_json::json!({ "role": "send", "correlation_key": key.0 });
+            let outcome = match multi_client
+                .pay(&id, invoice, gateway.map(GatewayUrl), meta)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => return fail_raw_row(&journal, &key, e.into()).await,
+            };
             match outcome {
-                SendOutcome::Started(op) => println!("started {}", to_hex(&op.0)),
-                SendOutcome::AlreadyInFlight(op) => println!("already-in-flight {}", to_hex(&op.0)),
-                SendOutcome::AlreadyPaid(op) => println!("already-paid {}", to_hex(&op.0)),
+                SendOutcome::Started(op) => {
+                    note_ledger(journal.record_update(&key, op_id_upd(op)).await);
+                    println!("started {}", to_hex(&op.0));
+                }
+                SendOutcome::AlreadyInFlight(op) => {
+                    note_ledger(journal.record_update(&key, op_id_upd(op)).await);
+                    println!("already-in-flight {}", to_hex(&op.0));
+                }
+                SendOutcome::AlreadyPaid(op) => {
+                    // Terminal at creation. Read the ORIGINAL op-log meta for definitive fees
+                    // FIRST, THEN terminalize — freezing the row before the lookup would keep
+                    // blank/estimated fees (§10.1).
+                    let upd = settlement_upd(&multi_client, &id, op).await;
+                    note_ledger(
+                        journal
+                            .record_terminal(
+                                &key,
+                                OperationStatus::Succeeded,
+                                cli_now_ms(),
+                                None,
+                                Some(upd),
+                            )
+                            .await,
+                    );
+                    println!("already-paid {}", to_hex(&op.0));
+                }
             }
+            eprintln!("key: {}", key.0);
         }
-        Command::AwaitReceive { op, fed } => {
+        Command::AwaitReceive { op, fed, key } => {
             let id = select_fed(&joined_ids, &open_ids, Some(&fed))?;
             let op = OperationId(parse_hex32(&op)?);
-            match multi_client.await_receive(&id, op).await? {
+            let state = multi_client.await_receive(&id, op).await?;
+            if let Some(key) = &key {
+                let (status, error) = match &state {
+                    ReceiveState::Claimed => (OperationStatus::Succeeded, None),
+                    ReceiveState::Expired => {
+                        (OperationStatus::Failed, Some("receive expired".to_string()))
+                    }
+                    ReceiveState::Failed(msg) => (OperationStatus::Failed, Some(msg.clone())),
+                };
+                terminalize_awaited(
+                    &journal,
+                    &multi_client,
+                    &id,
+                    op,
+                    key,
+                    AwaitRole::Receive,
+                    (status, error),
+                )
+                .await;
+            }
+            match state {
                 ReceiveState::Claimed => println!("claimed"),
                 ReceiveState::Expired => println!("expired"),
                 ReceiveState::Failed(msg) => println!("failed: {msg}"),
             }
         }
-        Command::AwaitSend { op, fed } => {
+        Command::AwaitSend { op, fed, key } => {
             let id = select_fed(&joined_ids, &open_ids, Some(&fed))?;
             let op = OperationId(parse_hex32(&op)?);
-            match multi_client.await_send(&id, op).await? {
+            let state = multi_client.await_send(&id, op).await?;
+            if let Some(key) = &key {
+                let (status, error) = match &state {
+                    SendState::Success(_) => (OperationStatus::Succeeded, None),
+                    SendState::Refunded => {
+                        (OperationStatus::Failed, Some("send refunded".to_string()))
+                    }
+                    SendState::Failed(msg) => (OperationStatus::Failed, Some(msg.clone())),
+                };
+                terminalize_awaited(
+                    &journal,
+                    &multi_client,
+                    &id,
+                    op,
+                    key,
+                    AwaitRole::Send,
+                    (status, error),
+                )
+                .await;
+            }
+            match state {
                 SendState::Success(preimage) => println!("success {}", to_hex(&preimage.0)),
                 SendState::Refunded => println!("refunded"),
                 SendState::Failed(msg) => println!("failed: {msg}"),
@@ -605,8 +877,79 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        // §11: dispatched OFFLINE before any client setup (see the top of `main`).
+        Command::History { .. } | Command::Show { .. } => {
+            unreachable!("history/show are dispatched offline before the wallet client is opened")
+        }
     }
 
+    Ok(())
+}
+
+/// `history` (§11): scan the ledger newest-first, apply the filters, then take `--limit` (the
+/// spec's only pagination is the reverse seq scan; a personal wallet's ledger is tiny, §7
+/// non-goals). Offline — journal scan only.
+async fn run_history(
+    journal: &FedimintJournal,
+    limit: usize,
+    fed: Option<String>,
+    actor: Option<ActorFilter>,
+    status: Option<StatusFilter>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let fed_filter = fed.as_deref().map(parse_fed_id).transpose()?;
+    let rows = journal
+        .history(usize::MAX, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("reading the operation ledger: {e:?}"))?;
+    for record in rows
+        .into_iter()
+        .filter(|r| fed_filter.is_none_or(|f| record_involves_fed(r, f)))
+        .filter(|r| actor.is_none_or(|a| a.matches(r.actor)))
+        .filter(|r| status.is_none_or(|s| s.matches(r.status)))
+        .take(limit)
+    {
+        if json {
+            println!("{}", serde_json::to_string(&record)?);
+        } else {
+            println!("{}", history_tsv(&record));
+        }
+    }
+    Ok(())
+}
+
+/// `show <key|seq>` (§11): resolve one record by correlation key OR numeric seq and print it plus
+/// its live linked intent status. Offline — journal scan only.
+async fn run_show(journal: &FedimintJournal, reference: String, json: bool) -> anyhow::Result<()> {
+    // A numeric reference is a seq; anything else is a correlation key (keys are always
+    // `<verb>:…`-prefixed, never bare digits).
+    let sel = match reference.parse::<u64>() {
+        Ok(seq) => OperationRef::Seq(seq),
+        Err(_) => OperationRef::Key(IdempotencyKey(reference.clone())),
+    };
+    let Some(record) = journal
+        .operation(&sel)
+        .await
+        .map_err(|e| anyhow::anyhow!("reading the operation ledger: {e:?}"))?
+    else {
+        anyhow::bail!("no operation found for {reference:?}");
+    };
+    if json {
+        println!("{}", serde_json::to_string(&record)?);
+    } else {
+        print_show_record(&record);
+        // The linked intent status, read live (intent-keyed rows only; `-` otherwise).
+        let intent_status = journal
+            .get(&record.correlation_key)
+            .await
+            .ok()
+            .flatten()
+            .map(|i| i.status);
+        println!(
+            "linked_intent_status: {}",
+            intent_status.map_or("-", intent_status_tag)
+        );
+    }
     Ok(())
 }
 
@@ -1054,6 +1397,513 @@ async fn load_or_generate_mnemonic(db: &Database) -> anyhow::Result<Mnemonic> {
     }
 }
 
+// --- operation-ledger recording + display helpers (spec §9-§11) -----------------------------
+
+/// Map a ledger-write [`wallet_core::ExecError`] into `anyhow` for a `?` that must fail the
+/// command — the pre-side-effect `record_started` writes (§10.1): if we cannot even open the
+/// history row, do NOT proceed to the money op (nothing has happened yet).
+fn ledger_err(e: impl std::fmt::Debug) -> anyhow::Error {
+    anyhow::anyhow!("ledger write failed: {e:?}")
+}
+
+/// Log a best-effort raw-op ledger write failure without failing the command — used AFTER the
+/// SDK call, where the money op is already authoritative and reconcile repair (§10.3) heals any
+/// resulting history gap. A recording hiccup must never regress the live money operation.
+fn note_ledger(result: Result<(), impl std::fmt::Debug>) {
+    if let Err(e) = result {
+        eprintln!("note: raw-op ledger write failed (reconcile will repair): {e:?}");
+    }
+}
+
+/// Wall-clock unix millis for a caller-provided ledger timestamp (§9.4). Display material.
+fn cli_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// A fresh 128-bit nonce as 32 lowercase-hex chars for a per-attempt ledger key (§10.1 — a
+/// 32-bit nonce risks birthday collisions over a wallet lifetime). The CLI owns randomness.
+fn cli_nonce() -> String {
+    use rand::RngCore as _;
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    to_hex(&bytes)
+}
+
+/// Terminalize a raw op's pre-written ledger row `Failed` with `error`, then surface `error` —
+/// the synchronous-error path (§10.1): never leave the `Started` row for a repair to mislabel.
+async fn fail_raw_row(
+    journal: &FedimintJournal,
+    key: &IdempotencyKey,
+    error: anyhow::Error,
+) -> anyhow::Result<()> {
+    if let Err(e) = journal
+        .record_terminal(
+            key,
+            OperationStatus::Failed,
+            cli_now_ms(),
+            Some(&error.to_string()),
+            None,
+        )
+        .await
+    {
+        eprintln!("note: recording the failed ledger row failed: {e:?}");
+    }
+    Err(error)
+}
+
+fn op_id_upd(op: OperationId) -> RawOpUpdate {
+    RawOpUpdate {
+        op_id: Some(op),
+        ..Default::default()
+    }
+}
+
+fn receive_fee_upd(fee: Msat) -> RawOpUpdate {
+    RawOpUpdate {
+        fees: Some(FeeBreakdown {
+            receive_fee: Some(fee),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn pay_parse_upd(
+    amount: Option<Msat>,
+    payment_hash: [u8; 32],
+    send_fee: Option<Msat>,
+) -> RawOpUpdate {
+    RawOpUpdate {
+        invoice_amount: amount,
+        payment_hash: Some(payment_hash),
+        fees: send_fee.map(|f| FeeBreakdown {
+            send_fee_quoted: Some(f),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Pre-call receive-fee estimate (§9.3): the gateway deduction on the invoiced amount plus the
+/// fed claim fee on the post-gateway contract, quoted against a concrete gateway. Best-effort —
+/// any quote failure degrades to `None` (never blocks the receive; the definitive value
+/// backfills at settlement).
+async fn estimate_receive_fee(
+    mc: &MultiClient,
+    id: &FederationId,
+    amount: Msat,
+    sdk_gateway: Option<GatewayUrl>,
+) -> Option<Msat> {
+    let gateway = estimate_gateway(mc, id, sdk_gateway).await?;
+    let gateway_deduction = mc.receive_gateway_fee(id, &gateway).await.ok()?.on(amount);
+    let contract = Msat(amount.0.saturating_sub(gateway_deduction.0));
+    let fed_fee = mc.receive_fee_quote(id, contract).await.ok()?;
+    Some(Msat(gateway_deduction.0.saturating_add(fed_fee.0)))
+}
+
+/// Pre-call send-fee estimate (§9.3): the gateway send fee on the invoice plus the fed send-tx
+/// fee on the funded contract, quoted against a concrete gateway. Best-effort (degrades to
+/// `None`; the exact value backfills from the op-log contract at settlement).
+async fn estimate_send_fee(
+    mc: &MultiClient,
+    id: &FederationId,
+    invoice: &Invoice,
+    sdk_gateway: Option<GatewayUrl>,
+) -> Option<Msat> {
+    let amount = parse_invoice(invoice).ok()?.amount?;
+    let gateway = estimate_gateway(mc, id, sdk_gateway).await?;
+    let gateway_quote = mc
+        .send_gateway_fee(id, &gateway, invoice)
+        .await
+        .ok()?
+        .on(amount);
+    let contract = Msat(amount.0.saturating_add(gateway_quote.0));
+    let fed_fee = mc.send_fee_quote_for_amount(id, contract).await.ok()?;
+    Some(Msat(gateway_quote.0.saturating_add(fed_fee.0)))
+}
+
+/// The concrete gateway to quote a raw-op fee ESTIMATE against: the explicit `--gateway` if
+/// given, else the fed's first registered gateway; `None` when none is available (the estimate
+/// then degrades to a blank fee — the definitive value backfills at settlement, §9.3). The
+/// actual auto-selected gateway is unknown pre-call, so the row's `gateway` field stays `None`.
+async fn estimate_gateway(
+    mc: &MultiClient,
+    id: &FederationId,
+    sdk_gateway: Option<GatewayUrl>,
+) -> Option<GatewayUrl> {
+    match sdk_gateway {
+        Some(gateway) => Some(gateway),
+        None => mc.gateways(id).await.ok()?.into_iter().next(),
+    }
+}
+
+/// The definitive settlement enrichment for a raw op (§9.3 backfill), read from its op-log meta
+/// via the repair oracle. On failure the fees degrade to `None` (the op id is still recorded).
+async fn settlement_upd(mc: &MultiClient, id: &FederationId, op: OperationId) -> RawOpUpdate {
+    match mc.observe_op(*id, op).await {
+        Ok(obs) => RawOpUpdate {
+            op_id: Some(op),
+            gateway: obs.gateway,
+            invoice_amount: obs.invoice_amount,
+            payment_hash: obs.payment_hash,
+            fees: Some(obs.fees),
+            // Definitive iff the op is TERMINAL: settlement fees then replace any pre-call
+            // estimate outright (even with `None`) so a terminal row never freezes an
+            // estimate as an observed cost.
+            fees_definitive: obs.terminal.is_some(),
+        },
+        Err(e) => {
+            eprintln!(
+                "note: could not read settlement fees for {}: {e:?}",
+                to_hex(&op.0)
+            );
+            op_id_upd(op)
+        }
+    }
+}
+
+/// Whether an `await-*` `--key` names a `send` (`pay:`) or a `receive` (`recv:`) row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AwaitRole {
+    Send,
+    Receive,
+}
+
+/// Verify a `--key`-named ledger row is the one this `await-*` op belongs to before a terminal
+/// write (§10.1). A terminal ledger row is IMMUTABLE, so a `--key` naming an UNRELATED row (wrong
+/// verb, wrong federation, or a different in-flight op) would permanently corrupt that row's
+/// history — refuse instead. Returns `Ok(true)` for a BLANK row (op id not yet recorded — the
+/// crash-before-`record_update` window): the caller must then prove via the op-log's
+/// `correlation_key` meta that the awaited op really is this row's before terminalizing —
+/// a blank row of the same kind/federation could belong to a DIFFERENT attempt.
+fn awaited_row_matches(
+    row: &OperationRecord,
+    role: AwaitRole,
+    id: &FederationId,
+    op: OperationId,
+) -> Result<bool, String> {
+    let (row_fed, row_op) = match (&row.kind, role) {
+        (OperationKind::Pay { fed, op_id, .. }, AwaitRole::Send) => (fed, op_id),
+        (OperationKind::Receive { fed, op_id, .. }, AwaitRole::Receive) => (fed, op_id),
+        _ => return Err("its kind is not the awaited pay/receive operation".to_owned()),
+    };
+    if row_fed != id {
+        return Err("it belongs to a different federation".to_owned());
+    }
+    match row_op {
+        Some(existing) if *existing != op => {
+            Err("it already tracks a different operation".to_owned())
+        }
+        Some(_) => Ok(false),
+        None => Ok(true),
+    }
+}
+
+/// Advance the `--key` ledger row to its terminal state after an `await-*` (§10.1), carrying
+/// the definitive settlement enrichment. Auxiliary — a recording fault is logged, not fatal.
+async fn terminalize_awaited(
+    journal: &FedimintJournal,
+    mc: &MultiClient,
+    id: &FederationId,
+    op: OperationId,
+    key: &str,
+    role: AwaitRole,
+    outcome: (OperationStatus, Option<String>),
+) {
+    let (status, error) = outcome;
+    let key = IdempotencyKey(key.to_owned());
+    // Guard against a mistyped/mismatched `--key`: a terminal row cannot be un-written, so verify
+    // the row is this op's before touching it (§10.1). A missing row is a no-op anyway.
+    match journal.operation(&OperationRef::Key(key.clone())).await {
+        Ok(Some(row)) => {
+            match awaited_row_matches(&row, role, id, op) {
+                Err(why) => {
+                    eprintln!(
+                        "note: --key {} does not match this operation ({why}); not recording",
+                        key.0
+                    );
+                    return;
+                }
+                // A BLANK row (op id never recorded) is only accepted when the op-log proves
+                // the awaited op was created under THIS correlation key — the pre-call meta
+                // embeds it, so a genuine crash-before-`record_update` attempt matches. A
+                // deduped retry (the op carries another attempt's key) or a wrong blank row
+                // is refused and left to reconcile's hash-dedup repair, which records the
+                // attribution ambiguity honestly instead of silently mis-attaching history.
+                Ok(true) => match mc.find_op_by_correlation_key(*id, &key).await {
+                    Ok(Some(found)) if found == op => {}
+                    Ok(_) => {
+                        eprintln!(
+                            "note: --key {} has no recorded op id and the op-log does not tie \
+                             this operation to it; not recording (reconcile repairs it)",
+                            key.0
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "note: could not verify --key {} against the op-log: {e:?}; \
+                             not recording",
+                            key.0
+                        );
+                        return;
+                    }
+                },
+                Ok(false) => {}
+            }
+        }
+        Ok(None) => {
+            eprintln!("note: no ledger row for --key {}; not recording", key.0);
+            return;
+        }
+        Err(e) => {
+            eprintln!(
+                "note: could not read the ledger row for --key {}: {e:?}",
+                key.0
+            );
+            return;
+        }
+    }
+    let upd = settlement_upd(mc, id, op).await;
+    if let Err(e) = journal
+        .record_terminal(&key, status, cli_now_ms(), error.as_deref(), Some(upd))
+        .await
+    {
+        eprintln!("note: recording the terminal ledger row failed: {e:?}");
+    }
+}
+
+impl ActorFilter {
+    fn matches(self, actor: Actor) -> bool {
+        matches!(
+            (self, actor),
+            (ActorFilter::User, Actor::User) | (ActorFilter::Agent, Actor::Agent { .. })
+        )
+    }
+}
+
+impl StatusFilter {
+    fn matches(self, status: OperationStatus) -> bool {
+        matches!(
+            (self, status),
+            (StatusFilter::Started, OperationStatus::Started)
+                | (StatusFilter::Awaiting, OperationStatus::Awaiting)
+                | (StatusFilter::Succeeded, OperationStatus::Succeeded)
+                | (StatusFilter::Failed, OperationStatus::Failed)
+        )
+    }
+}
+
+/// Whether a record involves `fed` (for `history --fed`): a `Move` matches either endpoint.
+fn record_involves_fed(record: &OperationRecord, fed: FederationId) -> bool {
+    match &record.kind {
+        OperationKind::Join { fed: f } | OperationKind::Refusal { fed: f } => *f == fed,
+        OperationKind::Receive { fed: f, .. } | OperationKind::Pay { fed: f, .. } => *f == fed,
+        OperationKind::DirectInflow { to, .. } => *to == fed,
+        OperationKind::Move { from, to, .. } => *from == fed || *to == fed,
+        OperationKind::Tick { .. } => false,
+    }
+}
+
+/// One TAB-separated `history` row (§11); unknown fields render as `-`.
+fn history_tsv(r: &OperationRecord) -> String {
+    let (kind, amount) = kind_and_amount(&r.kind);
+    [
+        r.seq.to_string(),
+        rfc3339_from_millis(r.updated_at_ms),
+        kind.to_owned(),
+        status_tag(r.status).to_owned(),
+        opt_msat(amount),
+        opt_msat(r.fees.receive_fee),
+        opt_msat(r.fees.send_fee_quoted),
+        actor_tag(r.actor),
+        reason_tag(r.reason).to_owned(),
+        r.correlation_key.0.clone(),
+    ]
+    .join("\t")
+}
+
+/// The multi-line `show` view (§11): the full record plus kind-specific op ids/gateway.
+fn print_show_record(r: &OperationRecord) {
+    let (kind, amount) = kind_and_amount(&r.kind);
+    println!("seq: {}", r.seq);
+    println!("key: {}", r.correlation_key.0);
+    println!("kind: {kind}");
+    println!(
+        "status: {}{}",
+        status_tag(r.status),
+        if r.repaired { " (repaired)" } else { "" }
+    );
+    println!("actor: {}", actor_tag(r.actor));
+    println!("reason: {}", reason_tag(r.reason));
+    println!("created_at: {}", rfc3339_from_millis(r.created_at_ms));
+    println!("updated_at: {}", rfc3339_from_millis(r.updated_at_ms));
+    println!("amount_msat: {}", opt_msat(amount));
+    println!("fee_cap_msat: {}", opt_msat(r.fees.fee_cap));
+    println!("receive_fee_msat: {}", opt_msat(r.fees.receive_fee));
+    println!("send_fee_quoted_msat: {}", opt_msat(r.fees.send_fee_quoted));
+    print_kind_details(&r.kind);
+    println!("error: {}", r.error.as_deref().unwrap_or("-"));
+}
+
+fn print_kind_details(kind: &OperationKind) {
+    match kind {
+        OperationKind::Join { fed } | OperationKind::Refusal { fed } => {
+            println!("fed: {}", fed.to_hex())
+        }
+        OperationKind::Receive { op_id, gateway, .. } => {
+            println!("op_id: {}", opt_op(op_id));
+            println!("gateway: {}", opt_gw(gateway));
+        }
+        OperationKind::Pay {
+            op_id,
+            gateway,
+            payment_hash,
+            ..
+        } => {
+            println!("op_id: {}", opt_op(op_id));
+            println!("gateway: {}", opt_gw(gateway));
+            println!(
+                "payment_hash: {}",
+                payment_hash.map_or_else(|| "-".to_owned(), |h| to_hex(&h))
+            );
+        }
+        OperationKind::DirectInflow {
+            to,
+            recv_op,
+            gateway,
+            ..
+        } => {
+            println!("to: {}", to.to_hex());
+            println!("recv_op: {}", opt_op(recv_op));
+            println!("gateway: {}", opt_gw(gateway));
+        }
+        OperationKind::Move {
+            from,
+            to,
+            send_op,
+            recv_op,
+            gateway,
+            evacuation,
+            amount: _,
+        } => {
+            println!("from: {}", from.to_hex());
+            println!("to: {}", to.to_hex());
+            println!("evacuation: {evacuation}");
+            println!("send_op: {}", opt_op(send_op));
+            println!("recv_op: {}", opt_op(recv_op));
+            println!("gateway: {}", opt_gw(gateway));
+        }
+        OperationKind::Tick {
+            occurrence,
+            decisions,
+            performed,
+            failed,
+        } => {
+            println!("occurrence: {}", occurrence.0);
+            println!("decisions: {decisions}");
+            println!("performed: {performed}");
+            println!("failed: {failed}");
+        }
+    }
+}
+
+/// `(kind label, headline amount)` for a record (§11): the label vocab + the kind's amount.
+fn kind_and_amount(kind: &OperationKind) -> (&'static str, Option<Msat>) {
+    match kind {
+        OperationKind::Join { .. } => ("join", None),
+        OperationKind::Receive {
+            amount_invoiced, ..
+        } => ("receive", Some(*amount_invoiced)),
+        OperationKind::Pay { invoice_amount, .. } => ("pay", *invoice_amount),
+        OperationKind::DirectInflow { amount, .. } => ("direct-inflow", Some(*amount)),
+        OperationKind::Move {
+            amount, evacuation, ..
+        } => (
+            if *evacuation { "evacuation" } else { "move" },
+            Some(*amount),
+        ),
+        OperationKind::Refusal { .. } => ("refusal", None),
+        OperationKind::Tick { .. } => ("tick", None),
+    }
+}
+
+fn status_tag(status: OperationStatus) -> &'static str {
+    match status {
+        OperationStatus::Started => "started",
+        OperationStatus::Awaiting => "awaiting",
+        OperationStatus::Succeeded => "succeeded",
+        OperationStatus::Failed => "failed",
+    }
+}
+
+fn actor_tag(actor: Actor) -> String {
+    match actor {
+        Actor::User => "user".to_owned(),
+        Actor::Agent { occurrence } => format!("agent:{}", occurrence.0),
+    }
+}
+
+/// The snake_case reason tag (§11). Mirrors the allocator's private `reason_tag` — this is the
+/// display layer, so the small duplication across the module boundary is intentional.
+fn reason_tag(reason: ReasonCode) -> &'static str {
+    match reason {
+        ReasonCode::SpendingBelowTarget => "spending_below_target",
+        ReasonCode::StandbyBelowTarget => "standby_below_target",
+        ReasonCode::ShutdownNotice => "shutdown_notice",
+        ReasonCode::Unhealthy => "unhealthy",
+        ReasonCode::OverCap => "over_cap",
+        ReasonCode::NotProbed => "not_probed",
+        ReasonCode::LowReputation => "low_reputation",
+        ReasonCode::UserInitiated => "user_initiated",
+        ReasonCode::StandingInstruction => "standing_instruction",
+    }
+}
+
+fn intent_status_tag(status: IntentStatus) -> &'static str {
+    status_label(Some(status))
+}
+
+fn opt_msat(amount: Option<Msat>) -> String {
+    amount.map_or_else(|| "-".to_owned(), |m| m.0.to_string())
+}
+
+fn opt_op(op: &Option<OperationId>) -> String {
+    op.map_or_else(|| "-".to_owned(), |o| to_hex(&o.0))
+}
+
+fn opt_gw(gateway: &Option<GatewayUrl>) -> String {
+    gateway
+        .as_ref()
+        .map_or_else(|| "-".to_owned(), |g| g.0.clone())
+}
+
+/// RFC3339 UTC (`YYYY-MM-DDThh:mm:ss.mmmZ`) from unix millis, no date-library dependency
+/// (Howard Hinnant's civil-from-days algorithm). Display-only; `seq` is the ordering
+/// authority, so a skewed clock degrades this string, never the order (§9.4).
+fn rfc3339_from_millis(ms: u64) -> String {
+    let secs = (ms / 1000) as i64;
+    let millis = ms % 1000;
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+    // Civil date from days since 1970-01-01 (Hinnant): shift the epoch to 0000-03-01.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1371,5 +2221,191 @@ mod tests {
         assert_eq!(status_label(Some(IntentStatus::Done)), "done");
         assert_eq!(status_label(Some(IntentStatus::Failed)), "failed");
         assert_eq!(status_label(None), "unknown");
+    }
+
+    // --- §11 history/show formatting ---
+
+    fn ledger_record(
+        kind: OperationKind,
+        actor: Actor,
+        status: OperationStatus,
+    ) -> OperationRecord {
+        OperationRecord {
+            seq: 7,
+            correlation_key: IdempotencyKey("pay:0101:n".to_string()),
+            kind,
+            actor,
+            reason: ReasonCode::UserInitiated,
+            status,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_000,
+            fees: FeeBreakdown {
+                fee_cap: None,
+                receive_fee: None,
+                send_fee_quoted: Some(Msat(88)),
+            },
+            error: None,
+            repaired: false,
+        }
+    }
+
+    #[test]
+    fn rfc3339_from_millis_golden() {
+        assert_eq!(rfc3339_from_millis(0), "1970-01-01T00:00:00.000Z");
+        // 1_700_000_000 unix seconds = 2023-11-14T22:13:20Z, plus 456 ms.
+        assert_eq!(
+            rfc3339_from_millis(1_700_000_000_456),
+            "2023-11-14T22:13:20.456Z"
+        );
+    }
+
+    #[test]
+    fn history_tsv_golden_columns() {
+        // A `pay` row `Awaiting`, invoice amount known, only the send fee quoted, no receive fee.
+        let record = ledger_record(
+            OperationKind::Pay {
+                fed: fed(1),
+                invoice_amount: Some(Msat(50_000)),
+                payment_hash: None,
+                op_id: None,
+                gateway: None,
+            },
+            Actor::User,
+            OperationStatus::Awaiting,
+        );
+        assert_eq!(
+            history_tsv(&record),
+            "7\t2023-11-14T22:13:20.000Z\tpay\tawaiting\t50000\t-\t88\tuser\tuser_initiated\tpay:0101:n"
+        );
+    }
+
+    #[test]
+    fn history_tsv_renders_unknown_fields_as_dash_and_agent_actor() {
+        // A `join` row by the agent: no amount / fees, actor = `agent:<occurrence>`.
+        let mut record = ledger_record(
+            OperationKind::Join { fed: fed(2) },
+            Actor::Agent {
+                occurrence: Occurrence(9),
+            },
+            OperationStatus::Succeeded,
+        );
+        record.reason = ReasonCode::StandingInstruction;
+        record.fees = FeeBreakdown::default();
+        let line = history_tsv(&record);
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols[2], "join");
+        assert_eq!(cols[3], "succeeded");
+        assert_eq!(cols[4], "-", "no amount");
+        assert_eq!(cols[5], "-", "no receive fee");
+        assert_eq!(cols[6], "-", "no send fee");
+        assert_eq!(cols[7], "agent:9");
+        assert_eq!(cols[8], "standing_instruction");
+    }
+
+    #[test]
+    fn kind_and_amount_labels() {
+        let evac = OperationKind::Move {
+            from: fed(1),
+            to: fed(2),
+            amount: Msat(40_000),
+            send_op: None,
+            recv_op: None,
+            gateway: None,
+            evacuation: true,
+        };
+        assert_eq!(kind_and_amount(&evac), ("evacuation", Some(Msat(40_000))));
+        assert_eq!(
+            kind_and_amount(&OperationKind::Refusal { fed: fed(1) }),
+            ("refusal", None)
+        );
+    }
+
+    #[test]
+    fn status_and_actor_filters_match() {
+        assert!(StatusFilter::Awaiting.matches(OperationStatus::Awaiting));
+        assert!(!StatusFilter::Awaiting.matches(OperationStatus::Failed));
+        assert!(ActorFilter::User.matches(Actor::User));
+        assert!(ActorFilter::Agent.matches(Actor::Agent {
+            occurrence: Occurrence(1)
+        }));
+        assert!(!ActorFilter::User.matches(Actor::Agent {
+            occurrence: Occurrence(1)
+        }));
+    }
+
+    #[test]
+    fn record_involves_fed_matches_either_move_endpoint() {
+        let mv = OperationKind::Move {
+            from: fed(1),
+            to: fed(2),
+            amount: Msat(1),
+            send_op: None,
+            recv_op: None,
+            gateway: None,
+            evacuation: false,
+        };
+        let record = ledger_record(mv, Actor::User, OperationStatus::Awaiting);
+        assert!(record_involves_fed(&record, fed(1)));
+        assert!(record_involves_fed(&record, fed(2)));
+        assert!(!record_involves_fed(&record, fed(3)));
+    }
+
+    fn op(byte: u8) -> OperationId {
+        OperationId([byte; 32])
+    }
+
+    fn pay_row(fed_id: FederationId, op_id: Option<OperationId>) -> OperationRecord {
+        ledger_record(
+            OperationKind::Pay {
+                fed: fed_id,
+                invoice_amount: None,
+                payment_hash: None,
+                op_id,
+                gateway: None,
+            },
+            Actor::User,
+            OperationStatus::Awaiting,
+        )
+    }
+
+    #[test]
+    fn awaited_row_matches_accepts_the_awaited_pay_row() {
+        // No op id yet (crash before the op-id update): accepted as BLANK — the caller must
+        // then prove the correlation via the op-log meta before terminalizing (§10.1).
+        assert_eq!(
+            awaited_row_matches(&pay_row(fed(1), None), AwaitRole::Send, &fed(1), op(7)),
+            Ok(true)
+        );
+        // Op id present and equal → accepted outright (not blank).
+        assert_eq!(
+            awaited_row_matches(
+                &pay_row(fed(1), Some(op(7))),
+                AwaitRole::Send,
+                &fed(1),
+                op(7)
+            ),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn awaited_row_matches_rejects_a_mismatched_key() {
+        // Wrong verb: a pay row cannot be terminalized by an `await-receive --key`.
+        assert!(
+            awaited_row_matches(&pay_row(fed(1), None), AwaitRole::Receive, &fed(1), op(7))
+                .is_err()
+        );
+        // Wrong federation: a valid key from another fed must not corrupt this row.
+        assert!(
+            awaited_row_matches(&pay_row(fed(2), None), AwaitRole::Send, &fed(1), op(7)).is_err()
+        );
+        // A different in-flight op already recorded on the row.
+        assert!(awaited_row_matches(
+            &pay_row(fed(1), Some(op(9))),
+            AwaitRole::Send,
+            &fed(1),
+            op(7)
+        )
+        .is_err());
     }
 }

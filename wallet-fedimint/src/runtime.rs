@@ -35,9 +35,9 @@ use fedimint_core::runtime;
 use std::time::Duration;
 use std::{collections::BTreeSet, sync::Arc};
 use wallet_core::{
-    score, Action, Actor, AllocatorDecision, AllocatorSnapshot, ExecError, Executor, FederationId,
-    IdempotencyKey, Intent, IntentStatus, Journal, Msat, Occurrence, PerformOutcome, ReasonCode,
-    ScorerPolicy,
+    score, Action, Actor, AllocatorDecision, AllocatorSnapshot, ExecError, ExecutionSummary,
+    Executor, FederationId, IdempotencyKey, Intent, IntentStatus, Journal, Msat, Occurrence,
+    OperationStatus, PerformOutcome, ReasonCode, ScorerPolicy,
 };
 
 /// Wall-clock in unix millis for the ledger's `created_at_ms` (§8/§9.4). `seq` is the
@@ -48,6 +48,20 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// A fresh 128-bit nonce as 32 lowercase-hex chars for a per-attempt ledger key (§10.1 — a
+/// 32-bit nonce risks birthday collisions over a wallet lifetime, aliasing two attempts onto
+/// one `0x06` entry). The runtime owns randomness (the journal stays deterministic, §9.3);
+/// this draws from fedimint's CSPRNG.
+fn ledger_nonce() -> String {
+    use std::fmt::Write as _;
+    let bytes = fedimint_core::core::OperationId::new_random().0;
+    let mut out = String::with_capacity(32);
+    for byte in &bytes[..16] {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// The result of a [`Runtime::direct_inflow`] call: the intent's key (the durable handle the
@@ -498,6 +512,23 @@ impl Runtime {
         let driving = self.driving_executor();
         let exec = wallet_core::reconcile(self.journal.as_ref(), &driving).await;
 
+        // §10.3: repair stuck non-terminal ledger rows (raw pay/recv, join, tick) from op-log +
+        // registry evidence. Best-effort — a repair I/O fault must not fail the whole reconcile
+        // (the intent re-drive above already committed its own money-path progress).
+        match self.journal.repair_ledger(self.mc.as_ref()).await {
+            Ok(summary) if summary.repaired > 0 => {
+                tracing::info!(
+                    repaired = summary.repaired,
+                    "reconcile: repaired stuck ledger rows"
+                )
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                error = ?e,
+                "reconcile: ledger repair pass failed; leaving rows for a later pass"
+            ),
+        }
+
         // §9.3: surface the Awaiting set so the operator drives `await-move` for each.
         let awaiting = self.journal.awaiting().await.map_err(exec_err)?;
         Ok(ReconcileSummary {
@@ -529,15 +560,37 @@ impl Runtime {
     /// LDK gateway; §4), exactly as `do_move` does. The probe route gate validates that same
     /// pinned gateway when present, so decisions match the route the executor will use.
     pub async fn tick(&self, policy: &TickPolicy) -> anyhow::Result<TickReport> {
+        // §10.4: open a `Started` tick row BEFORE probing (a per-attempt `tick:` key, §10.1), so
+        // a crash mid-tick leaves a durable row that reconcile repairs after 1h. Ledger recording
+        // is auxiliary to the money op, so a storage fault here is logged, never fatal.
+        let tick_key = IdempotencyKey(format!("tick:{}:{}", policy.occurrence.0, ledger_nonce()));
+        if let Err(e) = self
+            .journal
+            .record_tick_started(&tick_key, policy.occurrence, now_ms())
+            .await
+        {
+            tracing::warn!(error = ?e, "tick: recording the Started tick row failed");
+        }
+
         let plan = self.plan_tick(policy, &ScorerPolicy::default()).await;
         // A tick is a money op: an operator-pinned fed that could not be sensed or failed the
         // lnv2/probe gate this pass means the requested rebalance was NOT evaluated. Fail LOUDLY
         // (non-zero exit) rather than let `decide` degrade it to an advisory `RefuseInflow` that
         // `apply` skips, which would report a false success to a scheduler gating on the exit code.
+        // Both bail paths land a `Failed` tick row WITH the diagnostic before returning (§10.4).
         let problems = pinned_input_problems(policy, &plan.snapshot, &plan.probes, &plan.decisions);
-        anyhow::ensure!(problems.is_empty(), "tick: {}", problems.join("; "));
-        self.ensure_fresh_tick_decisions(&plan.decisions, policy.occurrence)
-            .await?;
+        if !problems.is_empty() {
+            let error = format!("tick: {}", problems.join("; "));
+            self.record_tick_failed(&tick_key, &error).await;
+            anyhow::bail!("{error}");
+        }
+        if let Err(e) = self
+            .ensure_fresh_tick_decisions(&plan.decisions, policy.occurrence)
+            .await
+        {
+            self.record_tick_failed(&tick_key, &e.to_string()).await;
+            return Err(e);
+        }
         let executor = self.driving_executor();
         let summary = wallet_core::apply(
             self.journal.as_ref(),
@@ -549,10 +602,51 @@ impl Runtime {
             now_ms(),
         )
         .await;
+
+        // §10.4: one `Refusal` row per advisory decision, then terminalize the tick with its
+        // decision/apply counts. Both are auxiliary recordings — log a fault, never fail the tick.
+        if let Err(e) = self
+            .journal
+            .record_refusals(&plan.decisions, policy.occurrence, now_ms())
+            .await
+        {
+            tracing::warn!(error = ?e, "tick: recording refusal rows failed");
+        }
+        let counts = Some((
+            plan.decisions.len() as u32,
+            summary.performed as u32,
+            summary.failed as u32,
+        ));
+        let (tick_status, tick_error) = tick_terminal(&summary);
+        if let Err(e) = self
+            .journal
+            .record_tick_terminal(
+                &tick_key,
+                counts,
+                tick_status,
+                tick_error.as_deref(),
+                now_ms(),
+            )
+            .await
+        {
+            tracing::warn!(error = ?e, "tick: recording the terminal tick row failed");
+        }
         Ok(TickReport {
             decisions: plan.decisions,
             summary,
         })
+    }
+
+    /// Terminalize a tick row `Failed` on a bail path (§10.4) with zero counts + its diagnostic.
+    /// Best-effort: a recording fault must not mask the bail's own error.
+    async fn record_tick_failed(&self, key: &IdempotencyKey, error: &str) {
+        if let Err(e) = self
+            .journal
+            .record_tick_terminal(key, None, OperationStatus::Failed, Some(error), now_ms())
+            .await
+        {
+            tracing::warn!(error = ?e, "tick: recording the failed tick row failed");
+        }
     }
 
     /// A DRY-RUN tick (Phase 2 step 2.2): probe → `score()` → `build_snapshot` → `decide()`, but
@@ -1095,6 +1189,26 @@ fn intent_status_label(status: IntentStatus) -> &'static str {
         IntentStatus::Awaiting => "awaiting",
         IntentStatus::Failed => "failed",
     }
+}
+
+fn tick_terminal(summary: &ExecutionSummary) -> (OperationStatus, Option<String>) {
+    if summary.failed == 0 && summary.terminal_failed_skipped == 0 {
+        return (OperationStatus::Succeeded, None);
+    }
+
+    (
+        OperationStatus::Failed,
+        Some(format!(
+            "tick: {} decision(s) did not apply (performed={} skipped={} failed={} \
+             terminal_failed_skipped={} retryable={})",
+            summary.failed + summary.terminal_failed_skipped,
+            summary.performed,
+            summary.skipped,
+            summary.failed,
+            summary.terminal_failed_skipped,
+            summary.retryable
+        )),
+    )
 }
 
 /// Bridge an [`ExecError`] into an `anyhow::Error` for the CLI surface. `ExecError` carries its
@@ -1650,6 +1764,44 @@ mod tests {
             .ensure_fresh_tick_decisions(std::slice::from_ref(&decision), Occurrence(0))
             .await
             .expect("pending same-occurrence tick remains retryable");
+    }
+
+    #[test]
+    fn tick_terminal_marks_apply_failures_as_failed() {
+        let clean = ExecutionSummary {
+            performed: 2,
+            skipped: 1,
+            failed: 0,
+            terminal_failed_skipped: 0,
+            retryable: 0,
+        };
+        assert_eq!(tick_terminal(&clean), (OperationStatus::Succeeded, None));
+
+        let retryable = ExecutionSummary {
+            performed: 1,
+            skipped: 0,
+            failed: 1,
+            terminal_failed_skipped: 0,
+            retryable: 1,
+        };
+        let (status, error) = tick_terminal(&retryable);
+        assert_eq!(status, OperationStatus::Failed);
+        let error = error.expect("failed tick carries diagnostic");
+        assert!(error.contains("failed=1"), "{error}");
+        assert!(error.contains("retryable=1"), "{error}");
+
+        let terminal_skip = ExecutionSummary {
+            performed: 0,
+            skipped: 1,
+            failed: 0,
+            terminal_failed_skipped: 1,
+            retryable: 0,
+        };
+        let (status, error) = tick_terminal(&terminal_skip);
+        assert_eq!(status, OperationStatus::Failed);
+        assert!(error
+            .expect("terminal skip carries diagnostic")
+            .contains("terminal_failed_skipped=1"));
     }
 
     /// §8: the operator verbs stamp `Actor::User` + `ReasonCode::UserInitiated` on the intent

@@ -65,7 +65,48 @@ fn pay_evidence() -> RawOpUpdate {
             receive_fee: None,
             send_fee_quoted: Some(Msat(42)),
         }),
+        fees_definitive: false,
     }
+}
+
+#[test]
+fn definitive_settlement_fees_replace_a_stale_estimate() {
+    // A raw row wrote a pre-call fee ESTIMATE; settlement could not derive the real fee
+    // (fees None) but IS definitive — the terminal row must show the fee as unknown, never
+    // freeze the estimate as an observed cost. `fee_cap` (the caller's bound) survives.
+    let mut rec = pay_record(Started, false);
+    rec.fees.fee_cap = Some(Msat(1_000));
+    rec.fees.receive_fee = Some(Msat(77)); // stale pre-call estimate
+    let upd = RawOpUpdate {
+        fees: Some(FeeBreakdown::default()),
+        fees_definitive: true,
+        ..Default::default()
+    };
+    let next = advance(&rec, Succeeded, 300, Some(&upd), None, Authoritative).expect("terminal");
+    assert_eq!(next.fees.receive_fee, None, "stale estimate cleared");
+    assert_eq!(
+        next.fees.fee_cap,
+        Some(Msat(1_000)),
+        "fee_cap merges, never cleared"
+    );
+}
+
+#[test]
+fn non_definitive_fee_updates_never_wipe_a_known_fee() {
+    // The pre-§15-fix merge semantics stay for NON-definitive updates: None keeps.
+    let mut rec = pay_record(Started, false);
+    rec.fees.receive_fee = Some(Msat(77));
+    let upd = RawOpUpdate {
+        fees: Some(FeeBreakdown::default()),
+        fees_definitive: false,
+        ..Default::default()
+    };
+    let next = advance(&rec, Awaiting, 300, Some(&upd), None, Authoritative).expect("advance");
+    assert_eq!(
+        next.fees.receive_fee,
+        Some(Msat(77)),
+        "merge keeps the known fee"
+    );
 }
 
 // --- create ---
