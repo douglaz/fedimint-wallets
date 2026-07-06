@@ -156,6 +156,14 @@ pub struct RawOpUpdate {
     pub invoice_amount: Option<Msat>,
     pub payment_hash: Option<[u8; 32]>,
     pub fees: Option<FeeBreakdown>,
+    /// True when `fees` is a SETTLEMENT-derived statement (the §9.3 definitive backfill):
+    /// the two cost fields (`receive_fee`/`send_fee_quoted`) then REPLACE the stored values
+    /// outright — including replacing a stale pre-call ESTIMATE with `None` when the
+    /// settlement could not derive the real fee — instead of merging. A terminal row must
+    /// never present an estimate as an observed cost. `fee_cap` always merges (it is the
+    /// caller's bound, not a settlement observation), and non-definitive updates keep the
+    /// never-wipe-a-known-fee merge.
+    pub fees_definitive: bool,
 }
 
 /// Whether a ledger write is AUTHORITATIVE (evidence-carrying) or a defeasible REPAIR
@@ -277,7 +285,7 @@ pub fn advance(
     if let Some(upd) = upd {
         enrich_kind(&mut next.kind, upd);
         if let Some(fees) = upd.fees {
-            merge_fees(&mut next.fees, &fees);
+            merge_fees(&mut next.fees, &fees, upd.fees_definitive);
         }
     }
     if record.status.is_terminal() || new_status != record.status {
@@ -348,9 +356,17 @@ fn fill_gateway(slot: &mut Option<GatewayUrl>, incoming: &Option<GatewayUrl>) {
 }
 
 /// Field-wise fill of a [`FeeBreakdown`] — an incoming `Some` component overwrites, a `None`
-/// leaves the existing value (so a partial update never wipes a known fee).
-fn merge_fees(into: &mut FeeBreakdown, from: &FeeBreakdown) {
+/// leaves the existing value (so a partial update never wipes a known fee). EXCEPT when the
+/// update is settlement-DEFINITIVE (`RawOpUpdate::fees_definitive`): the two cost fields then
+/// replace outright, so a settlement that could not derive the real fee clears a stale
+/// pre-call estimate instead of freezing it onto a terminal row. `fee_cap` always merges.
+fn merge_fees(into: &mut FeeBreakdown, from: &FeeBreakdown, definitive: bool) {
     fill(&mut into.fee_cap, from.fee_cap);
-    fill(&mut into.receive_fee, from.receive_fee);
-    fill(&mut into.send_fee_quoted, from.send_fee_quoted);
+    if definitive {
+        into.receive_fee = from.receive_fee;
+        into.send_fee_quoted = from.send_fee_quoted;
+    } else {
+        fill(&mut into.receive_fee, from.receive_fee);
+        fill(&mut into.send_fee_quoted, from.send_fee_quoted);
+    }
 }
