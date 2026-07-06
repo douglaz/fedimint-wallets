@@ -130,7 +130,14 @@ pub struct ProbePolicy {
     pub min_span_ms: u64,          // default 24h — successes must SPAN this (ADR-0017 "sustained")
     pub ttl_ms: u64,               // default 7d — the NEWEST success must be younger than this
 }
-pub enum ActiveProbeVerdict { Passed, NeverProbed, Insufficient, Expired, FailedSinceLastPass }
+pub enum ActiveProbeVerdict {
+    Passed,
+    NeverProbed,
+    Insufficient,          // successes so far, but not yet count+span
+    Expired,               // a pass existed; its newest success is now older than ttl
+    Failed,                // newest in-window attempt is a candidate failure, no prior pass
+    FailedSinceLastPass,   // a qualifying pass existed, then a failure demoted it
+}
 
 pub fn probe_verdict(attempts: &[ProbeAttempt], source: FederationId, now_ms: u64,
                      policy: &ProbePolicy) -> ActiveProbeVerdict
@@ -154,10 +161,14 @@ count REGARDLESS of source: candidate dishonesty generalizes; routability does n
 ≥ `min_successes` successes, (b) its oldest and newest span ≥ `min_span_ms`, and (c) its
 newest is younger than `ttl_ms` (implied by the window). So
 `success, failure, success×3` passes only when the LAST three alone satisfy count+span.
-When the suffix is empty because the newest attempt failed after a prior qualifying pass
-= `FailedSinceLastPass` (immediate demotion); empty history = `NeverProbed`; suffix
-newest older than `ttl_ms` = `Expired`; suffix too short/narrow = `Insufficient`. Only
-`Passed` ever gates IN.
+When the suffix is empty because the newest in-window attempt is a failure: with a
+prior qualifying pass in evidence = `FailedSinceLastPass` (immediate demotion);
+WITHOUT one = `Failed` — a first-ever failing candidate must be distinguishable from
+one that merely has not accumulated successes yet (`Insufficient`), or the negative
+signal the scheduler/UI preserve would vanish into "keep probing". Empty window with a
+retained stale success = `Expired` (a pass existed; it aged out); empty history
+entirely = `NeverProbed`; suffix too short/narrow = `Insufficient`. Only `Passed` ever
+gates IN.
 
 **Scoping rule — the verdict measures the CANDIDATE's honesty; only
 candidate-ATTRIBUTABLE outcomes enter the history.** A SUCCESS (both legs settled)
@@ -185,10 +196,14 @@ does not demote.
   in_flight: Option<ProbeSession> }` — retention is TIME-AWARE, not count-only (a
   count-only cap could truncate the very successes the 24h `min_span` needs whenever
   probes run more often than span/cap): keep every attempt younger than the DEFAULT
-  `ttl_ms` — which is exactly the verdict's evaluation window (5.0.3), so pruning can
-  never flip a verdict — up to a hard bound of
-  `PROBE_HISTORY_CAP = 256` newest (a runaway manual cadence self-truncates; 5.2's
-  scheduler probes a candidate a few times per DAY, nowhere near the bound). The
+  `ttl_ms` — which is exactly the verdict's PASS-evaluation window (5.0.3), so pruning
+  cannot flip a pass — PLUS always retain the newest SUCCESS and the newest attempt
+  regardless of age (one row each: the evidence that distinguishes `Expired` — "a pass
+  existed and went stale" — from `NeverProbed` after a long quiet spell), up to a hard
+  bound of `PROBE_HISTORY_CAP = 256` newest. The count bound is a backstop, not a
+  guarantee: at the scheduler's few-probes-per-day cadence it holds years of history,
+  but a script hammering `probe` once a minute retains only ~4 hours and can truncate
+  a real 24h span — self-inflicted; the scheduler never probes near that rate. The
   ledger keeps the full narrative regardless. One row per fed, upserted in its own
   dbtx.
 - `ProbeSession { nonce: String /* 32 hex chars */, from: FederationId /* the probe's
@@ -372,14 +387,16 @@ on a failed attempt (a probe IS a money op). `status` gains the per-fed verdict 
   invisible: successes at 8d/2d/1h with a 7d ttl are `Insufficient`, not `Passed`);
   SOURCE scoping (an `A→C` pass gates `C` for `A` only — evaluated for `B` the same
   history is `Insufficient`; a candidate-fault failure recorded from ANY source demotes
-  the verdict for ALL sources); the suffix rule specifically:
+  the verdict for ALL sources); a FIRST-EVER candidate failure is `Failed`, not
+  `Insufficient` (the negative signal survives); the suffix rule specifically:
   `success, failure, success×3` passes iff the last three alone satisfy count+span
   (pre-failure successes never count); a trailing failure after a qualifying pass is
   `FailedSinceLastPass`; a NON-QUALIFYING success (amount below the policy's, or fee cap
   above it) never counts toward `Passed` but its failure still demotes.
-- **Journal (MemDatabase):** retention keeps sub-`ttl` attempts and enforces the 256
-  hard bound (a dense success run inside 24h is never truncated below `min_span`'s
-  evidence); `probe_record` FAILS
+- **Journal (MemDatabase):** retention keeps sub-`ttl` attempts plus the newest
+  success/attempt regardless of age, and enforces the 256 hard bound; a
+  stale-pass-then-silence history still reads `Expired`, never `NeverProbed`;
+  `probe_record` FAILS
   CLOSED on a corrupt row (never "no session" from garbage); session lifecycle (begin
   writes `in_flight`; `record_probe_attempt` clears it + appends the attempt +
   terminalizes the umbrella row in ONE dbtx — crash between them impossible by
