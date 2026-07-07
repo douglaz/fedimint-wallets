@@ -835,6 +835,11 @@ async fn main() -> anyhow::Result<()> {
             // operator) — distinct from a candidate-scoped fault, which carries a full
             // identity and IS recorded by the runtime.
             let source = probe_source(&journal, &joined_ids, candidate, from.as_deref()).await?;
+            // Like --from, the MONEY params of an in-flight probe are fixed: a resume runs
+            // its legs with the session's stored amount/fee_cap. Reject a conflicting
+            // --amount/--fee-cap rather than silently ignore it (the operator would think a
+            // different-sized money probe ran). Omitting them resumes as-is.
+            reject_conflicting_probe_money_flags(&journal, candidate, amount, fee_cap).await?;
             let policy =
                 build_probe_policy(amount, fee_cap, min_successes, min_span_secs, ttl_secs)?;
             // Probes ride the ordinary move machinery: no pinned gateway (the route
@@ -1288,6 +1293,46 @@ async fn probe_source(
     )
 }
 
+/// Refuse a resume whose `--amount`/`--fee-cap` conflict with the in-flight session's
+/// stored money params (§5.0.7): a resume runs the legs with the SESSION's values, so a
+/// differing flag would mislead the operator about what money probe ran. Omitting the flags
+/// (or matching them) is fine; no in-flight session makes this a no-op.
+async fn reject_conflicting_probe_money_flags(
+    journal: &FedimintJournal,
+    candidate: FederationId,
+    amount: Option<u64>,
+    fee_cap: Option<u64>,
+) -> anyhow::Result<()> {
+    if let Some(session) = journal
+        .probe_record(&candidate)
+        .await
+        .map_err(ledger_err)?
+        .and_then(|rec| rec.in_flight)
+    {
+        if let Some(a) = amount {
+            anyhow::ensure!(
+                a == session.amount_msat,
+                "federation {} has an in-flight probe of {} msat; --amount {} conflicts — \
+                 omit it to resume, or let the probe finish first",
+                candidate.to_hex(),
+                session.amount_msat,
+                a
+            );
+        }
+        if let Some(f) = fee_cap {
+            anyhow::ensure!(
+                f == session.leg_fee_cap_msat,
+                "federation {} has an in-flight probe with a {} msat leg fee cap; --fee-cap \
+                 {} conflicts — omit it to resume, or let the probe finish first",
+                candidate.to_hex(),
+                session.leg_fee_cap_msat,
+                f
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Build the probe [`ProbePolicy`] from the §5.0.7 flags. The verdict-window flags exist
 /// so a smoke can SHRINK the window and are clamped SHRINK-ONLY: `--ttl-secs` /
 /// `--min-span-secs` above their defaults are rejected — §5.0.4's durable retention keeps
@@ -1323,12 +1368,24 @@ fn build_probe_policy(
             defaults.min_span_ms / 1000
         );
     }
+    let resolved_span = min_span_ms.unwrap_or(defaults.min_span_ms);
+    let resolved_ttl = ttl_ms.unwrap_or(defaults.ttl_ms);
+    // `Passed` needs qualifying successes spanning `min_span` whose NEWEST is within `ttl`;
+    // if `ttl < span` that is unsatisfiable and the probe would report `insufficient`
+    // forever. Reject the contradiction at parse time (defaults satisfy ttl > span).
+    anyhow::ensure!(
+        resolved_ttl >= resolved_span,
+        "--ttl-secs {} is shorter than --min-span-secs {}: no verdict can ever pass \
+         (a sustained span cannot fit inside a shorter ttl window)",
+        resolved_ttl / 1000,
+        resolved_span / 1000
+    );
     Ok(ProbePolicy {
         amount_msat: amount.unwrap_or(defaults.amount_msat),
         leg_fee_cap_msat: fee_cap.unwrap_or(defaults.leg_fee_cap_msat),
         min_successes: min_successes.unwrap_or(defaults.min_successes),
-        min_span_ms: min_span_ms.unwrap_or(defaults.min_span_ms),
-        ttl_ms: ttl_ms.unwrap_or(defaults.ttl_ms),
+        min_span_ms: resolved_span,
+        ttl_ms: resolved_ttl,
     })
 }
 
@@ -2709,5 +2766,45 @@ mod tests {
                 .expect("matching --from"),
             b
         );
+    }
+
+    #[test]
+    fn build_probe_policy_rejects_ttl_shorter_than_span() {
+        // Contradiction: a sustained span cannot fit inside a shorter ttl -> never passes.
+        let err = build_probe_policy(None, None, None, Some(3600), Some(60))
+            .expect_err("ttl < span must be rejected");
+        assert!(err.to_string().contains("shorter than"), "{err}");
+        // ttl == span is allowed (the boundary).
+        assert!(build_probe_policy(None, None, None, Some(3600), Some(3600)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn conflicting_resume_money_flags_are_rejected() {
+        use fedimint_core::db::mem_impl::MemDatabase;
+        use fedimint_core::db::IRawDatabaseExt as _;
+        let c = fed(3);
+        let journal = FedimintJournal::new(MemDatabase::new().into_database());
+        // No in-flight session: any flags are fine.
+        reject_conflicting_probe_money_flags(&journal, c, Some(50_000), Some(9_000))
+            .await
+            .expect("no session -> no conflict");
+        // Begin a 20k / 10k session, then a conflicting --amount / --fee-cap is refused,
+        // while matching or omitted flags resume cleanly.
+        journal
+            .begin_probe_session(&c, &probe_session_from(fed(1)))
+            .await
+            .expect("begin session");
+        assert!(reject_conflicting_probe_money_flags(&journal, c, Some(50_000), None)
+            .await
+            .is_err());
+        assert!(reject_conflicting_probe_money_flags(&journal, c, None, Some(9_000))
+            .await
+            .is_err());
+        reject_conflicting_probe_money_flags(&journal, c, Some(20_000), Some(10_000))
+            .await
+            .expect("matching flags resume");
+        reject_conflicting_probe_money_flags(&journal, c, None, None)
+            .await
+            .expect("omitted flags resume");
     }
 }
