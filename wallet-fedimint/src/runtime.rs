@@ -613,9 +613,18 @@ impl Runtime {
         let out_net = match session.out_net_msat {
             Some(persisted) => Msat(persisted),
             None => {
+                // Size leg OUT against a budget REDUCED by a fee-jitter margin. The final
+                // fee cap (`probe_out_fee_cap`) is bounded by the FULL delivered_in for
+                // no-sweep, so sizing out_net a margin smaller leaves that cap headroom
+                // above the sizing-time fee ESTIMATE — absorbing the small upward re-quote
+                // the Pay step can produce (observed live: an 8432-msat actual vs an
+                // 8417-msat estimate deferred the whole probe). The margin becomes bounded
+                // extra RESIDUE on the candidate (accepted, §5.0.9 decision 6); it stays
+                // well under the leg fee cap, so the "residue < fee cap" invariant holds.
+                let sizing_budget = Msat(delivered_in.0.saturating_sub(PROBE_FEE_MARGIN_MSAT));
                 match self
                     .executor()
-                    .size_probe_leg_out(candidate, run.source, delivered_in, run.leg_fee_cap)
+                    .size_probe_leg_out(candidate, run.source, sizing_budget, run.leg_fee_cap)
                     .await
                 {
                     Ok(Some(sized)) => {
@@ -1944,6 +1953,13 @@ fn no_sweep_ok(c_spendable: Msat, baseline: Msat, delivered_in: Msat) -> bool {
 /// return leg must also prove `out_net + actual drive-time fees <= delivered_in`.
 /// The executor re-quotes send fees at `Pay`, so using the remaining delivered delta
 /// as the move's fee cap keeps a fee spike from spending pre-probe candidate funds.
+/// Fee-jitter margin reserved when sizing leg OUT (§5.0.2): the fee QUOTE at sizing time
+/// can come in a few msat under the ACTUAL fee re-quoted at the Pay step, and the return
+/// leg's cap is bounded tight by the no-sweep budget — with no margin, that jitter breaches
+/// the cap and defers the probe. Sized out of the redeemed budget, it lands as bounded
+/// extra candidate residue (accepted, §5.0.9 decision 6), always far below the leg fee cap.
+const PROBE_FEE_MARGIN_MSAT: u64 = 1_000;
+
 fn probe_out_fee_cap(delivered_in: Msat, out_net: Msat, leg_fee_cap: Msat) -> Msat {
     Msat(leg_fee_cap.0.min(delivered_in.0.saturating_sub(out_net.0)))
 }
