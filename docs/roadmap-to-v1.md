@@ -25,6 +25,9 @@ either outcome (the ledger, hardening, UI, and recovery serve a single-fed walle
 - **Phase 4 — hardening + operation ledger: COMPLETE (2026-07-06)** — all six 2026-07-05
   review P1s closed; the append-only ledger + `history`/`show` shipped; both live exit
   gates passed ([phase4-plan.md](./phase4-plan.md)).
+- **Phase 5.0 — active probe: COMPLETE (2026-07-07)** — the sats-spending A->B->A
+  redeemability probe passed its live devimint gate and now records durable verdict history
+  for discovery-driven funding decisions ([phase5-plan.md](./phase5-plan.md)).
 
 ## Sequence
 
@@ -40,18 +43,15 @@ append-only operation ledger + `history`/`show`
 substrate every later phase writes into. **Gate:** a full devimint session is
 reconstructible from `wallet-cli history`.
 
-### Phase 5 — discovery + triggers (= 3.B + 3.C) — blocked on the REAL active probe
-Today's probe facts are cheap proxies (`round_trip_ok` ⇐ gateway availability,
-`peg_out_quotable` ⇐ wallet-module presence). That is fine while the wallet only rebalances
-between feds the USER joined, but ADR-0017's trust gate for funding a DISCOVERED federation is
-the empirical, sats-spending probe. So Phase 5 starts with **5.0: the real active probe** (a
-small two-leg round-trip MOVE — mint on the candidate, then redeem back to the spending fed,
-proving REDEEMABILITY; TTL-cached sustained-window verdict, tiered behind the free structural
-checks — buildable spec in [phase5-plan.md](./phase5-plan.md) §5.0) — discovery-driven
-auto-funding is BLOCKED on it; until then discovered feds are surface/manual-join only. Then the candidate universe
-(`ObserverClient` + Nostr kind-38173, untrusted, probe-gated per ADR-0017/0019/0020) and the
-self-running loop (`wallet-cli watch`: interval + reactive `federation_expiry_timestamp`
-subscription; probe TTL cache). Every agent action lands in the ledger from day one.
+### Phase 5 — active probe, discovery + triggers (= 3.B + 3.C)
+5.0, the empirical sats-spending active probe, is complete: the wallet can mint on a
+candidate, redeem the probe delta back to the spending federation, and cache a durable
+sustained-window verdict. That proves the trust gate ADR-0017 requires before any
+discovery-driven funding. Next is the candidate universe (`ObserverClient` + Nostr
+kind-38173, untrusted, probe-gated per ADR-0017/0019/0020) and the self-running loop
+(`wallet-cli watch`: interval + reactive `federation_expiry_timestamp` subscription; probe
+TTL cache). Every agent action lands in the ledger from day one. Until 5.1 wires discovery
+into the gate, discovered federations are surface/manual-join only.
 **Gate:** discover → structural floor → ACTIVE probe → score → rebalance runs unattended
 against devimint, fully recorded; a candidate failing only the active probe is never funded.
 
