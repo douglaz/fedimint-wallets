@@ -642,7 +642,10 @@ async fn stranded_leg_and_source_and_local_faults_write_umbrella_only_outcomes()
             .active_probe(CANDIDATE, SOURCE, &ProbePolicy::default(), Actor::User)
             .await
             .expect("a stranded leg is an umbrella-only NoAttempt, not an Err");
-        assert!(matches!(report.outcome, ProbeOutcome::NoAttempt(_)), "{report:?}");
+        assert!(
+            matches!(report.outcome, ProbeOutcome::NoAttempt(_)),
+            "{report:?}"
+        );
         let state = probe_state(&journal).await;
         assert!(state.attempts.is_empty(), "no attempt: verdict untouched");
         assert_eq!(state.in_flight, None);

@@ -498,7 +498,12 @@ impl Runtime {
             candidate,
             source: session.from,
             actor,
-            verdict_before: probe_verdict(&attempts_before, session.from, now_ms(), &effective_policy),
+            verdict_before: probe_verdict(
+                &attempts_before,
+                session.from,
+                now_ms(),
+                &effective_policy,
+            ),
             nonce: session.nonce.clone(),
             umbrella_key: probe_umbrella_key(&candidate, &session.nonce),
             amount,
@@ -540,6 +545,27 @@ impl Runtime {
                 .map_err(exec_err)?;
             if let Err(diagnostic) = self.probe_preflight(&session, candidate).await {
                 return self.finish_probe_no_attempt(&run, &diagnostic, None).await;
+            }
+        }
+
+        // Re-sample the no-sweep BASELINE immediately before leg IN — after the slow
+        // preflight/route validation (gateway HTTP), during which a candidate-side receive
+        // state machine could settle asynchronously and change the balance. Sampling here
+        // (vs. pre-preflight) folds any such settlement into the pre-existing baseline, so
+        // the exact-match resume guard isolates the probe delta precisely instead of
+        // false-aborting a valid resume as "delta consumed" (a safe-direction failure, but
+        // avoidable). ONLY before leg IN credits the candidate (`!leg_in_journaled`); a
+        // post-IN resume keeps its recorded baseline. Best-effort: a read failure keeps the
+        // early baseline (already durable), and a same-nonce write only fires on a change.
+        if !leg_in_journaled && self.mc.federations().contains(&candidate) {
+            if let Ok(fresh) = self.mc.balance(&candidate).await {
+                if fresh.0 != session.c_spendable_before_in_msat {
+                    session.c_spendable_before_in_msat = fresh.0;
+                    self.journal
+                        .begin_probe_session(&candidate, &session)
+                        .await
+                        .map_err(exec_err)?;
+                }
             }
         }
 
@@ -888,7 +914,12 @@ impl Runtime {
                 Ok(ProbeReport {
                     verdict_before: run.verdict_before,
                     outcome: ProbeOutcome::Attempt(attempt),
-                    verdict_after: probe_verdict(&after, run.source, now_ms(), &run.effective_policy),
+                    verdict_after: probe_verdict(
+                        &after,
+                        run.source,
+                        now_ms(),
+                        &run.effective_policy,
+                    ),
                     in_key: run.in_key.clone(),
                     out_key,
                 })
