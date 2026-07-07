@@ -540,7 +540,7 @@ blocking). No source is load-bearing; discovery unions whatever the configured s
 ### 5.1.1 The durable candidate registry (journal tag `0x09`)
 
 A candidate is a fed the wallet learned about but has NOT necessarily joined and has NOT
-funded. Distinct from the JOINED registry (`0x01`, user- and auto-joined membership):
+funded. Distinct from the JOINED registry (`0x03` `FederationKey`→`FederationInfo`, user- and auto-joined membership):
 
 ```rust
 pub struct CandidateRecord {
@@ -574,11 +574,12 @@ pub enum CandidateState {
     /// read live from `probe_record`) is NOT stored here — `probe_record` stays the single
     /// source of truth.
     AutoJoined,
-    /// A user EXPLICITLY approved a candidate (5.1.4a): it leaves the probe gate and the
-    /// auto-join budget for the grandfathered USER-joined path — the user vouched for it.
+    /// A user EXPLICITLY approved a candidate (5.1.4a): it leaves the probe GATE and the
+    /// CONCURRENT cap for the grandfathered USER-joined path — the user vouched for it.
     /// Reached from `Discovered` (a plain `wallet-cli join`) OR from `AutoJoined` (an
-    /// `approve`, so an agent-joined fed the user later blesses stops being probe-gated and
-    /// stops counting toward the lifetime cap).
+    /// `approve`). It does NOT leave the LIFETIME cap: that counts immutable successful
+    /// agent-join history, and approval does not reclaim the partition (5.1.4/5.1.4a) — else
+    /// approving old auto-joins would reopen the budget and defeat the finite-partition bound.
     UserApproved,
 }
 ```
@@ -586,7 +587,7 @@ pub enum CandidateState {
 - Keys: `0x09 ++ fed_id` → JSON v1 `CandidateRecord`; scans are poison-tolerant like every
   other registry. One row per fed, upserted in its own dbtx.
 - `FedimintJournal::{put_candidate, get_candidate, list_candidates}`.
-- Membership authority stays the joined registry (`0x01`); the candidate row's STATE
+- Membership authority stays the joined registry (`0x03`); the candidate row's STATE
   distinguishes agent- from user-owned for the gate (5.1.3) and the budget (5.1.4). The
   user-ownership transitions are explicit (5.1.4a): a `Discovered` fed the user `join`s, or
   an `AutoJoined` fed the user `approve`s, both move to `UserApproved` — off the probe gate
@@ -603,7 +604,7 @@ invite through the authenticated fetch (step 2) and adopt the FIRST that authent
 that id — so a good invite from a later source is never dropped in favor of an earlier stale
 one. Then, per reconciled fed:
 
-0. **Already-joined short-circuit.** If the fed is in the `0x01` JOINED registry (a USER
+0. **Already-joined short-circuit.** If the fed is in the `0x03` JOINED registry (a USER
    join, or an earlier restore) but has no `0x09` candidate row, seed the candidate row as
    `UserApproved` and STOP — a fed the user already owns must never be reported as
    `Discovered`, re-floored for auto-join, or counted against the auto-join budget. (An
@@ -663,6 +664,15 @@ adds: for an AUTO-JOINED discovered fed, `eligible_to_fund` ALSO requires
 grandfathered proxy path (eligible on the scorer verdict alone — the roadmap's stance: the
 cheap proxy is fine for feds the user chose).
 
+- **Break the self-reference first (ordering rule):** the gate reads
+  `active_probe(source = designated spending fed)`, so an `AutoJoined` fed must NEVER
+  auto-designate as the spending fed — otherwise it becomes its own source, its self-probe
+  is `None` (a fed cannot probe itself, §5.0.6), and the gate oscillates. `build_snapshot`'s
+  auto-designation (tick.rs) therefore EXCLUDES `AutoJoined` feds from the spending pick
+  (they remain eligible DESTINATIONS once `Passed` — a probed discovered fed is a place to
+  PUT funds, not the wallet's spender). An operator may still PIN a `UserApproved` fed as
+  spending (it is user-owned by then). This makes the source stable and the gate
+  well-defined as balances/rankings change.
 - `build_snapshot` gains the auto-joined set (`&BTreeSet<FederationId>` from
   `list_candidates` where `state == AutoJoined`) and the per-fed probe verdict (already
   computed for §5.0.6's status surfacing). The probe gate LAYERS ON TOP of today's
@@ -689,15 +699,20 @@ fetch + a client partition), lands as a `join` ledger row with `actor: Agent`, a
 bounded by THREE limits in `DiscoveryPolicy`:
 
 - `max_concurrent_unproven` (default 3): auto-joined feds whose probe is not yet `Passed`.
-  Caps the in-flight probing surface.
-- `max_auto_joins_per_week` (default 5): a rate limit read from the ledger's `join`
-  (actor Agent) rows in the trailing 7 days.
+  Caps the in-flight probing surface. (Counted from the candidate registry's `AutoJoined`
+  rows — one row per real partition — so it is naturally free of attempt/no-op noise.)
+- `max_auto_joins_per_week` (default 5): a rate limit over SUCCESSFUL NEW-partition agent
+  joins in the trailing 7 days.
 - **`auto_join_lifetime_cap` (default 20): the SETTLED lifetime bound.** Joins are one-way
   in v1 (no eviction — a documented non-goal), so the rate limits bound the RATE, not the
   total; a hard lifetime cap on total agent-created partitions is the simplest bound that
   keeps a long-running wallet's partition set finite. **Counted from IMMUTABLE agent-join
-  HISTORY — the ledger's `actor: Agent` `join` rows (a monotonic count of every partition
-  the agent ever created), NOT the mutable candidate state.** Counting live `AutoJoined`
+  HISTORY — the ledger's `actor: Agent` `join` rows that SUCCEEDED and created a NEW
+  partition (status `Succeeded` AND `newly_joined`), a monotonic count of every partition the
+  agent ever created, NOT the mutable candidate state.** (Failed attempts and no-op re-opens
+  also write `join:` rows but created no partition, so they must NOT count — else a few
+  transient auto-join failures would exhaust the budget. The weekly cap filters the same way;
+  the concurrent cap sidesteps it by counting `AutoJoined` registry rows.) Counting live `AutoJoined`
   rows would let a user flip 20 auto-joins to `UserApproved` (5.1.4a), reset the budget to 0
   while all 20 partitions still exist, and let discovery create 20 more — the finite-set
   guarantee gone. Approval leaves the partition in place, so it must keep counting against
@@ -799,7 +814,7 @@ wallet-cli approve <fed-hex>   # bless an AutoJoined candidate -> UserApproved (
    follow-on; kind-38000 ratings are dropped entirely (data-sources §E).
 2. Every structural fact is re-derived from the AUTHENTICATED config; a source can only
    suggest, never promote — the id is re-verified against the invite.
-3. The candidate registry (`0x09`) is distinct from joined membership (`0x01`); the
+3. The candidate registry (`0x09`) is distinct from joined membership (`0x03`); the
    candidate STATE (`Rejected`/`Discovered`/`AutoJoined`/`UserApproved`) distinguishes
    agent-owned (probe-gated, budgeted) from user-owned (grandfathered) for the gate and the
    budget; a user `join`/`approve` moves a candidate to `UserApproved` (5.1.4a).
