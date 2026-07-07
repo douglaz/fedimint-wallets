@@ -104,11 +104,19 @@ echo "history OK: umbrella probe row + IN/OUT legs, all active_probe"
 # ---------------------------------------------------------------------------------------
 echo "== SUSTAINED WINDOW: 2 more probes -> the verb's verdict flips to 'passed' =="
 # The verb evaluates verdict_after under ITS OWN (shrunk-span) policy; status uses DEFAULT.
+# Capture output so a failure is diagnosable (a probe is a real two-leg money op).
+run_probe() { # run_probe <label> <outfile> <errfile>
+  if ! wcli probe "$FED_B" --from "$FED_A" --gateway "$GW" --min-span-secs 1 >"$2" 2>"$3"; then
+    echo "  --- $1 stdout ---" >&2; cat "$2" >&2
+    echo "  --- $1 stderr ---" >&2; cat "$3" >&2
+    fail "$1 failed"
+  fi
+}
 sleep 1
-wcli probe "$FED_B" --from "$FED_A" --gateway "$GW" --min-span-secs 1 >/dev/null 2>&1 || fail "2nd probe failed"
+run_probe "2nd probe" "$(mktemp)" "$(mktemp)"
 sleep 1
 P3_OUT=$(mktemp)
-wcli probe "$FED_B" --from "$FED_A" --gateway "$GW" --min-span-secs 1 >"$P3_OUT" 2>/dev/null || fail "3rd probe failed"
+run_probe "3rd probe" "$P3_OUT" "$(mktemp)"
 grep -q '^verdict: passed$' "$P3_OUT" || { cat "$P3_OUT" >&2; fail "3 qualifying successes over a 1s span did not read 'passed'"; }
 echo "verdict OK: the probe verb reads 'passed' after 3 successes spanning its shrunk window"
 
