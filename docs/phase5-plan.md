@@ -587,12 +587,16 @@ pub enum CandidateState {
 ### 5.1.2 The pipeline (pure floor + one config-fetch I/O)
 
 `Runtime::discover(sources, policy) -> DiscoverReport`. Discovery is REFRESHING, not
-skip-on-seen — a known candidate is revisited so it is never permanently stranded. Per
-announcement (dedup by id within the pass):
+skip-on-seen — a known candidate is revisited so it is never permanently stranded. Multiple
+announcements for ONE fed id in a pass (a mixed-source union can surface a stale AND a
+current invite for the same fed) are RECONCILED, not first-wins-deduped: try each distinct
+invite through the authenticated fetch (step 2) and adopt the FIRST that authenticates for
+that id — so a good invite from a later source is never dropped in favor of an earlier stale
+one. Then, per reconciled fed:
 
-1. **Decide whether to (re)fetch.** A NEW id, an invite that DIFFERS from the stored one (a
-   source may publish a rotated/better invite for the same fed — invites are not canonical
-   for a fed id), or a row whose `structural_checked_at_ms` is older than
+1. **Decide whether to (re)fetch.** A NEW id, a reconciled invite that DIFFERS from the
+   stored one (a source may publish a rotated/better invite for the same fed — invites are
+   not canonical for a fed id), or a row whose `structural_checked_at_ms` is older than
    `STRUCTURAL_RECHECK_BACKOFF_MS` (default 7d) → (re)fetch + re-floor below. An
    `AutoJoined`/`UserApproved` candidate (already joined; membership is authority) only has
    its stored `invite` REFRESHED to the newest valid one and is not re-floored. An
@@ -621,11 +625,16 @@ announcement (dedup by id within the pass):
    unprobeable forever.
 
 Every discover invocation writes ONE ledger row PER SOURCE (not one per pass), a new
-`OperationKind::Discover { source, found, structurally_passed, rejected, auto_joined }`
-keyed `discover:<source>:<nonce>` — so a mixed run (Observer + Manual, later + Nostr) records
-which source found what and which was empty/down (a down source = a `found: 0` row, not a
-missing one). The Phase-4 auditability contract thus extends to each of the agent's discovery
-sources independently.
+`OperationKind::Discover { source, found, structurally_passed, rejected }` keyed
+`discover:<source>:<nonce>` — so a mixed run (Observer + Manual, later + Nostr) records which
+source found what and which was empty/down (a down source = a `found: 0` row, not a missing
+one). The Discover row carries NO `auto_joined` count: auto-join runs over the GLOBAL
+`Discovered` pool (candidates from earlier runs and OTHER sources), so counting it under the
+current pass's source would mis-attribute it. Each auto-join is instead its own `join` ledger
+row (`actor: Agent`, 5.1.4) — decoupled from the discovery source — and the candidate's
+durable `source` field records who ORIGINALLY discovered it. The Phase-4 auditability contract
+thus extends to each discovery source independently, and auto-joins are attributable to the
+candidate (not conflated with whichever pass happened to trigger them).
 
 ### 5.1.3 The gate wire-up — a discovered fed funds only when PASSED
 
