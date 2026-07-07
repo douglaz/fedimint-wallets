@@ -539,10 +539,14 @@ pub struct CandidateRecord {
     pub invite: InviteCode,
     pub source: DiscoverySource,
     pub discovered_at_ms: u64,
-    /// The one-time authenticated STRUCTURAL verdict (the free floor: guardian count,
-    /// threshold/BFT, network, modules — the scorer's structural half). Recorded so a
-    /// rejected candidate is not re-fetched every discovery pass.
+    /// The authenticated STRUCTURAL verdict (the free floor: guardian count, threshold/BFT,
+    /// network, modules — the scorer's structural half). Refreshed on rediscovery, not frozen.
     pub structural: StructuralOutcome,
+    /// When the structural verdict was last computed (a config fetch). Discovery RE-CHECKS a
+    /// stale row after `STRUCTURAL_RECHECK_BACKOFF_MS` — so a fed initially `Rejected` for a
+    /// missing module (an UPGRADEABLE property under the same id) is reconsidered later, and a
+    /// `Discovered` fed's facts do not go permanently stale — without a config fetch every pass.
+    pub structural_checked_at_ms: u64,
     pub state: CandidateState,
     pub updated_at_ms: u64,
 }
@@ -550,7 +554,9 @@ pub struct CandidateRecord {
 pub enum StructuralOutcome { Passed, Rejected(String) }  // the reason mirrors ReasonCode
 
 pub enum CandidateState {
-    /// Structurally rejected (never fundable; kept so it is not re-probed/re-fetched).
+    /// Structurally rejected — not fundable NOW, but NOT a permanent blacklist: kept so it
+    /// is not re-fetched every pass, and reconsidered after `STRUCTURAL_RECHECK_BACKOFF_MS`
+    /// (a fed can enable a required module under the same id and later pass).
     Rejected,
     /// Structurally vetted, NOT joined — surface-only until the user or the loop joins it.
     Discovered,
@@ -580,24 +586,39 @@ pub enum CandidateState {
 
 ### 5.1.2 The pipeline (pure floor + one config-fetch I/O)
 
-`Runtime::discover(sources, policy) -> DiscoverReport`, per announcement (dedup by id;
-already-known candidates are skipped unless their structural row is absent):
+`Runtime::discover(sources, policy) -> DiscoverReport`. Discovery is REFRESHING, not
+skip-on-seen — a known candidate is revisited so it is never permanently stranded. Per
+announcement (dedup by id within the pass):
 
-1. **Authenticate the invite:** fetch the `ClientConfig` from the guardian quorum WITHOUT
+1. **Decide whether to (re)fetch.** A NEW id, an invite that DIFFERS from the stored one (a
+   source may publish a rotated/better invite for the same fed — invites are not canonical
+   for a fed id), or a row whose `structural_checked_at_ms` is older than
+   `STRUCTURAL_RECHECK_BACKOFF_MS` (default 7d) → (re)fetch + re-floor below. An
+   `AutoJoined`/`UserApproved` candidate (already joined; membership is authority) only has
+   its stored `invite` REFRESHED to the newest valid one and is not re-floored. An
+   up-to-date `Discovered`/`Rejected` row within the backoff and with an unchanged invite is
+   left as-is (no wasted fetch).
+2. **Authenticate the invite:** fetch the `ClientConfig` from the guardian quorum WITHOUT
    joining — reuse `client_builder().preview(connectors, &invite)` (the same authenticated
-   fetch `join` does, minus the partition write). The config is authenticated against the
-   invite's federation id, so a source cannot spoof N/threshold/modules/network. A fetch
-   failure is a TRANSIENT skip (retry next pass), recorded on the ledger, not a Rejected row.
-2. **Verify the claimed id (Sybil hygiene):** all three must agree —
+   fetch `join` does, minus the partition write). Authenticated against the invite's id, so a
+   source cannot spoof N/threshold/modules/network. A fetch failure is a TRANSIENT skip
+   (retry next pass), recorded on the ledger, and NEVER downgrades an existing row (a
+   transiently-unreachable fed keeps its last verdict).
+3. **Verify the claimed id (Sybil hygiene):** all three must agree —
    `announcement.claimed_id == invite.federation_id() == config.federation_id()`. The
-   invite→config equality is the AUTHENTICITY check (the config is authenticated against the
-   invite's embedded id); the claimed→invite equality catches a source that announced an id
-   inconsistent with the invite it shipped. A mismatch drops the candidate (logged; no row).
-3. **Assemble structural facts + run the scorer's STRUCTURAL floor** (the free half of
+   invite→config equality is the AUTHENTICITY check; the claimed→invite equality catches a
+   source that announced an id inconsistent with the invite it shipped. A mismatch drops the
+   candidate (logged; no row change).
+4. **Assemble structural facts + run the scorer's STRUCTURAL floor** (the free half of
    `score` — guardian count, BFT threshold, network, module presence; NO probe, NO Observer
-   prior). `Passed` → a `Discovered` `CandidateRecord`; `Rejected(reason)` → a `Rejected`
-   row (never fundable, not re-fetched).
-4. **Optionally auto-join** (5.1.4) the newly-`Discovered` candidates within budget.
+   prior), stamping `structural_checked_at_ms = now`. `Passed` → the row becomes/stays
+   `Discovered` (or keeps `AutoJoined`/`UserApproved`); `Rejected(reason)` → `Rejected` (a
+   previously-`Discovered` fed that regressed drops back to `Rejected`, but an already-JOINED
+   fed is not un-joined — membership is one-way in v1).
+5. **Consider auto-join (5.1.4) over ALL `Discovered` candidates**, newly-added AND
+   pre-existing, within budget — so a fed first seen while `--auto-join` was off, or while a
+   cap was exhausted, is picked up on a later pass once budget frees, rather than stranded
+   unprobeable forever.
 
 Every discover invocation writes ONE ledger row PER SOURCE (not one per pass), a new
 `OperationKind::Discover { source, found, structurally_passed, rejected, auto_joined }`
