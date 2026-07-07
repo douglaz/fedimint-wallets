@@ -1,5 +1,18 @@
 # Phase 5 plan — the real active probe, discovery, and the self-running loop
 
+> **STATUS: Phase 5.0 (the active probe) COMPLETE (2026-07-07).** Implemented across an
+> rb-lite run (died on a transient API overload; finished by hand) + 8 codex verification
+> passes (~24 findings, 2 rejected with evidence as v1-unreachable concurrency) + the live
+> `smoke_probe_devimint.sh` exit gate, which caught two composition bugs the unit tests
+> could not (a missing `--gateway` route pin; a zero-fee-headroom leg-OUT defer) — both
+> fixed. The gate PASSED: a real A→B→A round trip proving redeemability (B nets its delta
+> then drains back, combined loss fees-only), both legs + the umbrella row auditable as
+> `active_probe`, a sustained window flipping the verb's verdict to `passed` while `status`
+> stays conservative, and an unjoined-fed probe as a non-zero `NoAttempt` that never
+> demotes. NEXT: 5.1 discovery (wire the gate for `Discovered` feds; settle the auto-join
+> lifetime bound). 5.0 gates nothing yet by design.
+
+
 The re-scoped 3.B + 3.C ([roadmap-to-v1.md](./roadmap-to-v1.md)): turn the engine from
 "rebalances the feds the user joined" into "discovers, vets, and manages federations
 unattended". **5.0 (the active probe) is fully specified here and BLOCKS the rest** —
