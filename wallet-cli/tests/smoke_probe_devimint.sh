@@ -66,7 +66,7 @@ A0=$(bal_for "$FED_A"); B0=$(bal_for "$FED_B")
 echo "pre-probe: A=$A0 msat  B=$B0 msat"
 
 P_OUT=$(mktemp); P_ERR=$(mktemp)
-if ! wcli probe "$FED_B" --from "$FED_A" >"$P_OUT" 2>"$P_ERR"; then
+if ! wcli probe "$FED_B" --from "$FED_A" --gateway "$GW" >"$P_OUT" 2>"$P_ERR"; then
   echo "  --- probe stdout ---" >&2; cat "$P_OUT" >&2
   echo "  --- probe stderr ---" >&2; cat "$P_ERR" >&2
   fail "a healthy probe B from A must succeed (exit 0)"
@@ -105,10 +105,10 @@ echo "history OK: umbrella probe row + IN/OUT legs, all active_probe"
 echo "== SUSTAINED WINDOW: 2 more probes -> the verb's verdict flips to 'passed' =="
 # The verb evaluates verdict_after under ITS OWN (shrunk-span) policy; status uses DEFAULT.
 sleep 1
-wcli probe "$FED_B" --from "$FED_A" --min-span-secs 1 >/dev/null 2>&1 || fail "2nd probe failed"
+wcli probe "$FED_B" --from "$FED_A" --gateway "$GW" --min-span-secs 1 >/dev/null 2>&1 || fail "2nd probe failed"
 sleep 1
 P3_OUT=$(mktemp)
-wcli probe "$FED_B" --from "$FED_A" --min-span-secs 1 >"$P3_OUT" 2>/dev/null || fail "3rd probe failed"
+wcli probe "$FED_B" --from "$FED_A" --gateway "$GW" --min-span-secs 1 >"$P3_OUT" 2>/dev/null || fail "3rd probe failed"
 grep -q '^verdict: passed$' "$P3_OUT" || { cat "$P3_OUT" >&2; fail "3 qualifying successes over a 1s span did not read 'passed'"; }
 echo "verdict OK: the probe verb reads 'passed' after 3 successes spanning its shrunk window"
 
@@ -128,13 +128,13 @@ echo "status OK: default-policy verdict stays 'insufficient' under the test-shru
 echo "== NO-ATTEMPT FAILURE: probing an UNJOINED fed exits non-zero, never demotes =="
 UNJOINED="$(printf '%064d' 0)"  # a 32-byte zero fed id we never joined
 NA_OUT=$(mktemp)
-if wcli probe "$UNJOINED" --from "$FED_A" >"$NA_OUT" 2>/dev/null; then
+if wcli probe "$UNJOINED" --from "$FED_A" --gateway "$GW" >"$NA_OUT" 2>/dev/null; then
   cat "$NA_OUT" >&2; fail "probing an unjoined fed must exit non-zero"
 fi
 grep -q '^attempt: none ' "$NA_OUT" || { cat "$NA_OUT" >&2; fail "an unjoined-fed probe must print 'attempt: none <diagnostic>'"; }
 # B's verdict history is untouched by the unrelated failure (still 'passed' under the shrunk verb policy).
 V_OUT=$(mktemp)
-wcli probe "$FED_B" --from "$FED_A" --min-span-secs 1 >"$V_OUT" 2>/dev/null || fail "post-failure re-probe failed"
+wcli probe "$FED_B" --from "$FED_A" --gateway "$GW" --min-span-secs 1 >"$V_OUT" 2>/dev/null || fail "post-failure re-probe failed"
 grep -q '^verdict: passed$' "$V_OUT" || { cat "$V_OUT" >&2; fail "B's verdict must be untouched by an unrelated unjoined-fed failure"; }
 echo "no-attempt OK: unjoined-fed probe exits non-zero with 'attempt: none'; B's verdict untouched"
 

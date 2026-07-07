@@ -364,11 +364,14 @@ probe as one umbrella row plus up to two explained moves.
 ### 5.0.7 CLI
 
 ```
-wallet-cli probe <fed-hex> [--from <spending-fed-hex>]
+wallet-cli probe <fed-hex> [--from <spending-fed-hex>] [--gateway URL]
                  [--amount MSAT] [--fee-cap MSAT-per-leg]
                  [--min-successes N] [--min-span-secs S] [--ttl-secs S]
 ```
-`--from` names the spending federation `S` explicitly. When omitted: exactly TWO joined
+`--gateway` pins the shared lnv2 gateway routing both legs (it must serve BOTH `S` and the
+candidate); omitted, the route resolves from each fed's registered gateways — required
+explicitly against devimint, whose LDK gateway is not auto-registered into the lnv2 set
+(like every other money verb). `--from` names the spending federation `S` explicitly. When omitted: exactly TWO joined
 feds ⇒ `S` = the other one (the common probe topology); otherwise the verb refuses with
 "pass --from" — deterministic, and deliberately NOT coupled to the tick's designation
 logic (a probe must not silently ride whatever auto-designation picked this run).

@@ -206,6 +206,12 @@ enum Command {
         /// Seconds before the newest success goes stale (default 7d). SHRINK-ONLY.
         #[arg(long)]
         ttl_secs: Option<u64>,
+        /// Shared lnv2 gateway URL routing both probe legs — it must serve BOTH the source
+        /// and the candidate. Defaults to each fed's first registered gateway; pass one
+        /// explicitly against devimint (its LDK gateway is not auto-registered — see
+        /// docs/devimint-runbook.md §4).
+        #[arg(long)]
+        gateway: Option<String>,
     },
     /// Re-drive pending intents and rebuild move records from the op-log (spec §9 resume loop):
     /// print performed/failed/skipped/retryable/awaiting counts; awaiting intent keys go to stderr.
@@ -824,6 +830,7 @@ async fn main() -> anyhow::Result<()> {
             min_successes,
             min_span_secs,
             ttl_secs,
+            gateway,
         } => {
             // Parse-only — deliberately NOT `select_fed`: a not-joined candidate must
             // still reach the runtime's preflight so the refusal lands in `history`
@@ -842,13 +849,15 @@ async fn main() -> anyhow::Result<()> {
             reject_conflicting_probe_money_flags(&journal, candidate, amount, fee_cap).await?;
             let policy =
                 build_probe_policy(amount, fee_cap, min_successes, min_span_secs, ttl_secs)?;
-            // Probes ride the ordinary move machinery: no pinned gateway (the route
-            // resolves from the registered set) and the ADR-0018 hard cap enforced
-            // verbatim — probe legs never bypass it (§5.0.5).
+            // Probes ride the ordinary move machinery: an explicit --gateway pins the
+            // shared route (required against devimint, whose LDK gateway is not registered
+            // into the lnv2 set), else the route resolves from each fed's registered
+            // gateways. The ADR-0018 hard cap is enforced verbatim — probe legs never
+            // bypass it (§5.0.5).
             let runtime = Runtime::new(
                 multi_client.clone(),
                 journal.clone(),
-                None,
+                gateway.map(GatewayUrl),
                 operator_hard_cap(false),
                 perform_timeout,
             );
