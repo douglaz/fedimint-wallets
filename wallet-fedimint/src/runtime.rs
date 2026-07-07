@@ -510,6 +510,7 @@ impl Runtime {
             leg_fee_cap,
             in_key: move_key(&session.from, &candidate, amount, leg_fee_cap, occurrence),
             effective_policy,
+            started_at_ms: session.started_at_ms,
         };
 
         // §5.0.5 step 1 — umbrella row then preflight, for a FRESH probe or a pre-leg-IN
@@ -746,10 +747,20 @@ impl Runtime {
 
         // §5.0.5 step 6 — both legs settled: ONE atomic outcome write (attempt appended,
         // session cleared, umbrella row Succeeded with the S-net-outflow cost).
-        let out_rec = self.journal.get_move(&out_key).await.map_err(exec_err)?;
-        let cost = probe_cost(Some(&in_rec), out_rec.as_ref());
+        // Fail closed on a missing out record (as leg IN does): `Done` proves leg OUT
+        // settled, but a cache-loss recovery could leave `get_move` empty, and recording
+        // `cost = full debit` (credit 0) would persist a successful probe in history as if
+        // NONE of the funds came back. Deferring (session retained) lets a re-run rebuild
+        // the record and record the true S-net-outflow cost.
+        let out_rec = self.journal.get_move(&out_key).await.map_err(exec_err)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "probe leg OUT settled but its move record is missing; transient — re-run \
+                 `probe` to resume (session retained)"
+            )
+        })?;
+        let cost = probe_cost(Some(&in_rec), Some(&out_rec));
         let attempt = ProbeAttempt {
-            at_ms: now_ms(),
+            at_ms: run.started_at_ms,
             ok: true,
             from: run.source,
             amount_msat: run.amount.0,
@@ -915,7 +926,7 @@ impl Runtime {
         match classify_leg_failure(leg, leg_rec.as_ref(), &diagnostic) {
             LegFault::Candidate => {
                 let attempt = ProbeAttempt {
-                    at_ms: now_ms(),
+                    at_ms: run.started_at_ms,
                     ok: false,
                     from: run.source,
                     amount_msat: run.amount.0,
@@ -951,7 +962,14 @@ impl Runtime {
                     out_key,
                 })
             }
-            LegFault::UmbrellaOnly => self.finish_probe_no_attempt(run, &error_text, cost).await,
+            LegFault::UmbrellaOnly => {
+                // Preserve the failed out leg's handle on the report (finish_probe_no_attempt
+                // defaults it None for the pre-leg-OUT refusals): when leg OUT itself failed,
+                // its move exists and `out_key` is the operator's direct handle to inspect it.
+                let mut report = self.finish_probe_no_attempt(run, &error_text, cost).await?;
+                report.out_key = out_key;
+                Ok(report)
+            }
         }
     }
 
@@ -1769,6 +1787,12 @@ struct ProbeRun {
     /// The policy the legs actually run under — money fields locked to the session, so a
     /// resumed attempt is judged against the parameters it was spent with (not the flags).
     effective_policy: ProbePolicy,
+    /// The probe's START time, from the durable session (persisted before leg IN). The
+    /// recorded attempt's `at_ms` uses THIS, not `now_ms()`: a crash-then-delayed-resume
+    /// must stamp the evidence at when the probe happened, not at recovery time — the
+    /// verdict is driven entirely by `at_ms`, so a recovery-time stamp could keep a stale
+    /// probe inside the ttl window or synthesize the span a `Passed` needs.
+    started_at_ms: u64,
 }
 
 /// Which probe leg a move drives: IN mints on the candidate (S → C), OUT redeems back
