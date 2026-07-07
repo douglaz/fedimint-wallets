@@ -604,14 +604,24 @@ invite through the authenticated fetch (step 2) and adopt the FIRST that authent
 that id — so a good invite from a later source is never dropped in favor of an earlier stale
 one. Then, per reconciled fed:
 
-0. **Already-joined short-circuit.** If the fed is in the `0x03` JOINED registry AND is not
-   agent-owned (i.e. NOT an `AutoJoined` candidate — a USER join, or an earlier restore), set
-   its candidate row to `UserApproved` and STOP — regardless of any PRIOR state. This covers
-   the no-row case AND a stale `Rejected`/`Discovered` row for a fed the user has since joined
-   manually: without it, a later pass would re-floor a user-owned fed back to
-   `Rejected`/`Discovered` and step 5 would treat it as an auto-join candidate again. A fed
-   the user owns must never be re-floored, auto-joined, or budget-charged. (An `AutoJoined`
-   candidate keeps its state here — it is agent-owned until an explicit `approve`, 5.1.4a.)
+0. **Already-joined short-circuit (provenance-preserving).** If the fed is in the `0x03`
+   JOINED registry, discovery must NOT re-floor / re-auto-join / budget-charge it (it is
+   already joined), and must NOT DOWNGRADE its provenance. So:
+   - It already has a candidate row (`AutoJoined` or `UserApproved`): keep that state and STOP.
+     (Ownership is authoritative — an agent fed stays probe-gated, a user fed stays
+     grandfathered.)
+   - It has a `Discovered`/`Rejected` row but is now joined (a stale row): STOP without
+     changing state here — the row is superseded by membership; the OWNERSHIP is set by
+     whoever joined it (a USER `join` set `UserApproved` via 5.1.4a; discovery never joins a
+     fed outside step 5, which sets `AutoJoined`). A stale floor row is never re-used for
+     auto-join because it is already joined.
+   - It has NO candidate row but IS joined — a RESTORE that recovered the `0x03` membership
+     but not the `0x09` state (§5.1.1 backup contract). Provenance is UNKNOWN, so default to
+     the CONSERVATIVE side: seed the row as `AutoJoined` (PROBE-GATED, not `UserApproved`) —
+     never infer user ownership from a missing row, or a restored agent fed would silently
+     bypass its probe gate. The user promotes it with `approve` (5.1.4a) if it was really
+     theirs. (No new join / no lifetime charge — the partition already exists; a restored fed
+     that lacks its immutable join-history row simply is not counted, a bounded restore edge.)
 1. **Decide whether to (re)fetch.** A NEW id, a reconciled invite that DIFFERS from the
    stored one (a source may publish a rotated/better invite for the same fed — invites are
    not canonical for a fed id), or a row whose `structural_checked_at_ms` is older than
@@ -640,7 +650,13 @@ one. Then, per reconciled fed:
 5. **Consider auto-join (5.1.4) over ALL `Discovered` candidates**, newly-added AND
    pre-existing, within budget — so a fed first seen while `--auto-join` was off, or while a
    cap was exhausted, is picked up on a later pass once budget frees, rather than stranded
-   unprobeable forever.
+   unprobeable forever. **Re-validate before joining:** a pre-existing `Discovered` row was
+   floored at `structural_checked_at_ms`, which may predate an upgrade OR a REGRESSION under
+   the same id (module removed, guardians dropped). So auto-join FORCES a fresh authenticated
+   config fetch + structural re-floor for a cached candidate immediately before the join (a
+   newly-floored candidate from steps 2-4 this pass is already current and skips the refetch),
+   and joins ONLY if it still passes — otherwise it drops back to `Rejected` and is not
+   joined. "Structurally vetted" is thus true AT JOIN TIME, not merely at first discovery.
 
 Every discover invocation writes ledger rows so an unattended pass is fully auditable, split
 so each fact lives where it is attributable:
@@ -744,8 +760,11 @@ window of the same join rows: approval is irrelevant to it (the join ages out of
 on its own). So: approval frees CONCURRENT + the probe gate; LIFETIME and WEEKLY are
 unaffected.
 
-- `wallet-cli join <invite>` of a `Discovered` candidate: joins it AND sets `UserApproved`
-  (a user-initiated join is a user vouch; the `join` ledger row carries `actor: User`).
+- `wallet-cli join <invite>` of a candidate in ANY state (`Discovered`, `Rejected`, or no
+  row): joins it AND sets `UserApproved` — a user-initiated join is a user vouch, regardless
+  of a prior structural rejection or a stale row; the `join` ledger row carries `actor: User`.
+  (This is how a user takes ownership of a fed discovery had `Rejected` — the join path, not
+  the discovery short-circuit, confers user ownership.)
 - `wallet-cli approve <fed>` of an `AutoJoined` candidate: the fed is already joined, so this
   only flips the candidate state `AutoJoined -> UserApproved` (no money, no new membership) —
   but it IS a user-visible ownership change, so it writes a ledger row
