@@ -604,11 +604,14 @@ invite through the authenticated fetch (step 2) and adopt the FIRST that authent
 that id — so a good invite from a later source is never dropped in favor of an earlier stale
 one. Then, per reconciled fed:
 
-0. **Already-joined short-circuit.** If the fed is in the `0x03` JOINED registry (a USER
-   join, or an earlier restore) but has no `0x09` candidate row, seed the candidate row as
-   `UserApproved` and STOP — a fed the user already owns must never be reported as
-   `Discovered`, re-floored for auto-join, or counted against the auto-join budget. (An
-   `AutoJoined` candidate already HAS its row — this branch is only the no-row case.)
+0. **Already-joined short-circuit.** If the fed is in the `0x03` JOINED registry AND is not
+   agent-owned (i.e. NOT an `AutoJoined` candidate — a USER join, or an earlier restore), set
+   its candidate row to `UserApproved` and STOP — regardless of any PRIOR state. This covers
+   the no-row case AND a stale `Rejected`/`Discovered` row for a fed the user has since joined
+   manually: without it, a later pass would re-floor a user-owned fed back to
+   `Rejected`/`Discovered` and step 5 would treat it as an auto-join candidate again. A fed
+   the user owns must never be re-floored, auto-joined, or budget-charged. (An `AutoJoined`
+   candidate keeps its state here — it is agent-owned until an explicit `approve`, 5.1.4a.)
 1. **Decide whether to (re)fetch.** A NEW id, a reconciled invite that DIFFERS from the
    stored one (a source may publish a rotated/better invite for the same fed — invites are
    not canonical for a fed id), or a row whose `structural_checked_at_ms` is older than
@@ -744,9 +747,12 @@ unaffected.
 - `wallet-cli join <invite>` of a `Discovered` candidate: joins it AND sets `UserApproved`
   (a user-initiated join is a user vouch; the `join` ledger row carries `actor: User`).
 - `wallet-cli approve <fed>` of an `AutoJoined` candidate: the fed is already joined, so this
-  only flips the candidate state `AutoJoined -> UserApproved` (no money, no new membership).
-  Without this, an agent-auto-joined fed would stay probe-gated and keep counting toward the
-  lifetime cap forever even after the user explicitly blessed it (the gap codex flagged).
+  only flips the candidate state `AutoJoined -> UserApproved` (no money, no new membership) —
+  but it IS a user-visible ownership change, so it writes a ledger row
+  (`OperationKind::Approve { fed }`, `actor: User`, keyed `approve:<fed>:<nonce>`) explaining
+  why the fed left the probe gate and the concurrent cap (the Phase-4 auditability contract).
+  Without the state flip an agent-auto-joined fed would stay probe-gated and keep counting
+  toward the concurrent cap even after the user blessed it (the gap codex flagged).
 - A `UserApproved` fed that the user later LEAVES (a future eviction verb) is out of scope
   here (5.1 has no eviction); approval is one-way in v1, like membership.
 
@@ -776,7 +782,11 @@ wallet-cli approve <fed-hex>   # bless an AutoJoined candidate -> UserApproved (
 ```
 - `discover` runs the pipeline over the chosen source(s) (`manual` = the `--invite` list, the
   offline + live-gate source; `observer` = the HTTP source). `--auto-join` enables bounded
-  agent auto-join (needs `--gateway` for the subsequent probe route against devimint). Prints
+  agent auto-join. A devimint-only `--scorer-allow-regtest` relaxes the structural floor's
+  mainnet requirement for the harness (production discovery keeps `require_mainnet = true`).
+  `--gateway` is used for the immediate post-join probe route where applicable; the ongoing
+  probe/tick verbs take their OWN `--gateway` (no route is persisted per candidate in 5.1).
+  Prints
   a summary (found / structurally passed / rejected / auto-joined) to stdout; diagnostics to
   stderr; exits non-zero only on a usage error (a source being down is not a failure — it is
   an empty contribution, ADR-0020).
@@ -798,13 +808,22 @@ wallet-cli approve <fed-hex>   # bless an AutoJoined candidate -> UserApproved (
 - **Observer source unit:** parse a recorded `/federations` fixture into announcements;
   a malformed row is skipped; a claimed id that mismatches its invite is caught downstream.
 - **Devimint smoke (`smoke_discover_devimint.sh`, the 5.1 exit gate):** the two-fed harness
-  with a MANUAL source = fed B's invite. `discover --source manual --invite <B> --auto-join
-  --gateway <GW>` structurally vets B, auto-joins it (Agent join row), and leaves it
-  `Discovered/AutoJoined` but NOT yet fundable. A `tick` at that point does NOT fund B (probe
-  not `Passed`). Then drive 5.0 probes (`probe B --from A --min-span-secs 1` ×3) to `Passed`,
-  and a `tick` NOW funds B (the gate opened). Assert the full chain in `history`: the
-  `Discover` row, the Agent `join`, the probes, and the gated-then-ungated funding — a
-  candidate that only ever failed the probe is never funded. This is the phase gate
+  with a MANUAL source = fed B's invite. **Devimint scaffolding (as every other smoke uses):**
+  devimint feds are REGTEST, so the discovery structural floor runs with a devimint scorer
+  policy (`require_mainnet = false`) — otherwise the `network` floor rejects B before
+  auto-join; and every `probe`/`tick` command carries `--gateway <GW>` (the shared LDK gateway
+  is not auto-registered into the lnv2 set) plus explicit `--spending <A> --standby <B>` pins
+  on the `tick` steps (regtest feds are scorer-ineligible, so auto-designation picks nothing —
+  the same pins `smoke_tick`/`smoke_evacuate` rely on; note the §15.3 pin refinement does NOT
+  bypass the PROBE gate for the auto-joined B, which is exactly what this gate tests).
+  Steps: `discover --source manual --invite <B> --auto-join --gateway <GW>
+  --scorer-allow-regtest` structurally vets B, auto-joins it (Agent join row), leaving it
+  `AutoJoined` but NOT fundable — a `tick --spending A --standby B --gateway <GW>` at this
+  point does NOT fund B (probe not `Passed`, asserted). Then drive 5.0 probes
+  (`probe B --from A --gateway <GW> --min-span-secs 1` ×3) to `Passed`, and the SAME `tick`
+  NOW funds B (the gate opened). Assert the full chain in `history`: the per-source `Discover`
+  row, the `AutoJoin` row, the Agent `join`, the probes, and the gated-then-ungated funding —
+  a candidate that only ever failed the probe is never funded. This is the phase gate
   (discover → structural floor → active probe → score → rebalance, fully recorded).
 
 ### 5.1.8 Settled decisions
