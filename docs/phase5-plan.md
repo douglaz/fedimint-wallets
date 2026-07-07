@@ -474,32 +474,249 @@ on a failed attempt (a probe IS a money op). `status` gains the per-fed verdict 
 
 ---
 
-## 5.1 — discovery (plan-level; buildable spec after 5.0)
+## 5.1 — discovery (BUILDABLE spec)
 
-- **Sources (both UNTRUSTED, ADR-0019/0020):** the Fedimint Observer client (candidate
-  list + uptime prior; optional, swappable, never load-bearing) and Nostr kind-38173
-  announcements (`d`=federation_id, `u`=invite, network) — DISCOVERY ONLY; kind-38000
-  ratings are ignored entirely (tested and rejected,
-  [federation-data-sources-spec.md](./federation-data-sources-spec.md) §E).
-- **Pipeline:** announcement → invite parse → authenticated config fetch (the structural
-  facts are self-authenticating against the federation id) → scorer structural floor →
-  candidate registry row (`Discovered`, never auto-funded).
-- **The 5.0 gate wire-up:** a `Discovered` fed becomes ALLOCATOR-fundable only when
-  `active_probe == Passed` (the one `if` 5.0 prepared). User-JOINED feds keep the
-  grandfathered proxy path.
-- **SETTLED (direction; the 5.1 spec owns the numbers): the loop MAY auto-join a
-  candidate that passed the structural floor, bounded and disclosed.** Without
-  auto-join, a freshly discovered federation could never reach `active_probe == Passed`
-  unattended and the phase gate below would be unsatisfiable. A join moves NO money (an
-  authenticated config fetch + a client partition — bounded local surface), lands in
-  the ledger as a `join` row with `actor: Agent` (ADR-0007's disclose-not-consent
-  posture: visible, bounded autonomy), and is THROTTLED: a CONCURRENT cap on
-  auto-joined-but-not-yet-Passed candidates plus a per-week auto-join budget (numbers
-  in the 5.1 spec). Stated honestly: with one-way joins these caps bound the RATE, not
-  the lifetime total — a long-running wallet still accumulates joined-candidate
-  partitions over months. The 5.1 spec must pick the lifetime bound: a hard lifetime
-  auto-join cap (simplest), or a partition-eviction path for never-passed candidates
-  (new machinery; currently a non-goal). Manual joins are unaffected and uncounted.
+Turn the wallet from "manage the feds the user joined" into "discover, structurally vet,
+and probe-gate candidate federations." 5.0 built the empirical trust gate (`active_probe`);
+5.1 builds the CANDIDATE PIPELINE that feeds it and WIRES the gate so a discovered fed is
+allocator-fundable only once it has PASSED. Grounded in ADR-0017 (probes gate, discovery
+never promotes), ADR-0019/0020 (discovery inputs are UNTRUSTED, the Observer is a swappable
+prior behind the gate), and [federation-data-sources-spec.md](./federation-data-sources-spec.md)
+(the Observer API §C; Nostr kind-38173 is discovery-only §E; kind-38000 ratings dropped).
+
+**Greenfield note.** Pre-release, no persisted data, no external users: NO backwards
+compatibility, NO migration shims, NO serde compat layers.
+
+### 5.1.0 The shape: a source-agnostic pipeline, sources behind a swappable seam
+
+Discovery is UNTRUSTED I/O (HTTP to the Observer, later Nostr relays), and devimint hosts
+neither — so the buildable core is the PURE pipeline + durable registry + gate wire-up +
+auto-join accounting, and the concrete sources sit behind ONE trait so (a) the logic is
+unit-testable against a fixture source, (b) the live devimint gate drives a fixture/manual
+source pointed at the harness's fed B, and (c) ADR-0020's "swappable, never load-bearing"
+Observer is literally one impl of the seam.
+
+```rust
+/// One untrusted candidate announcement (federation id + invite + network). A source NEVER
+/// asserts trust — the id is later re-derived from the AUTHENTICATED config and must match.
+pub struct CandidateAnnouncement {
+    pub federation_id: FederationId,   // as CLAIMED by the source (verified at fetch)
+    pub invite: InviteCode,
+    pub network_hint: Option<String>,  // e.g. "bitcoin"/"signet" — a hint, re-checked structurally
+    pub source: DiscoverySource,       // provenance (Observer | Nostr | Manual), for the ledger
+}
+
+pub enum DiscoverySource { Observer, Nostr, Manual }
+
+#[async_trait]
+pub trait CandidateSource {
+    /// Best-effort: a source that errors/times out yields an empty list (never blocks
+    /// discovery of the others) — ADR-0020 "the wallet is correct if the Observer is down."
+    async fn candidates(&self) -> Vec<CandidateAnnouncement>;
+}
+```
+
+Impls: **ObserverSource** (5.1, HTTP — the richest source), **ManualSource** (5.1, a fixed
+invite list from a CLI flag / fixture — the offline + live-gate source), **NostrSource**
+(DEFERRED within 5.1 to a follow-on run: same trait, added when a Nostr relay-client dep is
+vetted; the Observer already yields the candidate universe, so Nostr is additive, not
+blocking). No source is load-bearing; discovery unions whatever the configured sources return.
+
+### 5.1.1 The durable candidate registry (journal tag `0x09`)
+
+A candidate is a fed the wallet learned about but has NOT necessarily joined and has NOT
+funded. Distinct from the JOINED registry (`0x01`, user- and auto-joined membership):
+
+```rust
+pub struct CandidateRecord {
+    pub id: FederationId,
+    pub invite: InviteCode,
+    pub source: DiscoverySource,
+    pub discovered_at_ms: u64,
+    /// The one-time authenticated STRUCTURAL verdict (the free floor: guardian count,
+    /// threshold/BFT, network, modules — the scorer's structural half). Recorded so a
+    /// rejected candidate is not re-fetched every discovery pass.
+    pub structural: StructuralOutcome,
+    pub state: CandidateState,
+    pub updated_at_ms: u64,
+}
+
+pub enum StructuralOutcome { Passed, Rejected(String) }  // the reason mirrors ReasonCode
+
+pub enum CandidateState {
+    /// Structurally rejected (never fundable; kept so it is not re-probed/re-fetched).
+    Rejected,
+    /// Structurally vetted, NOT joined — surface-only until the user or the loop joins it.
+    Discovered,
+    /// AUTO-joined by the agent (a client partition exists); now probeable. The probe
+    /// verdict (5.0, read live from `probe_record`) gates funding — NOT stored here, to
+    /// stay the single source of truth.
+    AutoJoined,
+}
+```
+
+- Keys: `0x09 ++ fed_id` → JSON v1 `CandidateRecord`; scans are poison-tolerant like every
+  other registry. One row per fed, upserted in its own dbtx.
+- `FedimintJournal::{put_candidate, get_candidate, list_candidates}`.
+- A USER `join` of a discovered fed promotes nothing here — the joined registry is authority
+  for membership; the candidate row's `AutoJoined` flag distinguishes AGENT-joined from
+  USER-joined for the gate (5.1.3) and the auto-join budget (5.1.4).
+
+### 5.1.2 The pipeline (pure floor + one config-fetch I/O)
+
+`Runtime::discover(sources, policy) -> DiscoverReport`, per announcement (dedup by id;
+already-known candidates are skipped unless their structural row is absent):
+
+1. **Authenticate the invite:** fetch the `ClientConfig` from the guardian quorum WITHOUT
+   joining — reuse `client_builder().preview(connectors, &invite)` (the same authenticated
+   fetch `join` does, minus the partition write). The config is authenticated against the
+   invite's federation id, so a source cannot spoof N/threshold/modules/network. A fetch
+   failure is a TRANSIENT skip (retry next pass), recorded on the ledger, not a Rejected row.
+2. **Verify the claimed id:** `config.federation_id() == announcement.federation_id` — a
+   source that lied about the id is dropped (logged; no row) — cheap Sybil hygiene.
+3. **Assemble structural facts + run the scorer's STRUCTURAL floor** (the free half of
+   `score` — guardian count, BFT threshold, network, module presence; NO probe, NO Observer
+   prior). `Passed` → a `Discovered` `CandidateRecord`; `Rejected(reason)` → a `Rejected`
+   row (never fundable, not re-fetched).
+4. **Optionally auto-join** (5.1.4) the newly-`Discovered` candidates within budget.
+
+Every discover invocation writes a ledger row (a new `OperationKind::Discover { source,
+found, structurally_passed, rejected, auto_joined }`) so an unattended discovery pass is
+auditable — the Phase-4 auditability contract extends to the agent's discovery actions.
+
+### 5.1.3 The gate wire-up — a discovered fed funds only when PASSED
+
+`build_snapshot` (`tick.rs`) already stamps `eligible_to_fund` from the scorer verdict. 5.1
+adds: for an AUTO-JOINED discovered fed, `eligible_to_fund` ALSO requires
+`active_probe(source = designated spending fed) == Passed`. USER-joined feds keep the
+grandfathered proxy path (eligible on the scorer verdict alone — the roadmap's stance: the
+cheap proxy is fine for feds the user chose).
+
+- `build_snapshot` gains the auto-joined set (`&BTreeSet<FederationId>` from
+  `list_candidates` where `state == AutoJoined`) and the per-fed probe verdict (already
+  computed for §5.0.6's status surfacing). The `eligible_to_fund` rule becomes:
+  `scorer_eligible && (!is_auto_joined_discovered(id) || active_probe == Some(Passed))`.
+- This is the one `if` §5.0.6 prepared. It is PURE (the auto-joined set + verdict are inputs),
+  so it is golden-tested in `tick.rs` without any I/O.
+- An operator PIN still overrides for a user-joined fed (the §15.3 pin refinement); a PIN of
+  an auto-joined-discovered fed does NOT bypass the probe gate — the whole point is that the
+  agent must not fund an unproven discovered fed, and a pin cannot vouch for empirical
+  redeemability the way it vouches for a user's own fed. (A user who wants to fund a
+  discovered fed regardless joins it as a USER fed, moving it onto the grandfathered path.)
+
+### 5.1.4 Auto-join, bounded and disclosed (the SETTLED lifetime decision)
+
+Without auto-join a discovered fed can never reach `Passed` unattended, so the loop MAY
+auto-join a structurally-vetted candidate. A join moves NO money (an authenticated config
+fetch + a client partition), lands as a `join` ledger row with `actor: Agent`, and is
+bounded by THREE limits in `DiscoveryPolicy`:
+
+- `max_concurrent_unproven` (default 3): auto-joined feds whose probe is not yet `Passed`.
+  Caps the in-flight probing surface.
+- `max_auto_joins_per_week` (default 5): a rate limit read from the ledger's `join`
+  (actor Agent) rows in the trailing 7 days.
+- **`auto_join_lifetime_cap` (default 20): the SETTLED lifetime bound.** Joins are one-way
+  in v1 (no eviction — a documented non-goal), so the rate limits bound the RATE, not the
+  total; a hard lifetime cap on total agent-joined feds is the simplest bound that keeps a
+  long-running wallet's partition set finite. Counted from the candidate registry's
+  `AutoJoined` rows. **Eviction of never-passed candidates is deferred** to a later phase
+  (it needs partition-reclamation machinery; flagged, not built) — until then, hitting the
+  lifetime cap stops further auto-joins and surfaces a diagnostic, rather than silently
+  churning partitions.
+
+Every limit that BLOCKS an auto-join is `log`+`ledger`-recorded on the `Discover` row's
+counts, never silent. Manual (user) joins are unaffected and uncounted against these caps.
+
+### 5.1.5 Observer source (the first real `CandidateSource`)
+
+`ObserverSource { base_url, http }` over `reqwest` (rustls; the workspace's HTTP stance):
+`GET {base}/federations` → the summaries (`{id, name, invite, ...}`,
+[data-sources §C](./federation-data-sources-spec.md)); map each to a `CandidateAnnouncement`
+(parse the `invite`, derive the claimed id). **UNTRUSTED + swappable + never load-bearing
+(ADR-0020):** the Observer only SUGGESTS candidates; every structural fact is re-derived
+from the authenticated config (5.1.2), so a wrong/hostile Observer can waste a config fetch
+but cannot promote a fed. The unstable `/federations` schema is parsed leniently (unknown
+fields ignored; a row that fails to parse is skipped, not fatal). The Observer prior
+(uptime/backing/activity — the ADR-0020 rank bonus behind the gate) is a SEPARATE, later
+wiring into `FederationFacts.observer`; 5.1's Observer use is discovery only.
+
+### 5.1.6 CLI
+
+```
+wallet-cli discover [--source observer|manual] [--observer-url URL]
+                    [--invite <code>]... [--auto-join] [--gateway URL]
+                    [--max-auto-joins-per-week N] [--lifetime-cap N] [--json]
+wallet-cli candidates [--state discovered|autojoined|rejected] [--json]
+```
+- `discover` runs the pipeline over the chosen source(s) (`manual` = the `--invite` list, the
+  offline + live-gate source; `observer` = the HTTP source). `--auto-join` enables bounded
+  agent auto-join (needs `--gateway` for the subsequent probe route against devimint). Prints
+  a summary (found / structurally passed / rejected / auto-joined) to stdout; diagnostics to
+  stderr; exits non-zero only on a usage error (a source being down is not a failure — it is
+  an empty contribution, ADR-0020).
+- `candidates` lists the durable registry (TSV + `--json`), newest-first, filterable by state.
+
+### 5.1.7 Tests / exit gate
+
+- **Pure goldens (`wallet-core` + `tick.rs`):** the gate rule — an AUTO-JOINED discovered fed
+  is `eligible_to_fund` ONLY when `active_probe == Passed`; a USER-joined fed is eligible on
+  the scorer verdict alone; a pin does not bypass the probe gate for an auto-joined fed;
+  structural-floor pass/reject mapping.
+- **Pipeline unit (`wallet-fedimint`, fixture source):** an announcement with a mismatched
+  claimed id is dropped; a structurally-rejected config yields a `Rejected` row (not
+  re-fetched); a passed config yields a `Discovered` row; the three auto-join caps each
+  block and record (concurrent / weekly / lifetime); a down source contributes nothing
+  without failing the pass.
+- **Journal (MemDatabase):** candidate registry round-trip + poison tolerance; the
+  `Discover` ledger row records the counts; auto-join writes an Agent `join` row.
+- **Observer source unit:** parse a recorded `/federations` fixture into announcements;
+  a malformed row is skipped; a claimed id that mismatches its invite is caught downstream.
+- **Devimint smoke (`smoke_discover_devimint.sh`, the 5.1 exit gate):** the two-fed harness
+  with a MANUAL source = fed B's invite. `discover --source manual --invite <B> --auto-join
+  --gateway <GW>` structurally vets B, auto-joins it (Agent join row), and leaves it
+  `Discovered/AutoJoined` but NOT yet fundable. A `tick` at that point does NOT fund B (probe
+  not `Passed`). Then drive 5.0 probes (`probe B --from A --min-span-secs 1` ×3) to `Passed`,
+  and a `tick` NOW funds B (the gate opened). Assert the full chain in `history`: the
+  `Discover` row, the Agent `join`, the probes, and the gated-then-ungated funding — a
+  candidate that only ever failed the probe is never funded. This is the phase gate
+  (discover → structural floor → active probe → score → rebalance, fully recorded).
+
+### 5.1.8 Settled decisions
+
+1. Sources are UNTRUSTED and behind a `CandidateSource` seam; the Observer is one swappable
+   impl, never load-bearing (ADR-0020). Nostr kind-38173 slots into the same seam in a
+   follow-on; kind-38000 ratings are dropped entirely (data-sources §E).
+2. Every structural fact is re-derived from the AUTHENTICATED config; a source can only
+   suggest, never promote — the id is re-verified against the invite.
+3. The candidate registry (`0x09`) is distinct from joined membership (`0x01`); the
+   `AutoJoined` flag distinguishes agent- from user-joins for the gate and the budget.
+4. The gate: an auto-joined discovered fed funds only at `active_probe == Passed`; user-joined
+   feds keep the grandfathered proxy path; a pin does not bypass the probe gate for a
+   discovered fed.
+5. Auto-join is bounded by three caps; the LIFETIME cap (default 20) is the settled finite
+   bound — eviction of never-passed candidates is a documented deferral, not built in 5.1.
+6. Discovery I/O is best-effort: a down/hostile source is an empty contribution, never a
+   failure (the wallet is correct if the Observer is wrong/down/gone).
+
+### 5.1.9 Build order (for rb-lite)
+
+1. **5.1a — the pure core + registry + gate** (no external I/O): `CandidateAnnouncement`/
+   `DiscoverySource`/`CandidateSource` trait + `CandidateRecord`/`CandidateState` + the
+   `0x09` journal registry + `Discover` ledger kind + the `build_snapshot` gate rule +
+   auto-join accounting (the three caps, read from the ledger/registry). `ManualSource`.
+   Golden + MemDatabase tests. NO reqwest.
+2. **5.1b — `Runtime::discover` + the CLI verbs + the Observer HTTP source** (adds reqwest):
+   the pipeline (preview-fetch → id-verify → structural floor → registry → bounded
+   auto-join), `wallet-cli discover`/`candidates`, `ObserverSource`. Fixture-source unit
+   tests + the recorded-`/federations` parse test.
+3. **5.1c — the devimint exit-gate smoke** (`smoke_discover_devimint.sh`, run by hand).
+
+### Non-goals (5.1)
+
+The self-running loop (5.2, `wallet-cli watch`), the live Nostr relay source (a follow-on on
+the same seam), the Observer RANK prior (a later `FederationFacts.observer` wiring — 5.1 uses
+the Observer for discovery only), candidate/partition EVICTION (deferred; the lifetime cap is
+the finite bound instead), and any UI.
 
 ## 5.2 — the self-running loop (plan-level; buildable spec after 5.1)
 
