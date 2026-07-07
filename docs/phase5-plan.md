@@ -500,7 +500,13 @@ Observer is literally one impl of the seam.
 /// One untrusted candidate announcement (federation id + invite + network). A source NEVER
 /// asserts trust — the id is later re-derived from the AUTHENTICATED config and must match.
 pub struct CandidateAnnouncement {
-    pub federation_id: FederationId,   // as CLAIMED by the source (verified at fetch)
+    /// The federation id the SOURCE asserts — its RAW claim (Observer `id` field, Nostr `d`
+    /// tag), NOT re-derived from `invite`. Kept distinct so the pipeline's Sybil check
+    /// (`claimed_id == invite.federation_id() == config.federation_id()`) is meaningful — a
+    /// source whose claimed id disagrees with its own invite is internally inconsistent and
+    /// dropped. (For `Manual`, the caller supplies the invite and `claimed_id` is the
+    /// invite's own id — the check is a no-op there, which is correct: the user IS the source.)
+    pub claimed_id: FederationId,
     pub invite: InviteCode,
     pub network_hint: Option<String>,  // e.g. "bitcoin"/"signet" — a hint, re-checked structurally
     pub source: DiscoverySource,       // provenance (Observer | Nostr | Manual), for the ledger
@@ -548,19 +554,29 @@ pub enum CandidateState {
     Rejected,
     /// Structurally vetted, NOT joined — surface-only until the user or the loop joins it.
     Discovered,
-    /// AUTO-joined by the agent (a client partition exists); now probeable. The probe
-    /// verdict (5.0, read live from `probe_record`) gates funding — NOT stored here, to
-    /// stay the single source of truth.
+    /// AUTO-joined by the agent (a client partition exists); now probeable AND probe-GATED
+    /// for funding, and COUNTED against the auto-join caps (5.1.4). The probe verdict (5.0,
+    /// read live from `probe_record`) is NOT stored here — `probe_record` stays the single
+    /// source of truth.
     AutoJoined,
+    /// A user EXPLICITLY approved a candidate (5.1.4a): it leaves the probe gate and the
+    /// auto-join budget for the grandfathered USER-joined path — the user vouched for it.
+    /// Reached from `Discovered` (a plain `wallet-cli join`) OR from `AutoJoined` (an
+    /// `approve`, so an agent-joined fed the user later blesses stops being probe-gated and
+    /// stops counting toward the lifetime cap).
+    UserApproved,
 }
 ```
 
 - Keys: `0x09 ++ fed_id` → JSON v1 `CandidateRecord`; scans are poison-tolerant like every
   other registry. One row per fed, upserted in its own dbtx.
 - `FedimintJournal::{put_candidate, get_candidate, list_candidates}`.
-- A USER `join` of a discovered fed promotes nothing here — the joined registry is authority
-  for membership; the candidate row's `AutoJoined` flag distinguishes AGENT-joined from
-  USER-joined for the gate (5.1.3) and the auto-join budget (5.1.4).
+- Membership authority stays the joined registry (`0x01`); the candidate row's STATE
+  distinguishes agent- from user-owned for the gate (5.1.3) and the budget (5.1.4). The
+  user-ownership transitions are explicit (5.1.4a): a `Discovered` fed the user `join`s, or
+  an `AutoJoined` fed the user `approve`s, both move to `UserApproved` — off the probe gate
+  and out of the auto-join caps. `is_auto_joined_discovered(id)` in the gate means
+  `state == AutoJoined` specifically (NOT `UserApproved`).
 
 ### 5.1.2 The pipeline (pure floor + one config-fetch I/O)
 
@@ -572,17 +588,23 @@ already-known candidates are skipped unless their structural row is absent):
    fetch `join` does, minus the partition write). The config is authenticated against the
    invite's federation id, so a source cannot spoof N/threshold/modules/network. A fetch
    failure is a TRANSIENT skip (retry next pass), recorded on the ledger, not a Rejected row.
-2. **Verify the claimed id:** `config.federation_id() == announcement.federation_id` — a
-   source that lied about the id is dropped (logged; no row) — cheap Sybil hygiene.
+2. **Verify the claimed id (Sybil hygiene):** all three must agree —
+   `announcement.claimed_id == invite.federation_id() == config.federation_id()`. The
+   invite→config equality is the AUTHENTICITY check (the config is authenticated against the
+   invite's embedded id); the claimed→invite equality catches a source that announced an id
+   inconsistent with the invite it shipped. A mismatch drops the candidate (logged; no row).
 3. **Assemble structural facts + run the scorer's STRUCTURAL floor** (the free half of
    `score` — guardian count, BFT threshold, network, module presence; NO probe, NO Observer
    prior). `Passed` → a `Discovered` `CandidateRecord`; `Rejected(reason)` → a `Rejected`
    row (never fundable, not re-fetched).
 4. **Optionally auto-join** (5.1.4) the newly-`Discovered` candidates within budget.
 
-Every discover invocation writes a ledger row (a new `OperationKind::Discover { source,
-found, structurally_passed, rejected, auto_joined }`) so an unattended discovery pass is
-auditable — the Phase-4 auditability contract extends to the agent's discovery actions.
+Every discover invocation writes ONE ledger row PER SOURCE (not one per pass), a new
+`OperationKind::Discover { source, found, structurally_passed, rejected, auto_joined }`
+keyed `discover:<source>:<nonce>` — so a mixed run (Observer + Manual, later + Nostr) records
+which source found what and which was empty/down (a down source = a `found: 0` row, not a
+missing one). The Phase-4 auditability contract thus extends to each of the agent's discovery
+sources independently.
 
 ### 5.1.3 The gate wire-up — a discovered fed funds only when PASSED
 
@@ -594,15 +616,21 @@ cheap proxy is fine for feds the user chose).
 
 - `build_snapshot` gains the auto-joined set (`&BTreeSet<FederationId>` from
   `list_candidates` where `state == AutoJoined`) and the per-fed probe verdict (already
-  computed for §5.0.6's status surfacing). The `eligible_to_fund` rule becomes:
-  `scorer_eligible && (!is_auto_joined_discovered(id) || active_probe == Some(Passed))`.
-- This is the one `if` §5.0.6 prepared. It is PURE (the auto-joined set + verdict are inputs),
-  so it is golden-tested in `tick.rs` without any I/O.
-- An operator PIN still overrides for a user-joined fed (the §15.3 pin refinement); a PIN of
-  an auto-joined-discovered fed does NOT bypass the probe gate — the whole point is that the
-  agent must not fund an unproven discovered fed, and a pin cannot vouch for empirical
-  redeemability the way it vouches for a user's own fed. (A user who wants to fund a
-  discovered fed regardless joins it as a USER fed, moving it onto the grandfathered path.)
+  computed for §5.0.6's status surfacing). The probe gate LAYERS ON TOP of today's
+  `verdict.eligible_to_fund || is_pinned` rule (the §15.3 pin refinement) — it does not
+  replace it:
+  `eligible_to_fund = (scorer_eligible || is_pinned) && probe_gate_ok(id)`, where
+  `probe_gate_ok(id) = !is_auto_joined_discovered(id) || active_probe == Some(Passed)`.
+  So a USER-joined fed (never in the auto-joined set) keeps EXACTLY today's behavior
+  including the pin override; only an AGENT-auto-joined discovered fed additionally requires
+  a `Passed` probe.
+- This is the one `if` §5.0.6 prepared. It is PURE (the pinned/auto-joined sets + verdict are
+  inputs), so it is golden-tested in `tick.rs` without any I/O.
+- A PIN of an auto-joined-discovered fed does NOT bypass the probe gate (`probe_gate_ok`
+  ignores pinning): the agent must not fund an unproven discovered fed, and a pin cannot
+  vouch for empirical redeemability the way it vouches for a user's own fed. A user who wants
+  to fund a discovered fed regardless APPROVES it (5.1.4a), moving it onto the grandfathered
+  user-joined path where the pin override applies again.
 
 ### 5.1.4 Auto-join, bounded and disclosed (the SETTLED lifetime decision)
 
@@ -627,12 +655,29 @@ bounded by THREE limits in `DiscoveryPolicy`:
 Every limit that BLOCKS an auto-join is `log`+`ledger`-recorded on the `Discover` row's
 counts, never silent. Manual (user) joins are unaffected and uncounted against these caps.
 
+### 5.1.4a User approval — the manual escape hatch off the probe gate
+
+A user can take ownership of a candidate at any time, moving it to `UserApproved` (the
+grandfathered path — fundable on the scorer verdict / pin alone, no probe gate, uncounted
+against the auto-join caps):
+
+- `wallet-cli join <invite>` of a `Discovered` candidate: joins it AND sets `UserApproved`
+  (a user-initiated join is a user vouch; the `join` ledger row carries `actor: User`).
+- `wallet-cli approve <fed>` of an `AutoJoined` candidate: the fed is already joined, so this
+  only flips the candidate state `AutoJoined -> UserApproved` (no money, no new membership).
+  Without this, an agent-auto-joined fed would stay probe-gated and keep counting toward the
+  lifetime cap forever even after the user explicitly blessed it (the gap codex flagged).
+- A `UserApproved` fed that the user later LEAVES (a future eviction verb) is out of scope
+  here (5.1 has no eviction); approval is one-way in v1, like membership.
+
 ### 5.1.5 Observer source (the first real `CandidateSource`)
 
 `ObserverSource { base_url, http }` over `reqwest` (rustls; the workspace's HTTP stance):
 `GET {base}/federations` → the summaries (`{id, name, invite, ...}`,
 [data-sources §C](./federation-data-sources-spec.md)); map each to a `CandidateAnnouncement`
-(parse the `invite`, derive the claimed id). **UNTRUSTED + swappable + never load-bearing
+carrying the Observer's OWN `id` as `claimed_id` (NOT re-derived from the invite — so the
+5.1.2 `claimed == invite == config` check can actually catch an Observer row whose `id` and
+`invite` disagree) plus the parsed `invite`. **UNTRUSTED + swappable + never load-bearing
 (ADR-0020):** the Observer only SUGGESTS candidates; every structural fact is re-derived
 from the authenticated config (5.1.2), so a wrong/hostile Observer can waste a config fetch
 but cannot promote a fed. The unstable `/federations` schema is parsed leniently (unknown
@@ -646,7 +691,8 @@ wiring into `FederationFacts.observer`; 5.1's Observer use is discovery only.
 wallet-cli discover [--source observer|manual] [--observer-url URL]
                     [--invite <code>]... [--auto-join] [--gateway URL]
                     [--max-auto-joins-per-week N] [--lifetime-cap N] [--json]
-wallet-cli candidates [--state discovered|autojoined|rejected] [--json]
+wallet-cli candidates [--state discovered|autojoined|userapproved|rejected] [--json]
+wallet-cli approve <fed-hex>   # bless an AutoJoined candidate -> UserApproved (5.1.4a)
 ```
 - `discover` runs the pipeline over the chosen source(s) (`manual` = the `--invite` list, the
   offline + live-gate source; `observer` = the HTTP source). `--auto-join` enables bounded
@@ -689,7 +735,9 @@ wallet-cli candidates [--state discovered|autojoined|rejected] [--json]
 2. Every structural fact is re-derived from the AUTHENTICATED config; a source can only
    suggest, never promote — the id is re-verified against the invite.
 3. The candidate registry (`0x09`) is distinct from joined membership (`0x01`); the
-   `AutoJoined` flag distinguishes agent- from user-joins for the gate and the budget.
+   candidate STATE (`Rejected`/`Discovered`/`AutoJoined`/`UserApproved`) distinguishes
+   agent-owned (probe-gated, budgeted) from user-owned (grandfathered) for the gate and the
+   budget; a user `join`/`approve` moves a candidate to `UserApproved` (5.1.4a).
 4. The gate: an auto-joined discovered fed funds only at `active_probe == Passed`; user-joined
    feds keep the grandfathered proxy path; a pin does not bypass the probe gate for a
    discovered fed.
