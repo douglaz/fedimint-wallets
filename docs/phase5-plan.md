@@ -516,10 +516,19 @@ pub enum DiscoverySource { Observer, Nostr, Manual }
 
 #[async_trait]
 pub trait CandidateSource {
-    /// Best-effort: a source that errors/times out yields an empty list (never blocks
-    /// discovery of the others) — ADR-0020 "the wallet is correct if the Observer is down."
-    async fn candidates(&self) -> Vec<CandidateAnnouncement>;
+    /// Best-effort AND status-bearing: a source that errors/times out returns
+    /// `{ candidates: [], status: Failed(reason) }` — it never blocks discovery of the
+    /// others (ADR-0020 "the wallet is correct if the Observer is down"), but a DOWN source
+    /// stays distinguishable from a healthy source that truly found nothing, so the ledger
+    /// (5.1.2) can record which happened.
+    async fn candidates(&self) -> SourceResult;
 }
+
+pub struct SourceResult {
+    pub candidates: Vec<CandidateAnnouncement>,
+    pub status: SourceStatus,
+}
+pub enum SourceStatus { Ok, Failed(String) }
 ```
 
 Impls: **ObserverSource** (5.1, HTTP — the richest source), **ManualSource** (5.1, a fixed
@@ -624,17 +633,22 @@ one. Then, per reconciled fed:
    cap was exhausted, is picked up on a later pass once budget frees, rather than stranded
    unprobeable forever.
 
-Every discover invocation writes ONE ledger row PER SOURCE (not one per pass), a new
-`OperationKind::Discover { source, found, structurally_passed, rejected }` keyed
-`discover:<source>:<nonce>` — so a mixed run (Observer + Manual, later + Nostr) records which
-source found what and which was empty/down (a down source = a `found: 0` row, not a missing
-one). The Discover row carries NO `auto_joined` count: auto-join runs over the GLOBAL
-`Discovered` pool (candidates from earlier runs and OTHER sources), so counting it under the
-current pass's source would mis-attribute it. Each auto-join is instead its own `join` ledger
-row (`actor: Agent`, 5.1.4) — decoupled from the discovery source — and the candidate's
-durable `source` field records who ORIGINALLY discovered it. The Phase-4 auditability contract
-thus extends to each discovery source independently, and auto-joins are attributable to the
-candidate (not conflated with whichever pass happened to trigger them).
+Every discover invocation writes ledger rows so an unattended pass is fully auditable, split
+so each fact lives where it is attributable:
+- ONE `OperationKind::Discover { source, status, found, structurally_passed, rejected }` PER
+  SOURCE (keyed `discover:<source>:<nonce>`), `status` from the source's `SourceResult`
+  (`ok`/`failed:<reason>`) — so a DOWN source (`status: failed, found: 0`) is distinguishable
+  from a healthy-but-empty one (`status: ok, found: 0`).
+- ONE source-neutral `OperationKind::AutoJoin { considered, joined, blocked_concurrent,
+  blocked_weekly, blocked_lifetime }` per invocation (keyed `autojoin:<nonce>`), because
+  auto-join runs over the GLOBAL `Discovered` pool (candidates from earlier runs and other
+  sources) — a per-source counter would mis-attribute a global budget exhaustion to whichever
+  source ran last. This row is where the cap-block diagnostics live.
+- Each actual auto-join is ALSO its own `actor: Agent` `join` row (5.1.4), decoupled from the
+  discovery source; the candidate's durable `source` field records who ORIGINALLY discovered
+  it. So discovery counts are per-source, budget/cap outcomes are source-neutral, and each
+  partition the agent created is individually attributable — extending the Phase-4
+  auditability contract to every discovery action.
 
 ### 5.1.3 The gate wire-up — a discovered fed funds only when PASSED
 
@@ -675,15 +689,23 @@ bounded by THREE limits in `DiscoveryPolicy`:
   (actor Agent) rows in the trailing 7 days.
 - **`auto_join_lifetime_cap` (default 20): the SETTLED lifetime bound.** Joins are one-way
   in v1 (no eviction — a documented non-goal), so the rate limits bound the RATE, not the
-  total; a hard lifetime cap on total agent-joined feds is the simplest bound that keeps a
-  long-running wallet's partition set finite. Counted from the candidate registry's
-  `AutoJoined` rows. **Eviction of never-passed candidates is deferred** to a later phase
-  (it needs partition-reclamation machinery; flagged, not built) — until then, hitting the
-  lifetime cap stops further auto-joins and surfaces a diagnostic, rather than silently
-  churning partitions.
+  total; a hard lifetime cap on total agent-created partitions is the simplest bound that
+  keeps a long-running wallet's partition set finite. **Counted from IMMUTABLE agent-join
+  HISTORY — the ledger's `actor: Agent` `join` rows (a monotonic count of every partition
+  the agent ever created), NOT the mutable candidate state.** Counting live `AutoJoined`
+  rows would let a user flip 20 auto-joins to `UserApproved` (5.1.4a), reset the budget to 0
+  while all 20 partitions still exist, and let discovery create 20 more — the finite-set
+  guarantee gone. Approval leaves the partition in place, so it must keep counting against
+  the lifetime cap; the immutable join history does exactly that. (The CONCURRENT cap, by
+  contrast, correctly uses live `AutoJoined` state — it bounds in-flight PROBING surface,
+  which an approved fed has left; and the WEEKLY cap uses the trailing-7d window of the same
+  join rows.) **Eviction of never-passed candidates is deferred** to a later phase (it needs
+  partition-reclamation machinery; flagged, not built) — until then, hitting the lifetime cap
+  stops further auto-joins and surfaces a diagnostic, rather than silently churning partitions.
 
-Every limit that BLOCKS an auto-join is `log`+`ledger`-recorded on the `Discover` row's
-counts, never silent. Manual (user) joins are unaffected and uncounted against these caps.
+Every limit that BLOCKS an auto-join is `log`+`ledger`-recorded on the source-neutral
+`AutoJoin` row's `blocked_*` counts, never silent. Manual (user) joins are unaffected and
+uncounted against these caps.
 
 ### 5.1.4a User approval — the manual escape hatch off the probe gate
 
