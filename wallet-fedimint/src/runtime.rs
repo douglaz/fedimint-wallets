@@ -756,7 +756,8 @@ impl Runtime {
             leg_fee_cap_msat: run.leg_fee_cap.0,
             error: None,
         };
-        self.journal
+        let committed = self
+            .journal
             .record_probe_outcome(
                 &candidate,
                 &run.nonce,
@@ -769,6 +770,7 @@ impl Runtime {
             )
             .await
             .map_err(exec_err)?;
+        Self::note_probe_commit(committed, &run.nonce);
         let after = self.probe_attempts(&candidate).await?;
         Ok(ProbeReport {
             verdict_before: run.verdict_before,
@@ -833,13 +835,35 @@ impl Runtime {
 
     /// Terminalize a probe with NO attempt (§5.0.5's local/route/inconclusive exits):
     /// session cleared + umbrella row `Failed` in one dbtx, verdict history untouched.
+    /// Note a probe finalizer that lost to a stale-nonce guard in `record_probe_outcome`
+    /// (its `false` return). Under single-writer v1 (exclusive `db.lock` + the synchronous
+    /// verb) two finalizers for one session cannot race, so `committed` is always true; the
+    /// `debug_assert` pins that invariant for tests/dev, and the release warn flags the
+    /// Phase-6 concurrency case (where the returned report could disagree with history)
+    /// instead of silently discarding the signal.
+    fn note_probe_commit(committed: bool, nonce: &str) {
+        if !committed {
+            tracing::warn!(
+                nonce,
+                "probe: stale finalizer — durable history holds a different outcome for this \
+                 session; the returned report may not match it (a concurrency case \
+                 single-writer v1 forecloses; Phase-6 revisit)"
+            );
+        }
+        debug_assert!(
+            committed,
+            "stale probe finalizer for {nonce} (unreachable under single-writer v1)"
+        );
+    }
+
     async fn finish_probe_no_attempt(
         &self,
         run: &ProbeRun,
         diagnostic: &str,
         cost: Option<Msat>,
     ) -> anyhow::Result<ProbeReport> {
-        self.journal
+        let committed = self
+            .journal
             .record_probe_outcome(
                 &run.candidate,
                 &run.nonce,
@@ -852,6 +876,7 @@ impl Runtime {
             )
             .await
             .map_err(exec_err)?;
+        Self::note_probe_commit(committed, &run.nonce);
         // No attempt was recorded, so the trust verdict is unchanged from the run's start.
         Ok(ProbeReport {
             verdict_before: run.verdict_before,
@@ -897,7 +922,8 @@ impl Runtime {
                     leg_fee_cap_msat: run.leg_fee_cap.0,
                     error: Some(error_text.clone()),
                 };
-                self.journal
+                let committed = self
+                    .journal
                     .record_probe_outcome(
                         &run.candidate,
                         &run.nonce,
@@ -910,6 +936,7 @@ impl Runtime {
                     )
                     .await
                     .map_err(exec_err)?;
+                Self::note_probe_commit(committed, &run.nonce);
                 let after = self.probe_attempts(&run.candidate).await?;
                 Ok(ProbeReport {
                     verdict_before: run.verdict_before,
