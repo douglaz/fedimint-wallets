@@ -20,8 +20,8 @@ use wallet_core::{
 };
 use wallet_fedimint::{
     parse_invoice, FedimintJournal, FinalizeOutcome, GatewayUrl, Invoice, LedgerRepairOracle,
-    MoveOutcome, MultiClient, OperationId, OperationRef, ReceiveState, Runtime, ScoredFed,
-    SendOutcome, SendState, TickPolicy,
+    MoveOutcome, MultiClient, OperationId, OperationRef, ProbeOutcome, ReceiveState, Runtime,
+    ScoredFed, SendOutcome, SendState, TickPolicy,
 };
 
 #[derive(Parser)]
@@ -859,16 +859,29 @@ async fn main() -> anyhow::Result<()> {
                 "verdict_before: {}",
                 active_probe_label(report.verdict_before)
             );
-            if report.attempt.ok {
-                println!("attempt: ok");
-                println!("verdict: {}", active_probe_label(report.verdict_after));
-            } else {
-                println!(
-                    "attempt: failed {}",
-                    report.attempt.error.as_deref().unwrap_or("(no diagnostic)")
-                );
-                println!("verdict: {}", active_probe_label(report.verdict_after));
-                anyhow::bail!("probe attempt failed (a probe is a money operation)");
+            // §5.0.7 scriptable contract: attempt + verdict on stdout for EVERY terminal
+            // outcome (active_probe returns Ok even for umbrella-only no-attempt refusals;
+            // only genuinely transient defers reach the `?` above and bail to stderr).
+            match &report.outcome {
+                ProbeOutcome::Attempt(attempt) if attempt.ok => {
+                    println!("attempt: ok");
+                    println!("verdict: {}", active_probe_label(report.verdict_after));
+                }
+                ProbeOutcome::Attempt(attempt) => {
+                    println!(
+                        "attempt: failed {}",
+                        attempt.error.as_deref().unwrap_or("(no diagnostic)")
+                    );
+                    println!("verdict: {}", active_probe_label(report.verdict_after));
+                    anyhow::bail!("probe attempt failed (a probe is a money operation)");
+                }
+                ProbeOutcome::NoAttempt(diagnostic) => {
+                    // No demoting attempt was recorded (verdict unchanged), but the
+                    // invocation failed — surface it on stdout AND exit non-zero.
+                    println!("attempt: none {diagnostic}");
+                    println!("verdict: {}", active_probe_label(report.verdict_after));
+                    anyhow::bail!("probe did not complete (umbrella-only; no attempt recorded)");
+                }
             }
         }
         Command::Reconcile {
