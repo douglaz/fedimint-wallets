@@ -603,6 +603,11 @@ invite through the authenticated fetch (step 2) and adopt the FIRST that authent
 that id — so a good invite from a later source is never dropped in favor of an earlier stale
 one. Then, per reconciled fed:
 
+0. **Already-joined short-circuit.** If the fed is in the `0x01` JOINED registry (a USER
+   join, or an earlier restore) but has no `0x09` candidate row, seed the candidate row as
+   `UserApproved` and STOP — a fed the user already owns must never be reported as
+   `Discovered`, re-floored for auto-join, or counted against the auto-join budget. (An
+   `AutoJoined` candidate already HAS its row — this branch is only the no-row case.)
 1. **Decide whether to (re)fetch.** A NEW id, a reconciled invite that DIFFERS from the
    stored one (a source may publish a rotated/better invite for the same fed — invites are
    not canonical for a fed id), or a row whose `structural_checked_at_ms` is older than
@@ -710,8 +715,16 @@ uncounted against these caps.
 ### 5.1.4a User approval — the manual escape hatch off the probe gate
 
 A user can take ownership of a candidate at any time, moving it to `UserApproved` (the
-grandfathered path — fundable on the scorer verdict / pin alone, no probe gate, uncounted
-against the auto-join caps):
+grandfathered path — fundable on the scorer verdict / pin alone, no probe gate). Precisely
+which caps this frees (resolving the tension with 5.1.4's immutable lifetime count):
+approval removes the fed from the CONCURRENT cap (it leaves the in-flight probing surface
+that cap bounds, via the `AutoJoined -> UserApproved` state change) and off the probe gate.
+It does NOT free the LIFETIME cap — that counts immutable agent-`join` history, and approval
+neither reclaims the partition nor deletes the original Agent join row, so the partition the
+agent created keeps counting (the finite-set guarantee). The WEEKLY cap is a trailing-7d
+window of the same join rows: approval is irrelevant to it (the join ages out of the window
+on its own). So: approval frees CONCURRENT + the probe gate; LIFETIME and WEEKLY are
+unaffected.
 
 - `wallet-cli join <invite>` of a `Discovered` candidate: joins it AND sets `UserApproved`
   (a user-initiated join is a user vouch; the `join` ledger row carries `actor: User`).
