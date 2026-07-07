@@ -84,7 +84,7 @@ vendored here and are gitignored when cloned locally for analysis.
 | ecash-app | Flutter + Rust (FRB), Android | <https://github.com/fedimint/ecash-app> |
 | harbor | pure Rust (iced), desktop | <https://github.com/HarborWallet/harbor> |
 | vipr-wallet | Vue 3 + TS PWA | <https://github.com/ngutech21/vipr-wallet> |
-| Fedi | Rust core + React Native/PWA | Fedi monorepo |
+| Fedi | Rust core + React Native/PWA | <https://github.com/fedixyz/fedi> |
 
 ## License
 
