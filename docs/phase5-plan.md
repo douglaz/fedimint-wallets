@@ -607,9 +607,12 @@ one. Then, per reconciled fed:
 0. **Already-joined short-circuit (provenance-preserving).** If the fed is in the `0x03`
    JOINED registry, discovery must NOT re-floor / re-auto-join / budget-charge it (it is
    already joined), and must NOT DOWNGRADE its provenance. So:
-   - It already has a candidate row (`AutoJoined` or `UserApproved`): keep that state and STOP.
-     (Ownership is authoritative — an agent fed stays probe-gated, a user fed stays
-     grandfathered.)
+   - It already has a candidate row (`AutoJoined` or `UserApproved`): REFRESH its stored
+     `invite` to the newest valid one (a rotated invite is still worth keeping current for
+     backup/re-open) but keep its STATE, and STOP — no re-floor, no re-auto-join, no
+     budget charge. (Ownership is authoritative — an agent fed stays probe-gated, a user fed
+     stays grandfathered; only the invite is allowed to move, consistent with step 1's
+     refresh rule.)
    - It has a `Discovered`/`Rejected` row but is now joined (a stale row): STOP without
      changing state here — the row is superseded by membership; the OWNERSHIP is set by
      whoever joined it (a USER `join` set `UserApproved` via 5.1.4a; discovery never joins a
