@@ -83,6 +83,17 @@ fn raw_ledger_key_index(key: &IdempotencyKey) -> Vec<u8> {
     raw
 }
 
+/// The runtime's `now_ms()` is the REAL wall clock (not injected), and a recorded probe
+/// attempt now takes its `at_ms` from the session's `started_at_ms` (§P2-1: resume-independent
+/// evidence). So a seeded session must stamp `started_at_ms` at ~now, or the recorded attempt
+/// would be ancient relative to real-now and fall outside the verdict's ttl window.
+fn real_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_millis() as u64
+}
+
 fn session(out_net: Option<u64>) -> ProbeSession {
     ProbeSession {
         nonce: NONCE.to_string(),
@@ -91,7 +102,7 @@ fn session(out_net: Option<u64>) -> ProbeSession {
         leg_fee_cap_msat: LEG_FEE_CAP,
         c_spendable_before_in_msat: 0,
         out_net_msat: out_net,
-        started_at_ms: 0,
+        started_at_ms: real_now_ms(),
     }
 }
 
@@ -390,6 +401,52 @@ async fn mid_out_resume_drives_the_journaled_leg_without_any_guard() {
         "{err}"
     );
     assert!(probe_state(&journal).await.in_flight.is_some());
+}
+
+#[tokio::test]
+async fn recovered_attempt_is_stamped_at_probe_start_not_recovery_time() {
+    // §P2-1: a crash-then-delayed-resume must stamp the durable attempt at when the probe
+    // HAPPENED (the session's started_at_ms), not at recovery time — the verdict is driven
+    // entirely by at_ms, so a recovery-time stamp could keep a stale probe inside ttl.
+    let (runtime, journal) = fixture().await;
+    let started = real_now_ms() - 3_600_000; // 1h ago: distinct from now, well within ttl
+    journal
+        .begin_probe_session(
+            &CANDIDATE,
+            &ProbeSession {
+                started_at_ms: started,
+                ..session(Some(OUT_NET))
+            },
+        )
+        .await
+        .expect("seed a session that started an hour ago");
+    let mut done_in = leg_intent(in_key(), SOURCE, CANDIDATE, AMOUNT);
+    done_in.status = IntentStatus::Done;
+    seed_intent(&journal, &done_in).await;
+    let mut done_out = out_leg_intent(OUT_NET);
+    done_out.status = IntentStatus::Done;
+    seed_intent(&journal, &done_out).await;
+    journal
+        .put_move(&leg_record(in_key(), SOURCE, CANDIDATE, DELIVERED_IN, MovePhase::Settled, None))
+        .await
+        .expect("seed settled in record");
+    journal
+        .put_move(&out_leg_record(OUT_NET, MovePhase::Settled, None))
+        .await
+        .expect("seed settled out record");
+
+    let report = runtime
+        .active_probe(CANDIDATE, SOURCE, &ProbePolicy::default(), Actor::User)
+        .await
+        .expect("the resume records the attempt");
+    assert_eq!(
+        attempt(&report).at_ms,
+        started,
+        "the recovered attempt must be stamped at the probe's start, not recovery time"
+    );
+    // Durable too: the persisted attempt carries the same start time.
+    let state = probe_state(&journal).await;
+    assert_eq!(state.attempts.first().map(|a| a.at_ms), Some(started));
 }
 
 #[tokio::test]
@@ -733,6 +790,8 @@ async fn stranded_leg_and_source_and_local_faults_write_umbrella_only_outcomes()
             }
             other => panic!("expected NoAttempt, got {other:?}"),
         }
+        // §P3: leg OUT failed, so its move exists — the report keeps the out_key handle.
+        assert_eq!(report.out_key, Some(out_key(OUT_NET)), "out_key preserved on leg-OUT failure");
         let state = probe_state(&journal).await;
         assert!(state.attempts.is_empty());
         assert_eq!(state.in_flight, None);
