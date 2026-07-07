@@ -79,6 +79,13 @@ preserves the preimage) are umbrella-row history only.
 - `PROBE_AMOUNT_MSAT = 20_000` (20 sats) default: leg OUT then redeems ~13-17 sats after
   observed devimint/mainnet-cluster fees (gateway base 2-2.5 sats + ppm + fed tx fees),
   comfortably above the 5-sat floor. `PROBE_LEG_FEE_CAP_MSAT = 10_000` (10 sats) per leg.
+- **Fee-jitter margin (found by the live smoke):** leg OUT is sized against
+  `delivered_in − PROBE_FEE_MARGIN_MSAT` (default 1000 msat), NOT the full delivered net.
+  The return leg's fee cap is bounded tight by the no-sweep budget (`delivered_in −
+  out_net`), so with no margin a small upward fee re-quote at the Pay step (observed live:
+  8432 actual vs 8417 estimate) breaches the cap and defers the whole probe. The margin
+  lands as bounded extra candidate residue (accepted, §5.0.9 decision 6), far below the leg
+  fee cap, and keeps a normal probe from deferring on ordinary fee jitter.
 - Worst-case cost per attempt ≈ both legs' fees ≤ 20 sats, typical ~4-8 sats; worst-case
   LOSS on a hostile candidate = `PROBE_AMOUNT + leg fees` (leg OUT never redeems),
   bounded ≈ 30 sats. Both are `ProbePolicy` fields (5.0.3) with these defaults. There
