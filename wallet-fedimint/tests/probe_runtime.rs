@@ -14,8 +14,17 @@ use wallet_core::{
 };
 use wallet_fedimint::{
     FedimintJournal, GatewayUrl, Invoice, MovePhase, MoveRecord, MultiClient, OperationId,
-    OperationRef, Preimage, ProbeSession, Runtime,
+    OperationRef, Preimage, ProbeOutcome, ProbeReport, ProbeSession, Runtime,
 };
+
+/// Unwrap a report's recorded attempt (the tests that call this drive a full round trip or a
+/// candidate-attributable leg failure — both record an attempt).
+fn attempt(report: &ProbeReport) -> &wallet_core::ProbeAttempt {
+    match &report.outcome {
+        ProbeOutcome::Attempt(a) => a,
+        ProbeOutcome::NoAttempt(d) => panic!("expected a recorded attempt, got NoAttempt: {d}"),
+    }
+}
 
 const CANDIDATE: FederationId = FederationId([0xCC; 32]);
 const SOURCE: FederationId = FederationId([0x55; 32]);
@@ -201,11 +210,18 @@ async fn corrupt_ledger_key_index(db: &Database, key: &IdempotencyKey) {
 #[tokio::test]
 async fn not_joined_candidate_lands_a_failed_umbrella_row_with_no_attempt() {
     let (runtime, journal) = fixture().await;
-    let err = runtime
+    let report = runtime
         .active_probe(CANDIDATE, SOURCE, &ProbePolicy::default(), Actor::User)
         .await
-        .expect_err("a not-joined candidate must refuse");
-    assert!(err.to_string().contains("not joined"), "{err}");
+        .expect("a not-joined candidate is a terminal NoAttempt outcome, not an Err");
+    match &report.outcome {
+        ProbeOutcome::NoAttempt(d) => assert!(d.contains("not joined"), "{d}"),
+        other => panic!("expected NoAttempt, got {other:?}"),
+    }
+    assert_eq!(
+        report.verdict_after, report.verdict_before,
+        "a no-attempt refusal never changes the verdict"
+    );
 
     // The refusal is in history (kind Probe, Failed, the diagnostic verbatim), the
     // session is cleared, and NO attempt was written (no demotion).
@@ -237,11 +253,14 @@ async fn session_only_pre_umbrella_resume_recreates_the_row_and_repreflights() {
         .await
         .expect("seed session");
 
-    let err = runtime
+    let report = runtime
         .active_probe(CANDIDATE, SOURCE, &ProbePolicy::default(), Actor::User)
         .await
-        .expect_err("preflight still refuses the not-joined candidate");
-    assert!(err.to_string().contains("not joined"), "{err}");
+        .expect("preflight refuses the not-joined candidate as a terminal NoAttempt");
+    match &report.outcome {
+        ProbeOutcome::NoAttempt(d) => assert!(d.contains("not joined"), "{d}"),
+        other => panic!("expected NoAttempt, got {other:?}"),
+    }
 
     let row = journal
         .operation(&OperationRef::Key(umbrella_key()))
@@ -410,7 +429,7 @@ async fn crash_window_repair_records_the_attempt_and_clears_the_session() {
         .active_probe(CANDIDATE, SOURCE, &ProbePolicy::default(), Actor::User)
         .await
         .expect("both legs terminal: the resume records the attempt");
-    assert!(report.attempt.ok);
+    assert!(attempt(&report).ok);
     assert_eq!(report.verdict_before, ActiveProbeVerdict::NeverProbed);
     assert_eq!(report.verdict_after, ActiveProbeVerdict::Insufficient);
     assert_eq!(report.in_key, in_key());
@@ -482,10 +501,9 @@ async fn candidate_refused_pay_on_leg_out_writes_a_demoting_attempt() {
         .active_probe(CANDIDATE, SOURCE, &ProbePolicy::default(), Actor::User)
         .await
         .expect("a demoting failure still records an attempt (Ok report)");
-    assert!(!report.attempt.ok);
+    assert!(!attempt(&report).ok);
     assert!(
-        report
-            .attempt
+        attempt(&report)
             .error
             .as_deref()
             .unwrap_or("")
@@ -540,7 +558,7 @@ async fn candidate_refused_mint_on_leg_in_writes_a_demoting_attempt() {
         .active_probe(CANDIDATE, SOURCE, &ProbePolicy::default(), Actor::User)
         .await
         .expect("a demoting failure still records an attempt");
-    assert!(!report.attempt.ok);
+    assert!(!attempt(&report).ok);
     assert_eq!(report.verdict_after, ActiveProbeVerdict::Failed);
     assert_eq!(report.out_key, None, "leg OUT never existed");
     let state = probe_state(&journal).await;
@@ -620,11 +638,11 @@ async fn stranded_leg_and_source_and_local_faults_write_umbrella_only_outcomes()
             ))
             .await
             .expect("seed stranded record");
-        let err = runtime
+        let report = runtime
             .active_probe(CANDIDATE, SOURCE, &ProbePolicy::default(), Actor::User)
             .await
-            .expect_err("a stranded leg is ambiguous — umbrella only");
-        assert!(err.to_string().contains("no demotion"), "{err}");
+            .expect("a stranded leg is an umbrella-only NoAttempt, not an Err");
+        assert!(matches!(report.outcome, ProbeOutcome::NoAttempt(_)), "{report:?}");
         let state = probe_state(&journal).await;
         assert!(state.attempts.is_empty(), "no attempt: verdict untouched");
         assert_eq!(state.in_flight, None);
@@ -659,11 +677,14 @@ async fn stranded_leg_and_source_and_local_faults_write_umbrella_only_outcomes()
             )
             .await
             .expect("terminalize leg IN");
-        let err = runtime
+        let report = runtime
             .active_probe(CANDIDATE, SOURCE, &ProbePolicy::default(), Actor::User)
             .await
-            .expect_err("a parametric refusal must not demote");
-        assert!(err.to_string().contains("no demotion"), "{err}");
+            .expect("a parametric refusal is an umbrella-only NoAttempt");
+        match &report.outcome {
+            ProbeOutcome::NoAttempt(d) => assert!(d.contains("fee over cap"), "{d}"),
+            other => panic!("expected NoAttempt, got {other:?}"),
+        }
         let state = probe_state(&journal).await;
         assert!(state.attempts.is_empty());
         assert_eq!(state.in_flight, None);
@@ -699,11 +720,16 @@ async fn stranded_leg_and_source_and_local_faults_write_umbrella_only_outcomes()
             )
             .await
             .expect("terminalize leg OUT");
-        let err = runtime
+        let report = runtime
             .active_probe(CANDIDATE, SOURCE, &ProbePolicy::default(), Actor::User)
             .await
-            .expect_err("a source-side fault must not demote");
-        assert!(err.to_string().contains("no demotion"), "{err}");
+            .expect("a source-side fault is an umbrella-only NoAttempt");
+        match &report.outcome {
+            ProbeOutcome::NoAttempt(d) => {
+                assert!(d.contains("source federation refused to mint"), "{d}")
+            }
+            other => panic!("expected NoAttempt, got {other:?}"),
+        }
         let state = probe_state(&journal).await;
         assert!(state.attempts.is_empty());
         assert_eq!(state.in_flight, None);

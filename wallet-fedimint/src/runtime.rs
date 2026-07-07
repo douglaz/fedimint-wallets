@@ -539,9 +539,7 @@ impl Runtime {
                 .await
                 .map_err(exec_err)?;
             if let Err(diagnostic) = self.probe_preflight(&session, candidate).await {
-                self.finish_probe_no_attempt(&run, &diagnostic, None)
-                    .await?;
-                anyhow::bail!("probe preflight failed: {diagnostic}");
+                return self.finish_probe_no_attempt(&run, &diagnostic, None).await;
             }
         }
 
@@ -621,13 +619,13 @@ impl Runtime {
                              leg fee cap (shortfall is parametric, not a redeemability failure)",
                             delivered_in.0, run.leg_fee_cap.0
                         );
-                        self.finish_probe_no_attempt(
-                            &run,
-                            &diagnostic,
-                            probe_cost(Some(&in_rec), None),
-                        )
-                        .await?;
-                        anyhow::bail!("{diagnostic}");
+                        return self
+                            .finish_probe_no_attempt(
+                                &run,
+                                &diagnostic,
+                                probe_cost(Some(&in_rec), None),
+                            )
+                            .await;
                     }
                     Err(e) => anyhow::bail!(
                         "probe leg OUT sizing failed transiently ({e:?}); re-run `probe` to \
@@ -662,9 +660,28 @@ impl Runtime {
                 delivered_in,
             ) {
                 let diagnostic = "probe delta consumed before redemption; inconclusive";
-                self.finish_probe_no_attempt(&run, diagnostic, probe_cost(Some(&in_rec), None))
-                    .await?;
-                anyhow::bail!("{diagnostic}");
+                return self
+                    .finish_probe_no_attempt(&run, diagnostic, probe_cost(Some(&in_rec), None))
+                    .await;
+            }
+            // Re-check the SOURCE cap on resume too (the fresh preflight's check is stale
+            // once a resume can span an inflow): if `from` drifted above the cap between the
+            // legs, `do_move(candidate -> from)` would deterministically fail ADR-0018 after
+            // leg IN already spent — the same guaranteed inconclusive spend the fresh
+            // preflight prevents. Abort umbrella-only BEFORE the doomed return move.
+            if let Some(cap) = self.hard_cap {
+                let src_spendable = self.mc.balance(&run.source).await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "probe: reading the source balance for the resume cap check failed                          transiently ({e}); re-run `probe` to resume (session retained)"
+                    )
+                })?;
+                if src_spendable.0 > cap.0 {
+                    let diagnostic =
+                        "probe source rose above the per-fed cap between legs; inconclusive";
+                    return self
+                        .finish_probe_no_attempt(&run, diagnostic, probe_cost(Some(&in_rec), None))
+                        .await;
+                }
             }
         }
 
@@ -729,7 +746,7 @@ impl Runtime {
         let after = self.probe_attempts(&candidate).await?;
         Ok(ProbeReport {
             verdict_before: run.verdict_before,
-            attempt,
+            outcome: ProbeOutcome::Attempt(attempt),
             verdict_after: probe_verdict(&after, run.source, now_ms(), &run.effective_policy),
             in_key: run.in_key,
             out_key: Some(out_key),
@@ -795,7 +812,7 @@ impl Runtime {
         run: &ProbeRun,
         diagnostic: &str,
         cost: Option<Msat>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<ProbeReport> {
         self.journal
             .record_probe_outcome(
                 &run.candidate,
@@ -808,8 +825,15 @@ impl Runtime {
                 Some(diagnostic),
             )
             .await
-            .map_err(exec_err)
-            .map(|_| ())
+            .map_err(exec_err)?;
+        // No attempt was recorded, so the trust verdict is unchanged from the run's start.
+        Ok(ProbeReport {
+            verdict_before: run.verdict_before,
+            outcome: ProbeOutcome::NoAttempt(diagnostic.to_string()),
+            verdict_after: run.verdict_before,
+            in_key: run.in_key.clone(),
+            out_key: None,
+        })
     }
 
     /// Terminalize a probe whose leg FAILED (§5.0.3's fault attribution): a
@@ -863,19 +887,13 @@ impl Runtime {
                 let after = self.probe_attempts(&run.candidate).await?;
                 Ok(ProbeReport {
                     verdict_before: run.verdict_before,
-                    attempt,
+                    outcome: ProbeOutcome::Attempt(attempt),
                     verdict_after: probe_verdict(&after, run.source, now_ms(), &run.effective_policy),
                     in_key: run.in_key.clone(),
                     out_key,
                 })
             }
-            LegFault::UmbrellaOnly => {
-                self.finish_probe_no_attempt(run, &error_text, cost).await?;
-                anyhow::bail!(
-                    "{error_text} (not candidate-attributable; recorded on the probe's \
-                     umbrella ledger row only — no demotion)"
-                );
-            }
+            LegFault::UmbrellaOnly => self.finish_probe_no_attempt(run, &error_text, cost).await,
         }
     }
 
@@ -1655,11 +1673,28 @@ fn move_key(
 #[derive(Clone, Debug)]
 pub struct ProbeReport {
     pub verdict_before: ActiveProbeVerdict,
-    pub attempt: ProbeAttempt,
+    pub outcome: ProbeOutcome,
     pub verdict_after: ActiveProbeVerdict,
     pub in_key: IdempotencyKey,
     /// `None` when the probe never reached leg OUT (a leg-IN failure).
     pub out_key: Option<IdempotencyKey>,
+}
+
+/// A probe invocation's terminal, operator-visible result. `active_probe` returns this
+/// (Ok) for EVERY terminal outcome — success, a candidate-attributable leg failure, OR an
+/// umbrella-only no-attempt refusal — so the CLI can honor its §5.0.7 scriptable stdout
+/// contract in the failure cases too. `active_probe` reserves `Err` for genuinely
+/// TRANSIENT defers (a balance read failed, session retained for a re-run).
+#[derive(Clone, Debug)]
+pub enum ProbeOutcome {
+    /// A recorded attempt: a full round trip (`ok`) or a candidate-attributable leg
+    /// failure (`!ok`) — both durably appended to the probe history and reflected in
+    /// `verdict_after`.
+    Attempt(ProbeAttempt),
+    /// A terminal umbrella-only refusal that recorded NO attempt (a source/route/local
+    /// fault, an inconclusive resume, or a parametric infeasibility): the trust verdict is
+    /// unchanged. Carries the verbatim diagnostic.
+    NoAttempt(String),
 }
 
 /// One probe invocation's fixed identity, threaded through the §5.0.5 exits.
