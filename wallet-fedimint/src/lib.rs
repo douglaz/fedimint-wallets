@@ -61,8 +61,8 @@ pub use multi_client::{
 };
 pub use probe::{assemble_facts, assemble_status, FedimintProbeRunner, ProbeResult};
 pub use runtime::{
-    DirectInflowOutcome, FinalizeOutcome, MoveOutcome, ProbeOutcome, ProbeReport,
-    ReconcileSummary, Runtime,
+    DirectInflowOutcome, FinalizeOutcome, MoveOutcome, ProbeOutcome, ProbeReport, ReconcileSummary,
+    Runtime,
 };
 pub use tick::{build_snapshot, ScoredFed, StatusReport, TickPolicy, TickReport};
 pub use types::{GatewayUrl, Invoice, OperationId, Preimage};

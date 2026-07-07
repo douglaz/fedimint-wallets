@@ -1753,7 +1753,14 @@ pub fn prune_probe_attempts(attempts: Vec<ProbeAttempt>, now_ms: u64) -> Vec<Pro
     // DEFAULT-sized pass, turning that pair's aged-out `Expired` into a false `NeverProbed`.
     // Keep, per source: (a) the newest success (any strength) AND (b) the newest success
     // that qualifies under the DEFAULT policy — the strength `status`/gating actually
-    // evaluate. Both are bounded by the joined-fed count (small).
+    // evaluate. Both are bounded by the joined-fed count (small). BOUND (deliberate): only
+    // the default policy's stale evidence is preserved, not every possible strictness. No
+    // 5.0 caller evaluates a NON-default policy over STALE evidence — `status` and 5.1's
+    // gate both read the DEFAULT-policy `active_probe` verdict (§5.0.6), and the `probe`
+    // verb evaluates its own (possibly stricter) flags only against FRESH post-attempt
+    // state. A future gate that trusts a stricter-than-default policy must revisit
+    // retention (retaining every strictness would require keeping all successes, defeating
+    // the bound); flagged for 5.1, not built speculatively here.
     let default_policy = ProbePolicy::default();
     let default_qualifies = |a: &ProbeAttempt| {
         a.ok && a.amount_msat >= default_policy.amount_msat
