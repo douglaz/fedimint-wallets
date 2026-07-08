@@ -121,6 +121,48 @@ const MAX_OBSERVER_PRIOR_BONUS: u32 = STRUCTURAL_WEIGHT - 1;
 
 /// Score one federation. PURE: deterministic, no I/O, no floats.
 pub fn score(facts: &FederationFacts, policy: &ScorerPolicy) -> FederationVerdict {
+    let (floor_ok, mut reasons) = structural_floor(facts, policy);
+
+    // ---- Probe gate: hard reject (ADR-0017). ----
+    let gate_ok = facts.quorum_live && facts.round_trip_ok;
+    if !gate_ok {
+        reasons.push(ReasonCode::ProbeFailed);
+    }
+
+    // Eligibility = floor AND gate. The Observer prior is BEHIND the gate and
+    // cannot enter this decision: a probe-failed fed stays ineligible regardless.
+    let eligible_to_fund = floor_ok && gate_ok;
+
+    // Rank is only meaningful for eligible feds; otherwise it is forced to 0 so an
+    // untrusted prior can never lift a rejected fed above an eligible one.
+    let rank_score = if eligible_to_fund {
+        rank(facts, &mut reasons)
+    } else {
+        0
+    };
+
+    FederationVerdict {
+        eligible_to_fund,
+        rank_score,
+        reasons,
+    }
+}
+
+/// Run only the authenticated structural floor used by discovery (§5.1.2).
+///
+/// Discovery candidates are unprobed by definition, so this deliberately excludes
+/// [`ReasonCode::ProbeFailed`] and all ranking/prior reasons. It answers only whether the
+/// config-derived facts satisfy the free structural minimum.
+pub fn score_structural(facts: &FederationFacts, policy: &ScorerPolicy) -> FederationVerdict {
+    let (floor_ok, reasons) = structural_floor(facts, policy);
+    FederationVerdict {
+        eligible_to_fund: floor_ok,
+        rank_score: 0,
+        reasons,
+    }
+}
+
+fn structural_floor(facts: &FederationFacts, policy: &ScorerPolicy) -> (bool, Vec<ReasonCode>) {
     let mut reasons = Vec::new();
 
     // ---- Structural floor: hard rejects (collect every failing reason). ----
@@ -178,29 +220,7 @@ pub fn score(facts: &FederationFacts, policy: &ScorerPolicy) -> FederationVerdic
         floor_ok = false;
     }
 
-    // ---- Probe gate: hard reject (ADR-0017). ----
-    let gate_ok = facts.quorum_live && facts.round_trip_ok;
-    if !gate_ok {
-        reasons.push(ReasonCode::ProbeFailed);
-    }
-
-    // Eligibility = floor AND gate. The Observer prior is BEHIND the gate and
-    // cannot enter this decision: a probe-failed fed stays ineligible regardless.
-    let eligible_to_fund = floor_ok && gate_ok;
-
-    // Rank is only meaningful for eligible feds; otherwise it is forced to 0 so an
-    // untrusted prior can never lift a rejected fed above an eligible one.
-    let rank_score = if eligible_to_fund {
-        rank(facts, &mut reasons)
-    } else {
-        0
-    };
-
-    FederationVerdict {
-        eligible_to_fund,
-        rank_score,
-        reasons,
-    }
+    (floor_ok, reasons)
 }
 
 /// Fedimint's own BFT threshold for `n` guardians: `n − f` with `f = (n−1)/3`

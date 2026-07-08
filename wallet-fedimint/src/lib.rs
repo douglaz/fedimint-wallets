@@ -46,7 +46,10 @@ pub mod runtime;
 pub mod tick;
 pub mod types;
 
-pub use discovery::{CandidateAnnouncement, CandidateSource, ManualSource, SourceResult};
+pub use discovery::{
+    parse_observer_federations, AutoJoinReport, CandidateAnnouncement, CandidateSource,
+    DiscoverReport, DiscoverSourceReport, ManualSource, ObserverSource, SourceResult,
+};
 pub use executor::FedimintExecutor;
 pub use fee::{gross_up, predicted_net, total_within_cap, GatewayFee, GrossUp};
 pub use journal::{

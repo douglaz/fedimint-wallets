@@ -17,6 +17,7 @@ use fedimint_client::module::oplog::UpdateStreamOrOutcome;
 use fedimint_client::secret::RootSecretStrategy as _;
 use fedimint_client::{Client, ClientBuilder, ClientHandleArc, RootSecret};
 use fedimint_connectors::ConnectorRegistry;
+use fedimint_core::config::ClientConfig;
 use fedimint_core::core::OperationId as FedimintOperationId;
 use fedimint_core::db::{Database, IDatabaseTransactionOpsCore};
 use fedimint_core::invite_code::InviteCode;
@@ -185,6 +186,18 @@ impl MultiClient {
             .keys()
             .copied()
             .collect()
+    }
+
+    /// Fetch and authenticate a federation config from an invite without joining or writing a
+    /// client partition (§5.1.2 step 2). This is the same preview fetch `join` uses before the
+    /// partition write.
+    pub async fn preview_config(&self, invite: &InviteCode) -> anyhow::Result<ClientConfig> {
+        let preview = self
+            .client_builder()
+            .await?
+            .preview(self.connectors.clone(), invite)
+            .await?;
+        Ok(preview.config().clone())
     }
 
     fn has_client(&self, id: &FederationId) -> bool {

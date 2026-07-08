@@ -526,7 +526,10 @@ async fn put_candidate_overwrites_a_corrupt_row_so_get_recovers() {
         .expect("overwrite the corrupt row");
 
     assert_eq!(
-        journal.get_candidate(&id).await.expect("get after overwrite"),
+        journal
+            .get_candidate(&id)
+            .await
+            .expect("get after overwrite"),
         Some(recovered),
         "put_candidate overwrites the poisoned key so the fed is recovered as UserApproved"
     );
@@ -646,7 +649,7 @@ async fn concurrent_unproven_counts_unidentified_rows_fail_closed() {
 }
 
 #[tokio::test]
-async fn auto_join_history_counts_only_successful_new_agent_joins() {
+async fn auto_join_history_counts_agent_created_partitions() {
     const DAY_MS: u64 = 24 * 60 * 60 * 1000;
     let journal = mem_journal();
     let actor = Actor::Agent {
@@ -678,6 +681,27 @@ async fn auto_join_history_counts_only_successful_new_agent_joins() {
             .record_terminal(&key, status, started_at_ms + 1, error, None)
             .await
             .expect("record terminal");
+    }
+
+    async fn write_started_join(
+        journal: &FedimintJournal,
+        suffix: &str,
+        fed_id: FederationId,
+        actor: Actor,
+        started_at_ms: u64,
+    ) {
+        let key = IdempotencyKey(format!("join:{}:{suffix}", fed_id.to_hex()));
+        journal
+            .record_started(
+                &key,
+                OperationKind::Join { fed: fed_id },
+                actor,
+                ReasonCode::StandingInstruction,
+                started_at_ms,
+                None,
+            )
+            .await
+            .expect("record started");
     }
 
     let now = 10 * DAY_MS;
@@ -732,16 +756,165 @@ async fn auto_join_history_counts_only_successful_new_agent_joins() {
     )
     .await;
 
+    let crashed_after_registry = fed(0x47);
+    let crashed_started_at = now - DAY_MS;
+    write_started_join(
+        &journal,
+        "crashed-after-registry",
+        crashed_after_registry,
+        actor,
+        crashed_started_at,
+    )
+    .await;
+    journal
+        .put_federation(
+            &crashed_after_registry,
+            &FederationInfo {
+                invite: "fed1crashed".to_string(),
+                db_prefix: 47,
+                joined_at: crashed_started_at / 1000,
+            },
+        )
+        .await
+        .expect("put crashed registry evidence");
+
+    let slow_crashed_after_registry = fed(0x4B);
+    let slow_crashed_started_at = now - DAY_MS;
+    write_started_join(
+        &journal,
+        "slow-crashed-after-registry",
+        slow_crashed_after_registry,
+        actor,
+        slow_crashed_started_at,
+    )
+    .await;
+    journal
+        .put_federation(
+            &slow_crashed_after_registry,
+            &FederationInfo {
+                invite: "fed1slowcrashed".to_string(),
+                db_prefix: 51,
+                joined_at: slow_crashed_started_at.saturating_add(2 * 60 * 1000) / 1000,
+            },
+        )
+        .await
+        .expect("put slow crashed registry evidence");
+
+    let started_without_registry = fed(0x48);
+    write_started_join(
+        &journal,
+        "started-without-registry",
+        started_without_registry,
+        actor,
+        now - DAY_MS,
+    )
+    .await;
+
+    let preexisting_registry = fed(0x49);
+    let preexisting_started_at = now - DAY_MS;
+    write_started_join(
+        &journal,
+        "preexisting-registry",
+        preexisting_registry,
+        actor,
+        preexisting_started_at,
+    )
+    .await;
+    journal
+        .put_federation(
+            &preexisting_registry,
+            &FederationInfo {
+                invite: "fed1preexisting".to_string(),
+                db_prefix: 49,
+                joined_at: preexisting_started_at.saturating_sub(2 * 60 * 1000) / 1000,
+            },
+        )
+        .await
+        .expect("put preexisting registry evidence");
+
+    let stale_before_later_user_join = fed(0x4A);
+    let stale_started_at = now - 2 * DAY_MS;
+    write_started_join(
+        &journal,
+        "stale-before-later-user-join",
+        stale_before_later_user_join,
+        actor,
+        stale_started_at,
+    )
+    .await;
+    journal
+        .put_federation(
+            &stale_before_later_user_join,
+            &FederationInfo {
+                invite: "fed1lateruser".to_string(),
+                db_prefix: 50,
+                joined_at: now / 1000,
+            },
+        )
+        .await
+        .expect("put later user registry evidence");
+
     assert_eq!(
         journal.weekly_auto_joins(now).await.expect("weekly count"),
-        1,
-        "weekly counts only recent successful new-partition Agent joins"
+        4,
+        "weekly counts recent terminal Agent joins plus registry-backed crashed Agent joins"
     );
     assert_eq!(
         journal.lifetime_auto_joins().await.expect("lifetime count"),
-        2,
-        "lifetime counts all successful new-partition Agent joins"
+        5,
+        "lifetime counts terminal Agent joins plus registry-backed crashed Agent joins"
     );
+    assert!(
+        journal
+            .agent_created_federation(&fed(0x41))
+            .await
+            .expect("agent-created recent"),
+        "a successful new-partition Agent join identifies the fed as agent-created"
+    );
+    assert!(
+        journal
+            .agent_created_federation(&fed(0x42))
+            .await
+            .expect("agent-created old"),
+        "old successful Agent joins still count for ownership recovery"
+    );
+    assert!(
+        journal
+            .agent_created_federation(&crashed_after_registry)
+            .await
+            .expect("agent-created from registry-backed started join"),
+        "a registry-backed non-terminal Agent join identifies the crash-after-partition case"
+    );
+    assert!(
+        journal
+            .agent_created_federation(&slow_crashed_after_registry)
+            .await
+            .expect("agent-created from slow registry-backed started join"),
+        "a slow registry-backed non-terminal Agent join is recovered fail-closed"
+    );
+    assert!(
+        journal
+            .agent_created_federation(&stale_before_later_user_join)
+            .await
+            .expect("agent-created from stale registry-backed started join"),
+        "an old non-terminal Agent join backed by a later registry row is ambiguous, so recovery counts it fail-closed"
+    );
+    for id in [
+        fed(0x43),
+        fed(0x44),
+        fed(0x45),
+        fed(0x46),
+        started_without_registry,
+        preexisting_registry,
+    ] {
+        assert!(
+            !journal
+                .agent_created_federation(&id)
+                .await
+                .expect("non agent-created"),
+            "failed, no-op, user, absent, and post-registry started joins are not agent-created evidence"
+        );
+    }
 }
 
 #[tokio::test]

@@ -22,5 +22,8 @@ pub use probe::{
     PROBE_LEG_FEE_CAP_MSAT,
 };
 pub use scorer::ReasonCode as ScorerReasonCode;
-pub use scorer::{score, FederationFacts, FederationVerdict, Module, ObserverPrior, ScorerPolicy};
+pub use scorer::{
+    score, score_structural, FederationFacts, FederationVerdict, Module, ObserverPrior,
+    ScorerPolicy,
+};
 pub use types::*;
