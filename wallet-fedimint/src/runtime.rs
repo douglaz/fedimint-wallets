@@ -1484,19 +1484,29 @@ impl Runtime {
         }
     }
 
+    /// The funding gate's PROBE-GATED set: every JOINED (`0x03`) federation that is NOT
+    /// provably user-owned. Deriving it from joined MEMBERSHIP minus `UserApproved` candidates
+    /// — rather than from `AutoJoined` candidate rows alone — fails CLOSED on two windows an
+    /// AutoJoined-only set misses, both of which would otherwise let `tick` fund an
+    /// agent-created member PRE-PROBE (defeating §5.1's "probes gate, discovery never
+    /// promotes" invariant on the money path): (a) a crash between the Agent `join` and the
+    /// `AutoJoined` candidate write leaves a member with a `Discovered`/absent `0x09` row;
+    /// (b) a `0x03`-only restore leaves every agent-joined member with no `0x09` row.
+    /// `discover`'s step-0 recovery repairs such rows, but `tick`/`build_snapshot` never run
+    /// it, so the GATE itself must be conservative. Only an explicit `UserApproved` row (a
+    /// user `join`/`approve`) exempts a member; a poison `0x09` row cannot PROVE user
+    /// ownership, so it never exempts (the member stays gated by construction).
     async fn auto_joined_candidates(&self) -> anyhow::Result<BTreeSet<FederationId>> {
         let report = self
             .journal
             .list_candidates_report()
             .await
             .map_err(exec_err)?;
-        let mut auto_joined: BTreeSet<FederationId> = report
-            .candidates
-            .into_iter()
-            .filter_map(|(id, rec)| (rec.state == CandidateState::AutoJoined).then_some(id))
-            .collect();
-        auto_joined.extend(report.skipped_ids);
-        Ok(auto_joined)
+        let joined = self.journal.list_federations().await.map_err(exec_err)?;
+        Ok(probe_gated_members(
+            joined.into_iter().map(|(id, _)| id),
+            report.candidates.iter().map(|(id, rec)| (*id, rec.state)),
+        ))
     }
 
     async fn active_probe_verdicts(
@@ -2340,6 +2350,25 @@ fn no_sweep_ok(c_spendable: Msat, baseline: Msat, delivered_in: Msat) -> bool {
     c_spendable.0 == baseline.0.saturating_add(delivered_in.0)
 }
 
+/// PURE core of [`Runtime::auto_joined_candidates`] (§5.1.3 funding gate): the probe-gated
+/// set = JOINED members minus the `UserApproved` ones. Membership-minus-UserApproved (NOT
+/// AutoJoined-rows-only) is what fails closed on the crash/restore windows where an
+/// agent-created member's `0x09` row is still `Discovered`/`Rejected`/absent — those would
+/// otherwise read as ungated on `tick` and fund pre-probe.
+fn probe_gated_members(
+    joined: impl IntoIterator<Item = FederationId>,
+    candidate_states: impl IntoIterator<Item = (FederationId, CandidateState)>,
+) -> BTreeSet<FederationId> {
+    let user_approved: BTreeSet<FederationId> = candidate_states
+        .into_iter()
+        .filter_map(|(id, state)| (state == CandidateState::UserApproved).then_some(id))
+        .collect();
+    joined
+        .into_iter()
+        .filter(|id| !user_approved.contains(id))
+        .collect()
+}
+
 /// Leg OUT's effective cap: the operator's per-leg cap still bounds fees, but the
 /// return leg must also prove `out_net + actual drive-time fees <= delivered_in`.
 /// The executor re-quotes send fees at `Pay`, so using the remaining delivered delta
@@ -2569,6 +2598,36 @@ mod tests {
 
     const FED_A: FederationId = FederationId([0xAA; 32]);
     const FED_B: FederationId = FederationId([0xBB; 32]);
+    const FED_C: FederationId = FederationId([0xCC; 32]);
+    const FED_D: FederationId = FederationId([0xDD; 32]);
+
+    #[test]
+    fn probe_gated_set_is_joined_members_minus_user_approved() {
+        // The §5.1.3 funding gate must probe-gate every JOINED member that is not provably
+        // user-owned — closing the crash/restore bypass where an agent-created member's 0x09
+        // row is still Discovered/absent and an AutoJoined-rows-only set would read it ungated.
+        let joined = [FED_A, FED_B, FED_C, FED_D];
+        let states = [
+            (FED_A, CandidateState::UserApproved), // user-owned -> UNGATED
+            (FED_B, CandidateState::AutoJoined),   // agent-owned -> gated
+            (FED_C, CandidateState::Discovered),   // crash: joined member, stale row -> gated
+            // FED_D: joined member with NO candidate row (0x03-only restore) -> gated
+        ];
+        let gated = probe_gated_members(joined, states);
+        assert!(!gated.contains(&FED_A), "UserApproved member is not probe-gated");
+        assert!(gated.contains(&FED_B), "AutoJoined member is probe-gated");
+        assert!(
+            gated.contains(&FED_C),
+            "a joined member with a stale Discovered row (crash window) is probe-gated"
+        );
+        assert!(
+            gated.contains(&FED_D),
+            "a joined member with no candidate row (restore) is probe-gated, not ungated"
+        );
+        // A Discovered candidate that is NOT joined never reaches the gate (not in `joined`).
+        let not_joined = probe_gated_members([FED_A], [(FED_B, CandidateState::Discovered)]);
+        assert_eq!(not_joined, BTreeSet::from([FED_A]));
+    }
 
     async fn runtime_fixture() -> (Runtime, Arc<FedimintJournal>) {
         let db = MemDatabase::new().into_database();

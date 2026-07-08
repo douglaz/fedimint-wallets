@@ -292,6 +292,17 @@ fn needs_structural_fetch(
     }
     let stale = now_ms.saturating_sub(existing.structural_checked_at_ms)
         > policy.structural_recheck_backoff_ms;
+    // Re-fetch when the stored invite is NO LONGER announced (a genuine rotation — the known
+    // endpoint is gone) OR the row is stale. A differing invite that merely COEXISTS with the
+    // still-announced stored invite does NOT force a re-fetch: the stored invite is still a
+    // known-good way to reach the fed, and honoring the backoff here is a deliberate
+    // DoS-defense — otherwise a noisy/hostile Observer could force an authenticated config
+    // fetch every pass by advertising ever-changing alternate invites (the untrusted-source
+    // volume/time class deferred to 5.2). A rotated invite is adopted within <= the backoff
+    // window, and auto-join re-validates the invite with a fresh fetch regardless, so a truly
+    // dead stored invite self-corrects. (Codex adversarial P2 flagged the coexistence case as
+    // a bug against the spec's literal wording; rejected with this evidence and the spec's
+    // §5.1.2 step 1 refined to match — the strict-backoff behavior is the more robust design.)
     let stored_invite_announced = announcements
         .iter()
         .any(|indexed| indexed.announcement.invite == existing.invite);
