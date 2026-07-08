@@ -1210,7 +1210,7 @@ fn client_prefix_bytes(db_prefix: u32) -> Vec<u8> {
 }
 
 /// Bridge fedimint's `FederationId` (a `sha256::Hash`) to ours (`[u8; 32]`, spec §3).
-fn bridge_federation_id(id: fedimint_core::config::FederationId) -> FederationId {
+pub(crate) fn bridge_federation_id(id: fedimint_core::config::FederationId) -> FederationId {
     FederationId(id.0.to_byte_array())
 }
 

@@ -10,6 +10,7 @@
 //! correlation keys — and this module's shapes are the impl spec §7 refinement of it
 //! (`reason` mandatory via [`crate::ReasonCode::UserInitiated`], gateways `Option`).
 
+use crate::discovery::{DiscoverySource, SourceStatus};
 use crate::executor::IntentStatus;
 use crate::types::{
     Action, FederationId, GatewayUrl, IdempotencyKey, Msat, Occurrence, OperationId, ReasonCode,
@@ -146,6 +147,36 @@ pub enum OperationKind {
         decisions: u32,
         performed: u32,
         failed: u32,
+    },
+    /// One discovery row PER SOURCE per `discover` invocation (phase 5 §5.1.2), keyed
+    /// `discover:<source>:<nonce>`. `status` (from the source's `SourceResult`) keeps a DOWN
+    /// source (`Failed`, `found: 0`) distinguishable from a healthy-but-empty one (`Ok`,
+    /// `found: 0`); the counts split the pass's outcome by structural verdict.
+    Discover {
+        source: DiscoverySource,
+        status: SourceStatus,
+        found: u32,
+        structurally_passed: u32,
+        rejected: u32,
+    },
+    /// The source-NEUTRAL auto-join row (§5.1.2), ONE per `discover` invocation, keyed
+    /// `autojoin:<nonce>`: auto-join runs over the GLOBAL `Discovered` pool, so a per-source
+    /// counter would mis-attribute a global budget exhaustion. `blocked_*` are the cap-block
+    /// diagnostics (§5.1.4) — every limit that stops an auto-join is recorded here, never
+    /// silent.
+    AutoJoin {
+        considered: u32,
+        joined: u32,
+        blocked_concurrent: u32,
+        blocked_weekly: u32,
+        blocked_lifetime: u32,
+    },
+    /// The `wallet-cli approve` audit row (§5.1.4a), `actor: User`, keyed
+    /// `approve:<fed-hex>:<nonce>`: a user blessing an `AutoJoined` candidate flips it to
+    /// `UserApproved` (no money, no new membership), leaving the probe gate + the concurrent
+    /// cap. The row explains WHY the fed left the gate (the Phase-4 auditability contract).
+    Approve {
+        fed: FederationId,
     },
 }
 
@@ -329,7 +360,12 @@ fn enrich_kind(kind: &mut OperationKind, upd: &RawOpUpdate) {
         OperationKind::Join { .. }
         | OperationKind::Refusal { .. }
         | OperationKind::Tick { .. }
-        | OperationKind::Probe { .. } => {}
+        | OperationKind::Probe { .. }
+        // Discovery rows carry their full counts at creation/terminalization; there are no
+        // in-flight op-ids/gateway/amounts to fill in later (§5.1.2).
+        | OperationKind::Discover { .. }
+        | OperationKind::AutoJoin { .. }
+        | OperationKind::Approve { .. } => {}
         OperationKind::Receive { op_id, gateway, .. } => {
             fill(op_id, upd.op_id);
             fill_gateway(gateway, &upd.gateway);

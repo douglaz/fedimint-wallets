@@ -427,7 +427,14 @@ async fn recovered_attempt_is_stamped_at_probe_start_not_recovery_time() {
     done_out.status = IntentStatus::Done;
     seed_intent(&journal, &done_out).await;
     journal
-        .put_move(&leg_record(in_key(), SOURCE, CANDIDATE, DELIVERED_IN, MovePhase::Settled, None))
+        .put_move(&leg_record(
+            in_key(),
+            SOURCE,
+            CANDIDATE,
+            DELIVERED_IN,
+            MovePhase::Settled,
+            None,
+        ))
         .await
         .expect("seed settled in record");
     journal
@@ -791,7 +798,11 @@ async fn stranded_leg_and_source_and_local_faults_write_umbrella_only_outcomes()
             other => panic!("expected NoAttempt, got {other:?}"),
         }
         // §P3: leg OUT failed, so its move exists — the report keeps the out_key handle.
-        assert_eq!(report.out_key, Some(out_key(OUT_NET)), "out_key preserved on leg-OUT failure");
+        assert_eq!(
+            report.out_key,
+            Some(out_key(OUT_NET)),
+            "out_key preserved on leg-OUT failure"
+        );
         let state = probe_state(&journal).await;
         assert!(state.attempts.is_empty());
         assert_eq!(state.in_flight, None);

@@ -35,6 +35,7 @@
 //! apply) and [`runtime::Runtime::status`] (decide only, a dry run). `build_snapshot` is PURE
 //! (golden-tested); the live tick is validated on the two-fed devimint harness at step 2.3.
 
+pub mod discovery;
 pub mod executor;
 pub mod fee;
 pub mod journal;
@@ -45,12 +46,14 @@ pub mod runtime;
 pub mod tick;
 pub mod types;
 
+pub use discovery::{CandidateAnnouncement, CandidateSource, ManualSource, SourceResult};
 pub use executor::FedimintExecutor;
 pub use fee::{gross_up, predicted_net, total_within_cap, GatewayFee, GrossUp};
 pub use journal::{
-    prune_probe_attempts, FederationInfo, FederationListReport, FedimintJournal,
-    LedgerRepairOracle, OperationRef, ProbeRecord, ProbeSession, RawOpObservation, RawTerminal,
-    RepairSummary, PROBE_HISTORY_CAP,
+    prune_probe_attempts, CandidateListReport, CandidateRecord, CandidateState, FederationInfo,
+    FederationListReport, FedimintJournal, LedgerRepairOracle, OperationRef, ProbeRecord,
+    ProbeSession, RawOpObservation, RawTerminal, RepairSummary, StructuralOutcome,
+    JOIN_NOOP_REOPEN_NOTE, PROBE_HISTORY_CAP,
 };
 pub use move_protocol::{
     assemble_move_record, next_step, Leg, MoveMeta, MoveParams, MovePhase, MovePlan, MoveRecord,

@@ -2,9 +2,9 @@
 //! `kind_from_action` / `status_from_intent` pure mappings.
 
 use wallet_core::{
-    advance, kind_from_action, status_from_intent, Action, Actor, FederationId, FeeBreakdown,
-    GatewayUrl, IdempotencyKey, IntentStatus, Msat, OperationId, OperationKind, OperationRecord,
-    OperationStatus, RawOpUpdate, ReasonCode, WriteKind,
+    advance, kind_from_action, status_from_intent, Action, Actor, DiscoverySource, FederationId,
+    FeeBreakdown, GatewayUrl, IdempotencyKey, IntentStatus, Msat, OperationId, OperationKind,
+    OperationRecord, OperationStatus, RawOpUpdate, ReasonCode, SourceStatus, WriteKind,
 };
 use OperationStatus::{Awaiting, Failed, Started, Succeeded};
 use WriteKind::{Authoritative, Repair};
@@ -465,6 +465,99 @@ fn kind_from_action_mapping() {
             reason: ReasonCode::OverCap,
         }),
         OperationKind::Refusal { fed: FED }
+    );
+}
+
+// --- discovery kinds (§5.1.2/§5.1.4a): advance + enrichment no-op ---
+
+/// A `Discover` row at `status`, created and last-touched at t=100. Count-only kind, so it is
+/// created complete (no in-flight op-ids to fill later).
+fn discover_record(status: OperationStatus) -> OperationRecord {
+    OperationRecord {
+        seq: 7,
+        correlation_key: IdempotencyKey("discover:manual:nonce".into()),
+        kind: OperationKind::Discover {
+            source: DiscoverySource::Manual,
+            status: SourceStatus::Ok,
+            found: 3,
+            structurally_passed: 2,
+            rejected: 1,
+        },
+        actor: Actor::User,
+        reason: ReasonCode::UserInitiated,
+        status,
+        created_at_ms: 100,
+        updated_at_ms: 100,
+        fees: FeeBreakdown::default(),
+        error: None,
+        repaired: false,
+    }
+}
+
+#[test]
+fn discovery_kinds_advance_forward_and_ignore_op_enrichment() {
+    // A `Discover` row advances Started -> Succeeded, preserving identity; a stray op-evidence
+    // enrichment is a NO-OP on its count fields (they carry no in-flight op-ids/gateway/amounts).
+    let rec = discover_record(Started);
+    let next = advance(
+        &rec,
+        Succeeded,
+        200,
+        Some(&pay_evidence()),
+        None,
+        Authoritative,
+    )
+    .expect("Started -> Succeeded");
+    assert_eq!(next.status, Succeeded);
+    assert_eq!(
+        next.created_at_ms, 100,
+        "advance preserves the row's identity"
+    );
+    assert_eq!(next.updated_at_ms, 200);
+    assert_eq!(
+        next.kind,
+        discover_record(Started).kind,
+        "op-evidence enrichment never touches a Discover row's counts"
+    );
+
+    // An `AutoJoin` row terminalizes the same way, counts intact.
+    let auto = OperationRecord {
+        kind: OperationKind::AutoJoin {
+            considered: 4,
+            joined: 1,
+            blocked_concurrent: 1,
+            blocked_weekly: 0,
+            blocked_lifetime: 2,
+        },
+        correlation_key: IdempotencyKey("autojoin:nonce".into()),
+        ..discover_record(Started)
+    };
+    let auto_next = advance(
+        &auto,
+        Succeeded,
+        200,
+        Some(&pay_evidence()),
+        None,
+        Authoritative,
+    )
+    .expect("terminal");
+    assert_eq!(
+        auto_next.kind, auto.kind,
+        "AutoJoin counts survive enrichment"
+    );
+
+    // An `Approve` row (a user vouch) is a terminal `Succeeded` audit fact; a terminal row is
+    // immutable, so a later advance is a no-op.
+    let approve = OperationRecord {
+        kind: OperationKind::Approve { fed: FED },
+        correlation_key: IdempotencyKey("approve:0101…:nonce".into()),
+        status: Succeeded,
+        ..discover_record(Succeeded)
+    };
+    assert_eq!(
+        advance(&approve, Failed, 200, None, Some("x"), Authoritative),
+        None,
+        "a terminal Approve row is immutable"
     );
 }
 

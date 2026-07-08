@@ -12,9 +12,9 @@ use fedimint_core::db::mem_impl::MemDatabase;
 use fedimint_core::db::{IDatabaseTransactionOpsCore, IRawDatabaseExt};
 use std::collections::BTreeMap;
 use wallet_core::{
-    Action, Actor, AllocatorDecision, ExecError, FederationId, FeeBreakdown, IdempotencyKey,
-    Intent, IntentStatus, Journal, Msat, Occurrence, OperationKind, OperationRecord,
-    OperationStatus, RawOpUpdate, ReasonCode,
+    Action, Actor, AllocatorDecision, DiscoverySource, ExecError, FederationId, FeeBreakdown,
+    IdempotencyKey, Intent, IntentStatus, Journal, Msat, Occurrence, OperationKind,
+    OperationRecord, OperationStatus, RawOpUpdate, ReasonCode, SourceStatus,
 };
 use wallet_fedimint::{
     FederationInfo, FedimintJournal, GatewayUrl, Invoice, LedgerRepairOracle, MovePhase,
@@ -1129,6 +1129,61 @@ async fn repair_soft_fails_a_stale_tick_row_after_1h() {
         rec.error.as_deref(),
         Some("interrupted — no terminal report")
     );
+}
+
+#[tokio::test]
+async fn repair_soft_fails_stale_discover_and_autojoin_rows_after_1h() {
+    let j = FedimintJournal::with_clock(MemDatabase::new().into_database(), clock_base_plus_2h);
+    let discover = key("discover:manual:n");
+    let autojoin = key("autojoin:n");
+    j.record_started(
+        &discover,
+        OperationKind::Discover {
+            source: DiscoverySource::Manual,
+            status: SourceStatus::Ok,
+            found: 3,
+            structurally_passed: 2,
+            rejected: 1,
+        },
+        Actor::Agent {
+            occurrence: Occurrence(7),
+        },
+        ReasonCode::StandingInstruction,
+        BASE,
+        None,
+    )
+    .await
+    .expect("discover started");
+    j.record_started(
+        &autojoin,
+        OperationKind::AutoJoin {
+            considered: 4,
+            joined: 1,
+            blocked_concurrent: 1,
+            blocked_weekly: 1,
+            blocked_lifetime: 1,
+        },
+        Actor::Agent {
+            occurrence: Occurrence(7),
+        },
+        ReasonCode::StandingInstruction,
+        BASE,
+        None,
+    )
+    .await
+    .expect("autojoin started");
+
+    let summary = j.repair_ledger(&empty_oracle()).await.expect("repair");
+    assert_eq!(summary.repaired, 2);
+    for k in [&discover, &autojoin] {
+        let rec = op_of(&j, k).await;
+        assert_eq!(rec.status, OperationStatus::Failed);
+        assert!(rec.repaired);
+        assert_eq!(
+            rec.error.as_deref(),
+            Some("interrupted — no terminal report")
+        );
+    }
 }
 
 #[tokio::test]

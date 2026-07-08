@@ -7,16 +7,19 @@ use async_trait::async_trait;
 use fedimint_core::db::mem_impl::MemDatabase;
 use fedimint_core::db::IDatabaseTransactionOpsCore;
 use fedimint_core::db::IRawDatabaseExt;
+use fedimint_core::invite_code::InviteCode;
 use futures::StreamExt;
 use std::sync::{Arc, Mutex};
+use std::{collections::BTreeSet, str::FromStr};
 use tokio::sync::Barrier;
 use wallet_core::{
-    reconcile, Action, Actor, ExecError, Executor, FederationId, IdempotencyKey, Intent,
-    IntentStatus, Journal, MockExecutor, Msat, PerformOutcome, ReasonCode,
+    reconcile, Action, Actor, DiscoverySource, ExecError, Executor, FederationId, IdempotencyKey,
+    Intent, IntentStatus, Journal, MockExecutor, Msat, Occurrence, OperationKind, OperationStatus,
+    PerformOutcome, ReasonCode,
 };
 use wallet_fedimint::{
-    FederationInfo, FedimintJournal, GatewayUrl, Invoice, MovePhase, MoveRecord, OperationId,
-    Preimage,
+    CandidateRecord, CandidateState, FederationInfo, FedimintJournal, GatewayUrl, Invoice,
+    MovePhase, MoveRecord, OperationId, Preimage, StructuralOutcome, JOIN_NOOP_REOPEN_NOTE,
 };
 
 fn mem_journal() -> FedimintJournal {
@@ -94,6 +97,26 @@ fn encoded_test_row<T: serde::Serialize>(value: &T) -> Vec<u8> {
         data: value,
     })
     .expect("encode test row")
+}
+
+fn invite() -> InviteCode {
+    InviteCode::from_str(
+        "fed11qgqpu8rhwden5te0vejkg6tdd9h8gepwd4cxcumxv4jzuen0duhsqqfqh6nl7sgk72caxfx8khtfnn8y436q3nhyrkev3qp8ugdhdllnh86qmp42pm",
+    )
+    .expect("valid invite code")
+}
+
+fn candidate(id: FederationId, state: CandidateState) -> CandidateRecord {
+    CandidateRecord {
+        id,
+        invite: invite(),
+        source: DiscoverySource::Manual,
+        discovered_at_ms: 1_700_000_000_000,
+        structural: StructuralOutcome::Passed,
+        structural_checked_at_ms: 1_700_000_000_100,
+        state,
+        updated_at_ms: 1_700_000_000_200,
+    }
 }
 
 /// Test 1: upsert an Intent → `get` returns the identical Intent (serde + DB round-trip).
@@ -281,6 +304,432 @@ async fn federation_registry_roundtrip() {
         listed,
         vec![(id_a, info_a), (id_b, info_b)],
         "list_federations returns every registered federation with its id"
+    );
+}
+
+#[tokio::test]
+async fn candidate_registry_round_trips_every_state_and_upserts() {
+    let journal = mem_journal();
+    for (n, state) in [
+        (0x10, CandidateState::Rejected),
+        (0x11, CandidateState::Discovered),
+        (0x12, CandidateState::AutoJoined),
+        (0x13, CandidateState::UserApproved),
+    ] {
+        let mut rec = candidate(fed(n), state);
+        if state == CandidateState::Rejected {
+            rec.structural = StructuralOutcome::Rejected("missing module".to_owned());
+        }
+        journal.put_candidate(&rec).await.expect("put candidate");
+        assert_eq!(
+            journal.get_candidate(&rec.id).await.expect("get candidate"),
+            Some(rec.clone())
+        );
+    }
+
+    let mut listed = journal.list_candidates().await.expect("list candidates");
+    listed.sort_by_key(|(id, _)| *id);
+    assert_eq!(listed.len(), 4);
+    assert_eq!(listed[0].1.state, CandidateState::Rejected);
+    assert_eq!(listed[1].1.state, CandidateState::Discovered);
+    assert_eq!(listed[2].1.state, CandidateState::AutoJoined);
+    assert_eq!(listed[3].1.state, CandidateState::UserApproved);
+
+    let mut replacement = candidate(fed(0x11), CandidateState::AutoJoined);
+    replacement.updated_at_ms = 1_700_000_999_999;
+    journal
+        .put_candidate(&replacement)
+        .await
+        .expect("upsert replacement");
+    assert_eq!(
+        journal
+            .get_candidate(&fed(0x11))
+            .await
+            .expect("get replacement"),
+        Some(replacement),
+        "put_candidate replaces the one row for that federation"
+    );
+}
+
+#[tokio::test]
+async fn list_candidates_skips_poison_rows() {
+    let db = MemDatabase::new().into_database();
+    let journal = FedimintJournal::new(db.clone());
+    let good_id = fed(0x21);
+    let good = candidate(good_id, CandidateState::Discovered);
+    journal.put_candidate(&good).await.expect("put good");
+
+    let app_db = db.with_prefix(vec![0x00]);
+    let mut dbtx = app_db.begin_transaction().await;
+    dbtx.raw_insert_bytes(&tagged_key(0x09, &[0x22; 32]), b"not valid json")
+        .await
+        .expect("insert corrupt candidate row");
+    dbtx.raw_insert_bytes(&tagged_key(0x09, &[0x33; 8]), b"{}")
+        .await
+        .expect("insert malformed-key candidate row");
+    dbtx.commit_tx_result().await.expect("commit poison rows");
+
+    let listed = journal.list_candidates().await.expect("list candidates");
+    assert_eq!(listed, vec![(good_id, good)]);
+
+    let report = journal
+        .list_candidates_report()
+        .await
+        .expect("candidate report");
+    assert_eq!(
+        report.candidates,
+        vec![(good_id, candidate(good_id, CandidateState::Discovered))]
+    );
+    assert_eq!(report.skipped_ids, BTreeSet::from([fed(0x22)]));
+    assert_eq!(report.skipped_rows, 2);
+    // The malformed-key row's value (`{}`) is not a decodable candidate, so its id is
+    // unrecoverable: it counts against the concurrent cap but cannot be gate-attributed.
+    assert_eq!(report.skipped_unidentified, 1);
+}
+
+#[tokio::test]
+async fn list_candidates_recovers_id_from_malformed_key_row() {
+    let db = MemDatabase::new().into_database();
+    let journal = FedimintJournal::new(db.clone());
+    // A malformed-key row (only 8 id bytes after the tag) whose VALUE still decodes to a valid
+    // AutoJoined candidate for `embedded_id`. The id must be recovered from the value so the row
+    // fails closed against BOTH the funding gate and the concurrent cap instead of vanishing.
+    let embedded_id = fed(0x52);
+    let auto = candidate(embedded_id, CandidateState::AutoJoined);
+
+    let app_db = db.with_prefix(vec![0x00]);
+    let mut dbtx = app_db.begin_transaction().await;
+    dbtx.raw_insert_bytes(&tagged_key(0x09, &[0x51; 8]), &encoded_test_row(&auto))
+        .await
+        .expect("insert malformed-key row with decodable value");
+    dbtx.commit_tx_result()
+        .await
+        .expect("commit malformed-key row");
+
+    let report = journal
+        .list_candidates_report()
+        .await
+        .expect("candidate report");
+    assert_eq!(
+        report.candidates,
+        Vec::new(),
+        "the malformed-key row is not listed"
+    );
+    assert_eq!(
+        report.skipped_ids,
+        BTreeSet::from([embedded_id]),
+        "the embedded id is recovered from the value"
+    );
+    assert_eq!(report.skipped_rows, 1);
+    assert_eq!(
+        report.skipped_unidentified, 0,
+        "an id was recovered, so nothing is unidentified"
+    );
+
+    // It counts fail-closed against the concurrent cap (could be an unproven AutoJoined
+    // partition), and drops out once its recovered id is known to have Passed.
+    assert_eq!(
+        journal
+            .concurrent_unproven(&BTreeSet::new())
+            .await
+            .expect("concurrent count"),
+        1,
+        "the recovered malformed-key AutoJoined id counts against the concurrent cap"
+    );
+    assert_eq!(
+        journal
+            .concurrent_unproven(&BTreeSet::from([embedded_id]))
+            .await
+            .expect("concurrent count with passed"),
+        0,
+        "once the recovered id has Passed it no longer counts"
+    );
+}
+
+#[tokio::test]
+async fn candidate_registry_treats_embedded_id_mismatch_as_poison() {
+    let db = MemDatabase::new().into_database();
+    let journal = FedimintJournal::new(db.clone());
+    let key_id = fed(0x25);
+    let embedded_id = fed(0x26);
+    let mismatched = candidate(embedded_id, CandidateState::AutoJoined);
+
+    let app_db = db.with_prefix(vec![0x00]);
+    let mut dbtx = app_db.begin_transaction().await;
+    dbtx.raw_insert_bytes(&tagged_key(0x09, &key_id.0), &encoded_test_row(&mismatched))
+        .await
+        .expect("insert mismatched candidate row");
+    dbtx.commit_tx_result()
+        .await
+        .expect("commit mismatched row");
+
+    let err = journal
+        .get_candidate(&key_id)
+        .await
+        .expect_err("targeted read fails closed on mismatched embedded id");
+    assert!(
+        matches!(
+            err,
+            ExecError::Permanent(ref msg)
+                if msg.contains("candidate row key id")
+                    && msg.contains(&key_id.to_hex())
+                    && msg.contains(&embedded_id.to_hex())
+        ),
+        "unexpected error: {err:?}"
+    );
+
+    assert_eq!(
+        journal.list_candidates().await.expect("list candidates"),
+        Vec::new(),
+        "bulk scans skip the mismatched row instead of returning it under either id"
+    );
+
+    let report = journal
+        .list_candidates_report()
+        .await
+        .expect("candidate report");
+    assert_eq!(report.candidates, Vec::new());
+    assert_eq!(report.skipped_ids, BTreeSet::from([key_id]));
+    assert_eq!(report.skipped_rows, 1);
+    // The key is well-formed, so the id came from the key, not an unrecoverable value.
+    assert_eq!(report.skipped_unidentified, 0);
+}
+
+#[tokio::test]
+async fn concurrent_unproven_counts_only_auto_joined_rows_without_passed_probe() {
+    let journal = mem_journal();
+    journal
+        .put_candidate(&candidate(fed(0x31), CandidateState::AutoJoined))
+        .await
+        .expect("put auto unproven");
+    journal
+        .put_candidate(&candidate(fed(0x32), CandidateState::AutoJoined))
+        .await
+        .expect("put auto passed");
+    journal
+        .put_candidate(&candidate(fed(0x33), CandidateState::UserApproved))
+        .await
+        .expect("put approved");
+    journal
+        .put_candidate(&candidate(fed(0x34), CandidateState::Discovered))
+        .await
+        .expect("put discovered");
+
+    let passed = BTreeSet::from([fed(0x32)]);
+    assert_eq!(
+        journal
+            .concurrent_unproven(&passed)
+            .await
+            .expect("concurrent count"),
+        1,
+        "only AutoJoined rows without Passed probe evidence count"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_unproven_counts_undecodable_rows_fail_closed() {
+    let db = MemDatabase::new().into_database();
+    let journal = FedimintJournal::new(db.clone());
+    // A live unproven auto-joined partition.
+    journal
+        .put_candidate(&candidate(fed(0x41), CandidateState::AutoJoined))
+        .await
+        .expect("put auto unproven");
+
+    // A corrupt candidate row: its state is unknowable, so it counts against the concurrent cap
+    // (it could be an unproven AutoJoined partition), never silently dropped — mirroring the
+    // funding gate's fail-closed treatment of the same skipped ids.
+    let app_db = db.with_prefix(vec![0x00]);
+    let mut dbtx = app_db.begin_transaction().await;
+    dbtx.raw_insert_bytes(&tagged_key(0x09, &[0x42; 32]), b"not valid json")
+        .await
+        .expect("insert corrupt candidate row");
+    dbtx.commit_tx_result().await.expect("commit poison row");
+
+    assert_eq!(
+        journal
+            .concurrent_unproven(&BTreeSet::new())
+            .await
+            .expect("concurrent count"),
+        2,
+        "a corrupt candidate row counts fail-closed alongside the live unproven auto-joined row"
+    );
+
+    // A skipped id that has since PASSED its probe is excluded (conservative, not double-fail).
+    assert_eq!(
+        journal
+            .concurrent_unproven(&BTreeSet::from([fed(0x42)]))
+            .await
+            .expect("concurrent count with passed skip"),
+        1,
+        "a corrupt row whose id has since passed no longer counts against the concurrent cap"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_unproven_counts_unidentified_rows_fail_closed() {
+    let db = MemDatabase::new().into_database();
+    let journal = FedimintJournal::new(db.clone());
+    // A live unproven auto-joined partition.
+    journal
+        .put_candidate(&candidate(fed(0x61), CandidateState::AutoJoined))
+        .await
+        .expect("put auto unproven");
+
+    // A doubly-corrupt row: BOTH the key (8 id bytes) AND the value are undecodable, so no id can
+    // be recovered. It cannot be Passed-filtered, so it counts unconditionally against the cap —
+    // the fully-conservative direction (it could be an unproven AutoJoined partition).
+    let app_db = db.with_prefix(vec![0x00]);
+    let mut dbtx = app_db.begin_transaction().await;
+    dbtx.raw_insert_bytes(&tagged_key(0x09, &[0x62; 8]), b"not valid json")
+        .await
+        .expect("insert doubly-corrupt candidate row");
+    dbtx.commit_tx_result().await.expect("commit poison row");
+
+    let report = journal
+        .list_candidates_report()
+        .await
+        .expect("candidate report");
+    assert!(
+        report.skipped_ids.is_empty(),
+        "no id could be recovered from the doubly-corrupt row"
+    );
+    assert_eq!(report.skipped_unidentified, 1);
+
+    // Even filtering by an arbitrary passed set cannot subtract an unidentified row, so it stays
+    // counted alongside the live unproven partition.
+    assert_eq!(
+        journal
+            .concurrent_unproven(&BTreeSet::from([fed(0x99)]))
+            .await
+            .expect("concurrent count"),
+        2,
+        "an unidentifiable corrupt candidate row counts fail-closed against the concurrent cap"
+    );
+}
+
+#[tokio::test]
+async fn auto_join_history_counts_only_successful_new_agent_joins() {
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    let journal = mem_journal();
+    let actor = Actor::Agent {
+        occurrence: Occurrence(7),
+    };
+
+    async fn write_join(
+        journal: &FedimintJournal,
+        suffix: &str,
+        fed_id: FederationId,
+        actor: Actor,
+        started_at_ms: u64,
+        status: OperationStatus,
+        error: Option<&str>,
+    ) {
+        let key = IdempotencyKey(format!("join:{}:{suffix}", fed_id.to_hex()));
+        journal
+            .record_started(
+                &key,
+                OperationKind::Join { fed: fed_id },
+                actor,
+                ReasonCode::StandingInstruction,
+                started_at_ms,
+                None,
+            )
+            .await
+            .expect("record started");
+        journal
+            .record_terminal(&key, status, started_at_ms + 1, error, None)
+            .await
+            .expect("record terminal");
+    }
+
+    let now = 10 * DAY_MS;
+    write_join(
+        &journal,
+        "recent-new",
+        fed(0x41),
+        actor,
+        now - DAY_MS,
+        OperationStatus::Succeeded,
+        None,
+    )
+    .await;
+    write_join(
+        &journal,
+        "old-new",
+        fed(0x42),
+        actor,
+        now - 8 * DAY_MS,
+        OperationStatus::Succeeded,
+        None,
+    )
+    .await;
+    write_join(
+        &journal,
+        "failed",
+        fed(0x43),
+        actor,
+        now - DAY_MS,
+        OperationStatus::Failed,
+        Some("network error"),
+    )
+    .await;
+    write_join(
+        &journal,
+        "noop",
+        fed(0x44),
+        actor,
+        now - DAY_MS,
+        OperationStatus::Succeeded,
+        Some(JOIN_NOOP_REOPEN_NOTE),
+    )
+    .await;
+    write_join(
+        &journal,
+        "user",
+        fed(0x45),
+        Actor::User,
+        now - DAY_MS,
+        OperationStatus::Succeeded,
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        journal.weekly_auto_joins(now).await.expect("weekly count"),
+        1,
+        "weekly counts only recent successful new-partition Agent joins"
+    );
+    assert_eq!(
+        journal.lifetime_auto_joins().await.expect("lifetime count"),
+        2,
+        "lifetime counts all successful new-partition Agent joins"
+    );
+}
+
+#[tokio::test]
+async fn auto_join_history_counts_corrupt_ledger_rows_fail_closed() {
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    let db = MemDatabase::new().into_database();
+    let journal = FedimintJournal::new(db.clone());
+
+    let app_db = db.with_prefix(vec![0x00]);
+    let mut dbtx = app_db.begin_transaction().await;
+    dbtx.raw_insert_bytes(&tagged_key(0x05, &99_u64.to_be_bytes()), b"not valid json")
+        .await
+        .expect("insert corrupt ledger row");
+    dbtx.commit_tx_result().await.expect("commit poison row");
+
+    let now = 10 * DAY_MS;
+    assert_eq!(
+        journal.weekly_auto_joins(now).await.expect("weekly count"),
+        1,
+        "a corrupt ledger row may be a recent successful Agent join, so it counts fail-closed"
+    );
+    assert_eq!(
+        journal.lifetime_auto_joins().await.expect("lifetime count"),
+        1,
+        "a corrupt ledger row may be a successful Agent join, so it counts fail-closed"
     );
 }
 
