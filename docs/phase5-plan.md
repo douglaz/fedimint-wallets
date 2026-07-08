@@ -625,14 +625,20 @@ one. Then, per reconciled fed:
      bypass its probe gate. The user promotes it with `approve` (5.1.4a) if it was really
      theirs. (No new join / no lifetime charge — the partition already exists; a restored fed
      that lacks its immutable join-history row simply is not counted, a bounded restore edge.)
-1. **Decide whether to (re)fetch.** A NEW id, a reconciled invite that DIFFERS from the
-   stored one (a source may publish a rotated/better invite for the same fed — invites are
-   not canonical for a fed id), or a row whose `structural_checked_at_ms` is older than
-   `STRUCTURAL_RECHECK_BACKOFF_MS` (default 7d) → (re)fetch + re-floor below. An
+1. **Decide whether to (re)fetch.** A NEW id, the stored invite NO LONGER announced (a
+   genuine rotation — the known endpoint is gone), or a row whose `structural_checked_at_ms`
+   is older than `STRUCTURAL_RECHECK_BACKOFF_MS` (default 7d) → (re)fetch + re-floor below. A
+   differing invite that merely COEXISTS with the still-announced stored invite does NOT force
+   a re-fetch: the stored invite is still a known-good way to reach the fed, and honoring the
+   backoff is a deliberate DoS-defense — otherwise a noisy/hostile source could force an
+   authenticated fetch every pass by advertising ever-changing alternate invites (the
+   untrusted-source volume/time class deferred to 5.2, §5.1.5). A rotated invite is thus
+   adopted within `<=` one backoff window, and auto-join re-validates the invite with a fresh
+   fetch regardless, so a truly dead stored invite self-corrects. An
    `AutoJoined`/`UserApproved` candidate (already joined; membership is authority) only has
    its stored `invite` REFRESHED to the newest valid one and is not re-floored. An
-   up-to-date `Discovered`/`Rejected` row within the backoff and with an unchanged invite is
-   left as-is (no wasted fetch).
+   up-to-date `Discovered`/`Rejected` row within the backoff whose stored invite is still
+   announced is left as-is (no wasted fetch).
 2. **Authenticate the invite:** fetch the `ClientConfig` from the guardian quorum WITHOUT
    joining — reuse `client_builder().preview(connectors, &invite)` (the same authenticated
    fetch `join` does, minus the partition write). Authenticated against the invite's id, so a
@@ -792,6 +798,8 @@ but cannot promote a fed. The unstable `/federations` schema is parsed leniently
 fields ignored; a row that fails to parse is skipped, not fatal). The Observer prior
 (uptime/backing/activity — the ADR-0020 rank bonus behind the gate) is a SEPARATE, later
 wiring into `FederationFacts.observer`; 5.1's Observer use is discovery only.
+
+**Deferred to 5.2 (volume/time bounds):** a hostile Observer can return unbounded rows, and each reconciled candidate triggers a guardian config `preview` with no per-preview timeout — so a manual `discover --source observer` against a flooded/slow feed can run long. This is low-impact in 5.1 (only a user manually invoking `discover` pays it), but becomes load-bearing when the 5.2 `watch` loop invokes discovery UNATTENDED on a schedule. Add a per-pass candidate cap (log-what-was-dropped, never a silent truncation) + a per-preview timeout THERE, where they can be tested against the autonomous loop.
 
 ### 5.1.6 CLI
 
