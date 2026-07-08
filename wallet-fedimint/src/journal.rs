@@ -75,8 +75,8 @@ const TAG_CANDIDATE: u8 = 0x09; // `0x09 ++ fed_id` → JSON row v1(CandidateRec
 const REPAIR_AGE_MS: u64 = 60 * 60 * 1000;
 
 /// `FederationInfo.joined_at` is unix SECONDS; a join-attempt row's `created_at_ms` is millis
-/// from the same device clock. The join-repair arbitration (§10.3) compares them with this
-/// slack added to the seconds→millis conversion.
+/// from the same device clock. The join-repair arbitration (§10.3) compares them within this
+/// symmetric slack around the seconds→millis conversion.
 const JOINED_AT_SLACK_MS: u64 = 60_000;
 
 /// Version for every JSON value row. Future schema changes should add a new version and
@@ -746,6 +746,38 @@ impl FedimintJournal {
         Ok(())
     }
 
+    /// Record a completed non-money fact row (discover/autojoin/approve) in one dbtx. Idempotent
+    /// per key: an existing row is left untouched, matching append-once ledger discipline.
+    pub async fn record_terminal_operation(
+        &self,
+        key: &IdempotencyKey,
+        kind: OperationKind,
+        actor: Actor,
+        reason: ReasonCode,
+        now_ms: u64,
+    ) -> Result<(), ExecError> {
+        let mut dbtx = self.db.begin_transaction().await;
+        ledger_upsert_in(&mut dbtx, key, |existing, seq| match existing {
+            Some(_) => None,
+            None => Some(OperationRecord {
+                seq,
+                correlation_key: key.clone(),
+                kind,
+                actor,
+                reason,
+                status: OperationStatus::Succeeded,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                fees: FeeBreakdown::default(),
+                error: None,
+                repaired: false,
+            }),
+        })
+        .await?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(())
+    }
+
     // --- ledger scans (spec §9.3, poison-tolerant) ---
 
     /// Every decodable ledger row, ascending by `seq` (the `0x05` prefix scan order). Poison
@@ -1081,23 +1113,81 @@ impl FedimintJournal {
         })
     }
 
+    /// Atomically approve an `AutoJoined` candidate (§5.1.4a): flip it to `UserApproved` and
+    /// append the user-visible `Approve` ledger row in the same dbtx. Refuses every other state.
+    pub async fn approve_auto_joined_candidate(
+        &self,
+        id: FederationId,
+        key: &IdempotencyKey,
+        now_ms: u64,
+    ) -> Result<(), ExecError> {
+        let raw_key = candidate_key(&id);
+        let mut dbtx = self.db.begin_transaction().await;
+        let bytes = dbtx
+            .raw_get_bytes(&raw_key)
+            .await
+            .map_err(db_err)?
+            .ok_or_else(|| {
+                ExecError::Permanent(format!("candidate {} is not AutoJoined", id.to_hex()))
+            })?;
+        let mut candidate = decode_candidate_row(id, &raw_key, &bytes)?;
+        if candidate.state != CandidateState::AutoJoined {
+            return Err(ExecError::Permanent(format!(
+                "candidate {} is {:?}, not AutoJoined",
+                id.to_hex(),
+                candidate.state
+            )));
+        }
+        candidate.state = CandidateState::UserApproved;
+        candidate.updated_at_ms = now_ms;
+        dbtx.raw_insert_bytes(&raw_key, &encode_row(&candidate)?)
+            .await
+            .map_err(db_err)?;
+        ledger_upsert_in(&mut dbtx, key, |existing, seq| match existing {
+            Some(_) => None,
+            None => Some(OperationRecord {
+                seq,
+                correlation_key: key.clone(),
+                kind: OperationKind::Approve { fed: id },
+                actor: Actor::User,
+                reason: ReasonCode::UserInitiated,
+                status: OperationStatus::Succeeded,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                fees: FeeBreakdown::default(),
+                error: None,
+                repaired: false,
+            }),
+        })
+        .await?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(())
+    }
+
     // --- auto-join accounting (phase 5 §5.1.4) ---
 
     /// Total agent-created partitions EVER — the lifetime-cap count (§5.1.4). Reads the
     /// immutable ledger join history, NOT the mutable candidate state (§P1): the count of
-    /// `actor: Agent` `join:` rows that SUCCEEDED and created a NEW partition. Monotonic, so
-    /// approval (which leaves the partition in place) keeps counting and the finite-set
-    /// guarantee holds. Undecodable ledger rows count fail-closed because any one may be a
-    /// successful new-partition Agent join.
+    /// `actor: Agent` `join:` rows that SUCCEEDED and created a NEW partition, plus the same
+    /// registry-backed non-terminal Agent join evidence used to recover a crash after the
+    /// partition write. Monotonic, so approval (which leaves the partition in place) keeps
+    /// counting and the finite-set guarantee holds. Undecodable ledger rows count fail-closed
+    /// because any one may be a successful new-partition Agent join.
     pub async fn lifetime_auto_joins(&self) -> Result<u32, ExecError> {
         let report = self.scan_ledger_rows_report().await?;
-        let counted = report
-            .rows
-            .iter()
-            .filter(|r| is_agent_new_partition_join(r))
-            .count()
-            + report.skipped_rows;
-        Ok(count_saturating_u32(counted))
+        let mut counted = BTreeSet::new();
+        for row in &report.rows {
+            if is_agent_new_partition_join(row) {
+                if let Some(fed) = join_row_fed(row) {
+                    counted.insert(fed);
+                }
+            } else if let Some(fed) = self.registry_backed_non_terminal_agent_join(row).await? {
+                counted.insert(fed);
+            }
+        }
+        Ok(count_saturating_u32(
+            counted.len().saturating_add(report.skipped_rows),
+        ))
     }
 
     /// Agent-created partitions in the trailing 7 days — the weekly rate-cap count (§5.1.4):
@@ -1106,16 +1196,67 @@ impl FedimintJournal {
     /// Undecodable ledger rows cannot be windowed, so they count fail-closed until repaired.
     pub async fn weekly_auto_joins(&self, now_ms: u64) -> Result<u32, ExecError> {
         let report = self.scan_ledger_rows_report().await?;
-        let counted = report
-            .rows
-            .iter()
-            .filter(|r| {
-                is_agent_new_partition_join(r)
-                    && now_ms.saturating_sub(r.created_at_ms) < AUTO_JOIN_WEEKLY_WINDOW_MS
-            })
-            .count()
-            + report.skipped_rows;
-        Ok(count_saturating_u32(counted))
+        let mut counted = BTreeSet::new();
+        for row in &report.rows {
+            if now_ms.saturating_sub(row.created_at_ms) >= AUTO_JOIN_WEEKLY_WINDOW_MS {
+                continue;
+            }
+            if is_agent_new_partition_join(row) {
+                if let Some(fed) = join_row_fed(row) {
+                    counted.insert(fed);
+                }
+            } else if let Some(fed) = self.registry_backed_non_terminal_agent_join(row).await? {
+                counted.insert(fed);
+            }
+        }
+        Ok(count_saturating_u32(
+            counted.len().saturating_add(report.skipped_rows),
+        ))
+    }
+
+    /// Whether durable evidence says this federation was created by the agent. Used to recover a
+    /// crash after the partition was created but before the candidate row flipped to
+    /// `AutoJoined`.
+    ///
+    /// A terminal successful Agent new-partition row is direct evidence. A non-terminal Agent
+    /// join row is enough when the joined registry already contains the fed and the attempt began
+    /// no later than the registry timestamp (with slack). That fails closed for slow joins that
+    /// wrote the partition long after the Agent row was created, while still ignoring attempts
+    /// that clearly started after a pre-existing membership.
+    pub async fn agent_created_federation(&self, id: &FederationId) -> Result<bool, ExecError> {
+        let report = self.scan_ledger_rows_report().await?;
+        if report.rows.iter().any(|row| {
+            matches!(row.kind, OperationKind::Join { fed } if fed == *id)
+                && is_agent_new_partition_join(row)
+        }) {
+            return Ok(true);
+        }
+
+        for row in &report.rows {
+            if self.registry_backed_non_terminal_agent_join(row).await? == Some(*id) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn registry_backed_non_terminal_agent_join(
+        &self,
+        row: &OperationRecord,
+    ) -> Result<Option<FederationId>, ExecError> {
+        let Some(fed) = join_row_fed(row) else {
+            return Ok(None);
+        };
+        if !is_non_terminal_agent_join_for(row, fed) {
+            return Ok(None);
+        }
+        let Some(info) = self.get_federation(&fed).await? else {
+            return Ok(None);
+        };
+        Ok(
+            join_attempt_could_have_created_registry_entry(row.created_at_ms, info.joined_at)
+                .then_some(fed),
+        )
     }
 
     /// Auto-joined candidates whose probe is not yet `Passed` — the concurrent-cap count
@@ -1243,12 +1384,11 @@ impl FedimintJournal {
     ) -> Result<usize, ExecError> {
         match self.get_federation(&fed).await? {
             Some(info) => {
-                // `joined_at` is unix SECONDS; a row's `created_at_ms` is millis — convert (+slack).
-                let cutoff = info
-                    .joined_at
-                    .saturating_mul(1000)
-                    .saturating_add(JOINED_AT_SLACK_MS);
-                let in_window = || attempts.iter().filter(|r| r.created_at_ms <= cutoff);
+                let in_window = || {
+                    attempts
+                        .iter()
+                        .filter(|r| join_attempt_matches_joined_at(r.created_at_ms, info.joined_at))
+                };
                 let in_window_count = in_window().count();
                 // Winner: an already-terminal successful retry is authoritative attempt-level
                 // evidence and prevents creating a duplicate soft success. Otherwise, newest
@@ -2020,6 +2160,30 @@ fn is_agent_new_partition_join(row: &OperationRecord) -> bool {
         && matches!(row.kind, OperationKind::Join { .. })
         && row.status == OperationStatus::Succeeded
         && row.error.as_deref() != Some(JOIN_NOOP_REOPEN_NOTE)
+}
+
+fn join_row_fed(row: &OperationRecord) -> Option<FederationId> {
+    match row.kind {
+        OperationKind::Join { fed } => Some(fed),
+        _ => None,
+    }
+}
+
+fn is_non_terminal_agent_join_for(row: &OperationRecord, id: FederationId) -> bool {
+    matches!(row.actor, Actor::Agent { .. })
+        && matches!(row.kind, OperationKind::Join { fed } if fed == id)
+        && !row.status.is_terminal()
+}
+
+fn join_attempt_matches_joined_at(created_at_ms: u64, joined_at_secs: u64) -> bool {
+    let joined_at_ms = joined_at_secs.saturating_mul(1000);
+    created_at_ms >= joined_at_ms.saturating_sub(JOINED_AT_SLACK_MS)
+        && created_at_ms <= joined_at_ms.saturating_add(JOINED_AT_SLACK_MS)
+}
+
+fn join_attempt_could_have_created_registry_entry(created_at_ms: u64, joined_at_secs: u64) -> bool {
+    let joined_at_ms = joined_at_secs.saturating_mul(1000);
+    created_at_ms <= joined_at_ms.saturating_add(JOINED_AT_SLACK_MS)
 }
 
 fn count_saturating_u32(count: usize) -> u32 {

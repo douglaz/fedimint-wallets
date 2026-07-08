@@ -14,14 +14,17 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use wallet_core::{
-    Action, ActiveProbeVerdict, Actor, AllocatorDecision, ExecutionSummary, FederationId,
-    FeeBreakdown, IdempotencyKey, IntentStatus, Journal, Msat, Occurrence, OperationKind,
-    OperationRecord, OperationStatus, ProbePolicy, RawOpUpdate, ReasonCode,
+    Action, ActiveProbeVerdict, Actor, AllocatorDecision, DiscoveryPolicy, DiscoverySource,
+    ExecutionSummary, FederationId, FeeBreakdown, IdempotencyKey, IntentStatus, Journal, Msat,
+    Occurrence, OperationKind, OperationRecord, OperationStatus, ProbePolicy, RawOpUpdate,
+    ReasonCode,
 };
 use wallet_fedimint::{
-    parse_invoice, CandidateState, FedimintJournal, FinalizeOutcome, GatewayUrl, Invoice,
-    LedgerRepairOracle, MoveOutcome, MultiClient, OperationId, OperationRef, ProbeOutcome,
-    ReceiveState, Runtime, ScoredFed, SendOutcome, SendState, TickPolicy, JOIN_NOOP_REOPEN_NOTE,
+    parse_invoice, AutoJoinReport, CandidateSource, CandidateState, DiscoverReport,
+    DiscoverSourceReport, FedimintJournal, FinalizeOutcome, GatewayUrl, Invoice,
+    LedgerRepairOracle, ManualSource, MoveOutcome, MultiClient, ObserverSource, OperationId,
+    OperationRef, ProbeOutcome, ReceiveState, Runtime, ScoredFed, SendOutcome, SendState,
+    TickPolicy, JOIN_NOOP_REOPEN_NOTE,
 };
 
 #[derive(Parser)]
@@ -46,6 +49,49 @@ enum Command {
     /// Join a federation by its invite code (idempotent: re-joining an already-joined
     /// federation just opens it).
     Join { invite: String },
+    /// Discover candidate federations from configured sources, structurally vet them, and
+    /// optionally auto-join within the discovery caps.
+    Discover {
+        /// Source to use. Repeat for multiple sources. Defaults to manual when --invite is
+        /// present, otherwise observer.
+        #[arg(long = "source", value_enum)]
+        source: Vec<DiscoverSourceArg>,
+        /// Observer API base URL.
+        #[arg(long, default_value = "https://observer.fedimint.org/api")]
+        observer_url: String,
+        /// Manual invite code(s) to discover.
+        #[arg(long = "invite")]
+        invite: Vec<String>,
+        /// Auto-join structurally-passing discovered candidates within the configured caps.
+        #[arg(long)]
+        auto_join: bool,
+        /// Shared lnv2 gateway URL reserved for follow-on probe/tick flows.
+        #[arg(long)]
+        gateway: Option<String>,
+        /// Allow regtest/signet in the structural scorer. Intended for devimint.
+        #[arg(long)]
+        scorer_allow_regtest: bool,
+        /// Maximum successful Agent auto-joins in the trailing 7 days.
+        #[arg(long)]
+        max_auto_joins_per_week: Option<u32>,
+        /// Lifetime cap on successful Agent-created partitions.
+        #[arg(long)]
+        lifetime_cap: Option<u32>,
+        /// Emit a JSON report instead of TSV-style summary lines.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the durable candidate registry newest-first.
+    Candidates {
+        /// Filter by candidate state.
+        #[arg(long, value_enum)]
+        state: Option<CandidateStateArg>,
+        /// Emit a JSON array instead of TSV rows.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark an AutoJoined candidate as user-approved.
+    Approve { fed: String },
     /// Print each joined federation's balance (msat) and the total.
     Balance,
     /// List joined federations.
@@ -302,6 +348,20 @@ enum StatusFilter {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DiscoverSourceArg {
+    Observer,
+    Manual,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CandidateStateArg {
+    Discovered,
+    Autojoined,
+    Userapproved,
+    Rejected,
+}
+
 /// The standing-instruction (ADR-0009) flags shared by `tick` and `status`. Every numeric flag
 /// falls back to [`TickPolicy::default`]'s v1 default; the designation flags fall back to
 /// auto-designation from the scored-eligible feds.
@@ -381,6 +441,8 @@ async fn main() -> anyhow::Result<()> {
             json,
         } => return run_history(&journal, limit, fed, actor, status, json).await,
         Command::Show { reference, json } => return run_show(&journal, reference, json).await,
+        Command::Candidates { state, json } => return run_candidates(&journal, state, json).await,
+        Command::Approve { fed } => return run_approve(&journal, fed).await,
         other => other,
     };
 
@@ -470,6 +532,45 @@ async fn main() -> anyhow::Result<()> {
                 );
                 println!("{}", outcome.id.to_hex());
                 eprintln!("key: {}", key.0);
+            }
+        }
+        Command::Discover {
+            source,
+            observer_url,
+            invite,
+            auto_join,
+            gateway,
+            scorer_allow_regtest,
+            max_auto_joins_per_week,
+            lifetime_cap,
+            json,
+        } => {
+            let sources = build_discover_sources(source, observer_url, invite)?;
+            let mut policy = DiscoveryPolicy {
+                auto_join,
+                require_mainnet: !scorer_allow_regtest,
+                ..DiscoveryPolicy::default()
+            };
+            if let Some(max) = max_auto_joins_per_week {
+                policy.max_auto_joins_per_week = max;
+            }
+            if let Some(cap) = lifetime_cap {
+                policy.auto_join_lifetime_cap = cap;
+            }
+            let runtime = Runtime::new(
+                multi_client.clone(),
+                journal.clone(),
+                gateway.map(GatewayUrl),
+                operator_hard_cap(false),
+                perform_timeout,
+            );
+            let report = runtime.discover(sources, policy).await?;
+            if json {
+                println!("{}", serde_json::to_string(&discover_report_json(&report))?);
+            } else {
+                for line in discover_summary_lines(&report) {
+                    println!("{line}");
+                }
             }
         }
         Command::Balance => {
@@ -1015,8 +1116,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         // §11: dispatched OFFLINE before any client setup (see the top of `main`).
-        Command::History { .. } | Command::Show { .. } => {
-            unreachable!("history/show are dispatched offline before the wallet client is opened")
+        Command::History { .. }
+        | Command::Show { .. }
+        | Command::Candidates { .. }
+        | Command::Approve { .. } => {
+            unreachable!(
+                "history/show/candidates/approve are dispatched offline before the wallet client is opened"
+            )
         }
     }
 
@@ -1088,6 +1194,166 @@ async fn run_show(journal: &FedimintJournal, reference: String, json: bool) -> a
         );
     }
     Ok(())
+}
+
+async fn run_candidates(
+    journal: &FedimintJournal,
+    state: Option<CandidateStateArg>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let rows = candidate_rows(journal, state).await?;
+    if json {
+        let values = rows
+            .iter()
+            .map(|(id, record)| {
+                serde_json::json!({
+                    "id": id.to_hex(),
+                    "invite": record.invite.to_string(),
+                    "source": discovery_source_tag(record.source),
+                    "discovered_at_ms": record.discovered_at_ms,
+                    "structural": structural_tag(&record.structural),
+                    "structural_checked_at_ms": record.structural_checked_at_ms,
+                    "state": candidate_state_tag(record.state),
+                    "updated_at_ms": record.updated_at_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string(&values)?);
+    } else {
+        for (id, record) in rows {
+            println!("{}", candidate_tsv(id, &record));
+        }
+    }
+    Ok(())
+}
+
+async fn run_approve(journal: &FedimintJournal, fed: String) -> anyhow::Result<()> {
+    let id = parse_fed_id(&fed)?;
+    let key = approve_candidate(journal, id, cli_now_ms(), &cli_nonce()).await?;
+    println!("{}", id.to_hex());
+    eprintln!("key: {}", key.0);
+    Ok(())
+}
+
+async fn candidate_rows(
+    journal: &FedimintJournal,
+    state: Option<CandidateStateArg>,
+) -> anyhow::Result<Vec<(FederationId, wallet_fedimint::CandidateRecord)>> {
+    let mut rows = journal
+        .list_candidates()
+        .await
+        .map_err(|e| anyhow::anyhow!("reading candidate registry: {e:?}"))?;
+    rows.retain(|(_, record)| state.is_none_or(|filter| filter.matches(record.state)));
+    rows.sort_by_key(|(_, record)| std::cmp::Reverse((record.updated_at_ms, record.id)));
+    Ok(rows)
+}
+
+async fn approve_candidate(
+    journal: &FedimintJournal,
+    id: FederationId,
+    now_ms: u64,
+    nonce: &str,
+) -> anyhow::Result<IdempotencyKey> {
+    let key = IdempotencyKey(format!("approve:{}:{nonce}", id.to_hex()));
+    journal
+        .approve_auto_joined_candidate(id, &key, now_ms)
+        .await
+        .map_err(|e| anyhow::anyhow!("approve failed: {e:?}"))?;
+    Ok(key)
+}
+
+fn build_discover_sources(
+    selected: Vec<DiscoverSourceArg>,
+    observer_url: String,
+    invites: Vec<String>,
+) -> anyhow::Result<Vec<Box<dyn CandidateSource>>> {
+    let selected = if selected.is_empty() {
+        if invites.is_empty() {
+            vec![DiscoverSourceArg::Observer]
+        } else {
+            vec![DiscoverSourceArg::Manual]
+        }
+    } else {
+        selected
+    };
+    let mut sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+    if selected.contains(&DiscoverSourceArg::Manual) {
+        anyhow::ensure!(
+            !invites.is_empty(),
+            "--source manual requires at least one --invite"
+        );
+        let invites = invites
+            .iter()
+            .map(|invite| InviteCode::from_str(invite))
+            .collect::<Result<Vec<_>, _>>()?;
+        sources.push(Box::new(ManualSource::from_invites(invites)));
+    } else if !invites.is_empty() {
+        anyhow::bail!("--invite requires --source manual, or omit --source to select manual");
+    }
+    if selected.contains(&DiscoverSourceArg::Observer) {
+        sources.push(Box::new(ObserverSource::new(observer_url)));
+    }
+    anyhow::ensure!(!sources.is_empty(), "no discovery sources configured");
+    Ok(sources)
+}
+
+fn discover_summary_lines(report: &DiscoverReport) -> Vec<String> {
+    let mut lines = report
+        .sources
+        .iter()
+        .map(source_summary_line)
+        .collect::<Vec<_>>();
+    lines.push(auto_join_summary_line(&report.auto_join));
+    lines
+}
+
+/// Build the `discover --json` payload from the lowercase-tag vocabulary the TSV summary and
+/// `candidates --json` already use (`source: "observer"`, `status: "ok"`/`"failed:reason"`), so a
+/// machine consumer sees ONE encoding of these concepts across every command — not the derive's
+/// PascalCase/adjacently-tagged enum form.
+fn discover_report_json(report: &DiscoverReport) -> serde_json::Value {
+    serde_json::json!({
+        "sources": report
+            .sources
+            .iter()
+            .map(|source| serde_json::json!({
+                "source": discovery_source_tag(source.source),
+                "status": source_status_tag(&source.status),
+                "found": source.found,
+                "structurally_passed": source.structurally_passed,
+                "rejected": source.rejected,
+            }))
+            .collect::<Vec<_>>(),
+        "auto_join": {
+            "considered": report.auto_join.considered,
+            "joined": report.auto_join.joined,
+            "blocked_concurrent": report.auto_join.blocked_concurrent,
+            "blocked_weekly": report.auto_join.blocked_weekly,
+            "blocked_lifetime": report.auto_join.blocked_lifetime,
+        },
+    })
+}
+
+fn source_summary_line(report: &DiscoverSourceReport) -> String {
+    format!(
+        "source={} status={} found={} passed={} rejected={}",
+        discovery_source_tag(report.source),
+        source_status_tag(&report.status),
+        report.found,
+        report.structurally_passed,
+        report.rejected
+    )
+}
+
+fn auto_join_summary_line(report: &AutoJoinReport) -> String {
+    format!(
+        "autojoin considered={} joined={} blocked_concurrent={} blocked_weekly={} blocked_lifetime={}",
+        report.considered,
+        report.joined,
+        report.blocked_concurrent,
+        report.blocked_weekly,
+        report.blocked_lifetime
+    )
 }
 
 /// Build a [`TickPolicy`] from the shared policy flags: each numeric flag overrides the v1
@@ -2078,6 +2344,21 @@ impl StatusFilter {
     }
 }
 
+impl CandidateStateArg {
+    fn matches(self, state: CandidateState) -> bool {
+        matches!(
+            (self, state),
+            (CandidateStateArg::Discovered, CandidateState::Discovered)
+                | (CandidateStateArg::Autojoined, CandidateState::AutoJoined)
+                | (
+                    CandidateStateArg::Userapproved,
+                    CandidateState::UserApproved
+                )
+                | (CandidateStateArg::Rejected, CandidateState::Rejected)
+        )
+    }
+}
+
 /// Whether a record involves `fed` (for `history --fed`): a `Move` matches either endpoint.
 fn record_involves_fed(record: &OperationRecord, fed: FederationId) -> bool {
     match &record.kind {
@@ -2261,11 +2542,11 @@ fn kind_and_amount(kind: &OperationKind) -> (&'static str, Option<Msat>) {
     }
 }
 
-fn discovery_source_tag(source: wallet_core::DiscoverySource) -> &'static str {
+fn discovery_source_tag(source: DiscoverySource) -> &'static str {
     match source {
-        wallet_core::DiscoverySource::Observer => "observer",
-        wallet_core::DiscoverySource::Nostr => "nostr",
-        wallet_core::DiscoverySource::Manual => "manual",
+        DiscoverySource::Observer => "observer",
+        DiscoverySource::Nostr => "nostr",
+        DiscoverySource::Manual => "manual",
     }
 }
 
@@ -2274,6 +2555,36 @@ fn source_status_tag(status: &wallet_core::SourceStatus) -> String {
         wallet_core::SourceStatus::Ok => "ok".to_owned(),
         wallet_core::SourceStatus::Failed(reason) => format!("failed:{reason}"),
     }
+}
+
+fn candidate_state_tag(state: CandidateState) -> &'static str {
+    match state {
+        CandidateState::Discovered => "discovered",
+        CandidateState::AutoJoined => "autojoined",
+        CandidateState::UserApproved => "userapproved",
+        CandidateState::Rejected => "rejected",
+    }
+}
+
+fn structural_tag(structural: &wallet_fedimint::StructuralOutcome) -> String {
+    match structural {
+        wallet_fedimint::StructuralOutcome::Passed => "passed".to_owned(),
+        wallet_fedimint::StructuralOutcome::Rejected(reason) => format!("rejected:{reason}"),
+    }
+}
+
+fn candidate_tsv(id: FederationId, record: &wallet_fedimint::CandidateRecord) -> String {
+    [
+        id.to_hex(),
+        candidate_state_tag(record.state).to_owned(),
+        discovery_source_tag(record.source).to_owned(),
+        record.discovered_at_ms.to_string(),
+        structural_tag(&record.structural),
+        record.structural_checked_at_ms.to_string(),
+        record.updated_at_ms.to_string(),
+        record.invite.to_string(),
+    ]
+    .join("\t")
 }
 
 fn status_tag(status: OperationStatus) -> &'static str {
@@ -2443,6 +2754,137 @@ mod tests {
         assert_eq!(inserted.structural_checked_at_ms, 1_700_000_000_400);
         assert_eq!(inserted.state, CandidateState::UserApproved);
         assert_eq!(inserted.updated_at_ms, 1_700_000_000_400);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approve_flips_autojoined_candidate_and_writes_ledger() -> anyhow::Result<()> {
+        use fedimint_core::db::mem_impl::MemDatabase;
+        use fedimint_core::db::IRawDatabaseExt as _;
+
+        let journal = FedimintJournal::new(MemDatabase::new().into_database());
+        let id = fed(0x30);
+        journal
+            .put_candidate(&test_candidate(id, CandidateState::AutoJoined))
+            .await
+            .map_err(exec_err)?;
+
+        let key = approve_candidate(&journal, id, 1_700_000_001_000, "abc").await?;
+
+        let updated = journal
+            .get_candidate(&id)
+            .await
+            .map_err(exec_err)?
+            .expect("candidate remains present");
+        assert_eq!(updated.state, CandidateState::UserApproved);
+        assert_eq!(updated.updated_at_ms, 1_700_000_001_000);
+
+        let row = journal
+            .operation(&OperationRef::Key(key))
+            .await
+            .map_err(exec_err)?
+            .expect("approve row recorded");
+        assert_eq!(row.actor, Actor::User);
+        assert_eq!(row.reason, ReasonCode::UserInitiated);
+        assert_eq!(row.status, OperationStatus::Succeeded);
+        assert_eq!(row.kind, OperationKind::Approve { fed: id });
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approve_refuses_non_autojoined_candidate() -> anyhow::Result<()> {
+        use fedimint_core::db::mem_impl::MemDatabase;
+        use fedimint_core::db::IRawDatabaseExt as _;
+
+        let journal = FedimintJournal::new(MemDatabase::new().into_database());
+        let id = fed(0x31);
+        journal
+            .put_candidate(&test_candidate(id, CandidateState::Discovered))
+            .await
+            .map_err(exec_err)?;
+
+        let err = approve_candidate(&journal, id, 1_700_000_001_000, "abc")
+            .await
+            .expect_err("non-AutoJoined candidates are refused");
+
+        assert!(err.to_string().contains("not AutoJoined"), "{err}");
+        let unchanged = journal
+            .get_candidate(&id)
+            .await
+            .map_err(exec_err)?
+            .expect("candidate remains present");
+        assert_eq!(unchanged.state, CandidateState::Discovered);
+        assert!(journal
+            .operation(&OperationRef::Key(IdempotencyKey(format!(
+                "approve:{}:abc",
+                id.to_hex()
+            ))))
+            .await
+            .map_err(exec_err)?
+            .is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn candidates_filter_by_state_newest_first() -> anyhow::Result<()> {
+        use fedimint_core::db::mem_impl::MemDatabase;
+        use fedimint_core::db::IRawDatabaseExt as _;
+
+        let journal = FedimintJournal::new(MemDatabase::new().into_database());
+        let mut older = test_candidate(fed(0x32), CandidateState::Discovered);
+        older.updated_at_ms = 10;
+        let mut newer = test_candidate(fed(0x33), CandidateState::Discovered);
+        newer.updated_at_ms = 20;
+        let approved = test_candidate(fed(0x34), CandidateState::UserApproved);
+        journal.put_candidate(&older).await.map_err(exec_err)?;
+        journal.put_candidate(&approved).await.map_err(exec_err)?;
+        journal.put_candidate(&newer).await.map_err(exec_err)?;
+
+        let rows = candidate_rows(&journal, Some(CandidateStateArg::Discovered)).await?;
+
+        assert_eq!(
+            rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![fed(0x33), fed(0x32)]
+        );
+        assert!(rows
+            .iter()
+            .all(|(_, rec)| rec.state == CandidateState::Discovered));
+        Ok(())
+    }
+
+    #[test]
+    fn discover_summary_and_json_shape_are_stable() -> anyhow::Result<()> {
+        let report = DiscoverReport {
+            sources: vec![DiscoverSourceReport {
+                source: DiscoverySource::Observer,
+                status: wallet_core::SourceStatus::Failed("timeout".into()),
+                found: 0,
+                structurally_passed: 0,
+                rejected: 0,
+            }],
+            auto_join: AutoJoinReport {
+                considered: 2,
+                joined: 1,
+                blocked_concurrent: 0,
+                blocked_weekly: 1,
+                blocked_lifetime: 0,
+            },
+        };
+
+        let lines = discover_summary_lines(&report);
+        assert_eq!(
+            lines,
+            vec![
+                "source=observer status=failed:timeout found=0 passed=0 rejected=0",
+                "autojoin considered=2 joined=1 blocked_concurrent=0 blocked_weekly=1 blocked_lifetime=0",
+            ]
+        );
+        // `--json` uses the SAME lowercase-tag vocabulary as the TSV and `candidates --json`, not
+        // the derive's PascalCase/adjacently-tagged enum form.
+        let json = discover_report_json(&report);
+        assert_eq!(json["sources"][0]["source"], "observer");
+        assert_eq!(json["sources"][0]["status"], "failed:timeout");
+        assert_eq!(json["auto_join"]["blocked_weekly"], 1);
         Ok(())
     }
 

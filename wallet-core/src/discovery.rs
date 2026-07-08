@@ -41,6 +41,9 @@ pub const STRUCTURAL_RECHECK_BACKOFF_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// `true`. `Default` is the v1 policy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveryPolicy {
+    /// Whether the pass may create agent-owned client partitions for `Discovered` candidates.
+    /// The CLI flips this with `discover --auto-join`; the default is discovery-only.
+    pub auto_join: bool,
     /// Auto-joined feds whose probe is not yet `Passed` (the in-flight probing surface).
     pub max_concurrent_unproven: u32,
     /// SUCCESSFUL new-partition agent joins allowed in the trailing 7 days (a rate limit).
@@ -62,6 +65,7 @@ pub struct DiscoveryPolicy {
 impl Default for DiscoveryPolicy {
     fn default() -> Self {
         Self {
+            auto_join: false,
             max_concurrent_unproven: 3,
             max_auto_joins_per_week: 5,
             auto_join_lifetime_cap: 20,

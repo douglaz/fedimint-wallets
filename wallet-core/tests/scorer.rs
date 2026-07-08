@@ -1,5 +1,5 @@
 use wallet_core::{
-    score, FederationFacts, FederationId, Module, ObserverPrior, ScorerPolicy,
+    score, score_structural, FederationFacts, FederationId, Module, ObserverPrior, ScorerPolicy,
     ScorerReasonCode as ReasonCode,
 };
 
@@ -65,6 +65,87 @@ fn reject_probe_failed() {
     let verdict = score(&facts, &ScorerPolicy::default());
     assert!(!verdict.eligible_to_fund);
     assert!(verdict.reasons.contains(&ReasonCode::ProbeFailed));
+}
+
+#[test]
+fn structural_score_ignores_probe_failure_for_unprobed_discovery() {
+    let facts = FederationFacts {
+        quorum_live: false,
+        round_trip_ok: false,
+        ..healthy()
+    };
+
+    let verdict = score_structural(&facts, &ScorerPolicy::default());
+
+    assert!(verdict.eligible_to_fund);
+    assert_eq!(verdict.rank_score, 0);
+    assert!(!verdict.reasons.contains(&ReasonCode::ProbeFailed));
+    assert!(verdict.reasons.is_empty());
+}
+
+#[test]
+fn structural_score_rejects_the_same_structural_faults_as_score() {
+    let cases = [
+        (
+            FederationFacts {
+                guardian_count: 1,
+                ..healthy()
+            },
+            ReasonCode::NoFaultTolerance,
+        ),
+        (
+            FederationFacts {
+                guardian_count: 4,
+                threshold: 2,
+                ..healthy()
+            },
+            ReasonCode::TooFewGuardians,
+        ),
+        (
+            FederationFacts {
+                guardian_count: 100,
+                threshold: 3,
+                ..healthy()
+            },
+            ReasonCode::InvalidThreshold,
+        ),
+        (
+            FederationFacts {
+                is_mainnet: false,
+                ..healthy()
+            },
+            ReasonCode::WrongNetwork,
+        ),
+        (
+            FederationFacts {
+                modules: vec![Module::Mint, Module::Ln],
+                ..healthy()
+            },
+            ReasonCode::MissingModule,
+        ),
+        (
+            FederationFacts {
+                has_lnv2: false,
+                ..healthy()
+            },
+            ReasonCode::NoLnv2,
+        ),
+    ];
+
+    for (facts, reason) in cases {
+        let full = score(&facts, &ScorerPolicy::default());
+        let structural = score_structural(&facts, &ScorerPolicy::default());
+        assert!(
+            full.reasons.contains(&reason),
+            "full scorer should reject for {reason:?}"
+        );
+        assert!(
+            structural.reasons.contains(&reason),
+            "structural scorer should reject for {reason:?}"
+        );
+        assert!(!structural.eligible_to_fund);
+        assert!(!structural.reasons.contains(&ReasonCode::ProbeFailed));
+    }
 }
 
 #[test]

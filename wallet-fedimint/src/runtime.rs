@@ -20,8 +20,14 @@
 //! gateway (⟦D4⟧; devimint's LDK gateway is not auto-registered, runbook §4) that a FRESH move
 //! resolves through — a resumed move reuses the gateway already recorded in its `MoveRecord`.
 
+use crate::discovery::{
+    auto_join_kind, discover_kind, discovery_actor, run_discover_pass, AutoJoinCounts,
+    CandidateSource, DiscoverReport, DiscoveryBackend, PreviewedCandidate, DISCOVERY_REASON,
+};
 use crate::executor::FedimintExecutor;
-use crate::journal::{CandidateState, FedimintJournal, OperationRef, ProbeSession};
+use crate::journal::{
+    CandidateListReport, CandidateState, FedimintJournal, OperationRef, ProbeSession,
+};
 use crate::move_protocol::{MovePhase, MoveRecord};
 use crate::multi_client::{MultiClient, ReceiveState};
 use crate::probe::{assemble_facts, assemble_status, FedimintProbeRunner, ProbeResult};
@@ -31,7 +37,11 @@ use crate::tick::{
 };
 use crate::types::{GatewayUrl, Invoice};
 use async_trait::async_trait;
+use fedimint_core::config::ClientConfig;
+use fedimint_core::encoding::{Decodable, DynRawFallback};
+use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fedimint_core::runtime;
+use fedimint_core::NumPeers;
 use std::time::Duration;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -39,9 +49,9 @@ use std::{
 };
 use wallet_core::{
     probe_verdict, score, Action, ActiveProbeVerdict, Actor, AllocatorDecision, AllocatorSnapshot,
-    ExecError, ExecutionSummary, Executor, FederationId, IdempotencyKey, Intent, IntentStatus,
-    Journal, Msat, Occurrence, OperationKind, OperationStatus, PerformOutcome, ProbeAttempt,
-    ProbePolicy, ReasonCode, ScorerPolicy,
+    DiscoveryPolicy, ExecError, ExecutionSummary, Executor, FederationFacts, FederationId,
+    IdempotencyKey, Intent, IntentStatus, Journal, Module, Msat, Occurrence, OperationKind,
+    OperationStatus, PerformOutcome, ProbeAttempt, ProbePolicy, ReasonCode, ScorerPolicy,
 };
 
 /// Wall-clock in unix millis for the ledger's `created_at_ms` (§8/§9.4). `seq` is the
@@ -406,6 +416,17 @@ impl Runtime {
             status,
             outcome,
         })
+    }
+
+    /// Run one discovery pass (§5.1.2): union source announcements, authenticate configs without
+    /// joining, write candidate rows, and optionally auto-join within the configured caps.
+    pub async fn discover(
+        &self,
+        sources: Vec<Box<dyn CandidateSource>>,
+        policy: DiscoveryPolicy,
+    ) -> anyhow::Result<DiscoverReport> {
+        let nonce = ledger_nonce();
+        run_discover_pass(&sources, &policy, self, now_ms(), &nonce).await
     }
 
     /// Run ONE active probe of `candidate` from spending federation `from` (phase 5
@@ -1779,6 +1800,291 @@ impl Runtime {
                     intent.idempotency_key.0
                 )
             })
+    }
+}
+
+#[async_trait]
+impl DiscoveryBackend for Runtime {
+    async fn joined_federations(&self) -> anyhow::Result<BTreeSet<FederationId>> {
+        Ok(self
+            .journal
+            .list_federations()
+            .await
+            .map_err(exec_err)?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect())
+    }
+
+    async fn joined_federation_invites(
+        &self,
+    ) -> anyhow::Result<Vec<(FederationId, fedimint_core::invite_code::InviteCode)>> {
+        let mut invites = Vec::new();
+        for (id, info) in self.journal.list_federations().await.map_err(exec_err)? {
+            match info
+                .invite
+                .parse::<fedimint_core::invite_code::InviteCode>()
+            {
+                Ok(invite) => invites.push((id, invite)),
+                Err(e) => tracing::warn!(
+                    federation = %id.to_hex(),
+                    error = ?e,
+                    "discover: joined federation registry invite is invalid; cannot seed candidate row"
+                ),
+            }
+        }
+        Ok(invites)
+    }
+
+    async fn get_candidate(
+        &self,
+        id: FederationId,
+    ) -> anyhow::Result<Option<crate::CandidateRecord>> {
+        self.journal.get_candidate(&id).await.map_err(exec_err)
+    }
+
+    async fn put_candidate(&self, record: crate::CandidateRecord) -> anyhow::Result<()> {
+        self.journal.put_candidate(&record).await.map_err(exec_err)
+    }
+
+    async fn list_candidates(&self) -> anyhow::Result<Vec<(FederationId, crate::CandidateRecord)>> {
+        self.journal.list_candidates().await.map_err(exec_err)
+    }
+
+    async fn agent_created_federation(&self, id: FederationId) -> anyhow::Result<bool> {
+        self.journal
+            .agent_created_federation(&id)
+            .await
+            .map_err(exec_err)
+    }
+
+    async fn preview(
+        &self,
+        invite: &fedimint_core::invite_code::InviteCode,
+    ) -> anyhow::Result<PreviewedCandidate> {
+        let config = self.mc.preview_config(invite).await?;
+        let id = crate::multi_client::bridge_federation_id(config.calculate_federation_id());
+        Ok(PreviewedCandidate {
+            id,
+            facts: facts_from_client_config(id, &config),
+        })
+    }
+
+    async fn auto_join_counts(&self, now_ms: u64) -> anyhow::Result<AutoJoinCounts> {
+        let passed = self.passed_probe_feds(now_ms).await;
+        Ok(AutoJoinCounts {
+            concurrent_unproven: self
+                .journal
+                .concurrent_unproven(&passed)
+                .await
+                .map_err(exec_err)?,
+            weekly_auto_joins: self
+                .journal
+                .weekly_auto_joins(now_ms)
+                .await
+                .map_err(exec_err)?,
+            lifetime_auto_joins: self.journal.lifetime_auto_joins().await.map_err(exec_err)?,
+        })
+    }
+
+    async fn join_as_agent(
+        &self,
+        id: FederationId,
+        invite: fedimint_core::invite_code::InviteCode,
+        occurrence: Occurrence,
+        now_ms: u64,
+    ) -> anyhow::Result<crate::JoinOutcome> {
+        let key = IdempotencyKey(format!("join:{}:{}", id.to_hex(), ledger_nonce()));
+        self.journal
+            .record_started(
+                &key,
+                OperationKind::Join { fed: id },
+                Actor::Agent { occurrence },
+                ReasonCode::StandingInstruction,
+                now_ms,
+                None,
+            )
+            .await
+            .map_err(exec_err)?;
+        let outcome = match self.mc.join(invite).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                let _ = self
+                    .journal
+                    .record_terminal(
+                        &key,
+                        OperationStatus::Failed,
+                        now_ms,
+                        Some(&e.to_string()),
+                        None,
+                    )
+                    .await;
+                return Err(e);
+            }
+        };
+        let note = (!outcome.newly_joined).then_some(crate::JOIN_NOOP_REOPEN_NOTE);
+        self.journal
+            .record_terminal(&key, OperationStatus::Succeeded, now_ms, note, None)
+            .await
+            .map_err(exec_err)?;
+        Ok(outcome)
+    }
+
+    async fn record_discover(
+        &self,
+        key: IdempotencyKey,
+        occurrence: Occurrence,
+        report: &crate::DiscoverSourceReport,
+        now_ms: u64,
+    ) -> anyhow::Result<()> {
+        self.journal
+            .record_terminal_operation(
+                &key,
+                discover_kind(report),
+                discovery_actor(occurrence),
+                DISCOVERY_REASON,
+                now_ms,
+            )
+            .await
+            .map_err(exec_err)
+    }
+
+    async fn record_auto_join(
+        &self,
+        key: IdempotencyKey,
+        occurrence: Occurrence,
+        report: &crate::AutoJoinReport,
+        now_ms: u64,
+    ) -> anyhow::Result<()> {
+        self.journal
+            .record_terminal_operation(
+                &key,
+                auto_join_kind(report),
+                discovery_actor(occurrence),
+                DISCOVERY_REASON,
+                now_ms,
+            )
+            .await
+            .map_err(exec_err)
+    }
+}
+
+/// The candidate ids whose live probe verdict can EXEMPT them from the concurrent-unproven cap
+/// (§5.1.4): every `AutoJoined` row PLUS every poison-skipped id. `concurrent_unproven` counts
+/// skipped ids fail-closed, so `passed_probe_feds` must be able to clear a skipped id that has
+/// since Passed — otherwise a corrupt `AutoJoined` row whose probe passed would consume a
+/// concurrent slot forever. Mirrors [`Runtime::auto_joined_candidates`]'s fail-closed set.
+fn probe_gate_candidate_ids(report: &CandidateListReport) -> BTreeSet<FederationId> {
+    let mut ids: BTreeSet<FederationId> = report
+        .candidates
+        .iter()
+        .filter(|(_, rec)| rec.state == CandidateState::AutoJoined)
+        .map(|(id, _)| *id)
+        .collect();
+    ids.extend(report.skipped_ids.iter().copied());
+    ids
+}
+
+impl Runtime {
+    async fn passed_probe_feds(&self, now_ms: u64) -> BTreeSet<FederationId> {
+        let report = match self.journal.list_candidates_report().await {
+            Ok(report) => report,
+            Err(e) => {
+                tracing::warn!(error = ?e, "discover: candidate scan failed while computing passed probes");
+                return BTreeSet::new();
+            }
+        };
+        let mut passed = BTreeSet::new();
+        for id in probe_gate_candidate_ids(&report) {
+            let attempts = match self.journal.probe_record(&id).await {
+                Ok(record) => record.map(|r| r.attempts).unwrap_or_default(),
+                Err(e) => {
+                    tracing::warn!(
+                        federation = %id.to_hex(),
+                        error = ?e,
+                        "discover: probe record unreadable; treating candidate as unproven"
+                    );
+                    continue;
+                }
+            };
+            let sources: BTreeSet<_> = attempts.iter().map(|attempt| attempt.from).collect();
+            if sources.into_iter().any(|source| {
+                probe_verdict(&attempts, source, now_ms, &ProbePolicy::default())
+                    == ActiveProbeVerdict::Passed
+            }) {
+                passed.insert(id);
+            }
+        }
+        passed
+    }
+}
+
+fn facts_from_client_config(id: FederationId, config: &ClientConfig) -> FederationFacts {
+    let num_endpoints = config.global.api_endpoints.len();
+    let module_kinds: Vec<String> = config
+        .modules
+        .values()
+        .map(|module| module.kind.as_str().to_owned())
+        .collect();
+    let has_lnv2 = module_kinds
+        .iter()
+        .any(|kind| kind == fedimint_lnv2_client::common::KIND.as_str());
+    FederationFacts {
+        id,
+        guardian_count: num_endpoints as u32,
+        threshold: threshold_for_endpoints(num_endpoints),
+        is_mainnet: wallet_network(config) == Some(bitcoin::Network::Bitcoin),
+        modules: module_kinds
+            .iter()
+            .map(|kind| module_from_kind(kind))
+            .collect(),
+        quorum_live: false,
+        round_trip_ok: false,
+        peg_out_quotable: false,
+        latency_ms: 0,
+        shutdown_scheduled: false,
+        has_lnv2,
+        observer: None,
+        active_probe: None,
+    }
+}
+
+fn threshold_for_endpoints(num_endpoints: usize) -> u32 {
+    if num_endpoints == 0 {
+        return 0;
+    }
+    NumPeers::from(num_endpoints).threshold() as u32
+}
+
+fn wallet_network(config: &ClientConfig) -> Option<bitcoin::Network> {
+    config
+        .modules
+        .values()
+        .find(|module| module.kind == fedimint_wallet_client::common::KIND)
+        .and_then(|module| match &module.config {
+            DynRawFallback::Decoded(config) => config
+                .as_any()
+                .downcast_ref::<fedimint_wallet_client::config::WalletClientConfig>()
+                .map(|config| config.network.0),
+            DynRawFallback::Raw { raw, .. } => {
+                fedimint_wallet_client::config::WalletClientConfig::consensus_decode_whole(
+                    raw,
+                    &ModuleDecoderRegistry::default(),
+                )
+                .ok()
+                .map(|config| config.network.0)
+            }
+        })
+}
+
+fn module_from_kind(kind: &str) -> Module {
+    match kind {
+        "mint" => Module::Mint,
+        "ln" => Module::Ln,
+        "lnv2" => Module::Lnv2,
+        "wallet" => Module::Wallet,
+        "meta" => Module::Meta,
+        _ => Module::Other,
     }
 }
 
@@ -3210,5 +3516,62 @@ mod tests {
             journal.get(&key).await.expect("get").map(|i| i.status),
             Some(IntentStatus::Done)
         );
+    }
+
+    #[test]
+    fn probe_gate_candidate_ids_covers_auto_joined_and_skipped_rows() {
+        use fedimint_core::invite_code::InviteCode;
+        use fedimint_core::util::SafeUrl;
+        use fedimint_core::PeerId;
+        use std::str::FromStr as _;
+
+        fn invite(id: FederationId) -> InviteCode {
+            let fed_id =
+                fedimint_core::config::FederationId::from_str(&id.to_hex()).expect("valid fed id");
+            InviteCode::new(
+                SafeUrl::parse("https://probe-gate.example").expect("valid url"),
+                PeerId::from(0),
+                fed_id,
+                None,
+            )
+        }
+        fn row(id: FederationId, state: CandidateState) -> crate::CandidateRecord {
+            crate::CandidateRecord {
+                id,
+                invite: invite(id),
+                source: wallet_core::DiscoverySource::Manual,
+                discovered_at_ms: 0,
+                structural: crate::StructuralOutcome::Passed,
+                structural_checked_at_ms: 0,
+                state,
+                updated_at_ms: 0,
+            }
+        }
+
+        let auto = FederationId([0x01; 32]);
+        let discovered = FederationId([0x02; 32]);
+        let skipped = FederationId([0x03; 32]);
+        let report = CandidateListReport {
+            candidates: vec![
+                (auto, row(auto, CandidateState::AutoJoined)),
+                (discovered, row(discovered, CandidateState::Discovered)),
+            ],
+            skipped_ids: BTreeSet::from([skipped]),
+            skipped_rows: 1,
+            skipped_unidentified: 0,
+        };
+
+        // A poison-skipped id joins the probe-gate set so a later Passed probe can clear the
+        // concurrent cap; a plain `Discovered` row (no partition) never counts.
+        let ids = probe_gate_candidate_ids(&report);
+        assert_eq!(ids, BTreeSet::from([auto, skipped]));
+        assert!(!ids.contains(&discovered));
+    }
+
+    #[test]
+    fn threshold_for_endpoints_handles_zero_without_underflow() {
+        assert_eq!(threshold_for_endpoints(0), 0);
+        assert_eq!(threshold_for_endpoints(1), 1);
+        assert_eq!(threshold_for_endpoints(4), 3);
     }
 }
