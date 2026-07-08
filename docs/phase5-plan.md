@@ -869,7 +869,12 @@ wallet-cli approve <fed-hex>   # bless an AutoJoined candidate -> UserApproved (
 
 ### 5.1.9 Build order (for rb-lite)
 
-1. **5.1a — the pure core + registry + gate** (no external I/O): `CandidateAnnouncement`/
+1. **5.1a — the pure core + registry + gate** (no external I/O): **DONE, merged `87b01f4`
+   2026-07-08.** Implemented via rb-lite (codex-first after a transient claude overload killed
+   attempt 1; 11 rounds clean) + independent verification + one adversarial codex P2 fixed
+   (user-join now recovers a corrupt `0x09` row instead of stranding the fed behind the probe
+   gate). ~500 tests green; the gate, self-reference break, three-cap accounting, and ledger
+   kinds all landed. No live gate here (pure/unit — the live gate is 5.1c). `CandidateAnnouncement`/
    `DiscoverySource`/`CandidateSource` trait + `CandidateRecord`/`CandidateState` + the
    `0x09` journal registry + `Discover` ledger kind + the `build_snapshot` gate rule +
    auto-join accounting (the three caps, read from the ledger/registry). `ManualSource`.
