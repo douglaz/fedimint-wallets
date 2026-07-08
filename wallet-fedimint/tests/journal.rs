@@ -496,6 +496,43 @@ async fn candidate_registry_treats_embedded_id_mismatch_as_poison() {
 }
 
 #[tokio::test]
+async fn put_candidate_overwrites_a_corrupt_row_so_get_recovers() {
+    // The CLI user-join path (mark_candidate_user_approved) recovers a poisoned 0x09 row by
+    // OVERWRITING it with a fresh UserApproved record rather than bailing — otherwise an
+    // EXPLICITLY user-joined fed stays fail-closed to AutoJoined behind the probe gate (a
+    // corrupt/skipped id counts as AutoJoined in auto_joined_candidates). This pins the
+    // load-bearing mechanism the fix depends on: put_candidate over a corrupt key makes the
+    // targeted get_candidate read the fresh row.
+    let db = MemDatabase::new().into_database();
+    let journal = FedimintJournal::new(db.clone());
+    let id = fed(0x27);
+
+    let app_db = db.with_prefix(vec![0x00]);
+    let mut dbtx = app_db.begin_transaction().await;
+    dbtx.raw_insert_bytes(&tagged_key(0x09, &id.0), b"not valid json")
+        .await
+        .expect("insert corrupt candidate row");
+    dbtx.commit_tx_result().await.expect("commit corrupt row");
+
+    journal
+        .get_candidate(&id)
+        .await
+        .expect_err("a corrupt row fails closed on the targeted read");
+
+    let recovered = candidate(id, CandidateState::UserApproved);
+    journal
+        .put_candidate(&recovered)
+        .await
+        .expect("overwrite the corrupt row");
+
+    assert_eq!(
+        journal.get_candidate(&id).await.expect("get after overwrite"),
+        Some(recovered),
+        "put_candidate overwrites the poisoned key so the fed is recovered as UserApproved"
+    );
+}
+
+#[tokio::test]
 async fn concurrent_unproven_counts_only_auto_joined_rows_without_passed_probe() {
     let journal = mem_journal();
     journal

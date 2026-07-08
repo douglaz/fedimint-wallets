@@ -1576,23 +1576,40 @@ async fn mark_candidate_user_approved(
     invite: &InviteCode,
     updated_at_ms: u64,
 ) -> anyhow::Result<()> {
-    let Some(mut candidate) = journal
-        .get_candidate(&fed_id)
-        .await
-        .map_err(|e| anyhow::anyhow!("reading candidate registry: {e:?}"))?
-    else {
-        let candidate = wallet_fedimint::CandidateRecord {
-            id: fed_id,
-            invite: invite.clone(),
-            source: wallet_core::DiscoverySource::Manual,
-            discovered_at_ms: updated_at_ms,
-            structural: wallet_fedimint::StructuralOutcome::Passed,
-            structural_checked_at_ms: updated_at_ms,
-            state: CandidateState::UserApproved,
-            updated_at_ms,
-        };
+    // A fresh UserApproved record for the fed we just successfully joined (we hold id + invite),
+    // used whenever there is no usable prior row to transition.
+    let fresh_user_approved = wallet_fedimint::CandidateRecord {
+        id: fed_id,
+        invite: invite.clone(),
+        source: wallet_core::DiscoverySource::Manual,
+        discovered_at_ms: updated_at_ms,
+        structural: wallet_fedimint::StructuralOutcome::Passed,
+        structural_checked_at_ms: updated_at_ms,
+        state: CandidateState::UserApproved,
+        updated_at_ms,
+    };
+    let existing = match journal.get_candidate(&fed_id).await {
+        Ok(existing) => existing,
+        Err(e) => {
+            // A CORRUPT `0x09` row must not strand a user-joined fed behind the probe gate:
+            // `auto_joined_candidates()` fail-closes an UNREADABLE id to `AutoJoined`, so
+            // skipping the ownership update here would keep an EXPLICITLY user-joined fed gated
+            // until a manual DB repair. We hold the fed's id + invite from the successful join,
+            // so OVERWRITE the poisoned row with a fresh `UserApproved` record (noted, not silent).
+            eprintln!(
+                "note: candidate row unreadable on user join ({e:?}); overwriting with a fresh \
+                 UserApproved record"
+            );
+            journal
+                .put_candidate(&fresh_user_approved)
+                .await
+                .map_err(|e| anyhow::anyhow!("writing candidate registry: {e:?}"))?;
+            return Ok(());
+        }
+    };
+    let Some(mut candidate) = existing else {
         journal
-            .put_candidate(&candidate)
+            .put_candidate(&fresh_user_approved)
             .await
             .map_err(|e| anyhow::anyhow!("writing candidate registry: {e:?}"))?;
         return Ok(());
