@@ -41,15 +41,16 @@
 use crate::move_protocol::MoveRecord;
 use async_trait::async_trait;
 use fedimint_core::db::{AutocommitError, Database, DatabaseError, IDatabaseTransactionOpsCore};
+use fedimint_core::invite_code::InviteCode;
 use futures::StreamExt;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use wallet_core::{
-    advance, kind_from_action, status_from_intent, Action, Actor, AllocatorDecision, ExecError,
-    FederationId, FeeBreakdown, GatewayUrl, IdempotencyKey, Intent, IntentStatus, Journal, Msat,
-    Occurrence, OperationId, OperationKind, OperationRecord, OperationStatus, ProbeAttempt,
-    ProbePolicy, RawOpUpdate, ReasonCode, WriteKind,
+    advance, kind_from_action, status_from_intent, Action, Actor, AllocatorDecision,
+    DiscoverySource, ExecError, FederationId, FeeBreakdown, GatewayUrl, IdempotencyKey, Intent,
+    IntentStatus, Journal, Msat, Occurrence, OperationId, OperationKind, OperationRecord,
+    OperationStatus, ProbeAttempt, ProbePolicy, RawOpUpdate, ReasonCode, WriteKind,
 };
 
 /// The app-state partition prefix (spec §4/§8). Clients live at `[0x01, ..]`, see
@@ -66,6 +67,7 @@ const TAG_LEDGER_ROW: u8 = 0x05; // `0x05 ++ be64(seq)` → JSON row v1(Operatio
 const TAG_LEDGER_KEY_INDEX: u8 = 0x06; // `0x06 ++ correlation_key_utf8` → be64(seq)
 const TAG_LEDGER_COUNTER: u8 = 0x07; // `0x07` (single key) → be64(next_seq)
 const TAG_PROBE: u8 = 0x08; // `0x08 ++ fed_id` → JSON row v1(ProbeRecord) (phase 5 §5.0.4)
+const TAG_CANDIDATE: u8 = 0x09; // `0x09 ++ fed_id` → JSON row v1(CandidateRecord) (phase 5 §5.1.1)
 
 /// Rows older than this are eligible for reconcile's NEGATIVE-inference repairs (§10.3): a
 /// fresh non-terminal row may belong to an operation still in flight in another process, so
@@ -110,6 +112,29 @@ pub struct FederationListReport {
     pub skipped_rows: usize,
 }
 
+/// Result of a candidate-registry scan, including poison rows skipped along the way.
+///
+/// The ordinary [`FedimintJournal::list_candidates`] call stays poison-tolerant for listing and
+/// discovery progress. Tick planning uses this report so an undecodable row with a well-formed
+/// federation id can still be treated conservatively by the auto-join probe gate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandidateListReport {
+    pub candidates: Vec<(FederationId, CandidateRecord)>,
+    pub skipped_ids: BTreeSet<FederationId>,
+    pub skipped_rows: usize,
+    /// Skipped rows whose federation id could be recovered from NEITHER the (malformed) key NOR
+    /// the (undecodable) value. They cannot be attributed to a fed, so the funding gate cannot
+    /// act on them, but each still counts fail-closed against the concurrent auto-join cap (any
+    /// one could be an unproven `AutoJoined` partition) — exactly like the id-recoverable
+    /// [`Self::skipped_ids`].
+    pub skipped_unidentified: usize,
+}
+
+struct LedgerRowsReport {
+    rows: Vec<OperationRecord>,
+    skipped_rows: usize,
+}
+
 /// Durable per-fed ACTIVE-probe state (phase 5 §5.0.4): the bounded attempt history the
 /// pure `probe_verdict` evaluates, plus the in-flight session identity a crashed probe
 /// resumes from. One `0x08` row per federation, upserted in its own dbtx.
@@ -150,6 +175,71 @@ pub struct ProbeSession {
 /// cadence this holds years; only a script hammering `probe` can hit it (self-inflicted —
 /// the ledger keeps the full narrative regardless).
 pub const PROBE_HISTORY_CAP: usize = 256;
+
+/// The durable candidate-registry row (phase 5 §5.1.1): a fed the wallet LEARNED about (from a
+/// discovery source) but has not necessarily joined. Distinct from the JOINED membership
+/// registry (`0x03` [`FederationInfo`]); membership authority stays there, and this row's
+/// [`CandidateState`] distinguishes agent- from user-owned for the gate (§5.1.3) and the
+/// auto-join budget (§5.1.4). One `0x09` row per fed, upserted in its own dbtx.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CandidateRecord {
+    pub id: FederationId,
+    pub invite: InviteCode,
+    pub source: DiscoverySource,
+    pub discovered_at_ms: u64,
+    /// The authenticated STRUCTURAL verdict (the free floor: guardian count, threshold/BFT,
+    /// network, modules — the scorer's structural half). Refreshed on rediscovery, not frozen.
+    pub structural: StructuralOutcome,
+    /// When [`Self::structural`] was last computed (a config fetch). Discovery re-checks a row
+    /// older than the recheck backoff (§5.1.1), so a fed initially `Rejected` for a now-
+    /// upgradeable property is reconsidered without a config fetch every pass.
+    pub structural_checked_at_ms: u64,
+    pub state: CandidateState,
+    pub updated_at_ms: u64,
+}
+
+/// The authenticated structural-floor outcome for a candidate (§5.1.1); the reason mirrors the
+/// scorer's `ReasonCode`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum StructuralOutcome {
+    Passed,
+    Rejected(String),
+}
+
+/// A candidate's lifecycle state (§5.1.1). The gate (§5.1.3) treats only [`AutoJoined`] as
+/// agent-owned/probe-gated; the budget (§5.1.4) counts it against the concurrent cap. A user
+/// `join`/`approve` moves a candidate to [`UserApproved`] (§5.1.4a).
+///
+/// [`AutoJoined`]: CandidateState::AutoJoined
+/// [`UserApproved`]: CandidateState::UserApproved
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CandidateState {
+    /// Structurally rejected — not fundable NOW, but NOT a permanent blacklist: kept so it is
+    /// not re-fetched every pass, and reconsidered after the structural recheck backoff (a fed
+    /// can enable a required module under the same id and later pass).
+    Rejected,
+    /// Structurally vetted, NOT joined — surface-only until the user or the loop joins it.
+    Discovered,
+    /// AUTO-joined by the agent (a client partition exists); now probeable AND probe-GATED for
+    /// funding, and COUNTED against the auto-join caps (§5.1.4). The probe verdict (5.0, read
+    /// live from `probe_record`) is NOT stored here — `probe_record` stays the source of truth.
+    AutoJoined,
+    /// A user EXPLICITLY approved a candidate (§5.1.4a): it leaves the probe GATE and the
+    /// CONCURRENT cap for the grandfathered USER-joined path. Reached from `Discovered` (a
+    /// plain `wallet-cli join`) OR from `AutoJoined` (an `approve`). It does NOT leave the
+    /// LIFETIME cap: that counts immutable agent-join history, and approval does not reclaim
+    /// the partition — else approving old auto-joins would reopen the budget (§5.1.4/§5.1.4a).
+    UserApproved,
+}
+
+/// The note a no-op re-open `join:` row carries in its `error` (§10.2): a `Succeeded` join that
+/// opened an ALREADY-joined fed, creating NO new partition. The auto-join accounting (§5.1.4)
+/// keys on it to EXCLUDE such rows from the partition counts, so the agent auto-join path
+/// (5.1b) MUST write exactly this string — the same one `wallet-cli join`'s user path uses.
+pub const JOIN_NOOP_REOPEN_NOTE: &str = "already joined (concurrent/prior); no-op re-open";
+
+/// Trailing-7d window for the weekly auto-join rate cap (§5.1.4).
+const AUTO_JOIN_WEEKLY_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// Durable [`wallet_core::Journal`] over a fedimint [`Database`], isolated to prefix `[0x00]`.
 #[derive(Clone, Debug)]
@@ -661,21 +751,30 @@ impl FedimintJournal {
     /// Every decodable ledger row, ascending by `seq` (the `0x05` prefix scan order). Poison
     /// rows are skipped + warned like every other scan; a storage error surfaces.
     async fn scan_ledger_rows(&self) -> Result<Vec<OperationRecord>, ExecError> {
+        Ok(self.scan_ledger_rows_report().await?.rows)
+    }
+
+    /// Operation-ledger scan with a report of skipped poison rows. The public history path
+    /// remains poison-tolerant, but auto-join budget counters consume `skipped_rows` so corrupt
+    /// ledger history cannot make hard caps fail open.
+    async fn scan_ledger_rows_report(&self) -> Result<LedgerRowsReport, ExecError> {
         let mut dbtx = self.db.begin_transaction_nc().await;
         let mut stream = dbtx
             .raw_find_by_prefix(&[TAG_LEDGER_ROW])
             .await
             .map_err(db_err)?;
         let mut rows = Vec::new();
+        let mut skipped_rows = 0;
         while let Some((raw_key, value)) = stream.next().await {
             match decode_row_result::<OperationRecord>("ledger row", &raw_key, &value) {
                 Ok(rec) => rows.push(rec),
                 Err(e) => {
+                    skipped_rows += 1;
                     tracing::warn!(?raw_key, error = ?e, "journal: skipping undecodable ledger row")
                 }
             }
         }
-        Ok(rows)
+        Ok(LedgerRowsReport { rows, skipped_rows })
     }
 
     /// Newest-first ledger scan for `history` (§11): up to `limit` rows with `seq < before_seq`
@@ -888,6 +987,171 @@ impl FedimintJournal {
         Ok(true)
     }
 
+    // --- candidate registry (phase 5 §5.1.1, tag 0x09) ---
+
+    /// Upsert the `0x09` candidate row for its fed (§5.1.1). One row per fed, its own dbtx —
+    /// the same write discipline as the probe/federation registries.
+    pub async fn put_candidate(&self, rec: &CandidateRecord) -> Result<(), ExecError> {
+        let value = encode_row(rec)?;
+        let mut dbtx = self.db.begin_transaction().await;
+        dbtx.raw_insert_bytes(&candidate_key(&rec.id), &value)
+            .await
+            .map_err(db_err)?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Read one federation's candidate row. TARGETED getter that FAILS CLOSED on an undecodable
+    /// row (like `get_federation`/`probe_record`): the caller asked for THIS id and should learn
+    /// it is unreadable. Only the bulk [`Self::list_candidates`] scan is poison-tolerant.
+    pub async fn get_candidate(
+        &self,
+        id: &FederationId,
+    ) -> Result<Option<CandidateRecord>, ExecError> {
+        let raw_key = candidate_key(id);
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        let Some(bytes) = dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? else {
+            return Ok(None);
+        };
+        Ok(Some(decode_candidate_row(*id, &raw_key, &bytes)?))
+    }
+
+    /// List every candidate row (§5.1.1), POISON-TOLERANT like the other registry scans: a
+    /// malformed key or undecodable value is SKIPPED (warn-logged), never fatal — one corrupt
+    /// candidate must not strand discovery of the rest. A transient storage error on the scan
+    /// still surfaces as [`ExecError::Retryable`].
+    pub async fn list_candidates(&self) -> Result<Vec<(FederationId, CandidateRecord)>, ExecError> {
+        Ok(self.list_candidates_report().await?.candidates)
+    }
+
+    /// Candidate-registry scan with a report of skipped poison rows. This is the same
+    /// poison-tolerant scan as [`Self::list_candidates`], but callers that need fail-closed
+    /// behavior can conservatively account for `skipped_ids`.
+    pub async fn list_candidates_report(&self) -> Result<CandidateListReport, ExecError> {
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        let mut stream = dbtx
+            .raw_find_by_prefix(&[TAG_CANDIDATE])
+            .await
+            .map_err(db_err)?;
+        let mut candidates = Vec::new();
+        let mut skipped_ids = BTreeSet::new();
+        let mut skipped_rows = 0;
+        let mut skipped_unidentified = 0;
+        while let Some((raw_key, value)) = stream.next().await {
+            // raw_key = [TAG_CANDIDATE] ++ 32-byte FederationId.
+            let Some(id) = raw_key.get(1..).and_then(|b| <[u8; 32]>::try_from(b).ok()) else {
+                // A malformed key hides the fed id, so recover it from the row VALUE: a
+                // corrupt-key `AutoJoined` row must still fail closed against BOTH the funding
+                // gate and the concurrent cap, not vanish (it would otherwise bypass the gate
+                // and free a concurrent slot). If the value is ALSO undecodable the id is
+                // unrecoverable — the gate cannot act, but it still counts fail-closed for the
+                // cap via `skipped_unidentified`.
+                skipped_rows += 1;
+                match decode_row_result::<CandidateRecord>("candidate", &raw_key, &value) {
+                    Ok(rec) => {
+                        tracing::warn!(
+                            ?raw_key,
+                            id = %rec.id.to_hex(),
+                            "journal: candidate row has a malformed key; recovered embedded id, counting fail-closed"
+                        );
+                        skipped_ids.insert(rec.id);
+                    }
+                    Err(e) => {
+                        skipped_unidentified += 1;
+                        tracing::warn!(?raw_key, error = ?e, "journal: skipping candidate row with malformed key and unrecoverable id");
+                    }
+                }
+                continue;
+            };
+            let id = FederationId(id);
+            match decode_candidate_row(id, &raw_key, &value) {
+                Ok(rec) => candidates.push((id, rec)),
+                Err(e) => {
+                    skipped_rows += 1;
+                    skipped_ids.insert(id);
+                    tracing::warn!(?raw_key, error = ?e, "journal: skipping undecodable candidate row")
+                }
+            }
+        }
+        Ok(CandidateListReport {
+            candidates,
+            skipped_ids,
+            skipped_rows,
+            skipped_unidentified,
+        })
+    }
+
+    // --- auto-join accounting (phase 5 §5.1.4) ---
+
+    /// Total agent-created partitions EVER — the lifetime-cap count (§5.1.4). Reads the
+    /// immutable ledger join history, NOT the mutable candidate state (§P1): the count of
+    /// `actor: Agent` `join:` rows that SUCCEEDED and created a NEW partition. Monotonic, so
+    /// approval (which leaves the partition in place) keeps counting and the finite-set
+    /// guarantee holds. Undecodable ledger rows count fail-closed because any one may be a
+    /// successful new-partition Agent join.
+    pub async fn lifetime_auto_joins(&self) -> Result<u32, ExecError> {
+        let report = self.scan_ledger_rows_report().await?;
+        let counted = report
+            .rows
+            .iter()
+            .filter(|r| is_agent_new_partition_join(r))
+            .count()
+            + report.skipped_rows;
+        Ok(count_saturating_u32(counted))
+    }
+
+    /// Agent-created partitions in the trailing 7 days — the weekly rate-cap count (§5.1.4):
+    /// the same filter as [`Self::lifetime_auto_joins`], windowed on each join's
+    /// `created_at_ms` (when the attempt began; a join Started and Succeeded near-instantly).
+    /// Undecodable ledger rows cannot be windowed, so they count fail-closed until repaired.
+    pub async fn weekly_auto_joins(&self, now_ms: u64) -> Result<u32, ExecError> {
+        let report = self.scan_ledger_rows_report().await?;
+        let counted = report
+            .rows
+            .iter()
+            .filter(|r| {
+                is_agent_new_partition_join(r)
+                    && now_ms.saturating_sub(r.created_at_ms) < AUTO_JOIN_WEEKLY_WINDOW_MS
+            })
+            .count()
+            + report.skipped_rows;
+        Ok(count_saturating_u32(counted))
+    }
+
+    /// Auto-joined candidates whose probe is not yet `Passed` — the concurrent-cap count
+    /// (§5.1.4). Counts `0x09` rows with `state == AutoJoined` whose id is NOT in `passed`
+    /// (the caller builds `passed` from the live probe verdicts). Counting live `AutoJoined`
+    /// rows (one per real partition) keeps this free of attempt/no-op noise; unlike the
+    /// lifetime cap, an APPROVED fed correctly leaves this count (it left the in-flight
+    /// probing surface via the `AutoJoined -> UserApproved` transition).
+    ///
+    /// FAILS CLOSED on corruption, exactly like the runtime's `auto_joined_candidates` funding
+    /// gate: an undecodable candidate row could be an unproven `AutoJoined` partition, so each
+    /// skipped id (that has not since Passed) counts against the concurrent cap. Otherwise a
+    /// single corrupt `AutoJoined` row would silently shrink the in-flight count and admit one
+    /// auto-join past the cap. Rows whose id is unrecoverable (`skipped_unidentified`) cannot be
+    /// Passed-filtered, so they count unconditionally — the fully-conservative direction.
+    pub async fn concurrent_unproven(
+        &self,
+        passed: &BTreeSet<FederationId>,
+    ) -> Result<u32, ExecError> {
+        let report = self.list_candidates_report().await?;
+        let live = report
+            .candidates
+            .iter()
+            .filter(|(id, rec)| rec.state == CandidateState::AutoJoined && !passed.contains(id))
+            .count();
+        let skipped = report
+            .skipped_ids
+            .iter()
+            .filter(|id| !passed.contains(id))
+            .count();
+        Ok(count_saturating_u32(
+            live.saturating_add(skipped)
+                .saturating_add(report.skipped_unidentified),
+        ))
+    }
+
     // --- reconcile repair (spec §10.3) ---
 
     /// Scan the FULL ledger for non-terminal (`Started`/`Awaiting`) rows and repair the stuck
@@ -925,7 +1189,9 @@ impl FedimintJournal {
             summary.repaired += self.repair_join_fed(fed, &attempts, now).await?;
         }
 
-        // `pay:`/`recv:` and `tick:` rows repair individually.
+        // `pay:`/`recv:` rows repair from op-log evidence. `tick:` and discovery maintenance
+        // rows have no external op-log witness, so stale non-terminal rows soft-fail after the
+        // age gate instead of staying in-flight forever.
         for row in &rows {
             if row.status.is_terminal() {
                 continue;
@@ -941,17 +1207,17 @@ impl FedimintJournal {
                         );
                     }
                 },
-                KeyClass::Tick => {
-                    // A crash between a tick's Started and terminal write is otherwise
-                    // unrepairable (later ticks use fresh nonces); age-gate keeps a live tick's
-                    // row safe from a concurrent reconcile.
+                KeyClass::Tick | KeyClass::Discovery => {
+                    // A crash between a Started row and terminal write is otherwise unrepairable
+                    // (later invocations use fresh nonces); age-gate keeps a live invocation's row
+                    // safe from a concurrent reconcile.
                     if now.saturating_sub(row.created_at_ms) >= REPAIR_AGE_MS {
                         self.apply_repair(
                             &row.correlation_key,
                             OperationStatus::Failed,
                             now,
                             None,
-                            Some(TICK_INTERRUPTED.to_owned()),
+                            Some(INTERRUPTED_NO_TERMINAL.to_owned()),
                             WriteKind::Repair,
                         )
                         .await?;
@@ -1235,7 +1501,7 @@ const JOIN_NOT_REGISTERED: &str =
     "join did not complete — federation not in the registry; re-run join";
 const JOIN_AMBIGUOUS_NOTE: &str =
     "overlapping attempts; correlation uncertain — membership itself is registry-proven";
-const TICK_INTERRUPTED: &str = "interrupted — no terminal report";
+const INTERRUPTED_NO_TERMINAL: &str = "interrupted — no terminal report";
 const RAW_NEVER_REACHED: &str = "never reached the federation";
 const HASH_DEDUP_NOTE: &str = "correlated by payment hash to an existing payment of this invoice; \
      attempt-level correlation uncertain (deduped retry or never-sent attempt); the matched \
@@ -1245,6 +1511,7 @@ const HASH_DEDUP_NOTE: &str = "correlated by payment hash to an existing payment
 enum KeyClass {
     Join,
     Tick,
+    Discovery,
     Raw,
     Other,
 }
@@ -1255,6 +1522,9 @@ fn classify_key(key: &IdempotencyKey) -> KeyClass {
         KeyClass::Join
     } else if s.starts_with("tick:") {
         KeyClass::Tick
+    } else if s.starts_with("discover:") || s.starts_with("autojoin:") || s.starts_with("approve:")
+    {
+        KeyClass::Discovery
     } else if s.starts_with("pay:") || s.starts_with("recv:") {
         KeyClass::Raw
     } else {
@@ -1735,6 +2005,27 @@ fn probe_key(id: &FederationId) -> Vec<u8> {
     tagged(TAG_PROBE, &id.0)
 }
 
+fn candidate_key(id: &FederationId) -> Vec<u8> {
+    tagged(TAG_CANDIDATE, &id.0)
+}
+
+/// Whether `row` is an AGENT `join:` row that SUCCEEDED and created a NEW partition (§5.1.4):
+/// `actor: Agent`, a `Join` kind, `Succeeded`, and NOT a no-op re-open. Failed attempts and
+/// no-op re-opens write `join:` rows too but created no partition, so they never count — the
+/// no-op re-open is the ONE `Succeeded` join case with no partition, marked by
+/// [`JOIN_NOOP_REOPEN_NOTE`] in `error`. This reads the immutable, monotonic history the
+/// lifetime/weekly caps trust, never the mutable candidate state (§P1).
+fn is_agent_new_partition_join(row: &OperationRecord) -> bool {
+    matches!(row.actor, Actor::Agent { .. })
+        && matches!(row.kind, OperationKind::Join { .. })
+        && row.status == OperationStatus::Succeeded
+        && row.error.as_deref() != Some(JOIN_NOOP_REOPEN_NOTE)
+}
+
+fn count_saturating_u32(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
 /// §5.0.4 TIME-AWARE probe-attempt retention (a count-only cap could truncate the very
 /// successes the 24h `min_span` needs whenever probes run more often than span/cap). Keep
 /// every attempt younger than the DEFAULT `ttl_ms` — exactly the verdict's PASS-evaluation
@@ -1889,6 +2180,22 @@ where
         )));
     }
     serde_json::from_value(row.data).map_err(|e| decode_err(kind, key, e))
+}
+
+fn decode_candidate_row(
+    key_id: FederationId,
+    raw_key: &[u8],
+    bytes: &[u8],
+) -> Result<CandidateRecord, ExecError> {
+    let rec: CandidateRecord = decode_row_result("candidate", raw_key, bytes)?;
+    if rec.id != key_id {
+        return Err(ExecError::Permanent(format!(
+            "journal: candidate row key id {} does not match embedded id {} for {raw_key:?}",
+            key_id.to_hex(),
+            rec.id.to_hex()
+        )));
+    }
+    Ok(rec)
 }
 
 /// A serde encode/decode failure is a data/logic bug, not transient → `Permanent`.

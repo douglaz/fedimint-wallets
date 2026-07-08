@@ -19,9 +19,9 @@ use wallet_core::{
     OperationRecord, OperationStatus, ProbePolicy, RawOpUpdate, ReasonCode,
 };
 use wallet_fedimint::{
-    parse_invoice, FedimintJournal, FinalizeOutcome, GatewayUrl, Invoice, LedgerRepairOracle,
-    MoveOutcome, MultiClient, OperationId, OperationRef, ProbeOutcome, ReceiveState, Runtime,
-    ScoredFed, SendOutcome, SendState, TickPolicy,
+    parse_invoice, CandidateState, FedimintJournal, FinalizeOutcome, GatewayUrl, Invoice,
+    LedgerRepairOracle, MoveOutcome, MultiClient, OperationId, OperationRef, ProbeOutcome,
+    ReceiveState, Runtime, ScoredFed, SendOutcome, SendState, TickPolicy, JOIN_NOOP_REOPEN_NOTE,
 };
 
 #[derive(Parser)]
@@ -411,7 +411,16 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("reading federation registry: {e:?}"))?
                 .is_some();
             if already {
-                let outcome = multi_client.join(invite).await?;
+                let outcome = multi_client.join(invite.clone()).await?;
+                note_candidate(
+                    mark_candidate_user_approved(
+                        journal.as_ref(),
+                        outcome.id,
+                        &invite,
+                        cli_now_ms(),
+                    )
+                    .await,
+                );
                 println!("{}", outcome.id.to_hex());
             } else {
                 // A fresh join: write the `Started` attempt row BEFORE the join, then terminalize
@@ -429,7 +438,7 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .await
                     .map_err(ledger_err)?;
-                let outcome = match multi_client.join(invite).await {
+                let outcome = match multi_client.join(invite.clone()).await {
                     Ok(outcome) => outcome,
                     Err(e) => {
                         let _ = journal
@@ -444,12 +453,20 @@ async fn main() -> anyhow::Result<()> {
                         return Err(e);
                     }
                 };
-                let note = (!outcome.newly_joined)
-                    .then_some("already joined (concurrent/prior); no-op re-open");
+                let note = (!outcome.newly_joined).then_some(JOIN_NOOP_REOPEN_NOTE);
                 note_ledger(
                     journal
                         .record_terminal(&key, OperationStatus::Succeeded, cli_now_ms(), note, None)
                         .await,
+                );
+                note_candidate(
+                    mark_candidate_user_approved(
+                        journal.as_ref(),
+                        outcome.id,
+                        &invite,
+                        cli_now_ms(),
+                    )
+                    .await,
                 );
                 println!("{}", outcome.id.to_hex());
                 eprintln!("key: {}", key.0);
@@ -1221,11 +1238,14 @@ fn describe_scored(
     } else {
         ""
     };
+    // `eligible` is the POST-GATE fundability the tick applies (§5.1.3 active-probe gate + pin
+    // override), NOT the raw scorer verdict — so an AutoJoined fed the tick would refuse never
+    // shows `eligible=true`. `active_probe`/`reasons` below explain any gap from the scorer view.
     format!(
         "{}{role} eligible={} rank={} spendable={} msat probed_ok={} healthy={} active_probe={} \
          reasons={:?}",
         scored.id.to_hex(),
-        scored.verdict.eligible_to_fund,
+        scored.gated_eligible,
         scored.verdict.rank_score,
         scored.status.balance.spendable.0,
         scored.status.probed_ok,
@@ -1550,6 +1570,54 @@ fn refuse_on_partial_open(joined: &[FederationId], open: &[FederationId]) -> any
     Ok(())
 }
 
+async fn mark_candidate_user_approved(
+    journal: &FedimintJournal,
+    fed_id: FederationId,
+    invite: &InviteCode,
+    updated_at_ms: u64,
+) -> anyhow::Result<()> {
+    let Some(mut candidate) = journal
+        .get_candidate(&fed_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("reading candidate registry: {e:?}"))?
+    else {
+        let candidate = wallet_fedimint::CandidateRecord {
+            id: fed_id,
+            invite: invite.clone(),
+            source: wallet_core::DiscoverySource::Manual,
+            discovered_at_ms: updated_at_ms,
+            structural: wallet_fedimint::StructuralOutcome::Passed,
+            structural_checked_at_ms: updated_at_ms,
+            state: CandidateState::UserApproved,
+            updated_at_ms,
+        };
+        journal
+            .put_candidate(&candidate)
+            .await
+            .map_err(|e| anyhow::anyhow!("writing candidate registry: {e:?}"))?;
+        return Ok(());
+    };
+    // §5.1.4a bullet 1: a user `join` confers ownership on a `Discovered`/`Rejected`/absent
+    // candidate. An `AutoJoined` candidate is agent-owned and already a member, so a re-`join`
+    // reaches the §10.2 no-ledger fast path; flipping it to `UserApproved` here would leave the
+    // probe gate + concurrent cap with NO audit row. That transition is the `approve` verb's job
+    // (§5.1.4a bullet 2 / 5.1b), which writes an `OperationKind::Approve` row explaining why the
+    // fed left the gate. So leave `AutoJoined` (and an already-`UserApproved`) row untouched.
+    if matches!(
+        candidate.state,
+        CandidateState::AutoJoined | CandidateState::UserApproved
+    ) {
+        return Ok(());
+    }
+    candidate.state = CandidateState::UserApproved;
+    candidate.updated_at_ms = updated_at_ms;
+    journal
+        .put_candidate(&candidate)
+        .await
+        .map_err(|e| anyhow::anyhow!("writing candidate registry: {e:?}"))?;
+    Ok(())
+}
+
 /// The hard per-fed balance cap for an OPERATOR verb (§15.2): the ADR-0018 v1 default unless
 /// `--allow-over-cap` was passed, in which case the cap is DISABLED (`None`) — an explicit
 /// override, never silence.
@@ -1697,6 +1765,17 @@ fn ledger_err(e: impl std::fmt::Debug) -> anyhow::Error {
 fn note_ledger(result: Result<(), impl std::fmt::Debug>) {
     if let Err(e) = result {
         eprintln!("note: raw-op ledger write failed (reconcile will repair): {e:?}");
+    }
+}
+
+/// Log a best-effort candidate-ownership update failure without failing the command — used AFTER a
+/// successful `join`, where the membership AND the terminal ledger row are already durable. A
+/// registry hiccup (a transient read/write error or a corrupt `0x09` row that `get_candidate`
+/// surfaces) must never regress the join or withhold the joined fed id from stdout; the update is
+/// ownership bookkeeping, not the money op — mirroring the best-effort `note_ledger` above it.
+fn note_candidate(result: anyhow::Result<()>) {
+    if let Err(e) = result {
+        eprintln!("note: candidate ownership update failed (join already durable): {e:?}");
     }
 }
 
@@ -1992,7 +2071,10 @@ fn record_involves_fed(record: &OperationRecord, fed: FederationId) -> bool {
         // Either endpoint matches, so `history --fed <source>` stays complete even for a
         // pair-scoped route failure whose move intents never existed (§5.0.5).
         OperationKind::Probe { fed: f, from, .. } => *f == fed || *from == fed,
-        OperationKind::Tick { .. } => false,
+        OperationKind::Approve { fed: f } => *f == fed,
+        OperationKind::Tick { .. }
+        | OperationKind::Discover { .. }
+        | OperationKind::AutoJoin { .. } => false,
     }
 }
 
@@ -2106,6 +2188,35 @@ fn print_kind_details(kind: &OperationKind) {
             println!("performed: {performed}");
             println!("failed: {failed}");
         }
+        OperationKind::Discover {
+            source,
+            status,
+            found,
+            structurally_passed,
+            rejected,
+        } => {
+            println!("source: {}", discovery_source_tag(*source));
+            println!("source_status: {}", source_status_tag(status));
+            println!("found: {found}");
+            println!("structurally_passed: {structurally_passed}");
+            println!("rejected: {rejected}");
+        }
+        OperationKind::AutoJoin {
+            considered,
+            joined,
+            blocked_concurrent,
+            blocked_weekly,
+            blocked_lifetime,
+        } => {
+            println!("considered: {considered}");
+            println!("joined: {joined}");
+            println!("blocked_concurrent: {blocked_concurrent}");
+            println!("blocked_weekly: {blocked_weekly}");
+            println!("blocked_lifetime: {blocked_lifetime}");
+        }
+        OperationKind::Approve { fed } => {
+            println!("fed: {}", fed.to_hex());
+        }
     }
 }
 
@@ -2127,6 +2238,24 @@ fn kind_and_amount(kind: &OperationKind) -> (&'static str, Option<Msat>) {
         OperationKind::Refusal { .. } => ("refusal", None),
         OperationKind::Probe { amount_msat, .. } => ("probe", Some(*amount_msat)),
         OperationKind::Tick { .. } => ("tick", None),
+        OperationKind::Discover { .. } => ("discover", None),
+        OperationKind::AutoJoin { .. } => ("autojoin", None),
+        OperationKind::Approve { .. } => ("approve", None),
+    }
+}
+
+fn discovery_source_tag(source: wallet_core::DiscoverySource) -> &'static str {
+    match source {
+        wallet_core::DiscoverySource::Observer => "observer",
+        wallet_core::DiscoverySource::Nostr => "nostr",
+        wallet_core::DiscoverySource::Manual => "manual",
+    }
+}
+
+fn source_status_tag(status: &wallet_core::SourceStatus) -> String {
+    match status {
+        wallet_core::SourceStatus::Ok => "ok".to_owned(),
+        wallet_core::SourceStatus::Failed(reason) => format!("failed:{reason}"),
     }
 }
 
@@ -2210,6 +2339,94 @@ mod tests {
 
     fn fed(byte: u8) -> FederationId {
         FederationId([byte; 32])
+    }
+
+    fn exec_err(e: wallet_core::ExecError) -> anyhow::Error {
+        anyhow::anyhow!("{e:?}")
+    }
+
+    fn test_invite() -> InviteCode {
+        InviteCode::from_str(
+            "fed11qgqpu8rhwden5te0vejkg6tdd9h8gepwd4cxcumxv4jzuen0duhsqqfqh6nl7sgk72caxfx8khtfnn8y436q3nhyrkev3qp8ugdhdllnh86qmp42pm",
+        )
+        .expect("valid invite code")
+    }
+
+    fn test_candidate(id: FederationId, state: CandidateState) -> wallet_fedimint::CandidateRecord {
+        wallet_fedimint::CandidateRecord {
+            id,
+            invite: test_invite(),
+            source: wallet_core::DiscoverySource::Manual,
+            discovered_at_ms: 1_700_000_000_000,
+            structural: wallet_fedimint::StructuralOutcome::Passed,
+            structural_checked_at_ms: 1_700_000_000_100,
+            state,
+            updated_at_ms: 1_700_000_000_200,
+        }
+    }
+
+    #[tokio::test]
+    async fn user_join_marks_candidate_user_approved() -> anyhow::Result<()> {
+        use fedimint_core::db::mem_impl::MemDatabase;
+        use fedimint_core::db::IRawDatabaseExt as _;
+
+        let journal = FedimintJournal::new(MemDatabase::new().into_database());
+        // §5.1.4a bullet 1: a user `join` grandfathers a `Discovered`/`Rejected` candidate to
+        // `UserApproved`. An `AutoJoined` candidate is left untouched here — promoting it is the
+        // `approve` verb's job (bullet 2 / 5.1b), which writes an `Approve` audit row; the
+        // no-ledger re-join fast path must not flip it silently.
+        for (byte, state, expected) in [
+            (0x20, CandidateState::Rejected, CandidateState::UserApproved),
+            (
+                0x21,
+                CandidateState::Discovered,
+                CandidateState::UserApproved,
+            ),
+            (0x22, CandidateState::AutoJoined, CandidateState::AutoJoined),
+        ] {
+            let id = fed(byte);
+            let original = test_candidate(id, state);
+            journal.put_candidate(&original).await.map_err(exec_err)?;
+
+            mark_candidate_user_approved(&journal, id, &original.invite, 1_700_000_000_300).await?;
+
+            let updated = journal
+                .get_candidate(&id)
+                .await
+                .map_err(exec_err)?
+                .expect("candidate remains present");
+            assert_eq!(updated.state, expected);
+            // A promoted row bumps `updated_at_ms`; the untouched `AutoJoined` row keeps its own.
+            let expected_updated_at_ms = if expected == CandidateState::UserApproved {
+                1_700_000_000_300
+            } else {
+                original.updated_at_ms
+            };
+            assert_eq!(updated.updated_at_ms, expected_updated_at_ms);
+            assert_eq!(updated.source, original.source);
+            assert_eq!(updated.invite, original.invite);
+            assert_eq!(updated.structural, original.structural);
+        }
+
+        let absent_id = fed(0x23);
+        let invite = test_invite();
+        mark_candidate_user_approved(&journal, absent_id, &invite, 1_700_000_000_400).await?;
+        let inserted = journal
+            .get_candidate(&absent_id)
+            .await
+            .map_err(exec_err)?
+            .expect("absent candidate is inserted");
+        assert_eq!(inserted.id, absent_id);
+        assert_eq!(inserted.invite, invite);
+        assert_eq!(inserted.source, wallet_core::DiscoverySource::Manual);
+        assert_eq!(
+            inserted.structural,
+            wallet_fedimint::StructuralOutcome::Passed
+        );
+        assert_eq!(inserted.structural_checked_at_ms, 1_700_000_000_400);
+        assert_eq!(inserted.state, CandidateState::UserApproved);
+        assert_eq!(inserted.updated_at_ms, 1_700_000_000_400);
+        Ok(())
     }
 
     /// §15.11: a PRESENT-but-corrupt client-secret row must abort NAMING the decode failure, never
@@ -2618,6 +2835,30 @@ mod tests {
             kind_and_amount(&OperationKind::Refusal { fed: fed(1) }),
             ("refusal", None)
         );
+        assert_eq!(
+            kind_and_amount(&OperationKind::Discover {
+                source: wallet_core::DiscoverySource::Manual,
+                status: wallet_core::SourceStatus::Ok,
+                found: 2,
+                structurally_passed: 1,
+                rejected: 1,
+            }),
+            ("discover", None)
+        );
+        assert_eq!(
+            kind_and_amount(&OperationKind::AutoJoin {
+                considered: 2,
+                joined: 1,
+                blocked_concurrent: 0,
+                blocked_weekly: 0,
+                blocked_lifetime: 0,
+            }),
+            ("autojoin", None)
+        );
+        assert_eq!(
+            kind_and_amount(&OperationKind::Approve { fed: fed(1) }),
+            ("approve", None)
+        );
     }
 
     #[test]
@@ -2648,6 +2889,47 @@ mod tests {
         assert!(record_involves_fed(&record, fed(1)));
         assert!(record_involves_fed(&record, fed(2)));
         assert!(!record_involves_fed(&record, fed(3)));
+    }
+
+    #[test]
+    fn record_involves_fed_matches_approve_but_not_source_neutral_discovery_rows() {
+        let approve = ledger_record(
+            OperationKind::Approve { fed: fed(2) },
+            Actor::User,
+            OperationStatus::Succeeded,
+        );
+        assert!(record_involves_fed(&approve, fed(2)));
+        assert!(!record_involves_fed(&approve, fed(1)));
+
+        let discover = ledger_record(
+            OperationKind::Discover {
+                source: wallet_core::DiscoverySource::Manual,
+                status: wallet_core::SourceStatus::Ok,
+                found: 1,
+                structurally_passed: 1,
+                rejected: 0,
+            },
+            Actor::Agent {
+                occurrence: Occurrence(1),
+            },
+            OperationStatus::Succeeded,
+        );
+        assert!(!record_involves_fed(&discover, fed(1)));
+
+        let autojoin = ledger_record(
+            OperationKind::AutoJoin {
+                considered: 1,
+                joined: 0,
+                blocked_concurrent: 1,
+                blocked_weekly: 0,
+                blocked_lifetime: 0,
+            },
+            Actor::Agent {
+                occurrence: Occurrence(1),
+            },
+            OperationStatus::Succeeded,
+        );
+        assert!(!record_involves_fed(&autojoin, fed(1)));
     }
 
     fn op(byte: u8) -> OperationId {
@@ -2803,12 +3085,16 @@ mod tests {
             .begin_probe_session(&c, &probe_session_from(fed(1)))
             .await
             .expect("begin session");
-        assert!(reject_conflicting_probe_money_flags(&journal, c, Some(50_000), None)
-            .await
-            .is_err());
-        assert!(reject_conflicting_probe_money_flags(&journal, c, None, Some(9_000))
-            .await
-            .is_err());
+        assert!(
+            reject_conflicting_probe_money_flags(&journal, c, Some(50_000), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            reject_conflicting_probe_money_flags(&journal, c, None, Some(9_000))
+                .await
+                .is_err()
+        );
         reject_conflicting_probe_money_flags(&journal, c, Some(20_000), Some(10_000))
             .await
             .expect("matching flags resume");

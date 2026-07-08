@@ -21,7 +21,7 @@
 //! resolves through — a resumed move reuses the gateway already recorded in its `MoveRecord`.
 
 use crate::executor::FedimintExecutor;
-use crate::journal::{FedimintJournal, OperationRef, ProbeSession};
+use crate::journal::{CandidateState, FedimintJournal, OperationRef, ProbeSession};
 use crate::move_protocol::{MovePhase, MoveRecord};
 use crate::multi_client::{MultiClient, ReceiveState};
 use crate::probe::{assemble_facts, assemble_status, FedimintProbeRunner, ProbeResult};
@@ -33,7 +33,10 @@ use crate::types::{GatewayUrl, Invoice};
 use async_trait::async_trait;
 use fedimint_core::runtime;
 use std::time::Duration;
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 use wallet_core::{
     probe_verdict, score, Action, ActiveProbeVerdict, Actor, AllocatorDecision, AllocatorSnapshot,
     ExecError, ExecutionSummary, Executor, FederationId, IdempotencyKey, Intent, IntentStatus,
@@ -117,6 +120,7 @@ pub struct ReconcileSummary {
 struct TickPlan {
     raw_probes: Vec<(FederationId, ProbeResult)>,
     probes: Vec<(FederationId, ProbeResult)>,
+    active_probes: BTreeMap<FederationId, ActiveProbeVerdict>,
     snapshot: AllocatorSnapshot,
     decisions: Vec<AllocatorDecision>,
 }
@@ -761,12 +765,17 @@ impl Runtime {
         // `cost = full debit` (credit 0) would persist a successful probe in history as if
         // NONE of the funds came back. Deferring (session retained) lets a re-run rebuild
         // the record and record the true S-net-outflow cost.
-        let out_rec = self.journal.get_move(&out_key).await.map_err(exec_err)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "probe leg OUT settled but its move record is missing; transient — re-run \
+        let out_rec = self
+            .journal
+            .get_move(&out_key)
+            .await
+            .map_err(exec_err)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "probe leg OUT settled but its move record is missing; transient — re-run \
                  `probe` to resume (session retained)"
-            )
-        })?;
+                )
+            })?;
         let cost = probe_cost(Some(&in_rec), Some(&out_rec));
         let attempt = ProbeAttempt {
             at_ms: run.started_at_ms,
@@ -1190,7 +1199,17 @@ impl Runtime {
             tracing::warn!(error = ?e, "tick: recording the Started tick row failed");
         }
 
-        let plan = self.plan_tick(policy, &ScorerPolicy::default()).await;
+        // `plan_tick` scans the candidate registry (`auto_joined_candidates`) before a plan
+        // exists, so a storage fault there can error out AFTER the `Started` row was written.
+        // Terminalize the tick `Failed` on that path too, or `history/show` leaves it in-flight
+        // until reconcile repairs it an hour later (§10.4), same as the bail paths below.
+        let plan = match self.plan_tick(policy, &ScorerPolicy::default()).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.record_tick_failed(&tick_key, &e.to_string()).await;
+                return Err(e);
+            }
+        };
         // A tick is a money op: an operator-pinned fed that could not be sensed or failed the
         // lnv2/probe gate this pass means the requested rebalance was NOT evaluated. Fail LOUDLY
         // (non-zero exit) rather than let `decide` degrade it to an advisory `RefuseInflow` that
@@ -1279,7 +1298,7 @@ impl Runtime {
     /// decisions. The route check reflects the pinned gateway when one was supplied, same as `tick`.
     pub async fn status(&self, policy: &TickPolicy) -> anyhow::Result<StatusReport> {
         let scorer_policy = ScorerPolicy::default();
-        let plan = self.plan_tick(policy, &scorer_policy).await;
+        let plan = self.plan_tick(policy, &scorer_policy).await?;
         // Surface (do NOT bail on) any pinned-input problem the equivalent `tick` would fail on, so
         // the operator sees BOTH the warning and the full scored view that explains it.
         for problem in pinned_input_problems(policy, &plan.snapshot, &plan.probes, &plan.decisions)
@@ -1314,31 +1333,27 @@ impl Runtime {
                 // pair): leave its own row's verdict `None`/`-` rather than reporting a
                 // bogus self-probe `never`/stale state on one of status's key rows.
                 Some(source) if source == *id => None,
-                Some(source) => match self.journal.probe_record(id).await {
-                    Ok(record) => Some(probe_verdict(
-                        &record.map(|r| r.attempts).unwrap_or_default(),
-                        source,
-                        now_ms(),
-                        &ProbePolicy::default(),
-                    )),
-                    Err(e) => {
-                        tracing::warn!(
-                            federation = %id.to_hex(),
-                            error = ?e,
-                            "status: unreadable probe record; omitting the active-probe verdict"
-                        );
-                        None
-                    }
-                },
+                Some(_) => plan.active_probes.get(id).copied(),
                 None => None,
             };
             let mut facts = assemble_facts(probe, *id);
             facts.active_probe = active_probe;
+            // The POST-GATE fundability the tick actually applies (§5.1.3), read from the exact
+            // snapshot `plan_tick` decided on — NOT re-derived from `score()`, which ignores the
+            // active probe. `build_snapshot` maps 1:1 over the probes, so the fed is always
+            // present; the `is_some_and` default is a defensive fail-closed, not a real branch.
+            let gated_eligible = plan
+                .snapshot
+                .federations
+                .iter()
+                .find(|f| f.id == *id)
+                .is_some_and(|f| f.eligible_to_fund);
             scored.push(ScoredFed {
                 id: *id,
                 verdict: score(&facts, &scorer_policy),
                 status: assemble_status(probe, *id),
                 active_probe,
+                gated_eligible,
             });
         }
         Ok(StatusReport {
@@ -1363,29 +1378,46 @@ impl Runtime {
     /// `apply`.
     /// `status` still reports the RAW scored probe view so a route-revision does not relabel a
     /// healthy federation as generally unprobed just because this tick's concrete move route failed.
-    async fn plan_tick(&self, policy: &TickPolicy, scorer_policy: &ScorerPolicy) -> TickPlan {
+    async fn plan_tick(
+        &self,
+        policy: &TickPolicy,
+        scorer_policy: &ScorerPolicy,
+    ) -> anyhow::Result<TickPlan> {
         let raw_probes = self.probe_all().await;
         let mut probes = raw_probes.clone();
+        let auto_joined = self.auto_joined_candidates().await?;
         let mut route_revisions = 0usize;
         let mut evacuation_fallback: Option<EvacuationFallback> = None;
         loop {
-            let snapshot = build_snapshot(&probes, policy, scorer_policy);
+            let preliminary = build_snapshot(
+                &probes,
+                policy,
+                scorer_policy,
+                &auto_joined,
+                &BTreeMap::new(),
+            );
+            let active_probes = self
+                .active_probe_verdicts(&probes, preliminary.spending_fed)
+                .await;
+            let snapshot =
+                build_snapshot(&probes, policy, scorer_policy, &auto_joined, &active_probes);
             let decisions = wallet_core::decide(&snapshot, policy.occurrence);
             if let Some(fallback) = &evacuation_fallback {
                 let still_trying_evacuation = decisions.iter().any(|d| {
                     matches!(&d.action, Action::Evacuate { from, .. } if *from == fallback.from)
                 });
                 if !still_trying_evacuation {
-                    return fallback.plan.clone();
+                    return Ok(fallback.plan.clone());
                 }
             }
             let Some(problem) = self.first_move_route_problem(&decisions).await else {
-                return TickPlan {
+                return Ok(TickPlan {
                     raw_probes,
                     probes,
+                    active_probes,
                     snapshot,
                     decisions,
-                };
+                });
             };
 
             if problem.evacuation_source_route {
@@ -1394,6 +1426,7 @@ impl Runtime {
                     plan: TickPlan {
                         raw_probes: raw_probes.clone(),
                         probes: probes.clone(),
+                        active_probes: active_probes.clone(),
                         snapshot: snapshot.clone(),
                         decisions: decisions.clone(),
                     },
@@ -1409,23 +1442,75 @@ impl Runtime {
                 "tick: planned send-required route failed executor gateway validation; revising this tick's fundable set"
             );
             if !changed {
-                return TickPlan {
+                return Ok(TickPlan {
                     raw_probes,
                     probes,
+                    active_probes,
                     snapshot,
                     decisions,
-                };
+                });
             }
             route_revisions += 1;
             if route_revisions > probes.len() {
-                return TickPlan {
+                return Ok(TickPlan {
                     raw_probes,
                     probes,
+                    active_probes,
                     snapshot,
                     decisions,
-                };
+                });
             }
         }
+    }
+
+    async fn auto_joined_candidates(&self) -> anyhow::Result<BTreeSet<FederationId>> {
+        let report = self
+            .journal
+            .list_candidates_report()
+            .await
+            .map_err(exec_err)?;
+        let mut auto_joined: BTreeSet<FederationId> = report
+            .candidates
+            .into_iter()
+            .filter_map(|(id, rec)| (rec.state == CandidateState::AutoJoined).then_some(id))
+            .collect();
+        auto_joined.extend(report.skipped_ids);
+        Ok(auto_joined)
+    }
+
+    async fn active_probe_verdicts(
+        &self,
+        probes: &[(FederationId, ProbeResult)],
+        spending: Option<FederationId>,
+    ) -> BTreeMap<FederationId, ActiveProbeVerdict> {
+        let Some(source) = spending else {
+            return BTreeMap::new();
+        };
+        let mut active = BTreeMap::new();
+        for (id, _) in probes {
+            if *id == source {
+                continue;
+            }
+            match self.journal.probe_record(id).await {
+                Ok(record) => {
+                    let verdict = probe_verdict(
+                        &record.map(|r| r.attempts).unwrap_or_default(),
+                        source,
+                        now_ms(),
+                        &ProbePolicy::default(),
+                    );
+                    active.insert(*id, verdict);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        federation = %id.to_hex(),
+                        error = ?e,
+                        "tick: unreadable probe record; omitting the active-probe verdict"
+                    );
+                }
+            }
+        }
+        active
     }
 
     async fn ensure_fresh_tick_decisions(

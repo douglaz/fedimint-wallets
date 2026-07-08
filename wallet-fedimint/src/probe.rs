@@ -943,11 +943,13 @@ mod tests {
         // the whole sense→decide wire.
         let mut spending_probe = healthy_probe();
         spending_probe.spendable_msat = 10_000;
-        let spending = assemble_status(&spending_probe, fed_id(0xaa));
+        let mut spending = assemble_status(&spending_probe, fed_id(0xaa));
+        spending.eligible_to_fund = true;
 
         let mut standby_probe = healthy_probe();
         standby_probe.spendable_msat = 5_000_000;
-        let standby = assemble_status(&standby_probe, fed_id(0xbb));
+        let mut standby = assemble_status(&standby_probe, fed_id(0xbb));
+        standby.eligible_to_fund = true;
 
         let snapshot = AllocatorSnapshot {
             federations: vec![spending.clone(), standby.clone()],

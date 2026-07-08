@@ -19,6 +19,7 @@
 //! snapshot's `federations` so the allocator can see an over-cap balance sitting on it.
 
 use crate::probe::{assemble_facts, assemble_status, ProbeResult};
+use std::collections::{BTreeMap, BTreeSet};
 use wallet_core::{
     score, Action, ActiveProbeVerdict, AllocatorDecision, AllocatorSnapshot, ExecutionSummary,
     FederationId, FederationStatus, FederationVerdict, Msat, Occurrence, ScorerPolicy,
@@ -97,6 +98,8 @@ pub fn build_snapshot(
     probes: &[(FederationId, ProbeResult)],
     policy: &TickPolicy,
     scorer_policy: &ScorerPolicy,
+    auto_joined: &BTreeSet<FederationId>,
+    active_probes: &BTreeMap<FederationId, ActiveProbeVerdict>,
 ) -> AllocatorSnapshot {
     // Score every fed once (pure): the verdict both stamps `eligible_to_fund` on each
     // status (§15.3 — the destination gate the evacuator reads) AND drives
@@ -118,40 +121,50 @@ pub fn build_snapshot(
             // standby on a scorer-rejected network (devimint is regtest) would turn every
             // evacuation into a refusal. The §15.3 gate exists for the FALLBACK scan: money
             // must never drain into an arbitrary scorer-rejected fed the operator never
-            // chose. Liveness/route gating (`receive_blocker`: probed_ok, reputation) still
-            // applies to pins unchanged.
-            eligible_to_fund: verdict.eligible_to_fund
+            // chose. Liveness/route gating still applies to pins unchanged (`receive_blocker`
+            // reads `probed_ok`/reputation), and — because the `&& probe_gate_ok` below folds
+            // into `eligible_to_fund`, which `receive_blocker` also reads — a pinned AutoJoined
+            // fed stays probe-gated too: a pin never bypasses the probe gate (§5.1.3).
+            eligible_to_fund: (verdict.eligible_to_fund
                 || policy.spending_fed == Some(*id)
-                || policy.standby_fed == Some(*id),
+                || policy.standby_fed == Some(*id))
+                && probe_gate_ok(*id, auto_joined, active_probes),
             ..assemble_status(probe, *id)
         })
         .collect();
 
-    // Scored-eligible feds ranked for auto-designation: keep only the fundable ones
-    // (the pure scorer gates on structural + probe facts), ordered by rank score first.
+    // Scored-eligible feds ranked for auto-designation: keep only the fundable ones,
+    // ordered by rank score first.
     // `spendable` is a secondary tie-breaker so equal-quality feds prefer the one already
     // holding the most usable balance; id makes the choice deterministic.
-    let mut eligible: Vec<(FederationId, u32, u64)> = probes
+    let mut eligible_destinations: Vec<(FederationId, u32, u64)> = probes
         .iter()
         .zip(&verdicts)
         .filter_map(|((id, probe), verdict)| {
-            verdict
-                .eligible_to_fund
+            (verdict.eligible_to_fund && probe_gate_ok(*id, auto_joined, active_probes))
                 .then_some((*id, verdict.rank_score, probe.spendable_msat))
         })
         .collect();
-    eligible.sort_by(|a, b| {
+    eligible_destinations.sort_by(|a, b| {
         b.1.cmp(&a.1)
             .then_with(|| b.2.cmp(&a.2))
             .then_with(|| a.0.cmp(&b.0))
     });
+    let eligible_spending: Vec<(FederationId, u32, u64)> = eligible_destinations
+        .iter()
+        .copied()
+        .filter(|(id, _, _)| !auto_joined.contains(id))
+        .collect();
 
     // Auto spending is the best-ranked eligible fed that is NOT an operator-pinned standby.
+    // Auto-joined discovered feds are excluded from this pick so they never become the source
+    // that must prove their own active probe. They can still be auto-designated as destinations
+    // once their active probe has passed.
     // Excluding the pinned standby matters when the operator pins ONLY `--standby` and that fed
     // ranks highest: without the guard, both roles would collapse onto it and the allocator would
     // silently no-op the rebalance the operator explicitly designated a standby for.
     let spending_fed = policy.spending_fed.or_else(|| {
-        eligible
+        eligible_spending
             .iter()
             .map(|(id, _, _)| *id)
             .find(|id| Some(*id) != policy.standby_fed)
@@ -159,7 +172,7 @@ pub fn build_snapshot(
     // Auto standby is the best-ranked eligible fed that is NOT the spending fed,
     // so an operator-pinned spending fed still gets a distinct auto standby.
     let standby_fed = policy.standby_fed.or_else(|| {
-        eligible
+        eligible_destinations
             .iter()
             .map(|(id, _, _)| *id)
             .find(|id| Some(*id) != spending_fed)
@@ -175,6 +188,14 @@ pub fn build_snapshot(
         max_fee: policy.max_fee,
         now: policy.now,
     }
+}
+
+fn probe_gate_ok(
+    id: FederationId,
+    auto_joined: &BTreeSet<FederationId>,
+    active_probes: &BTreeMap<FederationId, ActiveProbeVerdict>,
+) -> bool {
+    !auto_joined.contains(&id) || active_probes.get(&id) == Some(&ActiveProbeVerdict::Passed)
 }
 
 /// The operator-PINNED feds (`policy.spending_fed`/`standby_fed`) that are ABSENT from a built
@@ -235,10 +256,37 @@ pub fn unusable_pinned_feds(
     unusable
 }
 
+/// Operator-pinned feds that are present in the snapshot but not fundable as destinations after
+/// the full `build_snapshot` gate. This catches the §5.1 AutoJoined active-probe gate layered on
+/// top of the scorer/pin rule: a pin keeps ordinary user-owned feds eligible, but it must not
+/// bypass the probe gate for agent-auto-joined candidates.
+pub fn unfundable_pinned_feds(
+    policy: &TickPolicy,
+    snapshot: &AllocatorSnapshot,
+) -> Vec<FederationId> {
+    let mut unfundable = Vec::new();
+    for pinned in [policy.spending_fed, policy.standby_fed]
+        .into_iter()
+        .flatten()
+    {
+        if unfundable.contains(&pinned) {
+            continue;
+        }
+        if let Some(fed) = snapshot.federations.iter().find(|f| f.id == pinned) {
+            if !fed.eligible_to_fund {
+                unfundable.push(pinned);
+            }
+        }
+    }
+    unfundable
+}
+
 /// The operator-pinned inputs a tick could NOT honor this pass, each as a human-readable problem
-/// line (empty when every pin is usable). Two PIN-ONLY failure modes — an auto pick is only ever
+/// line (empty when every pin is usable). Three PIN-ONLY failure modes — an auto pick is only ever
 /// chosen from usable probes, so it is never reported:
 /// - a pin ABSENT from the snapshot (its probe failed this tick — [`missing_pinned_feds`]);
+/// - a pin PRESENT but not fundable after snapshot assembly, such as an AutoJoined candidate
+///   without a `Passed` active probe ([`unfundable_pinned_feds`]);
 /// - a pin PRESENT but unusable for lnv2 moves this tick — no lnv2 module, dead quorum, or no
 ///   usable gateway route ([`unusable_pinned_feds`]) — UNLESS it already drives an executable
 ///   `Move` in `decisions`, in which case its rebalance is genuinely running (see below).
@@ -272,12 +320,31 @@ pub fn pinned_input_problems(
             hexes(&missing)
         ));
     }
+    // A present pin that `build_snapshot` still marks not fundable was rejected by the AutoJoined
+    // active-probe gate (§5.1.3) — the ONLY gate that can leave a PIN not fundable, since a pin
+    // already satisfies the scorer/eligibility OR of `eligible_to_fund`. Unlike the raw lnv2/route
+    // gate below, this one is NOT relaxed by an executable move: a pinned AutoJoined fed appearing
+    // as a move SOURCE proves only that this tick's gateway route is usable, never that the
+    // discovered fed passed its active probe (source-side moves are gated on evacuation, not on
+    // `eligible_to_fund`, so an unproven pin CAN surface as a `from`). A pin does not vouch for
+    // empirical redeemability (§5.1.3), so it must still fail loudly rather than let `tick` drain
+    // an unproven auto-joined partition; approve or successfully probe the fed to fund from it.
+    let unfundable = unfundable_pinned_feds(policy, snapshot);
+    if !unfundable.is_empty() {
+        problems.push(format!(
+            "pinned federation(s) {} failed the fundability gate this tick, so their rebalance \
+             could not run; if this is an auto-joined candidate, run successful active probes or \
+             approve it before funding it",
+            hexes(&unfundable)
+        ));
+    }
     // A pin that already drives an executable `Move` this tick is usable by construction — its
     // full route was validated before the move was emitted — so drop it from the raw probe-gate
     // failures. Otherwise a source-only pin (which routes through the destination's gateway)
     // falsely fails the tick on its own missing registered gateway.
     let unusable: Vec<FederationId> = unusable_pinned_feds(policy, probes)
         .into_iter()
+        .filter(|id| !unfundable.contains(id))
         .filter(|id| !fed_in_executable_move(*id, decisions))
         .collect();
     if !unusable.is_empty() {
@@ -345,6 +412,13 @@ pub struct ScoredFed {
     /// designated (nothing to evaluate the pair against). Display + 5.1-gate material;
     /// 5.0 gates nothing on it.
     pub active_probe: Option<ActiveProbeVerdict>,
+    /// The POST-GATE fundability from the same `build_snapshot` the tick applies — i.e. what
+    /// `tick` will actually do, not just the scorer's structural verdict. It layers the §5.1.3
+    /// AutoJoined active-probe gate (and pin override) on top of `verdict.eligible_to_fund`, so
+    /// an `AutoJoined` fed reads `false` until its active probe Passes even when the scorer
+    /// (which ignores the active probe, §5.0.6) accepts it. Surfaced so `status` cannot report
+    /// `eligible=true` for a fed `tick` would refuse.
+    pub gated_eligible: bool,
 }
 
 /// The result of [`crate::runtime::Runtime::tick`]: the decisions the allocator produced
@@ -407,6 +481,29 @@ mod tests {
         probe.has_lnv2 = false;
         probe.module_kinds = vec!["mint".into(), "wallet".into(), "ln".into()];
         probe
+    }
+
+    fn build_snapshot(
+        probes: &[(FederationId, ProbeResult)],
+        policy: &TickPolicy,
+        scorer_policy: &ScorerPolicy,
+    ) -> AllocatorSnapshot {
+        super::build_snapshot(
+            probes,
+            policy,
+            scorer_policy,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        )
+    }
+
+    fn eligible_of(snapshot: &AllocatorSnapshot, id: FederationId) -> bool {
+        snapshot
+            .federations
+            .iter()
+            .find(|f| f.id == id)
+            .expect("fed present in snapshot")
+            .eligible_to_fund
     }
 
     fn move_between(
@@ -497,15 +594,6 @@ mod tests {
             (fed_id(1), healthy_probe(5_000_000)),
             (fed_id(2), ineligible_probe(1_000_000)),
         ];
-        let eligible_of = |snapshot: &AllocatorSnapshot, id: FederationId| {
-            snapshot
-                .federations
-                .iter()
-                .find(|f| f.id == id)
-                .expect("fed present in snapshot")
-                .eligible_to_fund
-        };
-
         let unpinned = build_snapshot(&probes, &TickPolicy::default(), &ScorerPolicy::default());
         assert!(!eligible_of(&unpinned, fed_id(2)));
 
@@ -518,6 +606,275 @@ mod tests {
         // The pin vouches for the DESTINATION role only; the scorer-rejected fed is still
         // never auto-designated as spending.
         assert_eq!(pinned.spending_fed, Some(fed_id(1)));
+    }
+
+    #[test]
+    fn auto_joined_fed_is_fundable_only_after_active_probe_passes() {
+        let probes = vec![(fed_id(1), healthy_probe(5_000_000))];
+        let auto_joined = BTreeSet::from([fed_id(1)]);
+
+        let no_probe = super::build_snapshot(
+            &probes,
+            &TickPolicy::default(),
+            &ScorerPolicy::default(),
+            &auto_joined,
+            &BTreeMap::new(),
+        );
+        assert!(!eligible_of(&no_probe, fed_id(1)));
+
+        let failed_probe = super::build_snapshot(
+            &probes,
+            &TickPolicy::default(),
+            &ScorerPolicy::default(),
+            &auto_joined,
+            &BTreeMap::from([(fed_id(1), ActiveProbeVerdict::Failed)]),
+        );
+        assert!(!eligible_of(&failed_probe, fed_id(1)));
+
+        let passed_probe = super::build_snapshot(
+            &probes,
+            &TickPolicy::default(),
+            &ScorerPolicy::default(),
+            &auto_joined,
+            &BTreeMap::from([(fed_id(1), ActiveProbeVerdict::Passed)]),
+        );
+        assert!(eligible_of(&passed_probe, fed_id(1)));
+    }
+
+    #[test]
+    fn auto_joined_pin_does_not_bypass_probe_gate() {
+        let probes = vec![(fed_id(1), healthy_probe(5_000_000))];
+        let auto_joined = BTreeSet::from([fed_id(1)]);
+        let policy = TickPolicy {
+            standby_fed: Some(fed_id(1)),
+            ..TickPolicy::default()
+        };
+        let snapshot = super::build_snapshot(
+            &probes,
+            &policy,
+            &ScorerPolicy::default(),
+            &auto_joined,
+            &BTreeMap::new(),
+        );
+        assert!(!eligible_of(&snapshot, fed_id(1)));
+        assert_eq!(snapshot.standby_fed, Some(fed_id(1)));
+    }
+
+    #[test]
+    fn pinned_auto_joined_destination_is_refused_until_active_probe_passes() {
+        let probes = vec![
+            (fed_id(1), healthy_probe(5_000_000)),
+            (fed_id(2), healthy_probe(0)),
+        ];
+        let auto_joined = BTreeSet::from([fed_id(2)]);
+        let policy = TickPolicy {
+            per_fed_cap: Msat(100_000_000),
+            target_spending_balance: Msat(1_000_000),
+            standby_target: Msat(2_000_000),
+            max_fee: Msat(10_000),
+            spending_fed: Some(fed_id(1)),
+            standby_fed: Some(fed_id(2)),
+            ..TickPolicy::default()
+        };
+
+        let gated = super::build_snapshot(
+            &probes,
+            &policy,
+            &ScorerPolicy::default(),
+            &auto_joined,
+            &BTreeMap::new(),
+        );
+        let gated_decisions = decide(&gated, policy.occurrence);
+        assert!(
+            gated_decisions.iter().any(|d| matches!(
+                &d.action,
+                Action::RefuseInflow {
+                    fed,
+                    reason: ReasonCode::NotProbed,
+                } if *fed == fed_id(2)
+            )),
+            "unpassed auto-joined standby must be refused, not funded: {gated_decisions:?}"
+        );
+        assert!(
+            !gated_decisions
+                .iter()
+                .any(|d| matches!(&d.action, Action::Move { to, .. } if *to == fed_id(2))),
+            "pinning must not bypass the probe gate: {gated_decisions:?}"
+        );
+        let gated_problems = pinned_input_problems(&policy, &gated, &probes, &gated_decisions);
+        assert!(
+            gated_problems.iter().any(
+                |p| p.contains("failed the fundability gate")
+                    && p.contains(&fed_id(2).to_hex())
+            ),
+            "a pinned AutoJoined fed blocked by the active-probe gate must fail loudly: {gated_problems:?}"
+        );
+
+        let spending_pin_policy = TickPolicy {
+            target_spending_balance: Msat(2_000_000),
+            standby_target: Msat(0),
+            spending_fed: Some(fed_id(2)),
+            standby_fed: Some(fed_id(1)),
+            ..policy.clone()
+        };
+        let spending_pin = super::build_snapshot(
+            &probes,
+            &spending_pin_policy,
+            &ScorerPolicy::default(),
+            &auto_joined,
+            &BTreeMap::new(),
+        );
+        let spending_pin_decisions = decide(&spending_pin, spending_pin_policy.occurrence);
+        assert!(
+            spending_pin_decisions.iter().any(|d| matches!(
+                &d.action,
+                Action::RefuseInflow {
+                    fed,
+                    reason: ReasonCode::NotProbed,
+                } if *fed == fed_id(2)
+            )),
+            "unpassed auto-joined spending pin must be refused, not topped up: {spending_pin_decisions:?}"
+        );
+        assert!(
+            !spending_pin_decisions
+                .iter()
+                .any(|d| matches!(&d.action, Action::Move { to, .. } if *to == fed_id(2))),
+            "spending pin must not bypass the probe gate: {spending_pin_decisions:?}"
+        );
+        let spending_pin_problems = pinned_input_problems(
+            &spending_pin_policy,
+            &spending_pin,
+            &probes,
+            &spending_pin_decisions,
+        );
+        assert!(
+            spending_pin_problems.iter().any(
+                |p| p.contains("failed the fundability gate")
+                    && p.contains(&fed_id(2).to_hex())
+            ),
+            "a pinned AutoJoined spending fed blocked by the active-probe gate must fail loudly: {spending_pin_problems:?}"
+        );
+
+        let passed = super::build_snapshot(
+            &probes,
+            &policy,
+            &ScorerPolicy::default(),
+            &auto_joined,
+            &BTreeMap::from([(fed_id(2), ActiveProbeVerdict::Passed)]),
+        );
+        let passed_decisions = decide(&passed, policy.occurrence);
+        assert!(
+            passed_decisions.iter().any(|d| matches!(
+                &d.action,
+                Action::Move { from, to, .. } if *from == fed_id(1) && *to == fed_id(2)
+            )),
+            "passed auto-joined standby can be funded: {passed_decisions:?}"
+        );
+        assert!(
+            pinned_input_problems(&policy, &passed, &probes, &passed_decisions).is_empty(),
+            "a passed AutoJoined pin should not fail the tick guard"
+        );
+    }
+
+    #[test]
+    fn pinned_auto_joined_source_move_does_not_bypass_the_fundability_gate() {
+        // The active-probe gate must fail loudly even when the pinned AutoJoined fed drives an
+        // executable move as its SOURCE. Fed 1 is AutoJoined + unproven, pinned `--spending`, and
+        // holds a surplus; fed 2 is a healthy user-owned standby under its target. The allocator
+        // funds the standby FROM fed 1 (source-side moves are gated on evacuation, not on
+        // `eligible_to_fund`), so fed 1 appears in an executable `Move`. That move only proves the
+        // tick's gateway route is usable — NOT that fed 1 passed its active probe — so the
+        // fundability problem must still be reported (§5.1.3: a pin does NOT bypass the probe gate,
+        // and `tick` must never silently drain an unproven auto-joined partition).
+        let probes = vec![
+            (fed_id(1), healthy_probe(5_000_000)),
+            (fed_id(2), healthy_probe(100_000)),
+        ];
+        let auto_joined = BTreeSet::from([fed_id(1)]);
+        let policy = TickPolicy {
+            per_fed_cap: Msat(100_000_000),
+            target_spending_balance: Msat(1_000_000),
+            standby_target: Msat(2_000_000),
+            max_fee: Msat(10_000),
+            spending_fed: Some(fed_id(1)),
+            standby_fed: Some(fed_id(2)),
+            ..TickPolicy::default()
+        };
+        let snapshot = super::build_snapshot(
+            &probes,
+            &policy,
+            &ScorerPolicy::default(),
+            &auto_joined,
+            &BTreeMap::new(),
+        );
+        // The unproven auto-joined spending pin is not fundable itself.
+        assert!(!eligible_of(&snapshot, fed_id(1)));
+        let decisions = decide(&snapshot, policy.occurrence);
+        // Sanity: the rebalance really is a `Move fed1 -> fed2` with fed 1 (the unproven pin) as
+        // the source, so `fed_in_executable_move(fed1)` is true this tick.
+        assert!(
+            move_between(&decisions, fed_id(1), fed_id(2)).is_some(),
+            "expected a fund-standby Move fed1 -> fed2 sourcing from the unproven pin: {decisions:?}"
+        );
+        assert!(fed_in_executable_move(fed_id(1), &decisions));
+        // Despite driving that move, the fundability gate must still fail loudly.
+        let problems = pinned_input_problems(&policy, &snapshot, &probes, &decisions);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("failed the fundability gate")
+                    && p.contains(&fed_id(1).to_hex())),
+            "an unproven AutoJoined spending pin must fail even when it drives a source move: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn user_approved_or_user_joined_feds_keep_existing_scorer_or_pin_rule() {
+        let healthy = vec![(fed_id(1), healthy_probe(5_000_000))];
+        let healthy_snapshot =
+            build_snapshot(&healthy, &TickPolicy::default(), &ScorerPolicy::default());
+        assert!(
+            eligible_of(&healthy_snapshot, fed_id(1)),
+            "a user-owned healthy fed is grandfathered off the active-probe gate"
+        );
+
+        let rejected = vec![(fed_id(2), ineligible_probe(1_000_000))];
+        let pinned_policy = TickPolicy {
+            standby_fed: Some(fed_id(2)),
+            ..TickPolicy::default()
+        };
+        let pinned = build_snapshot(&rejected, &pinned_policy, &ScorerPolicy::default());
+        assert!(
+            eligible_of(&pinned, fed_id(2)),
+            "a user-owned pinned fed keeps the existing pin override"
+        );
+    }
+
+    #[test]
+    fn auto_joined_fed_is_never_auto_designated_as_spending() {
+        let probes = vec![
+            (fed_id(1), healthy_probe(10_000_000)),
+            (fed_id(2), healthy_probe(100_000)),
+        ];
+        let auto_joined = BTreeSet::from([fed_id(1)]);
+        let active_probes = BTreeMap::from([(fed_id(1), ActiveProbeVerdict::Passed)]);
+        let snapshot = super::build_snapshot(
+            &probes,
+            &TickPolicy::default(),
+            &ScorerPolicy::default(),
+            &auto_joined,
+            &active_probes,
+        );
+        assert_eq!(
+            snapshot.spending_fed,
+            Some(fed_id(2)),
+            "auto spending must choose the non-auto-joined eligible fed"
+        );
+        assert_eq!(
+            snapshot.standby_fed,
+            Some(fed_id(1)),
+            "a passed auto-joined fed remains eligible as a destination"
+        );
     }
 
     #[test]

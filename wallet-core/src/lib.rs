@@ -3,6 +3,7 @@
 //! `Journal`). No fedimint, no network, no db.
 
 pub mod allocator;
+pub mod discovery;
 pub mod executor;
 pub mod ledger;
 pub mod probe;
@@ -10,6 +11,10 @@ pub mod scorer;
 pub mod types;
 
 pub use allocator::decide;
+pub use discovery::{
+    auto_join_budget, BudgetVerdict, DiscoveryPolicy, DiscoverySource, SourceStatus,
+    STRUCTURAL_RECHECK_BACKOFF_MS,
+};
 pub use executor::*;
 pub use ledger::*;
 pub use probe::{

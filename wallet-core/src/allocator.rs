@@ -234,8 +234,14 @@ fn usable_source(source: Option<&FederationStatus>) -> Option<&FederationStatus>
     source.filter(|fed| evacuation_reason(fed).is_none())
 }
 
+/// Why a federation cannot RECEIVE credit (`fund_into` top-up/standby AND evacuation
+/// destinations both consult this). `eligible_to_fund` gates every receive path (§15.3: never
+/// direct money into a scorer-REJECTED fed — e.g. a joined 1-of-1 — nor, once the tick folds the
+/// §5.1.3 probe gate into it, into an unproven `AutoJoined` fed). A merely scorer-ineligible or
+/// probe-gated fed therefore surfaces `NotProbed` here — read it as "not fundable now", not
+/// "never probed"; `active_probe`/`reasons` on the `status` view carry the finer distinction.
 fn receive_blocker(fed: &FederationStatus) -> Option<ReasonCode> {
-    (!fed.probed_ok)
+    (!fed.eligible_to_fund || !fed.probed_ok)
         .then_some(ReasonCode::NotProbed)
         .or_else(|| (fed.reputation < 0).then_some(ReasonCode::LowReputation))
 }
@@ -262,10 +268,9 @@ fn cap_room_with(
 }
 
 /// True for a federation that is a safe evacuation TARGET: not itself evacuating,
-/// not receive-blocked, scorer-eligible to fund (§15.3), and still below the hard per-fed
-/// cap once this pass's pending inbound is accounted for. Used by `evacuate_decision` to
-/// pick the destination; does not invent new ranking policy, it reuses the same
-/// eligibility checks already used for funding decisions above.
+/// not receive-blocked, and still below the hard per-fed cap once this pass's pending inbound
+/// is accounted for. Used by `evacuate_decision` to pick the destination; does not invent new
+/// ranking policy, it reuses the same eligibility checks already used for funding decisions above.
 fn eligible_for_evacuation(
     snapshot: &AllocatorSnapshot,
     fed: &FederationStatus,
@@ -275,9 +280,6 @@ fn eligible_for_evacuation(
     fed.id != from.id
         && evacuation_reason(fed).is_none()
         && receive_blocker(fed).is_none()
-        // §15.3: never drain a dying fed into a scorer-REJECTED destination (e.g. a
-        // joined 1-of-1) even when it is reachable and has cap room.
-        && fed.eligible_to_fund
         && cap_room_with(snapshot, fed, credited) > 0
 }
 
