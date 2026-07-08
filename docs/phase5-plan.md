@@ -887,7 +887,7 @@ wallet-cli approve <fed-hex>   # bless an AutoJoined candidate -> UserApproved (
    `0x09` journal registry + `Discover` ledger kind + the `build_snapshot` gate rule +
    auto-join accounting (the three caps, read from the ledger/registry). `ManualSource`.
    Golden + MemDatabase tests. NO reqwest.
-2. **5.1b — `Runtime::discover` + the CLI verbs + the Observer HTTP source** (adds reqwest):
+2. **5.1b — `Runtime::discover` + the CLI verbs + the Observer HTTP source** (adds reqwest): **DONE, merged `6f59ef6` 2026-07-08.** rb-lite (codex-only after the claude *auth* logout — not overload — killed the cycling runs; 6 rounds clean) + independent gate + a DUAL adversarial pass (codex + a claude subagent, since the convergence panel was degraded 1-of-3 with the claude reviewer logged out). Closed a probe-gate bypass (agent-joined member with a stale/absent `0x09` row read ungated on `tick` → now `joined − UserApproved`, fail-closed); rejected 2 findings with evidence (concurrent-runs budget = v1-unreachable single-writer; any-differing-invite refetch = would reopen the deferred Observer DoS). ~500 tests.
    the pipeline (preview-fetch → id-verify → structural floor → registry → bounded
    auto-join), `wallet-cli discover`/`candidates`, `ObserverSource`. Fixture-source unit
    tests + the recorded-`/federations` parse test.
