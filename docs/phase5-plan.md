@@ -928,17 +928,19 @@ its whole life — it IS the single writer v1 assumes, so the loop never races i
 no new concurrency machinery. It runs a sequential cycle and SLEEPS between cycles for an
 ADAPTIVE interval = `min(base_interval, time-until-nearest-deadline)`, where a "deadline" is an
 approaching federation EXPIRY (evacuate before shutdown) or a verdict TTL about to lapse. This
-is the plan's "reactive `federation_expiry_timestamp`" behavior for the signals a cycle has
-ALREADY read: the loop derives its next wake from them, so a KNOWN future expiry is evacuated on
-time. **Honest bound (no push subscription exists — Phase 3 evacuation is entirely POLL-based: a
-`tick`'s probe reads the corroborated signal; there is no `subscribe_to_field`):** a signal
-published JUST AFTER a cycle is not detected until the next cycle, so detection latency for a
-NEWLY-published shutdown is `<= base_interval`. Safe for the normal case — an expiry is a FUTURE
-timestamp with hours/days of notice, dwarfing a 10-min poll against the 1h evacuation lead — and
-the operator shortens `base_interval` for tighter reaction to abrupt short-notice shutdowns. A
-meta PUSH-subscription that interrupts the sleep the instant a signal appears is a documented
-FUTURE refinement (it needs SDK support this wallet does not yet use, and adds only a read-only
-observer, not a new money path — beyond 5.2's "wrap the existing verbs" scope).
+covers the KNOWN deadlines a cycle has already read. To also react PROMPTLY to a signal
+published JUST AFTER a cycle (which pure polling would miss for up to `base_interval`), the loop
+ADDITIONALLY subscribes: the pinned Fedimint client exposes
+`client.meta_service().subscribe_to_field("federation_expiry_timestamp")` (verified at the pin,
+`fedimint-client/src/meta.rs`), and the loop's sleep is `select!(sleep(adaptive_interval),
+wake_rx.recv())` where each joined fed's subscription stream sends a WAKE on any change. So a
+freshly-published expiry interrupts the sleep and the NEXT cycle re-evaluates immediately.
+**Safety — the subscription is a WAKE HINT, never a decision:** the merged-meta
+`federation_expiry_timestamp` is UNTRUSTED (a single `meta_override_url` host can forge it,
+§15.1), so it only triggers a cycle; the ACTUAL evacuation stays the tick's f+1-CORROBORATED
+decision. A forged/spurious signal costs at most one extra (harmless, no-op) cycle, never a
+money move. The poll-based adaptive wake remains the FLOOR (so the loop still works if a
+subscription stream drops or a fed exposes no meta service).
 
 ### 5.2.1 The cycle (each iteration, in order)
 
@@ -976,14 +978,17 @@ The sleep before the next cycle is `min` over EVERY configured deadline (a large
   1h): wake in time to EVACUATE before shutdown, not after;
 - for every `Passed` verdict, `ttl_deadline - probe_refresh_lead - now` — wake to REFRESH BEFORE
   it lapses, not at the moment it goes stale;
-- for every non-`Passed` auto-joined fed, its next PROBE-DUE deadline per 5.2.3: `0` (wake at
-  `min_interval`) only for a `NeverProbed` fed, `last_attempt + probe_build_interval - now` for
-  `Insufficient`/`Expired`, `last_attempt + probe_retry_backoff - now` for `Failed`/
-  `FailedSinceLastPass` — so a large `base_interval` never sleeps past re-eligibility, and the
-  loop never busy-wakes a fed that cannot yet make progress toward its sustained pass.
+- for every non-`Passed` auto-joined fed, its next PROBE-DUE deadline per 5.2.3, keyed off
+  `last_invocation` (the umbrella row, not just qualifying attempts): `min_interval` only for a
+  `NeverProbed` fed with NO prior invocation; `last_invocation + probe_retry_backoff` for one
+  whose last invocation was a refusal/`NoAttempt`; `last_attempt + probe_build_interval` for
+  `Insufficient`/`Expired`; `last_attempt + probe_retry_backoff` for `Failed`/`FailedSinceLastPass`;
+  and, when the global budget is exhausted, the BUDGET-RESET time — so a large `base_interval`
+  never sleeps past re-eligibility yet the loop never hot-loops a fed that cannot make progress.
 Clamped to `[min_interval, base_interval]` (default min 30s) so the loop neither busy-spins nor
 oversleeps a deadline. A fed already INSIDE its evacuation window forces `min_interval` until it
-is evacuated or gone. This is the whole "reactive" behavior — no push subscription.
+is evacuated or gone. Together with the meta-subscription wake-hint above, this is the loop's
+"reactive" behavior — prompt to a fresh signal, bounded by the adaptive poll floor.
 
 ### 5.2.3 Probe scheduling + the global probe budget
 
@@ -1006,9 +1011,22 @@ TTL. Bounded by a GLOBAL `ProbeBudget` in `WatchPolicy` AND these per-verdict ca
 - `max_probe_spend_per_week_msat` (default 50_000): sum of those rows' `cost_msat` (the
   S-net-outflow the probe already records) in the trailing 7d.
 Both read from the ledger (the single source of truth), so the budget survives restart with no
-extra state. A probe the budget would exceed is SKIPPED and logged + counted (an `Agent`
-`Refusal`-style note or a scheduler diagnostic row), never silent. A fed left un-probed by an
-exhausted budget simply keeps its current verdict (gate stays closed if it lapsed — fail-safe).
+extra state.
+
+**Backoff for probes that don't produce an ATTEMPT (the hot-loop fix).** NEXT-DUE keys off the
+last probe INVOCATION, NOT just qualifying attempts — because 5.0 records a preflight refusal
+(no shared route, missing gateway, source fault) as a `NoAttempt` that writes NO attempt row,
+so a fed that can't be probed would otherwise stay `NeverProbed` and re-fire every `min_interval`
+forever. Two rules close it:
+- The umbrella `Probe` ledger row IS written on EVERY invocation (attempt or `NoAttempt`, §5.0.5);
+  the scheduler reads its timestamp as `last_invocation` and backs a fed off by
+  `probe_retry_backoff` after any invocation regardless of verdict — so a persistently unroutable
+  `NeverProbed` fed retries on the backoff, not every 30s.
+- A probe the GLOBAL budget would exceed is SKIPPED (logged + a scheduler diagnostic row, never
+  silent), and while the budget is exhausted the wake is set to the BUDGET-RESET time (when the
+  oldest counted row ages out of the 7d window) rather than `min_interval` — no spinning on a fed
+  that cannot be probed until the budget frees. A fed left un-probed keeps its current verdict
+  (gate stays closed if it lapsed — fail-safe).
 
 ### 5.2.4 Discovery scheduling + the deferred Observer bounds
 
@@ -1099,10 +1117,12 @@ wallet-cli watch [POLICY FLAGS: --spending --standby --per-fed-cap --spending-ta
 
 1. `watch` is the single writer (holds `db.lock`); no new concurrency. The loop is the existing
    verbs on an adaptive timer — NO new money path.
-2. "Reactive expiry" = an adaptive-wake `min` over the signals the cycle already reads (Phase 3
-   evacuation is poll-based; NO subscription exists to regress). A newly-published signal is
-   detected within `<= base_interval`; a push subscription eliminating that latency is a
-   documented future refinement (needs new SDK support), not a v1 requirement.
+2. "Reactive expiry" = the adaptive-wake `min` over known deadlines PLUS a
+   `meta_service().subscribe_to_field` wake-hint (available at the pin) that interrupts the sleep
+   on a freshly-published signal — so detection is prompt, not `<= base_interval`. The
+   subscription only WAKES the loop; the evacuation decision stays the tick's f+1-corroborated
+   path (an untrusted/forged meta costs at most one harmless no-op cycle). Poll-based wake is the
+   floor if a stream drops.
 3. The global probe budget (attempts/week + sats/week) is enforced ONLY for the scheduler and is
    read from the ledger (no new durable budget state); manual `probe` stays un-budgeted.
 4. The 5.1b-deferred Observer volume/time bounds (candidate cap + per-preview timeout) land here,
