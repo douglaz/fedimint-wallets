@@ -928,9 +928,17 @@ its whole life — it IS the single writer v1 assumes, so the loop never races i
 no new concurrency machinery. It runs a sequential cycle and SLEEPS between cycles for an
 ADAPTIVE interval = `min(base_interval, time-until-nearest-deadline)`, where a "deadline" is an
 approaching federation EXPIRY (evacuate before shutdown) or a verdict TTL about to lapse. This
-gives the plan's "reactive `federation_expiry_timestamp` subscription" WITHOUT a push
-subscription the SDK may not expose: the loop derives its next wake from the signals it already
-reads each cycle. (A true meta push-subscription is a later refinement; noted, not required.)
+is the plan's "reactive `federation_expiry_timestamp`" behavior for the signals a cycle has
+ALREADY read: the loop derives its next wake from them, so a KNOWN future expiry is evacuated on
+time. **Honest bound (no push subscription exists — Phase 3 evacuation is entirely POLL-based: a
+`tick`'s probe reads the corroborated signal; there is no `subscribe_to_field`):** a signal
+published JUST AFTER a cycle is not detected until the next cycle, so detection latency for a
+NEWLY-published shutdown is `<= base_interval`. Safe for the normal case — an expiry is a FUTURE
+timestamp with hours/days of notice, dwarfing a 10-min poll against the 1h evacuation lead — and
+the operator shortens `base_interval` for tighter reaction to abrupt short-notice shutdowns. A
+meta PUSH-subscription that interrupts the sleep the instant a signal appears is a documented
+FUTURE refinement (it needs SDK support this wallet does not yet use, and adds only a read-only
+observer, not a new money path — beyond 5.2's "wrap the existing verbs" scope).
 
 ### 5.2.1 The cycle (each iteration, in order)
 
@@ -1017,8 +1025,12 @@ hostile Observer must not stall the whole agent):
   - **Fairness (a resume CURSOR, not just "defer"):** `Runtime::discover` walks candidates in
     deterministic sorted order (a `BTreeMap`), so a bare "stop at the deadline, defer the rest"
     would re-process the SAME slow head every pass and STARVE the tail forever. The scheduler
-    persists a `discover_cursor` (the last fed id it authenticated) in the `0x0a` watch-state and
+    persists a `discover_cursor` (the last fed id it ATTEMPTED — advanced after EVERY candidate it
+    tries, whether the preview authenticated, failed, or timed out, NOT only on success) in the
+    `0x0a` watch-state and
     RESUMES the next pass AFTER it — a round-robin over the candidate set that wraps to the start,
+    stepping OVER a persistently slow/failing head instead of re-consuming the whole
+    `discover_pass_deadline` on it every pass and starving the tail,
     so every candidate is reached within a bounded number of passes regardless of a slow head.
     Fresh NEW-id announcements do NOT jump the queue: they join the SAME bounded rotation (a new
     id is inserted into the sorted candidate order and reached when the cursor arrives). Otherwise
@@ -1087,8 +1099,10 @@ wallet-cli watch [POLICY FLAGS: --spending --standby --per-fed-cap --spending-ta
 
 1. `watch` is the single writer (holds `db.lock`); no new concurrency. The loop is the existing
    verbs on an adaptive timer — NO new money path.
-2. "Reactive expiry" = an adaptive-wake `min` over the signals the cycle already reads, NOT a
-   push subscription (a later refinement).
+2. "Reactive expiry" = an adaptive-wake `min` over the signals the cycle already reads (Phase 3
+   evacuation is poll-based; NO subscription exists to regress). A newly-published signal is
+   detected within `<= base_interval`; a push subscription eliminating that latency is a
+   documented future refinement (needs new SDK support), not a v1 requirement.
 3. The global probe budget (attempts/week + sats/week) is enforced ONLY for the scheduler and is
    read from the ledger (no new durable budget state); manual `probe` stays un-budgeted.
 4. The 5.1b-deferred Observer volume/time bounds (candidate cap + per-preview timeout) land here,
