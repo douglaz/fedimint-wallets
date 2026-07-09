@@ -939,12 +939,15 @@ freshly-published expiry interrupts the sleep and the NEXT cycle re-evaluates im
 `federation_expiry_timestamp` is UNTRUSTED (a single `meta_override_url` host can forge it,
 §15.1), so it only triggers a cycle; the ACTUAL evacuation stays the tick's f+1-CORROBORATED
 decision. Because the field is UNTRUSTED, subscription wakes are COALESCED (rate-limited), NOT suppressed:
-a wake arriving inside the `min_interval` cooldown sets a PENDING flag and fires ONE cycle when
-the cooldown ends, rather than being dropped. So a buggy/hostile `meta_override_url` that FLAPS
-`federation_expiry_timestamp` triggers at most one cycle per window — bounded no-op cost — WHILE a
-genuine short-notice shutdown arriving during the cooldown is still serviced promptly (at the
-cooldown's end, not the far-off poll interval). Coalescing, not a cooldown that discards the last
-signal, is what makes this both flap-proof and evacuation-safe. The poll-based adaptive wake remains the FLOOR (so the loop still works if a
+a wake ALWAYS recomputes the adaptive sleep IMMEDIATELY, capping it to any newly-learned deadline
+— it NEVER waits out a cooldown, so a genuine short-notice shutdown that lands during the window
+still shortens the sleep and is serviced before its deadline (honoring the `<30s`-to-shutdown
+guarantee below). The rate-limit applies ONLY to consecutive subscription-triggered CYCLES that
+found NO corroborated change: after such a no-op cycle, another purely-subscription-driven cycle
+is held off for `min_interval`, so a flapping/hostile `meta_override_url` cannot force more than
+one no-op cycle per window. A cycle for a CORROBORATED deadline (or the poll floor) is never
+rate-limited. Recomputing the sleep is cheap; running the corroborating cycle is what is
+coalesced — flap-proof AND evacuation-safe. The poll-based adaptive wake remains the FLOOR (so the loop still works if a
 subscription stream drops or a fed exposes no meta service).
 
 ### 5.2.1 The cycle (each iteration, in order)
@@ -981,8 +984,10 @@ The sleep before the next cycle is `min` over EVERY configured deadline (a large
   skip a scheduled discovery pass;
 - for every joined fed with a corroborated expiry, `expiry - now - evacuation_lead` (default lead
   1h): wake in time to EVACUATE before shutdown, not after;
-- for every `Passed` verdict, `ttl_deadline - probe_refresh_lead - now` — wake to REFRESH BEFORE
-  it lapses, not at the moment it goes stale;
+- for every `Passed` verdict, `ttl_deadline - effective_refresh_lead - now` (the SAME
+  `min(probe_refresh_lead, ttl_ms / 2)` clamp §5.2.3 uses, NOT the raw lead) — wake to REFRESH
+  BEFORE it lapses; without the clamp a shrunk `--probe-ttl-secs` would put this deadline in the
+  past and wake every cycle;
 - for every non-`Passed` auto-joined fed, its next PROBE-DUE deadline per 5.2.3, keyed off
   `last_invocation` (the umbrella row, not just qualifying attempts): `min_interval` only for a
   `NeverProbed` fed with NO prior invocation; `last_invocation + probe_retry_backoff` for one
@@ -1057,8 +1062,9 @@ hostile Observer must not stall the whole agent):
   discovery step << `min_interval` and the evacuation lead. Discovery runs LAST in the cycle
   precisely so it is the step preempted, never a tick or evacuation. **A deadline-truncated pass
   is NOT deferred the full `discover_every`:** if the pass exits on the deadline with backlog
-  remaining (the cursor did not wrap), the loop schedules a prompt CONTINUATION — the next
-  discover-due is `min_interval`, not `now + discover_every` — so a large feed drains over
+  remaining (the cursor did not wrap), it SETS the persisted `discover_backlog` flag (5.2.5) so
+  the continuation survives a `--once` exit / restart; while that flag is set the next discover-due
+  is `min_interval`, not `now + discover_every` (cleared when the cursor wraps) — so a large feed drains over
   successive quick continuations instead of ~3 candidates per 6h. `discover_every` governs only
   a fully-drained pass (cursor wrapped): the routine re-scan cadence.
   - **Fairness (a resume CURSOR, not just "defer"):** `Runtime::discover` walks candidates in
@@ -1090,7 +1096,9 @@ hostile Observer must not stall the whole agent):
 The loop advances a monotonic `occurrence` each cycle so successive ticks re-decide with fresh
 idempotency keys (the tick's stale-occurrence guard otherwise wedges a repeated same-key
 decision, §step-2.3). The occurrence is PERSISTED (a small `0x0a` watch-state row: `{ occurrence,
-last_discover_ms, discover_cursor }`) so a restart continues the sequence rather than colliding
+last_discover_ms, discover_cursor, discover_backlog }`, where `discover_backlog` is set when a
+pass truncated on `discover_pass_deadline` with the cursor NOT yet wrapped and cleared when it
+wraps) so a restart continues the sequence rather than colliding
 with a journaled decision from the pre-crash cycle, and the discovery round-robin (5.2.4) resumes
 where it left off. The watch-state is CHECKPOINTED after EVERY successful cycle (the advanced
 occurrence + cursor made durable BEFORE the next cycle or a `--once` exit), NOT only on a signal
