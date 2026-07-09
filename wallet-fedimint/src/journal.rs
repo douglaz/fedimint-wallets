@@ -16,6 +16,7 @@
 //! - `0x02` `MoveKey(IdempotencyKey)`       → JSON row v1([`MoveRecord`])
 //! - `0x03` `FederationKey(FederationId)`   → JSON row v1([`FederationInfo`])
 //! - `0x04` `PendingIndexKey(status, key)`  → `()` (empty) — drives the status scans
+//! - `0x0a` `WatchStateKey`                 → JSON row v1([`WatchState`])
 //!
 //! `IdempotencyKey` is a `String`, so `id_bytes` is its UTF-8; `FederationId` is 32 bytes.
 //!
@@ -68,6 +69,7 @@ const TAG_LEDGER_KEY_INDEX: u8 = 0x06; // `0x06 ++ correlation_key_utf8` → be6
 const TAG_LEDGER_COUNTER: u8 = 0x07; // `0x07` (single key) → be64(next_seq)
 const TAG_PROBE: u8 = 0x08; // `0x08 ++ fed_id` → JSON row v1(ProbeRecord) (phase 5 §5.0.4)
 const TAG_CANDIDATE: u8 = 0x09; // `0x09 ++ fed_id` → JSON row v1(CandidateRecord) (phase 5 §5.1.1)
+const TAG_WATCH_STATE: u8 = 0x0a; // `0x0a` → JSON row v1(WatchState) (phase 5 §5.2.5)
 
 /// Rows older than this are eligible for reconcile's NEGATIVE-inference repairs (§10.3): a
 /// fresh non-terminal row may belong to an operation still in flight in another process, so
@@ -230,6 +232,20 @@ pub enum CandidateState {
     /// LIFETIME cap: that counts immutable agent-join history, and approval does not reclaim
     /// the partition — else approving old auto-joins would reopen the budget (§5.1.4/§5.1.4a).
     UserApproved,
+}
+
+/// Single-row watch scheduler checkpoint (phase 5 §5.2.5). The self-running loop is
+/// greenfield, so this is the v1 shape on disk: no compatibility shims or migration
+/// branches.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WatchState {
+    pub occurrence: u64,
+    pub last_discover_ms: u64,
+    pub discover_cursor: Option<FederationId>,
+    pub discover_backlog: bool,
+    /// Candidate order snapshot for a deadline/cap-truncated discovery rotation. A cursor alone
+    /// cannot distinguish older deferred source-only ids from fresh ids announced on restart.
+    pub discover_rotation: Vec<FederationId>,
 }
 
 /// The note a no-op re-open `join:` row carries in its `error` (§10.2): a `Succeeded` join that
@@ -1624,6 +1640,74 @@ impl FedimintJournal {
         dbtx.commit_tx_result().await.map_err(db_err)?;
         Ok(())
     }
+
+    // --- watch scheduler state (phase 5 §5.2.5, tag 0x0a) ---
+
+    /// Load the single watch-state row, seeding an absent row as [`WatchState::default`].
+    /// A corrupt row fails closed like the targeted `0x08` probe read: reusing an unknown
+    /// occurrence could collide with already-journaled tick keys.
+    pub async fn get_watch_state(&self) -> Result<WatchState, ExecError> {
+        let raw_key = watch_state_key();
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        let Some(bytes) = dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? else {
+            return Ok(WatchState::default());
+        };
+        decode_row_result("watch state", &raw_key, &bytes)
+    }
+
+    /// Store the complete watch-state checkpoint.
+    pub async fn put_watch_state(&self, state: &WatchState) -> Result<(), ExecError> {
+        let mut dbtx = self.db.begin_transaction().await;
+        dbtx.raw_insert_bytes(&watch_state_key(), &encode_row(state)?)
+            .await
+            .map_err(db_err)?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Update only the discovery checkpoint fields, preserving a concurrently advanced
+    /// occurrence from the row read inside this transaction.
+    pub async fn put_watch_discovery_state(
+        &self,
+        discover_cursor: Option<FederationId>,
+        discover_backlog: bool,
+        last_discover_ms: Option<u64>,
+        discover_rotation: Vec<FederationId>,
+    ) -> Result<WatchState, ExecError> {
+        let raw_key = watch_state_key();
+        let mut dbtx = self.db.begin_transaction().await;
+        let mut state = match dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? {
+            Some(bytes) => decode_row_result::<WatchState>("watch state", &raw_key, &bytes)?,
+            None => WatchState::default(),
+        };
+        state.discover_cursor = discover_cursor;
+        state.discover_backlog = discover_backlog;
+        state.discover_rotation = discover_rotation;
+        if let Some(last_discover_ms) = last_discover_ms {
+            state.last_discover_ms = last_discover_ms;
+        }
+        dbtx.raw_insert_bytes(&raw_key, &encode_row(&state)?)
+            .await
+            .map_err(db_err)?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(state)
+    }
+
+    /// Advance the persisted occurrence by one, preserving the discovery checkpoint fields.
+    pub async fn advance_watch_occurrence(&self) -> Result<WatchState, ExecError> {
+        let raw_key = watch_state_key();
+        let mut dbtx = self.db.begin_transaction().await;
+        let mut state = match dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? {
+            Some(bytes) => decode_row_result::<WatchState>("watch state", &raw_key, &bytes)?,
+            None => WatchState::default(),
+        };
+        state.occurrence = state.occurrence.saturating_add(1);
+        dbtx.raw_insert_bytes(&raw_key, &encode_row(&state)?)
+            .await
+            .map_err(db_err)?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(state)
+    }
 }
 
 // --- repair support (spec §10.3) -------------------------------------------------------
@@ -2147,6 +2231,10 @@ fn probe_key(id: &FederationId) -> Vec<u8> {
 
 fn candidate_key(id: &FederationId) -> Vec<u8> {
     tagged(TAG_CANDIDATE, &id.0)
+}
+
+fn watch_state_key() -> Vec<u8> {
+    vec![TAG_WATCH_STATE]
 }
 
 /// Whether `row` is an AGENT `join:` row that SUCCEEDED and created a NEW partition (§5.1.4):

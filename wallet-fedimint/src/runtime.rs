@@ -21,15 +21,16 @@
 //! resolves through — a resumed move reuses the gateway already recorded in its `MoveRecord`.
 
 use crate::discovery::{
-    auto_join_kind, discover_kind, discovery_actor, run_discover_pass, AutoJoinCounts,
-    CandidateSource, DiscoverReport, DiscoveryBackend, PreviewedCandidate, DISCOVERY_REASON,
+    auto_join_kind, discover_kind, discovery_actor, run_discover_pass_bounded_with_rotation,
+    AutoJoinAttempt, AutoJoinCounts, CandidateSource, DiscoverPassResume, DiscoverReport,
+    DiscoveryBackend, PreviewedCandidate, DISCOVERY_REASON,
 };
 use crate::executor::FedimintExecutor;
 use crate::journal::{
     CandidateListReport, CandidateState, FedimintJournal, OperationRef, ProbeSession,
 };
 use crate::move_protocol::{MovePhase, MoveRecord};
-use crate::multi_client::{MultiClient, ReceiveState};
+use crate::multi_client::{JoinDeadlineOutcome, MultiClient, ReceiveState};
 use crate::probe::{assemble_facts, assemble_status, FedimintProbeRunner, ProbeResult};
 use crate::tick::{
     build_snapshot, decisions_to_apply, pinned_input_problems, ScoredFed, StatusReport, TickPolicy,
@@ -52,6 +53,7 @@ use wallet_core::{
     DiscoveryPolicy, ExecError, ExecutionSummary, Executor, FederationFacts, FederationId,
     IdempotencyKey, Intent, IntentStatus, Journal, Module, Msat, Occurrence, OperationKind,
     OperationStatus, PerformOutcome, ProbeAttempt, ProbePolicy, ReasonCode, ScorerPolicy,
+    WatchPolicy,
 };
 
 /// Wall-clock in unix millis for the ledger's `created_at_ms` (§8/§9.4). `seq` is the
@@ -426,7 +428,31 @@ impl Runtime {
         policy: DiscoveryPolicy,
     ) -> anyhow::Result<DiscoverReport> {
         let nonce = ledger_nonce();
-        run_discover_pass(&sources, &policy, self, now_ms(), &nonce).await
+        let now = now_ms();
+        let watch_state = self.journal.get_watch_state().await.map_err(exec_err)?;
+        let outcome = run_discover_pass_bounded_with_rotation(
+            &sources,
+            &policy,
+            self,
+            now,
+            &nonce,
+            &WatchPolicy::default(),
+            DiscoverPassResume {
+                cursor: watch_state.discover_cursor,
+                rotation: &watch_state.discover_rotation,
+            },
+        )
+        .await?;
+        self.journal
+            .put_watch_discovery_state(
+                outcome.progress.next_cursor,
+                outcome.progress.backlog,
+                outcome.progress.wrapped.then_some(now),
+                outcome.next_rotation,
+            )
+            .await
+            .map_err(exec_err)?;
+        Ok(outcome.report)
     }
 
     /// Run ONE active probe of `candidate` from spending federation `from` (phase 5
@@ -1418,11 +1444,7 @@ impl Runtime {
                 &BTreeMap::new(),
             );
             let active_probes = self
-                .active_probe_verdicts(
-                    &probes,
-                    preliminary.spending_fed,
-                    &policy.probe_gate_policy,
-                )
+                .active_probe_verdicts(&probes, preliminary.spending_fed, &policy.probe_gate_policy)
                 .await;
             let snapshot =
                 build_snapshot(&probes, policy, scorer_policy, &auto_joined, &active_probes);
@@ -1908,9 +1930,11 @@ impl DiscoveryBackend for Runtime {
         invite: fedimint_core::invite_code::InviteCode,
         occurrence: Occurrence,
         now_ms: u64,
-    ) -> anyhow::Result<crate::JoinOutcome> {
+        join_timeout: Duration,
+    ) -> AutoJoinAttempt {
         let key = IdempotencyKey(format!("join:{}:{}", id.to_hex(), ledger_nonce()));
-        self.journal
+        if let Err(e) = self
+            .journal
             .record_started(
                 &key,
                 OperationKind::Join { fed: id },
@@ -1920,9 +1944,19 @@ impl DiscoveryBackend for Runtime {
                 None,
             )
             .await
-            .map_err(exec_err)?;
-        let outcome = match self.mc.join(invite).await {
-            Ok(outcome) => outcome,
+        {
+            return AutoJoinAttempt::Failed(exec_err(e));
+        }
+        let outcome = match self.mc.join_before_deadline(invite, join_timeout).await {
+            Ok(JoinDeadlineOutcome::Joined(outcome)) => outcome,
+            Ok(JoinDeadlineOutcome::DeadlineElapsed) => {
+                tracing::warn!(
+                    key = %key.0,
+                    timeout_ms = join_timeout.as_millis(),
+                    "auto-join exceeded pass deadline; leaving join row repairable"
+                );
+                return AutoJoinAttempt::DeadlineElapsed;
+            }
             Err(e) => {
                 let _ = self
                     .journal
@@ -1934,15 +1968,22 @@ impl DiscoveryBackend for Runtime {
                         None,
                     )
                     .await;
-                return Err(e);
+                return AutoJoinAttempt::Failed(e);
             }
         };
         let note = (!outcome.newly_joined).then_some(crate::JOIN_NOOP_REOPEN_NOTE);
-        self.journal
+        match self
+            .journal
             .record_terminal(&key, OperationStatus::Succeeded, now_ms, note, None)
             .await
-            .map_err(exec_err)?;
-        Ok(outcome)
+        {
+            Ok(()) => AutoJoinAttempt::Joined(outcome),
+            Err(e) => AutoJoinAttempt::Failed(anyhow::anyhow!(
+                "auto-join joined federation {} but failed to terminalize join row {}: {e:?}",
+                outcome.id.to_hex(),
+                key.0
+            )),
+        }
     }
 
     async fn record_discover(
@@ -2616,10 +2657,13 @@ mod tests {
             (FED_A, CandidateState::UserApproved), // user-owned -> UNGATED
             (FED_B, CandidateState::AutoJoined),   // agent-owned -> gated
             (FED_C, CandidateState::Discovered),   // crash: joined member, stale row -> gated
-            // FED_D: joined member with NO candidate row (0x03-only restore) -> gated
+                                                   // FED_D: joined member with NO candidate row (0x03-only restore) -> gated
         ];
         let gated = probe_gated_members(joined, states);
-        assert!(!gated.contains(&FED_A), "UserApproved member is not probe-gated");
+        assert!(
+            !gated.contains(&FED_A),
+            "UserApproved member is not probe-gated"
+        );
         assert!(gated.contains(&FED_B), "AutoJoined member is probe-gated");
         assert!(
             gated.contains(&FED_C),

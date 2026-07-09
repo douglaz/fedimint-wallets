@@ -48,14 +48,15 @@ pub mod types;
 
 pub use discovery::{
     parse_observer_federations, AutoJoinReport, CandidateAnnouncement, CandidateSource,
-    DiscoverReport, DiscoverSourceReport, ManualSource, ObserverSource, SourceResult,
+    DiscoverPassProgress, DiscoverReport, DiscoverSourceReport, ManualSource, ObserverSource,
+    SourceResult,
 };
 pub use executor::FedimintExecutor;
 pub use fee::{gross_up, predicted_net, total_within_cap, GatewayFee, GrossUp};
 pub use journal::{
     prune_probe_attempts, CandidateListReport, CandidateRecord, CandidateState, FederationInfo,
     FederationListReport, FedimintJournal, LedgerRepairOracle, OperationRef, ProbeRecord,
-    ProbeSession, RawOpObservation, RawTerminal, RepairSummary, StructuralOutcome,
+    ProbeSession, RawOpObservation, RawTerminal, RepairSummary, StructuralOutcome, WatchState,
     JOIN_NOOP_REOPEN_NOTE, PROBE_HISTORY_CAP,
 };
 pub use move_protocol::{

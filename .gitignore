@@ -13,6 +13,8 @@
 /target
 # nix-env build output (CARGO_TARGET_DIR under `nix develop`)
 /target-nix
+# review/build output
+/target-review
 # stray build artifacts sometimes emitted at the repo root
 /test
 # wallet-cli local data dir (RocksDB + mnemonic) when run by hand

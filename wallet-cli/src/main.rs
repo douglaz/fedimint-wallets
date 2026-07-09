@@ -1317,6 +1317,7 @@ fn discover_summary_lines(report: &DiscoverReport) -> Vec<String> {
         .map(source_summary_line)
         .collect::<Vec<_>>();
     lines.push(auto_join_summary_line(&report.auto_join));
+    lines.push(discover_progress_summary_line(report));
     lines
 }
 
@@ -1344,6 +1345,16 @@ fn discover_report_json(report: &DiscoverReport) -> serde_json::Value {
             "blocked_weekly": report.auto_join.blocked_weekly,
             "blocked_lifetime": report.auto_join.blocked_lifetime,
         },
+        "progress": {
+            "backlog": report.progress.backlog,
+            "deferred": report.progress.deferred,
+            "attempted": report.progress.attempted,
+            "wrapped": report.progress.wrapped,
+            "next_cursor": report
+                .progress
+                .next_cursor
+                .map(|cursor| cursor.to_hex()),
+        },
     })
 }
 
@@ -1366,6 +1377,22 @@ fn auto_join_summary_line(report: &AutoJoinReport) -> String {
         report.blocked_concurrent,
         report.blocked_weekly,
         report.blocked_lifetime
+    )
+}
+
+fn discover_progress_summary_line(report: &DiscoverReport) -> String {
+    let next_cursor = report
+        .progress
+        .next_cursor
+        .map(|cursor| cursor.to_hex())
+        .unwrap_or_else(|| "none".to_owned());
+    format!(
+        "progress backlog={} deferred={} attempted={} wrapped={} next_cursor={}",
+        report.progress.backlog,
+        report.progress.deferred,
+        report.progress.attempted,
+        report.progress.wrapped,
+        next_cursor
     )
 }
 
@@ -2704,6 +2731,7 @@ fn gate_policy_override(flags: &PolicyFlags) -> Option<wallet_core::ProbePolicy>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wallet_fedimint::DiscoverPassProgress;
 
     #[test]
     fn gate_policy_override_maps_window_flags_or_none() {
@@ -2723,7 +2751,10 @@ mod tests {
         assert_eq!(gate.min_successes, 2);
         assert_eq!(gate.ttl_ms, 30_000);
         assert_eq!(gate.amount_msat, default.amount_msat, "strength unchanged");
-        assert_eq!(gate.leg_fee_cap_msat, default.leg_fee_cap_msat, "strength unchanged");
+        assert_eq!(
+            gate.leg_fee_cap_msat, default.leg_fee_cap_msat,
+            "strength unchanged"
+        );
     }
 
     fn fed(byte: u8) -> FederationId {
@@ -2930,14 +2961,26 @@ mod tests {
                 blocked_weekly: 1,
                 blocked_lifetime: 0,
             },
+            progress: DiscoverPassProgress {
+                next_cursor: Some(fed(0x35)),
+                wrapped: false,
+                backlog: true,
+                attempted: 1,
+                deferred: 2,
+            },
         };
 
         let lines = discover_summary_lines(&report);
         assert_eq!(
             lines,
             vec![
-                "source=observer status=failed:timeout found=0 passed=0 rejected=0",
-                "autojoin considered=2 joined=1 blocked_concurrent=0 blocked_weekly=1 blocked_lifetime=0",
+                "source=observer status=failed:timeout found=0 passed=0 rejected=0".to_owned(),
+                "autojoin considered=2 joined=1 blocked_concurrent=0 blocked_weekly=1 blocked_lifetime=0"
+                    .to_owned(),
+                format!(
+                    "progress backlog=true deferred=2 attempted=1 wrapped=false next_cursor={}",
+                    fed(0x35).to_hex()
+                ),
             ]
         );
         // `--json` uses the SAME lowercase-tag vocabulary as the TSV and `candidates --json`, not
@@ -2946,6 +2989,11 @@ mod tests {
         assert_eq!(json["sources"][0]["source"], "observer");
         assert_eq!(json["sources"][0]["status"], "failed:timeout");
         assert_eq!(json["auto_join"]["blocked_weekly"], 1);
+        assert_eq!(json["progress"]["backlog"], true);
+        assert_eq!(json["progress"]["deferred"], 2);
+        assert_eq!(json["progress"]["attempted"], 1);
+        assert_eq!(json["progress"]["wrapped"], false);
+        assert_eq!(json["progress"]["next_cursor"], fed(0x35).to_hex());
         Ok(())
     }
 

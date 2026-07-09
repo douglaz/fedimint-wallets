@@ -22,8 +22,8 @@ use fedimint_core::core::OperationId as FedimintOperationId;
 use fedimint_core::db::{Database, IDatabaseTransactionOpsCore};
 use fedimint_core::invite_code::InviteCode;
 use fedimint_core::util::SafeUrl;
-use fedimint_core::Amount;
 use fedimint_core::BitcoinHash as _;
+use fedimint_core::{runtime, Amount};
 use fedimint_lnv2_client::common::gateway_api::{PaymentFee, RoutingInfo};
 use fedimint_lnv2_client::common::{Bolt11InvoiceDescription, LightningInvoice};
 use fedimint_lnv2_client::{
@@ -34,9 +34,10 @@ use futures::lock::Mutex;
 use futures::{FutureExt, StreamExt};
 use lightning_invoice::Bolt11Invoice;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::str::FromStr as _;
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wallet_core::{ExecError, FederationId, FeeBreakdown, IdempotencyKey, Msat};
 
 /// Tag byte for a per-federation client partition (spec §4 "Storage"): client `i` lives
@@ -61,6 +62,34 @@ pub struct MultiClient {
     /// cannot initialize different federations into the same per-fed partition.
     join_lock: Mutex<()>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JoinDeadlineOutcome {
+    Joined(JoinOutcome),
+    DeadlineElapsed,
+}
+
+#[derive(Clone, Copy)]
+struct JoinDeadline {
+    started_at: Instant,
+    budget: Duration,
+}
+
+impl JoinDeadline {
+    fn new(budget: Duration) -> Self {
+        Self {
+            started_at: Instant::now(),
+            budget,
+        }
+    }
+
+    fn remaining(self) -> Option<Duration> {
+        let remaining = self.budget.checked_sub(self.started_at.elapsed())?;
+        (!remaining.is_zero()).then_some(remaining)
+    }
+}
+
+struct JoinDeadlineElapsed;
 
 impl MultiClient {
     /// Derive the root secret once from `mnemonic` (`StandardDoubleDerive` — the
@@ -89,16 +118,41 @@ impl MultiClient {
     /// [`FederationInfo`] row. Idempotent: a federation already joined (in-memory, or
     /// recorded in the journal from a previous run) is opened instead of re-joined.
     pub async fn join(&self, invite: InviteCode) -> anyhow::Result<JoinOutcome> {
+        match self.join_inner(invite, None).await? {
+            JoinDeadlineOutcome::Joined(outcome) => Ok(outcome),
+            JoinDeadlineOutcome::DeadlineElapsed => {
+                unreachable!("unbounded joins do not install a deadline")
+            }
+        }
+    }
+
+    pub(crate) async fn join_before_deadline(
+        &self,
+        invite: InviteCode,
+        deadline: Duration,
+    ) -> anyhow::Result<JoinDeadlineOutcome> {
+        self.join_inner(invite, Some(JoinDeadline::new(deadline)))
+            .await
+    }
+
+    async fn join_inner(
+        &self,
+        invite: InviteCode,
+        deadline: Option<JoinDeadline>,
+    ) -> anyhow::Result<JoinDeadlineOutcome> {
         let id = bridge_federation_id(invite.federation_id());
 
         if self.has_client(&id) {
-            return Ok(JoinOutcome::opened(id));
+            return Ok(JoinDeadlineOutcome::Joined(JoinOutcome::opened(id)));
         }
 
-        let _join_guard = self.join_lock.lock().await;
+        let _join_guard = match join_deadline(deadline, self.join_lock.lock()).await {
+            Ok(guard) => guard,
+            Err(JoinDeadlineElapsed) => return Ok(JoinDeadlineOutcome::DeadlineElapsed),
+        };
 
         if self.has_client(&id) {
-            return Ok(JoinOutcome::opened(id));
+            return Ok(JoinDeadlineOutcome::Joined(JoinOutcome::opened(id)));
         }
         if let Some(info) = self
             .journal
@@ -107,26 +161,49 @@ impl MultiClient {
             .map_err(|e| anyhow::anyhow!("reading federation registry: {e:?}"))?
         {
             // Registered on a previous run (or by a concurrent process): open, don't re-join.
-            return Ok(JoinOutcome::opened(self.open_one(&info).await?));
+            return Ok(JoinDeadlineOutcome::Joined(JoinOutcome::opened(
+                self.open_one(&info).await?,
+            )));
         }
 
+        let preview = match join_deadline(deadline, async {
+            self.client_builder()
+                .await?
+                .preview(self.connectors.clone(), &invite)
+                .await
+        })
+        .await
+        {
+            Ok(preview) => preview?,
+            Err(JoinDeadlineElapsed) => return Ok(JoinDeadlineOutcome::DeadlineElapsed),
+        };
         let db_prefix = self.next_db_prefix().await?;
-        let client: ClientHandleArc = self
-            .client_builder()
-            .await?
-            .preview(self.connectors.clone(), &invite)
-            .await?
-            .join(self.client_db(db_prefix), self.root_secret.clone())
-            .await
-            .map(Arc::new)?;
+        let client = match join_deadline(
+            deadline,
+            preview.join(self.client_db(db_prefix), self.root_secret.clone()),
+        )
+        .await
+        {
+            Ok(Ok(client)) => Arc::new(client),
+            Ok(Err(e)) => {
+                self.remove_client_partition_best_effort(db_prefix).await;
+                return Err(e);
+            }
+            Err(JoinDeadlineElapsed) => {
+                self.remove_client_partition_best_effort(db_prefix).await;
+                return Ok(JoinDeadlineOutcome::DeadlineElapsed);
+            }
+        };
 
         let joined_id = bridge_federation_id(client.federation_id());
-        anyhow::ensure!(
-            joined_id == id,
-            "joined federation id {} did not match invite id {}",
-            joined_id.to_hex(),
-            id.to_hex()
-        );
+        if joined_id != id {
+            self.remove_client_partition_best_effort(db_prefix).await;
+            anyhow::bail!(
+                "joined federation id {} did not match invite id {}",
+                joined_id.to_hex(),
+                id.to_hex()
+            );
+        }
         let info = FederationInfo {
             invite: invite.to_string(),
             db_prefix,
@@ -140,10 +217,10 @@ impl MultiClient {
             .write()
             .expect("client map lock poisoned")
             .insert(joined_id, client);
-        Ok(JoinOutcome {
+        Ok(JoinDeadlineOutcome::Joined(JoinOutcome {
             id: joined_id,
             newly_joined: true,
-        })
+        }))
     }
 
     /// Open every already-joined federation, BEST-EFFORT: a federation whose client fails
@@ -270,6 +347,24 @@ impl MultiClient {
     /// Client `i`'s partition: `db.with_prefix([CLIENT_PREFIX_TAG] ++ u32_le(db_prefix))`.
     fn client_db(&self, db_prefix: u32) -> Database {
         self.db.with_prefix(client_prefix_bytes(db_prefix))
+    }
+
+    async fn remove_client_partition_best_effort(&self, db_prefix: u32) {
+        if let Err(e) = self.remove_client_partition(db_prefix).await {
+            tracing::warn!(
+                db_prefix,
+                error = ?e,
+                "multi_client: failed to remove unfinished client partition"
+            );
+        }
+    }
+
+    async fn remove_client_partition(&self, db_prefix: u32) -> anyhow::Result<()> {
+        let mut dbtx = self.db.begin_transaction().await;
+        dbtx.raw_remove_by_prefix(&client_prefix_bytes(db_prefix))
+            .await?;
+        dbtx.commit_tx_result().await?;
+        Ok(())
     }
 
     /// A fresh [`ClientBuilder`] with the modules a devimint federation uses: mint,
@@ -615,6 +710,21 @@ impl MultiClient {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("federation {} not joined/opened", id.to_hex()))
     }
+}
+
+async fn join_deadline<T>(
+    deadline: Option<JoinDeadline>,
+    future: impl Future<Output = T>,
+) -> Result<T, JoinDeadlineElapsed> {
+    let Some(deadline) = deadline else {
+        return Ok(future.await);
+    };
+    let Some(remaining) = deadline.remaining() else {
+        return Err(JoinDeadlineElapsed);
+    };
+    runtime::timeout(remaining, future)
+        .await
+        .map_err(|_elapsed| JoinDeadlineElapsed)
 }
 
 /// Invoice expiry (seconds) passed to lnv2 `receive`. Spec §4 fixes this at one hour; the
@@ -1239,6 +1349,7 @@ mod tests {
     use super::*;
     use fedimint_core::db::mem_impl::MemDatabase;
     use fedimint_core::db::IRawDatabaseExt as _;
+    use fedimint_core::PeerId;
     // `FromStr` (for `FederationId::from_str` / `Bolt11Invoice::from_str`) comes in via
     // `use super::*` — the module already imports it for `pay`.
 
@@ -1514,5 +1625,77 @@ mod tests {
         dbtx.commit_tx().await;
 
         assert_eq!(multi_client.next_db_prefix().await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn remove_client_partition_deletes_only_the_unfinished_prefix() {
+        let db = MemDatabase::new().into_database();
+        let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
+        let multi_client = MultiClient::new(db.clone(), mnemonic).await;
+
+        let mut target_key = client_prefix_bytes(7);
+        target_key.push(0x2f);
+        let mut neighbor_key = client_prefix_bytes(8);
+        neighbor_key.push(0x2f);
+        let app_key = vec![0x00, 0x2f];
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.raw_insert_bytes(&target_key, b"unfinished client row")
+            .await
+            .expect("mem db insert succeeds");
+        dbtx.raw_insert_bytes(&neighbor_key, b"neighbor client row")
+            .await
+            .expect("mem db insert succeeds");
+        dbtx.raw_insert_bytes(&app_key, b"app row")
+            .await
+            .expect("mem db insert succeeds");
+        dbtx.commit_tx().await;
+
+        multi_client
+            .remove_client_partition(7)
+            .await
+            .expect("remove target prefix");
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert!(dbtx
+            .raw_get_bytes(&target_key)
+            .await
+            .expect("target read succeeds")
+            .is_none());
+        assert_eq!(
+            dbtx.raw_get_bytes(&neighbor_key)
+                .await
+                .expect("neighbor read succeeds")
+                .as_deref(),
+            Some(&b"neighbor client row"[..])
+        );
+        assert_eq!(
+            dbtx.raw_get_bytes(&app_key)
+                .await
+                .expect("app read succeeds")
+                .as_deref(),
+            Some(&b"app row"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn join_before_deadline_bounds_join_lock_wait() -> anyhow::Result<()> {
+        let db = MemDatabase::new().into_database();
+        let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
+        let multi_client = MultiClient::new(db, mnemonic).await;
+        let _guard = multi_client.join_lock.lock().await;
+        let invite = InviteCode::new(
+            SafeUrl::parse("https://lock-held.example").expect("valid url"),
+            PeerId::from(0),
+            fedimint_core::config::FederationId::dummy(),
+            None,
+        );
+
+        let outcome = multi_client
+            .join_before_deadline(invite, Duration::from_millis(10))
+            .await?;
+
+        assert_eq!(outcome, JoinDeadlineOutcome::DeadlineElapsed);
+        Ok(())
     }
 }
