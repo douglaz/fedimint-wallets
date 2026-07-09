@@ -938,11 +938,13 @@ freshly-published expiry interrupts the sleep and the NEXT cycle re-evaluates im
 **Safety — the subscription is a WAKE HINT, never a decision:** the merged-meta
 `federation_expiry_timestamp` is UNTRUSTED (a single `meta_override_url` host can forge it,
 §15.1), so it only triggers a cycle; the ACTUAL evacuation stays the tick's f+1-CORROBORATED
-decision. Because the field is UNTRUSTED, subscription wakes are DEBOUNCED: after a
-subscription-triggered cycle no further subscription wake fires for at least `min_interval`, so a
-buggy/hostile `meta_override_url` that FLAPS `federation_expiry_timestamp` triggers at most one
-cycle per debounce window — a bounded no-op cost, never the unbounded spin an un-coalesced
-`wake_rx` would allow. The poll-based adaptive wake remains the FLOOR (so the loop still works if a
+decision. Because the field is UNTRUSTED, subscription wakes are COALESCED (rate-limited), NOT suppressed:
+a wake arriving inside the `min_interval` cooldown sets a PENDING flag and fires ONE cycle when
+the cooldown ends, rather than being dropped. So a buggy/hostile `meta_override_url` that FLAPS
+`federation_expiry_timestamp` triggers at most one cycle per window — bounded no-op cost — WHILE a
+genuine short-notice shutdown arriving during the cooldown is still serviced promptly (at the
+cooldown's end, not the far-off poll interval). Coalescing, not a cooldown that discards the last
+signal, is what makes this both flap-proof and evacuation-safe. The poll-based adaptive wake remains the FLOOR (so the loop still works if a
 subscription stream drops or a fed exposes no meta service).
 
 ### 5.2.1 The cycle (each iteration, in order)
@@ -1001,8 +1003,12 @@ clamp stays `base_interval`. Together with the meta-subscription wake-hint above
 The scheduler is the ONLY unattended probe initiator (a manual `wallet-cli probe` stays
 un-budgeted — the operator owns that spend). A fed is PROBE-DUE when it is an auto-joined
 candidate that is NOT fundably `Passed` and its last attempt (if any) is older than the retry
-backoff, OR it is `Passed` with its newest qualifying success within `probe_refresh_lead`
-(default 12h) of `ttl_ms`. Concretely, by verdict, the NEXT-DUE time is:
+backoff, OR it is `Passed` with its newest qualifying success within the EFFECTIVE refresh lead
+`min(probe_refresh_lead (default 12h), ttl_ms / 2)` of `ttl_ms`. Clamping to the TTL matters
+because 5.2.6 lets the operator shrink `--probe-ttl-secs`: with a fixed 12h lead, any TTL below
+12h would make a FRESHLY `Passed` fed instantly "within lead" and re-probed (paid) every cycle,
+burning the weekly budget; the clamp keeps a fresh pass aging at least half its TTL before a
+refresh. Concretely, by verdict, the NEXT-DUE time is:
 `NeverProbed` -> now (the one initial probe). `Insufficient` / `Expired` (have evidence, must
 BUILD the sustained window) -> `last_attempt + probe_build_interval`, where
 `probe_build_interval = max(min_interval, min_span_ms / max(1, min_successes - 1))` (default
@@ -1072,8 +1078,12 @@ hostile Observer must not stall the whole agent):
 - `per_preview_timeout` (default 20s): each authenticated config `preview` is ALSO wrapped in a
   timeout, so one unresponsive guardian set cannot consume the whole pass deadline — a timed-out
   preview is the same TRANSIENT skip as a fetch failure (retry next pass, no row downgrade).
-- `max_candidates_per_pass` (default 256): cap the reconciled candidate set per pass; a source
-  returning more has the excess DROPPED with a `log` of how many (no silent truncation).
+- `max_candidates_per_pass` (default 256): cap the WORK PER PASS — process at most 256 candidates
+  starting FROM THE CURSOR — NOT the backlog. The overflow is NOT dropped; it stays in the
+  rotation and is reached on the next pass as the cursor advances (a `log` of how many were
+  deferred this pass, no silent truncation). Dropping the tail would let a source returning `>256`
+  ids starve deferred rechecks/auto-joins forever; capping per-pass work + the cursor keeps the
+  bounded-round-robin guarantee intact.
 
 ### 5.2.5 Occurrence + crash recovery
 
@@ -1082,8 +1092,11 @@ idempotency keys (the tick's stale-occurrence guard otherwise wedges a repeated 
 decision, §step-2.3). The occurrence is PERSISTED (a small `0x0a` watch-state row: `{ occurrence,
 last_discover_ms, discover_cursor }`) so a restart continues the sequence rather than colliding
 with a journaled decision from the pre-crash cycle, and the discovery round-robin (5.2.4) resumes
-where it left off. On start: load the watch-state (or seed it), `reconcile`, then
-enter the loop. Recovery is the same single-writer sequential story as every other verb — no new
+where it left off. The watch-state is CHECKPOINTED after EVERY successful cycle (the advanced
+occurrence + cursor made durable BEFORE the next cycle or a `--once` exit), NOT only on a signal
+shutdown — else a repeated `watch --once` (the exit gate's driver) would reload the old occurrence,
+reuse the prior tick keys, and trip the stale-occurrence guard instead of progressing. On start:
+load the watch-state (or seed it), `reconcile`, then enter the loop. Recovery is the same single-writer sequential story as every other verb — no new
 concurrency.
 
 ### 5.2.6 CLI
