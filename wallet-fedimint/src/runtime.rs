@@ -427,9 +427,14 @@ impl Runtime {
         sources: Vec<Box<dyn CandidateSource>>,
         policy: DiscoveryPolicy,
     ) -> anyhow::Result<DiscoverReport> {
+        // A one-off `discover` (the CLI verb) is NOT the watch scheduler: it must NOT resume from
+        // or write back the persisted `0x0a` watch cursor/backlog — that rotation state belongs to
+        // `watch` (5.2b). Sharing it here would let an ad-hoc `discover --invite X` resume
+        // mid-rotation and SKIP X, and its write-back would clobber the loop's backlog. So run ONE
+        // fresh bounded pass (the per-preview timeout / whole-pass deadline / candidate cap still
+        // apply WITHIN the pass); cross-pass cursor rotation is wired only by the scheduler.
         let nonce = ledger_nonce();
         let now = now_ms();
-        let watch_state = self.journal.get_watch_state().await.map_err(exec_err)?;
         let outcome = run_discover_pass_bounded_with_rotation(
             &sources,
             &policy,
@@ -438,20 +443,11 @@ impl Runtime {
             &nonce,
             &WatchPolicy::default(),
             DiscoverPassResume {
-                cursor: watch_state.discover_cursor,
-                rotation: &watch_state.discover_rotation,
+                cursor: None,
+                rotation: &[],
             },
         )
         .await?;
-        self.journal
-            .put_watch_discovery_state(
-                outcome.progress.next_cursor,
-                outcome.progress.backlog,
-                outcome.progress.wrapped.then_some(now),
-                outcome.next_rotation,
-            )
-            .await
-            .map_err(exec_err)?;
         Ok(outcome.report)
     }
 
