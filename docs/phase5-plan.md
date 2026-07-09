@@ -908,18 +908,169 @@ the same seam), the Observer RANK prior (a later `FederationFacts.observer` wiri
 the Observer for discovery only), candidate/partition EVICTION (deferred; the lifetime cap is
 the finite bound instead), and any UI.
 
-## 5.2 — the self-running loop (plan-level; buildable spec after 5.1)
+## 5.2 — the self-running loop (BUILDABLE spec)
 
-- `wallet-cli watch`: interval ticks + a reactive `federation_expiry_timestamp`
-  subscription (the corroborated signal from §15.1) + probe scheduling off the verdict
-  TTLs, all through the SAME tick/probe verbs (the loop adds no new money paths).
-- **Budgets:** a global probe budget (attempts/week and sats/week) enforced here — the
-  scheduler is the only unattended probe initiator; manual `probe` stays un-budgeted.
-- Every scheduled action lands in the ledger as `Agent { occurrence }` — ADR-0014's
-  auditability is already the substrate.
-- **Gate (the phase exit):** discover → structural floor → active probe → score →
-  rebalance runs unattended against devimint, fully reconstructible from `history`;
-  a candidate failing ONLY the active probe is never funded.
+Turn the operator-invoked verbs into an UNATTENDED agent. `wallet-cli watch` is a long-running
+process that, on an adaptive cadence, RECONCILES in-flight work, TICKS (allocation +
+evacuation), re-PROBES federations whose trust verdict is going stale, and periodically
+DISCOVERS candidates — all through the SAME `tick`/`probe`/`discover` verbs, so the loop adds
+NO new money path. Its novelty is purely the SCHEDULER: when to wake, what to run, and the
+budget that bounds unattended probing. Grounded in ADR-0014 (every scheduled action is an
+`Agent` ledger row) and §15.1 (the corroborated shutdown/expiry signal the tick already reads).
+
+**Greenfield note.** Pre-release, no persisted data, no external users: NO backwards
+compatibility, NO migration shims, NO serde compat layers.
+
+### 5.2.0 The shape: one process, single writer, adaptive wake
+
+`watch` is the wallet's ONLY unattended actor and holds the exclusive RocksDB `db.lock` for
+its whole life — it IS the single writer v1 assumes, so the loop never races itself and needs
+no new concurrency machinery. It runs a sequential cycle and SLEEPS between cycles for an
+ADAPTIVE interval = `min(base_interval, time-until-nearest-deadline)`, where a "deadline" is an
+approaching federation EXPIRY (evacuate before shutdown) or a verdict TTL about to lapse. This
+gives the plan's "reactive `federation_expiry_timestamp` subscription" WITHOUT a push
+subscription the SDK may not expose: the loop derives its next wake from the signals it already
+reads each cycle. (A true meta push-subscription is a later refinement; noted, not required.)
+
+### 5.2.1 The cycle (each iteration, in order)
+
+1. **Reconcile** (`Runtime::reconcile`, §9): re-drive any Pending/Executing intents and rebuild
+   move records — a crash mid-cycle self-heals on the next wake before any new decision.
+2. **Tick** (`Runtime::tick`): probe → score → snapshot → decide → apply. This ALREADY performs
+   both proactive rebalancing AND evacuation of a shutdown-flagged fed (§15.1/Phase 3.A), so the
+   loop gets evacuation for free — it just has to tick promptly enough (5.2.2). Each cycle uses a
+   FRESH occurrence (5.2.5) so the tick's stale-occurrence guard never wedges the loop.
+3. **Schedule probes** (5.2.3): for each candidate/discovered fed whose active-probe verdict is
+   `Expired` or within `probe_refresh_lead` of its TTL, run a `probe` (source = the designated
+   spending fed) — bounded by the global probe budget. Keeping verdicts fresh is what keeps a
+   probe-gated fed fundable across ticks.
+4. **Discover** (5.2.4), on a longer sub-cadence (`discover_every`): run `Runtime::discover` over
+   the configured sources with bounded auto-join, so the candidate universe refreshes unattended.
+
+Every step's actions are already `Agent`-attributed ledger rows (tick decisions, probe umbrella,
+discover/autojoin) — an unattended session is fully reconstructible from `history`, no new
+ledger surface. A step that FAILS is logged + recorded and does NOT abort the cycle (the loop is
+resilient: a transient tick failure must not stop future evacuations/probes); only a fatal
+error (lock lost, DB corruption) stops the loop.
+
+### 5.2.2 Adaptive wake — reactive to expiry and TTL
+
+The sleep before the next cycle is `min` over:
+- `base_interval` (default 10 min) — the routine rebalance cadence;
+- for every joined fed with a corroborated expiry, `expiry - now - evacuation_lead` (default
+  lead 1h): wake in time to EVACUATE before the fed shuts down, not after;
+- for every fresh-enough verdict, `ttl_deadline - now` so a re-probe fires before it lapses.
+Clamped to `[min_interval, base_interval]` (default min 30s) so the loop never busy-spins nor
+oversleeps a deadline. A fed already INSIDE its evacuation window forces `min_interval` until it
+is evacuated or gone. This is the whole "reactive" behavior — no push subscription.
+
+### 5.2.3 Probe scheduling + the global probe budget
+
+The scheduler is the ONLY unattended probe initiator (a manual `wallet-cli probe` stays
+un-budgeted — the operator owns that spend). It re-probes a fed when the verdict is `Expired`
+or the newest qualifying success is within `probe_refresh_lead` (default 12h) of `ttl_ms`.
+Bounded by a GLOBAL `ProbeBudget` in `WatchPolicy`:
+- `max_probe_attempts_per_week` (default 50): count of `Agent` probe umbrella rows in the
+  trailing 7d.
+- `max_probe_spend_per_week_msat` (default 50_000): sum of those rows' `cost_msat` (the
+  S-net-outflow the probe already records) in the trailing 7d.
+Both read from the ledger (the single source of truth), so the budget survives restart with no
+extra state. A probe the budget would exceed is SKIPPED and logged + counted (an `Agent`
+`Refusal`-style note or a scheduler diagnostic row), never silent. A fed left un-probed by an
+exhausted budget simply keeps its current verdict (gate stays closed if it lapsed — fail-safe).
+
+### 5.2.4 Discovery scheduling + the deferred Observer bounds
+
+On the `discover_every` sub-cadence (default 6h), run `Runtime::discover` with the operator's
+`DiscoveryPolicy` (auto-join within its caps). This is where the 5.1b-DEFERRED untrusted-source
+VOLUME/TIME bounds land, because the loop makes them load-bearing (an unattended discover over a
+hostile Observer must not stall the whole agent):
+- `max_candidates_per_pass` (default 256): cap the reconciled candidate set per pass; a source
+  returning more has the excess DROPPED with a `log` of how many (no silent truncation).
+- `per_preview_timeout` (default 20s): each authenticated config `preview` is wrapped in a
+  timeout, so one slow/unresponsive guardian set cannot hang the cycle — a timed-out preview is
+  the same TRANSIENT skip as a fetch failure (retry next pass, no row downgrade).
+
+### 5.2.5 Occurrence + crash recovery
+
+The loop advances a monotonic `occurrence` each cycle so successive ticks re-decide with fresh
+idempotency keys (the tick's stale-occurrence guard otherwise wedges a repeated same-key
+decision, §step-2.3). The occurrence is PERSISTED (a small `0x0a` watch-state row: `{ occurrence,
+last_discover_ms }`) so a restart continues the sequence rather than colliding with a journaled
+decision from the pre-crash cycle. On start: load the watch-state (or seed it), `reconcile`, then
+enter the loop. Recovery is the same single-writer sequential story as every other verb — no new
+concurrency.
+
+### 5.2.6 CLI
+
+```
+wallet-cli watch [POLICY FLAGS: --spending --standby --per-fed-cap --spending-target
+                  --standby-target --max-fee --gateway --probe-min-span-secs ...]
+                 [--base-interval-secs S] [--min-interval-secs S] [--evacuation-lead-secs S]
+                 [--discover-every-secs S] [--source observer|manual] [--observer-url URL]
+                 [--invite <code>]... [--auto-join]
+                 [--max-probe-attempts-per-week N] [--max-probe-spend-per-week-msat N]
+                 [--once]
+```
+- Reuses the SAME `PolicyFlags` the `tick`/`status`/`probe` verbs take (designation, targets,
+  gateway, the §5.1.3 gate-policy knobs) — the loop is those verbs on a timer, so it must be
+  configured identically. `--once` runs a SINGLE cycle and exits (the testable/cron-friendly
+  unit; the exit gate drives `--once` repeatedly rather than a real sleep).
+- Runs until SIGINT/SIGTERM: on signal, finish the in-flight op, checkpoint the watch-state, and
+  exit 0 (a clean shutdown a supervisor can restart). A fatal loop error exits non-zero.
+- Diagnostics (next-wake reason, budget state, per-step outcomes) to stderr; the durable record
+  is the ledger.
+
+### 5.2.7 Tests / exit gate
+
+- **Pure scheduler goldens (`wallet-core` or a pure `watch` module):** the adaptive-wake `min`
+  (base vs nearest expiry-lead vs nearest ttl-deadline, clamped); the probe-refresh predicate
+  (`Expired` / within-lead → due); the budget predicate (attempts + spend caps from a synthetic
+  ledger); the candidate-cap truncation count.
+- **Journal (MemDatabase):** the `0x0a` watch-state round-trip + monotonic occurrence advance;
+  the budget counts computed from seeded ledger rows (attempts + cost in / out of the 7d window).
+- **`--once` unit (`wallet-fedimint`, fixtures):** one cycle runs reconcile→tick→probe→discover
+  in order; a step failure is logged + recorded but does not abort the cycle; an exhausted budget
+  skips + records the probe; a timed-out preview is a transient skip.
+- **Devimint smoke (`smoke_watch_devimint.sh`, the 5.2 exit gate):** the FULL unattended chain on
+  the two-fed harness driving `watch --once` repeatedly (deterministic, no real sleeps): discover
+  (manual source = fed B) → agent auto-join → a cycle where B is probe-gated does NOT fund it →
+  the scheduler probes B to a sustained pass (shrunk gate window) → a later cycle FUNDS B → then
+  force fed B's shutdown signal and a cycle EVACUATES it. Assert every action is an `Agent` row in
+  `history` and the whole discover→probe→score→rebalance→evacuate sequence is reconstructible; a
+  candidate that only ever failed the probe is never funded. This is the Phase-5 exit gate.
+
+### 5.2.8 Settled decisions
+
+1. `watch` is the single writer (holds `db.lock`); no new concurrency. The loop is the existing
+   verbs on an adaptive timer — NO new money path.
+2. "Reactive expiry" = an adaptive-wake `min` over the signals the cycle already reads, NOT a
+   push subscription (a later refinement).
+3. The global probe budget (attempts/week + sats/week) is enforced ONLY for the scheduler and is
+   read from the ledger (no new durable budget state); manual `probe` stays un-budgeted.
+4. The 5.1b-deferred Observer volume/time bounds (candidate cap + per-preview timeout) land here,
+   where the unattended loop makes them load-bearing; both log-not-silently-truncate.
+5. Occurrence is monotonic + persisted (`0x0a`) so restarts never reuse a journaled decision key.
+6. A non-fatal step failure is recorded and does not abort the cycle; only lock-loss/corruption
+   stops the loop. `--once` is the testable unit; the exit gate drives it repeatedly.
+
+### 5.2.9 Build order (for rb-lite)
+
+1. **5.2a — the pure scheduler + watch-state** (no loop, no I/O): `WatchPolicy`/`ProbeBudget`,
+   the adaptive-wake `min`, the probe-refresh predicate, the budget predicate, the candidate-cap
+   truncation, the `0x0a` watch-state registry (occurrence + last_discover_ms). Golden +
+   MemDatabase tests. The Observer candidate-cap + per-preview timeout in `discovery.rs`.
+2. **5.2b — `Runtime::watch_once` + the `wallet-cli watch` loop:** one cycle
+   (reconcile→tick→scheduled probes→scheduled discover) wired to the pure scheduler, the
+   adaptive sleep, `--once` vs the running loop, SIGINT/SIGTERM checkpoint. Fixture `--once`
+   tests.
+3. **5.2c — the devimint exit-gate smoke** (`smoke_watch_devimint.sh`, run by hand).
+
+### Non-goals (5.2)
+
+A true meta push-subscription (adaptive-wake poll suffices), a multi-process/distributed
+scheduler (single writer), a cron/systemd integration (the operator wraps `watch` themselves),
+per-fed probe budgets (one global budget), and any UI.
 
 ## Non-goals (Phase 5)
 
