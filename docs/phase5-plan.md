@@ -938,8 +938,11 @@ freshly-published expiry interrupts the sleep and the NEXT cycle re-evaluates im
 **Safety — the subscription is a WAKE HINT, never a decision:** the merged-meta
 `federation_expiry_timestamp` is UNTRUSTED (a single `meta_override_url` host can forge it,
 §15.1), so it only triggers a cycle; the ACTUAL evacuation stays the tick's f+1-CORROBORATED
-decision. A forged/spurious signal costs at most one extra (harmless, no-op) cycle, never a
-money move. The poll-based adaptive wake remains the FLOOR (so the loop still works if a
+decision. Because the field is UNTRUSTED, subscription wakes are DEBOUNCED: after a
+subscription-triggered cycle no further subscription wake fires for at least `min_interval`, so a
+buggy/hostile `meta_override_url` that FLAPS `federation_expiry_timestamp` triggers at most one
+cycle per debounce window — a bounded no-op cost, never the unbounded spin an un-coalesced
+`wake_rx` would allow. The poll-based adaptive wake remains the FLOOR (so the loop still works if a
 subscription stream drops or a fed exposes no meta service).
 
 ### 5.2.1 The cycle (each iteration, in order)
@@ -985,9 +988,12 @@ The sleep before the next cycle is `min` over EVERY configured deadline (a large
   `Insufficient`/`Expired`; `last_attempt + probe_retry_backoff` for `Failed`/`FailedSinceLastPass`;
   and, when the global budget is exhausted, the BUDGET-RESET time — so a large `base_interval`
   never sleeps past re-eligibility yet the loop never hot-loops a fed that cannot make progress.
-Clamped to `[min_interval, base_interval]` (default min 30s) so the loop neither busy-spins nor
-oversleeps a deadline. A fed already INSIDE its evacuation window forces `min_interval` until it
-is evacuated or gone. Together with the meta-subscription wake-hint above, this is the loop's
+The `min_interval` floor (default 30s) applies ONLY to the ROUTINE cadence — the fallback when
+no concrete deadline is sooner — so the loop does not busy-spin when idle. A CONCRETE deadline
+(an evacuation lead or a probe-due time) that falls sooner than `min_interval` BYPASSES the
+floor: the loop wakes at that deadline (with a tiny ~1s floor only to avoid a true busy-spin), so
+a fed already `<30s` from shutdown is still re-ticked BEFORE it shuts down, not after. The upper
+clamp stays `base_interval`. Together with the meta-subscription wake-hint above, this is the loop's
 "reactive" behavior — prompt to a fresh signal, bounded by the adaptive poll floor.
 
 ### 5.2.3 Probe scheduling + the global probe budget
@@ -1007,8 +1013,12 @@ attempts. `Failed` / `FailedSinceLastPass` -> `last_attempt + probe_retry_backof
 never hammer a persistently-failing fed). `Passed` -> refresh within `probe_refresh_lead` of the
 TTL. Bounded by a GLOBAL `ProbeBudget` in `WatchPolicy` AND these per-verdict cadences:
 - `max_probe_attempts_per_week` (default 50): count of `Agent` probe umbrella rows in the
-  trailing 7d.
-- `max_probe_spend_per_week_msat` (default 50_000): sum of those rows' `cost_msat` (the
+  trailing 7d THAT RECORDED AN ACTUAL ATTEMPT (money moved) — `NoAttempt` refusals (0-sat, no
+  route/gateway/source fault) are EXCLUDED. Otherwise one persistently unroutable fed's hourly
+  `NoAttempt` retries would hit the 50-cap in ~2 days and starve probing of HEALTHY candidates
+  for everyone; the per-fed `last_invocation` backoff already bounds a single fed's retry rate,
+  so the GLOBAL cap only needs to bound money-spending attempts.
+- `max_probe_spend_per_week_msat` (default 50_000): sum of those (attempt) rows' `cost_msat` (the
   S-net-outflow the probe already records) in the trailing 7d.
 Both read from the ledger (the single source of truth), so the budget survives restart with no
 extra state.
@@ -1039,7 +1049,12 @@ hostile Observer must not stall the whole agent):
   timeout alone is not enough — `256 x 20s ~ 85 min` would exceed the 1h evacuation lead and
   starve a tick/evacuation. The pass stops early once this deadline elapses, keeping the loop's
   discovery step << `min_interval` and the evacuation lead. Discovery runs LAST in the cycle
-  precisely so it is the step preempted, never a tick or evacuation.
+  precisely so it is the step preempted, never a tick or evacuation. **A deadline-truncated pass
+  is NOT deferred the full `discover_every`:** if the pass exits on the deadline with backlog
+  remaining (the cursor did not wrap), the loop schedules a prompt CONTINUATION — the next
+  discover-due is `min_interval`, not `now + discover_every` — so a large feed drains over
+  successive quick continuations instead of ~3 candidates per 6h. `discover_every` governs only
+  a fully-drained pass (cursor wrapped): the routine re-scan cadence.
   - **Fairness (a resume CURSOR, not just "defer"):** `Runtime::discover` walks candidates in
     deterministic sorted order (a `BTreeMap`), so a bare "stop at the deadline, defer the rest"
     would re-process the SAME slow head every pass and STARVE the tail forever. The scheduler
