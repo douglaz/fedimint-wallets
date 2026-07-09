@@ -1418,7 +1418,11 @@ impl Runtime {
                 &BTreeMap::new(),
             );
             let active_probes = self
-                .active_probe_verdicts(&probes, preliminary.spending_fed)
+                .active_probe_verdicts(
+                    &probes,
+                    preliminary.spending_fed,
+                    &policy.probe_gate_policy,
+                )
                 .await;
             let snapshot =
                 build_snapshot(&probes, policy, scorer_policy, &auto_joined, &active_probes);
@@ -1513,6 +1517,7 @@ impl Runtime {
         &self,
         probes: &[(FederationId, ProbeResult)],
         spending: Option<FederationId>,
+        gate_policy: &ProbePolicy,
     ) -> BTreeMap<FederationId, ActiveProbeVerdict> {
         let Some(source) = spending else {
             return BTreeMap::new();
@@ -1528,7 +1533,7 @@ impl Runtime {
                         &record.map(|r| r.attempts).unwrap_or_default(),
                         source,
                         now_ms(),
-                        &ProbePolicy::default(),
+                        gate_policy,
                     );
                     active.insert(*id, verdict);
                 }

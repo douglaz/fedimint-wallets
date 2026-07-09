@@ -365,7 +365,7 @@ enum CandidateStateArg {
 /// The standing-instruction (ADR-0009) flags shared by `tick` and `status`. Every numeric flag
 /// falls back to [`TickPolicy::default`]'s v1 default; the designation flags fall back to
 /// auto-designation from the scored-eligible feds.
-#[derive(Args)]
+#[derive(Args, Default)]
 struct PolicyFlags {
     /// Per-fed balance cap (ADR-0018), in millisatoshis.
     #[arg(long)]
@@ -389,6 +389,19 @@ struct PolicyFlags {
     /// Pending/Executing work; bump it after a settled tick to let the decision recur.
     #[arg(long, default_value_t = 0)]
     occurrence: u64,
+    /// §5.1.3 FUNDING-GATE probe policy: seconds the qualifying probe successes must span
+    /// before a discovered (auto-joined) fed becomes fundable. Default 24h (the conservative
+    /// sustained-trust window). Loosen it to accept a shorter window — the operator owns that
+    /// risk tradeoff (and it is how a live test funds a just-probed fed without a 24h wait).
+    #[arg(long)]
+    probe_min_span_secs: Option<u64>,
+    /// §5.1.3 funding-gate probe policy: qualifying successes required (default 3).
+    #[arg(long)]
+    probe_min_successes: Option<u32>,
+    /// §5.1.3 funding-gate probe policy: seconds before the newest success goes stale
+    /// (default 7d). A verdict outside this ttl window is not a pass.
+    #[arg(long)]
+    probe_ttl_secs: Option<u64>,
 }
 
 #[tokio::main]
@@ -1388,6 +1401,9 @@ fn build_tick_policy(
         policy.max_fee = Msat(v);
     }
     policy.occurrence = Occurrence(flags.occurrence);
+    if let Some(gate) = gate_policy_override(flags) {
+        policy.probe_gate_policy = gate;
+    }
     if let Some(hex) = flags.spending.as_deref() {
         policy.spending_fed = Some(select_fed(joined_ids, open_ids, Some(hex))?);
     }
@@ -2661,9 +2677,54 @@ fn rfc3339_from_millis(ms: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
+/// Build the §5.1.3 funding-gate probe-policy override from the operator's `PolicyFlags`, or
+/// `None` when no gate flag was passed (leaving `TickPolicy`'s conservative default). Only the
+/// sustained-WINDOW knobs are tunable; amount/leg_fee_cap stay at the default STRENGTH so real
+/// (default-strength) probes qualify. `secs -> ms` uses saturating multiplication.
+fn gate_policy_override(flags: &PolicyFlags) -> Option<wallet_core::ProbePolicy> {
+    if flags.probe_min_span_secs.is_none()
+        && flags.probe_min_successes.is_none()
+        && flags.probe_ttl_secs.is_none()
+    {
+        return None;
+    }
+    let mut gate = wallet_core::ProbePolicy::default();
+    if let Some(v) = flags.probe_min_span_secs {
+        gate.min_span_ms = v.saturating_mul(1000);
+    }
+    if let Some(v) = flags.probe_min_successes {
+        gate.min_successes = v;
+    }
+    if let Some(v) = flags.probe_ttl_secs {
+        gate.ttl_ms = v.saturating_mul(1000);
+    }
+    Some(gate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gate_policy_override_maps_window_flags_or_none() {
+        // No gate flag -> None (TickPolicy keeps the conservative default).
+        assert!(gate_policy_override(&PolicyFlags::default()).is_none());
+        // A window override -> a policy with secs converted to ms; STRENGTH (amount/fee_cap)
+        // stays at default so real default-strength probes still qualify.
+        let flags = PolicyFlags {
+            probe_min_span_secs: Some(1),
+            probe_min_successes: Some(2),
+            probe_ttl_secs: Some(30),
+            ..PolicyFlags::default()
+        };
+        let gate = gate_policy_override(&flags).expect("override built");
+        let default = wallet_core::ProbePolicy::default();
+        assert_eq!(gate.min_span_ms, 1_000);
+        assert_eq!(gate.min_successes, 2);
+        assert_eq!(gate.ttl_ms, 30_000);
+        assert_eq!(gate.amount_msat, default.amount_msat, "strength unchanged");
+        assert_eq!(gate.leg_fee_cap_msat, default.leg_fee_cap_msat, "strength unchanged");
+    }
 
     fn fed(byte: u8) -> FederationId {
         FederationId([byte; 32])
@@ -3051,13 +3112,9 @@ mod tests {
         standby: Option<String>,
     ) -> PolicyFlags {
         PolicyFlags {
-            per_fed_cap: None,
-            spending_target: None,
-            standby_target: None,
-            max_fee: None,
             spending,
             standby,
-            occurrence: 0,
+            ..PolicyFlags::default()
         }
     }
 
