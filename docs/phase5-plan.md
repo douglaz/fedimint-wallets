@@ -980,14 +980,19 @@ error (lock lost, DB corruption) stops the loop.
 The sleep before the next cycle is `min` over EVERY configured deadline (a larger
 `base_interval` must never sleep PAST a sub-cadence):
 - `base_interval` (default 10 min) — the routine rebalance cadence;
-- `next_discover_due = last_discover_ms + discover_every - now` — so a long base interval cannot
-  skip a scheduled discovery pass;
+- `next_discover_due` = `min_interval` when the persisted `discover_backlog` flag is set (a pass
+  truncated on its deadline with the cursor un-wrapped, 5.2.4/5.2.5 — drain the backlog over quick
+  continuations), else `last_discover_ms + discover_every - now` — so a long base interval cannot
+  skip a scheduled discovery pass AND a large feed actually drains rather than waiting 6h between
+  continuations;
 - for every joined fed with a corroborated expiry, `expiry - now - evacuation_lead` (default lead
   1h): wake in time to EVACUATE before shutdown, not after;
-- for every `Passed` verdict, `ttl_deadline - effective_refresh_lead - now` (the SAME
-  `min(probe_refresh_lead, ttl_ms / 2)` clamp §5.2.3 uses, NOT the raw lead) — wake to REFRESH
-  BEFORE it lapses; without the clamp a shrunk `--probe-ttl-secs` would put this deadline in the
-  past and wake every cycle;
+- for every AUTO-JOINED fed with a `Passed` verdict (only those the scheduler actually refreshes —
+  NOT a user-joined fed probed manually, which `watch` never re-probes), `ttl_deadline -
+  effective_refresh_lead - now` (the SAME `min(probe_refresh_lead, ttl_ms / 2)` clamp §5.2.3 uses,
+  NOT the raw lead) — wake to REFRESH BEFORE it lapses; scoping this to refreshed feds stops a
+  manually-probed user fed from driving near-1s wakeups once its verdict enters the lead window,
+  and the clamp stops a shrunk `--probe-ttl-secs` from putting the deadline in the past;
 - for every non-`Passed` auto-joined fed, its next PROBE-DUE deadline per 5.2.3, keyed off
   `last_invocation` (the umbrella row, not just qualifying attempts): `min_interval` only for a
   `NeverProbed` fed with NO prior invocation; `last_invocation + probe_retry_backoff` for one
@@ -1007,8 +1012,10 @@ clamp stays `base_interval`. Together with the meta-subscription wake-hint above
 
 The scheduler is the ONLY unattended probe initiator (a manual `wallet-cli probe` stays
 un-budgeted — the operator owns that spend). A fed is PROBE-DUE when it is an auto-joined
-candidate that is NOT fundably `Passed` and its last attempt (if any) is older than the retry
-backoff, OR it is `Passed` with its newest qualifying success within the EFFECTIVE refresh lead
+candidate that is NOT fundably `Passed` and is past its PER-VERDICT next-due time (defined
+precisely below — the generic word "backoff" here defers to those cadences, which differ by
+verdict: ~12h `probe_build_interval` for `Insufficient`/`Expired`, ~1h `probe_retry_backoff` for
+`Failed*`), OR it is `Passed` with its newest qualifying success within the EFFECTIVE refresh lead
 `min(probe_refresh_lead (default 12h), ttl_ms / 2)` of `ttl_ms`. Clamping to the TTL matters
 because 5.2.6 lets the operator shrink `--probe-ttl-secs`: with a fixed 12h lead, any TTL below
 12h would make a FRESHLY `Passed` fed instantly "within lead" and re-probed (paid) every cycle,
