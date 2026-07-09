@@ -28,6 +28,7 @@ either outcome (the ledger, hardening, UI, and recovery serve a single-fed walle
 - **Phase 5.0 — active probe: COMPLETE (2026-07-07)** — the sats-spending A->B->A
   redeemability probe passed its live devimint gate and now records durable verdict history
   for discovery-driven funding decisions ([phase5-plan.md](./phase5-plan.md)).
+- **Phase 5.1 — discovery: COMPLETE (2026-07-09)** — source-agnostic candidate pipeline (Observer HTTP + Manual; Nostr deferred), the `0x09` candidate registry, and the probe GATE wiring: an agent-discovered/auto-joined federation is fundable only after a sustained active-probe PASS (operator-tunable), never on discovery alone. Live devimint exit gate passed ([phase5-plan.md](./phase5-plan.md)).
 
 ## Sequence
 

@@ -899,7 +899,7 @@ wallet-cli approve <fed-hex>   # bless an AutoJoined candidate -> UserApproved (
    the pipeline (preview-fetch → id-verify → structural floor → registry → bounded
    auto-join), `wallet-cli discover`/`candidates`, `ObserverSource`. Fixture-source unit
    tests + the recorded-`/federations` parse test.
-3. **5.1c — the devimint exit-gate smoke** (`smoke_discover_devimint.sh`, run by hand).
+3. **5.1c — the devimint exit-gate smoke** (`smoke_discover_devimint.sh`, run by hand): **DONE 2026-07-09 — LIVE GATE PASSED.** discover -> agent auto-join B (within budget; Discover+AutoJoin+agent-join rows) -> gated tick BAILS (probe-gated; pin does not bypass) with B empty -> 3 probes -> passed -> the SAME tick funds B to ~target (never over). The live gate surfaced + fixed one real code gap: the funding-gate probe policy was hardcoded/un-tunable, now the `--probe-min-span-secs`/`-min-successes`/`-ttl-secs` standing-instruction knobs (default conservative). **Phase 5.1 (discovery) COMPLETE.**
 
 ### Non-goals (5.1)
 
