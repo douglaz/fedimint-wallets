@@ -18,9 +18,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr as _;
 use std::time::{Duration, Instant};
 use wallet_core::{
-    auto_join_budget, discover_pass_plan, score_structural, Actor, BudgetVerdict, DiscoveryPolicy,
-    DiscoverySource, FederationFacts, FederationId, IdempotencyKey, Occurrence, OperationKind,
-    ReasonCode, ScorerPolicy, SourceStatus, WatchPolicy,
+    auto_join_budget, discover_pass_plan, discover_pass_plan_in_rotation, score_structural, Actor,
+    BudgetVerdict, DiscoveryPolicy, DiscoverySource, FederationFacts, FederationId, IdempotencyKey,
+    Occurrence, OperationKind, ReasonCode, ScorerPolicy, SourceStatus, WatchPolicy,
 };
 
 /// One untrusted candidate announcement (§5.1.0): a federation id + invite + network hint.
@@ -77,7 +77,6 @@ pub struct DiscoverPassProgress {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BoundedDiscoverReport {
     pub report: DiscoverReport,
-    pub progress: DiscoverPassProgress,
     pub next_rotation: Vec<FederationId>,
 }
 
@@ -117,6 +116,7 @@ pub(crate) enum AutoJoinAttempt {
 pub(crate) struct DiscoverPassResume<'a> {
     pub cursor: Option<FederationId>,
     pub rotation: &'a [FederationId],
+    pub occurrence: Occurrence,
 }
 
 #[derive(Clone, Debug)]
@@ -185,6 +185,7 @@ struct IndexedAnnouncement {
 struct AutoJoinBounds<'a> {
     timing: DiscoverTiming,
     window: Vec<FederationId>,
+    occurrence: Occurrence,
     attempted_ids: &'a mut BTreeSet<FederationId>,
 }
 
@@ -295,6 +296,7 @@ pub(crate) async fn run_discover_pass_bounded(
         DiscoverPassResume {
             cursor,
             rotation: &[],
+            occurrence: Occurrence(0),
         },
     )
     .await
@@ -310,6 +312,7 @@ pub(crate) async fn run_discover_pass_bounded_with_rotation(
     resume: DiscoverPassResume<'_>,
 ) -> anyhow::Result<BoundedDiscoverReport> {
     let cursor = resume.cursor;
+    let occurrence = resume.occurrence;
     let timing = DiscoverTiming {
         pass_started_at: Instant::now(),
         pass_deadline: Duration::from_millis(watch_policy.discover_pass_deadline_ms),
@@ -364,7 +367,7 @@ pub(crate) async fn run_discover_pass_bounded_with_rotation(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let rotation_plan = discover_pass_plan_preserving_rotation(
+    let rotation_plan = build_discover_rotation_plan(
         cursor,
         &all_candidate_ids,
         resume.rotation,
@@ -402,23 +405,23 @@ pub(crate) async fn run_discover_pass_bounded_with_rotation(
                 let result =
                     authenticate_first_valid(announcements, backend, &mut reports, timing).await?;
                 if let Some(auth) = result.authenticated {
-                    mark_attempted(&mut structural_attempted_ids, claimed_id);
+                    structural_attempted_ids.insert(claimed_id);
                     handle_joined_candidate(auth, existing, backend, now_ms).await?;
                 } else if result.attempted_preview {
-                    mark_attempted(&mut structural_attempted_ids, claimed_id);
+                    structural_attempted_ids.insert(claimed_id);
                 } else {
                     completed_window = false;
                     break;
                 }
             } else {
-                mark_attempted(&mut structural_attempted_ids, claimed_id);
+                structural_attempted_ids.insert(claimed_id);
             }
             continue;
         }
 
         let needs_fetch = needs_structural_fetch(announcements, existing.as_ref(), now_ms, policy);
         if !needs_fetch {
-            mark_attempted(&mut structural_attempted_ids, claimed_id);
+            structural_attempted_ids.insert(claimed_id);
             continue;
         }
 
@@ -432,14 +435,14 @@ pub(crate) async fn run_discover_pass_bounded_with_rotation(
                     attempted_preview, ..
                 } => {
                     if attempted_preview {
-                        mark_attempted(&mut structural_attempted_ids, claimed_id);
+                        structural_attempted_ids.insert(claimed_id);
                         continue;
                     }
                     completed_window = false;
                     break;
                 }
             };
-        mark_attempted(&mut structural_attempted_ids, claimed_id);
+        structural_attempted_ids.insert(claimed_id);
 
         let verdict = score_structural(&auth.preview.facts, &scorer_policy);
         let structural = if verdict.eligible_to_fund {
@@ -480,7 +483,7 @@ pub(crate) async fn run_discover_pass_bounded_with_rotation(
         if let Err(e) = backend
             .record_discover(
                 discover_ledger_key(&reports, index, nonce),
-                Occurrence(0),
+                occurrence,
                 report,
                 now_ms,
             )
@@ -503,6 +506,7 @@ pub(crate) async fn run_discover_pass_bounded_with_rotation(
                 AutoJoinBounds {
                     timing,
                     window: planned_window.clone(),
+                    occurrence,
                     attempted_ids: &mut auto_join_attempted_ids,
                 },
             )
@@ -547,7 +551,7 @@ pub(crate) async fn run_discover_pass_bounded_with_rotation(
     if let Err(e) = backend
         .record_auto_join(
             IdempotencyKey(format!("autojoin:{nonce}")),
-            Occurrence(0),
+            occurrence,
             &auto_join_report,
             now_ms,
         )
@@ -562,7 +566,6 @@ pub(crate) async fn run_discover_pass_bounded_with_rotation(
             auto_join: auto_join_report,
             progress,
         },
-        progress,
         next_rotation: if progress.backlog {
             rotation_plan.rotation
         } else {
@@ -712,7 +715,7 @@ struct RotationPlan {
     rotation: Vec<FederationId>,
 }
 
-fn discover_pass_plan_preserving_rotation(
+fn build_discover_rotation_plan(
     cursor: Option<FederationId>,
     all_candidate_ids_sorted: &[FederationId],
     previous_rotation: &[FederationId],
@@ -725,14 +728,12 @@ fn discover_pass_plan_preserving_rotation(
         };
     }
 
-    let current_ids = all_candidate_ids_sorted
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
     let mut seen = BTreeSet::new();
     let mut rotation = Vec::new();
     for id in previous_rotation {
-        if seen.insert(*id) && (current_ids.contains(id) || cursor == Some(*id)) {
+        if seen.insert(*id)
+            && (all_candidate_ids_sorted.binary_search(id).is_ok() || cursor == Some(*id))
+        {
             rotation.push(*id);
         }
     }
@@ -752,62 +753,13 @@ fn discover_pass_plan_preserving_rotation(
         };
     }
 
-    let plan =
-        discover_pass_plan_from_rotation(cursor, &rotation, &current_ids, max_candidates_per_pass);
+    let plan = discover_pass_plan_in_rotation(
+        cursor,
+        &rotation,
+        all_candidate_ids_sorted,
+        max_candidates_per_pass,
+    );
     RotationPlan { plan, rotation }
-}
-
-fn discover_pass_plan_from_rotation(
-    cursor: Option<FederationId>,
-    rotation: &[FederationId],
-    current_ids: &BTreeSet<FederationId>,
-    max_candidates_per_pass: usize,
-) -> wallet_core::DiscoverPassPlan {
-    if current_ids.is_empty() {
-        return wallet_core::DiscoverPassPlan {
-            window: Vec::new(),
-            next_cursor: None,
-            wrapped: true,
-        };
-    }
-    if max_candidates_per_pass == 0 {
-        return wallet_core::DiscoverPassPlan {
-            window: Vec::new(),
-            next_cursor: cursor,
-            wrapped: false,
-        };
-    }
-
-    let cursor_index = cursor.and_then(|cursor| rotation.iter().position(|id| *id == cursor));
-    let start = cursor_index.map_or(0, |index| (index + 1) % rotation.len());
-    let take = max_candidates_per_pass.min(current_ids.len());
-    let mut window = Vec::with_capacity(take);
-    let mut crossed_rotation_end = false;
-    let mut index = start;
-
-    for _ in 0..rotation.len() {
-        if cursor_index.is_some() && start != 0 && index == rotation.len() - 1 {
-            crossed_rotation_end = true;
-        }
-        let id = rotation[index];
-        if current_ids.contains(&id) {
-            window.push(id);
-            if window.len() == take {
-                break;
-            }
-        }
-        index = (index + 1) % rotation.len();
-    }
-
-    wallet_core::DiscoverPassPlan {
-        next_cursor: window.last().copied(),
-        wrapped: window.len() == current_ids.len() || crossed_rotation_end,
-        window,
-    }
-}
-
-fn mark_attempted(attempted: &mut BTreeSet<FederationId>, candidate: FederationId) {
-    attempted.insert(candidate);
 }
 
 fn cursor_progress_attempts(
@@ -1013,6 +965,7 @@ async fn run_auto_join(
     let AutoJoinBounds {
         timing,
         window,
+        occurrence,
         attempted_ids,
     } = bounds;
     let mut completed_window = true;
@@ -1040,18 +993,18 @@ async fn run_auto_join(
         ) {
             BudgetVerdict::Allowed => {}
             BudgetVerdict::BlockedConcurrent => {
-                mark_attempted(attempted_ids, candidate.id);
+                attempted_ids.insert(candidate.id);
                 report.blocked_concurrent = report.blocked_concurrent.saturating_add(1);
                 continue;
             }
             BudgetVerdict::BlockedWeekly => {
-                mark_attempted(attempted_ids, candidate.id);
+                attempted_ids.insert(candidate.id);
                 report.blocked_weekly = report.blocked_weekly.saturating_add(1);
                 stopped_for_budget = true;
                 break;
             }
             BudgetVerdict::BlockedLifetime => {
-                mark_attempted(attempted_ids, candidate.id);
+                attempted_ids.insert(candidate.id);
                 report.blocked_lifetime = report.blocked_lifetime.saturating_add(1);
                 stopped_for_budget = true;
                 break;
@@ -1067,7 +1020,7 @@ async fn run_auto_join(
                 );
                 break;
             };
-            mark_attempted(attempted_ids, candidate.id);
+            attempted_ids.insert(candidate.id);
             match preview_with_timeout(backend, &candidate.invite, preview_timeout).await {
                 Ok(preview) => {
                     let invite_id = bridge_federation_id(candidate.invite.federation_id());
@@ -1104,10 +1057,10 @@ async fn run_auto_join(
                 }
             }
         } else {
-            mark_attempted(attempted_ids, candidate.id);
+            attempted_ids.insert(candidate.id);
         }
 
-        match join_as_agent_with_timeout(backend, &candidate, now_ms, timing).await {
+        match join_as_agent_with_timeout(backend, &candidate, occurrence, now_ms, timing).await {
             AutoJoinAttempt::Joined(outcome) => {
                 if outcome.newly_joined {
                     candidate.state = CandidateState::AutoJoined;
@@ -1151,6 +1104,7 @@ async fn run_auto_join(
 async fn join_as_agent_with_timeout(
     backend: &impl DiscoveryBackend,
     candidate: &CandidateRecord,
+    occurrence: Occurrence,
     now_ms: u64,
     timing: DiscoverTiming,
 ) -> AutoJoinAttempt {
@@ -1161,7 +1115,7 @@ async fn join_as_agent_with_timeout(
         .join_as_agent(
             candidate.id,
             candidate.invite.clone(),
-            Occurrence(0),
+            occurrence,
             now_ms,
             join_timeout,
         )
@@ -1593,6 +1547,7 @@ mod tests {
         count_calls: Mutex<u32>,
         agent_created: Mutex<BTreeSet<FederationId>>,
         joins: Mutex<Vec<FederationId>>,
+        join_occurrences: Mutex<Vec<(FederationId, Occurrence)>>,
         discover_keys: Mutex<Vec<IdempotencyKey>>,
         discover_rows: Mutex<Vec<DiscoverSourceReport>>,
         auto_rows: Mutex<Vec<AutoJoinReport>>,
@@ -1738,11 +1693,15 @@ mod tests {
             &self,
             id: FederationId,
             _invite: InviteCode,
-            _occurrence: Occurrence,
+            occurrence: Occurrence,
             _now_ms: u64,
             join_timeout: Duration,
         ) -> AutoJoinAttempt {
             self.joins.lock().expect("joins lock").push(id);
+            self.join_occurrences
+                .lock()
+                .expect("join occurrences lock")
+                .push((id, occurrence));
             let reply = self
                 .join_replies
                 .lock()
@@ -2411,6 +2370,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watch_auto_join_threads_cycle_occurrence_into_join_row() -> anyhow::Result<()> {
+        let backend = FakeBackend::default();
+        let id = fed(0x47);
+        let invite = invite_for(id, "watch-autojoin-occurrence");
+        backend.put_existing(candidate(
+            id,
+            invite.clone(),
+            CandidateState::Discovered,
+            10_000,
+        ));
+        backend.with_preview(
+            &invite,
+            PreviewReply::Ok(PreviewedCandidate {
+                id,
+                facts: good_facts(id),
+            }),
+        );
+        let policy = DiscoveryPolicy {
+            auto_join: true,
+            ..DiscoveryPolicy::default()
+        };
+        let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+        let occurrence = Occurrence(42);
+
+        let outcome = run_discover_pass_bounded_with_rotation(
+            &sources,
+            &policy,
+            &backend,
+            20_000,
+            "0000000000000047",
+            &WatchPolicy::default(),
+            DiscoverPassResume {
+                cursor: None,
+                rotation: &[],
+                occurrence,
+            },
+        )
+        .await?;
+
+        assert_eq!(outcome.report.auto_join.joined, 1);
+        assert_eq!(
+            backend
+                .join_occurrences
+                .lock()
+                .expect("join occurrences lock")
+                .as_slice(),
+            [(id, occurrence)]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn down_source_records_failed_status_without_failing_pass() -> anyhow::Result<()> {
         let backend = FakeBackend::default();
         let sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(FakeSource {
@@ -2444,9 +2455,9 @@ mod tests {
             .lock()
             .expect("candidates lock")
             .is_empty());
-        assert!(outcome.progress.wrapped);
-        assert!(!outcome.progress.backlog);
-        assert_eq!(outcome.progress.next_cursor, None);
+        assert!(outcome.report.progress.wrapped);
+        assert!(!outcome.report.progress.backlog);
+        assert_eq!(outcome.report.progress.next_cursor, None);
         Ok(())
     }
 
@@ -2476,9 +2487,9 @@ mod tests {
         )
         .await?;
 
-        assert!(empty.progress.wrapped);
-        assert!(!empty.progress.backlog);
-        assert_eq!(empty.progress.next_cursor, None);
+        assert!(empty.report.progress.wrapped);
+        assert!(!empty.report.progress.backlog);
+        assert_eq!(empty.report.progress.next_cursor, None);
 
         let ids = [fed(0x10), fed(0x11), fed(0x20), fed(0x21)];
         let invites = ids
@@ -2516,14 +2527,14 @@ mod tests {
             10_500,
             "0000000000000009",
             &watch,
-            empty.progress.next_cursor,
+            empty.report.progress.next_cursor,
         )
         .await?;
 
-        assert_eq!(later.progress.attempted, 2);
-        assert_eq!(later.progress.next_cursor, Some(ids[1]));
-        assert!(!later.progress.wrapped);
-        assert!(later.progress.backlog);
+        assert_eq!(later.report.progress.attempted, 2);
+        assert_eq!(later.report.progress.next_cursor, Some(ids[1]));
+        assert!(!later.report.progress.wrapped);
+        assert!(later.report.progress.backlog);
         assert_eq!(
             backend.previewed.lock().expect("previewed lock").as_slice(),
             [invites[0].to_string(), invites[1].to_string()]
@@ -2536,7 +2547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_sized_candidate_window_preserves_cursor() -> anyhow::Result<()> {
+    async fn zero_sized_candidate_window_does_not_advance_cursor() -> anyhow::Result<()> {
         let backend = FakeBackend::default();
         let cursor = fed(0x15);
         let id = fed(0x16);
@@ -2564,11 +2575,11 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(outcome.progress.attempted, 0);
-        assert_eq!(outcome.progress.next_cursor, Some(cursor));
-        assert!(!outcome.progress.wrapped);
-        assert!(outcome.progress.backlog);
-        assert_eq!(outcome.progress.deferred, 1);
+        assert_eq!(outcome.report.progress.attempted, 0);
+        assert_eq!(outcome.report.progress.next_cursor, None);
+        assert!(!outcome.report.progress.wrapped);
+        assert!(outcome.report.progress.backlog);
+        assert_eq!(outcome.report.progress.deferred, 1);
         assert!(backend.previewed.lock().expect("previewed lock").is_empty());
         assert!(backend.get_record(id).is_none());
         Ok(())
@@ -2611,9 +2622,9 @@ mod tests {
             status => panic!("expected source timeout, got {status:?}"),
         }
         assert_eq!(outcome.report.sources[0].found, 0);
-        assert!(outcome.progress.wrapped);
-        assert!(!outcome.progress.backlog);
-        assert_eq!(outcome.progress.next_cursor, None);
+        assert!(outcome.report.progress.wrapped);
+        assert!(!outcome.report.progress.backlog);
+        assert_eq!(outcome.report.progress.next_cursor, None);
         assert!(backend.get_record(id).is_none());
         assert!(backend.previewed.lock().expect("previewed lock").is_empty());
         Ok(())
@@ -2674,9 +2685,9 @@ mod tests {
         assert_eq!(outcome.report.sources[0].found, 0);
         assert_eq!(outcome.report.sources[1].status, SourceStatus::Ok);
         assert_eq!(outcome.report.sources[1].found, 1);
-        assert_eq!(outcome.progress.attempted, 1);
-        assert!(outcome.progress.wrapped);
-        assert!(!outcome.progress.backlog);
+        assert_eq!(outcome.report.progress.attempted, 1);
+        assert!(outcome.report.progress.wrapped);
+        assert!(!outcome.report.progress.backlog);
         assert!(backend.get_record(id).is_some());
         assert_eq!(
             backend.previewed.lock().expect("previewed lock").as_slice(),
@@ -2894,10 +2905,10 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(first.progress.attempted, 2);
-        assert_eq!(first.progress.next_cursor, Some(ids[1]));
-        assert!(first.progress.backlog);
-        assert_eq!(first.progress.deferred, 2);
+        assert_eq!(first.report.progress.attempted, 2);
+        assert_eq!(first.report.progress.next_cursor, Some(ids[1]));
+        assert!(first.report.progress.backlog);
+        assert_eq!(first.report.progress.deferred, 2);
         assert_eq!(
             backend.previewed.lock().expect("previewed lock").as_slice(),
             [invites[0].to_string(), invites[1].to_string()]
@@ -2914,15 +2925,15 @@ mod tests {
             21_000,
             "0000000000000052",
             &watch,
-            first.progress.next_cursor,
+            first.report.progress.next_cursor,
         )
         .await?;
 
-        assert_eq!(second.progress.attempted, 2);
-        assert_eq!(second.progress.next_cursor, Some(ids[3]));
-        assert!(second.progress.wrapped);
-        assert!(!second.progress.backlog);
-        assert_eq!(second.progress.deferred, 0);
+        assert_eq!(second.report.progress.attempted, 2);
+        assert_eq!(second.report.progress.next_cursor, Some(ids[3]));
+        assert!(second.report.progress.wrapped);
+        assert!(!second.report.progress.backlog);
+        assert_eq!(second.report.progress.deferred, 0);
         assert!(backend.get_record(ids[2]).is_some());
         assert!(backend.get_record(ids[3]).is_some());
         assert_eq!(
@@ -2984,8 +2995,8 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(first.progress.next_cursor, Some(original_ids[0]));
-        assert!(first.progress.backlog);
+        assert_eq!(first.report.progress.next_cursor, Some(original_ids[0]));
+        assert!(first.report.progress.backlog);
         assert_eq!(first.next_rotation, original_ids.to_vec());
 
         let fresh_ids = [fed(0x52), fed(0x53)];
@@ -3030,13 +3041,14 @@ mod tests {
             "0000000000000058",
             &second_watch,
             DiscoverPassResume {
-                cursor: first.progress.next_cursor,
+                cursor: first.report.progress.next_cursor,
                 rotation: &first.next_rotation,
+                occurrence: Occurrence(0),
             },
         )
         .await?;
 
-        assert_eq!(second.progress.next_cursor, Some(original_ids[2]));
+        assert_eq!(second.report.progress.next_cursor, Some(original_ids[2]));
         assert!(backend.get_record(original_ids[1]).is_some());
         assert!(backend.get_record(original_ids[2]).is_some());
         assert!(backend.get_record(fresh_ids[0]).is_none());
@@ -3110,11 +3122,11 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(outcome.progress.attempted, 2);
-        assert_eq!(outcome.progress.next_cursor, Some(ids[1]));
-        assert!(!outcome.progress.wrapped);
-        assert!(outcome.progress.backlog);
-        assert_eq!(outcome.progress.deferred, 2);
+        assert_eq!(outcome.report.progress.attempted, 2);
+        assert_eq!(outcome.report.progress.next_cursor, Some(ids[1]));
+        assert!(!outcome.report.progress.wrapped);
+        assert!(outcome.report.progress.backlog);
+        assert_eq!(outcome.report.progress.deferred, 2);
         assert!(backend.get_record(ids[0]).is_some());
         assert!(backend.get_record(ids[1]).is_some());
         assert!(backend.get_record(ids[2]).is_none());
@@ -3170,11 +3182,11 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(outcome.progress.attempted, 2);
-        assert_eq!(outcome.progress.next_cursor, Some(ids[3]));
-        assert!(!outcome.progress.wrapped);
-        assert!(outcome.progress.backlog);
-        assert_eq!(outcome.progress.deferred, 2);
+        assert_eq!(outcome.report.progress.attempted, 2);
+        assert_eq!(outcome.report.progress.next_cursor, Some(ids[3]));
+        assert!(!outcome.report.progress.wrapped);
+        assert!(outcome.report.progress.backlog);
+        assert_eq!(outcome.report.progress.deferred, 2);
         assert!(backend.get_record(ids[0]).is_none());
         assert!(backend.get_record(ids[1]).is_none());
         assert!(backend.get_record(ids[2]).is_some());
@@ -3245,10 +3257,10 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(first.progress.attempted, 1);
-        assert_eq!(first.progress.next_cursor, Some(source_id));
-        assert!(first.progress.backlog);
-        assert_eq!(first.progress.deferred, 1);
+        assert_eq!(first.report.progress.attempted, 1);
+        assert_eq!(first.report.progress.next_cursor, Some(source_id));
+        assert!(first.report.progress.backlog);
+        assert_eq!(first.report.progress.deferred, 1);
         assert_eq!(first.report.auto_join.considered, 0);
         assert!(backend.joins.lock().expect("joins lock").is_empty());
         assert_eq!(
@@ -3267,15 +3279,15 @@ mod tests {
             51_000,
             "0000000000000092",
             &watch,
-            first.progress.next_cursor,
+            first.report.progress.next_cursor,
         )
         .await?;
 
-        assert_eq!(second.progress.attempted, 1);
-        assert_eq!(second.progress.next_cursor, Some(later_auto_join));
-        assert!(second.progress.wrapped);
-        assert!(!second.progress.backlog);
-        assert_eq!(second.progress.deferred, 0);
+        assert_eq!(second.report.progress.attempted, 1);
+        assert_eq!(second.report.progress.next_cursor, Some(later_auto_join));
+        assert!(second.report.progress.wrapped);
+        assert!(!second.report.progress.backlog);
+        assert_eq!(second.report.progress.deferred, 0);
         assert_eq!(second.report.auto_join.considered, 1);
         assert_eq!(second.report.auto_join.joined, 1);
         assert_eq!(
@@ -3318,10 +3330,10 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(outcome.progress.attempted, 1);
-        assert_eq!(outcome.progress.next_cursor, Some(id));
-        assert!(outcome.progress.wrapped);
-        assert!(!outcome.progress.backlog);
+        assert_eq!(outcome.report.progress.attempted, 1);
+        assert_eq!(outcome.report.progress.next_cursor, Some(id));
+        assert!(outcome.report.progress.wrapped);
+        assert!(!outcome.report.progress.backlog);
         assert!(backend.get_record(id).is_none());
         assert_eq!(
             backend.previewed.lock().expect("previewed lock").as_slice(),
@@ -3382,11 +3394,11 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(outcome.progress.attempted, 1);
-        assert_eq!(outcome.progress.next_cursor, Some(slow));
-        assert!(!outcome.progress.wrapped);
-        assert!(outcome.progress.backlog);
-        assert_eq!(outcome.progress.deferred, 1);
+        assert_eq!(outcome.report.progress.attempted, 1);
+        assert_eq!(outcome.report.progress.next_cursor, Some(slow));
+        assert!(!outcome.report.progress.wrapped);
+        assert!(outcome.report.progress.backlog);
+        assert_eq!(outcome.report.progress.deferred, 1);
         assert!(backend.get_record(slow).is_none());
         assert!(backend.get_record(deferred).is_none());
         assert_eq!(
@@ -3434,11 +3446,11 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(outcome.progress.attempted, 0);
-        assert_eq!(outcome.progress.next_cursor, None);
-        assert!(!outcome.progress.wrapped);
-        assert!(outcome.progress.backlog);
-        assert_eq!(outcome.progress.deferred, 1);
+        assert_eq!(outcome.report.progress.attempted, 0);
+        assert_eq!(outcome.report.progress.next_cursor, None);
+        assert!(!outcome.report.progress.wrapped);
+        assert!(outcome.report.progress.backlog);
+        assert_eq!(outcome.report.progress.deferred, 1);
         assert!(backend.previewed.lock().expect("previewed lock").is_empty());
         assert!(backend.get_record(id).is_none());
         Ok(())
@@ -3486,10 +3498,10 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(outcome.progress.attempted, 1);
-        assert_eq!(outcome.progress.next_cursor, Some(id));
-        assert!(outcome.progress.wrapped);
-        assert!(!outcome.progress.backlog);
+        assert_eq!(outcome.report.progress.attempted, 1);
+        assert_eq!(outcome.report.progress.next_cursor, Some(id));
+        assert!(outcome.report.progress.wrapped);
+        assert!(!outcome.report.progress.backlog);
         assert!(backend.get_record(id).is_none());
         assert_eq!(
             backend.previewed.lock().expect("previewed lock").as_slice(),
@@ -3558,10 +3570,10 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(outcome.progress.next_cursor, Some(slow));
-        assert!(!outcome.progress.wrapped);
-        assert!(outcome.progress.backlog);
-        assert_eq!(outcome.progress.deferred, 1);
+        assert_eq!(outcome.report.progress.next_cursor, Some(slow));
+        assert!(!outcome.report.progress.wrapped);
+        assert!(outcome.report.progress.backlog);
+        assert_eq!(outcome.report.progress.deferred, 1);
         assert_eq!(outcome.report.auto_join.joined, 0);
         assert!(backend.joins.lock().expect("joins lock").is_empty());
         let previewed = backend.previewed.lock().expect("previewed lock").clone();
@@ -3575,7 +3587,7 @@ mod tests {
             40_800,
             "0000000000000079",
             &watch,
-            outcome.progress.next_cursor,
+            outcome.report.progress.next_cursor,
         )
         .await?;
 
@@ -3656,11 +3668,11 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(first.progress.attempted, 1);
-        assert_eq!(first.progress.next_cursor, Some(slow));
-        assert!(!first.progress.wrapped);
-        assert!(first.progress.backlog);
-        assert_eq!(first.progress.deferred, 1);
+        assert_eq!(first.report.progress.attempted, 1);
+        assert_eq!(first.report.progress.next_cursor, Some(slow));
+        assert!(!first.report.progress.wrapped);
+        assert!(first.report.progress.backlog);
+        assert_eq!(first.report.progress.deferred, 1);
         assert!(backend.joins.lock().expect("joins lock").is_empty());
         assert_eq!(
             backend.previewed.lock().expect("previewed lock").as_slice(),
@@ -3674,7 +3686,7 @@ mod tests {
             40_900,
             "0000000000000075",
             &watch,
-            first.progress.next_cursor,
+            first.report.progress.next_cursor,
         )
         .await?;
 
@@ -3758,11 +3770,11 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(outcome.progress.attempted, 2);
-        assert_eq!(outcome.progress.next_cursor, Some(first_auto_join));
-        assert!(!outcome.progress.wrapped);
-        assert!(outcome.progress.backlog);
-        assert_eq!(outcome.progress.deferred, 1);
+        assert_eq!(outcome.report.progress.attempted, 2);
+        assert_eq!(outcome.report.progress.next_cursor, Some(first_auto_join));
+        assert!(!outcome.report.progress.wrapped);
+        assert!(outcome.report.progress.backlog);
+        assert_eq!(outcome.report.progress.deferred, 1);
         assert_eq!(
             backend
                 .get_record(later_rejected)
@@ -3818,9 +3830,9 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(outcome.progress.next_cursor, Some(id));
-        assert!(!outcome.progress.wrapped);
-        assert!(outcome.progress.backlog);
+        assert_eq!(outcome.report.progress.next_cursor, Some(id));
+        assert!(!outcome.report.progress.wrapped);
+        assert!(outcome.report.progress.backlog);
         assert_eq!(outcome.report.auto_join.considered, 1);
         assert_eq!(outcome.report.auto_join.joined, 0);
         assert_eq!(backend.joins.lock().expect("joins lock").as_slice(), [id]);
@@ -3894,11 +3906,11 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(outcome.progress.attempted, 1);
-        assert_eq!(outcome.progress.next_cursor, Some(c));
-        assert!(!outcome.progress.wrapped);
-        assert!(outcome.progress.backlog);
-        assert_eq!(outcome.progress.deferred, 2);
+        assert_eq!(outcome.report.progress.attempted, 1);
+        assert_eq!(outcome.report.progress.next_cursor, Some(c));
+        assert!(!outcome.report.progress.wrapped);
+        assert!(outcome.report.progress.backlog);
+        assert_eq!(outcome.report.progress.deferred, 2);
         assert!(backend.get_record(c).is_none());
         assert!(backend.get_record(a).is_none());
         assert!(backend.get_record(b).is_none());

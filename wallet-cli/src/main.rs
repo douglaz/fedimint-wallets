@@ -9,22 +9,25 @@ use fedimint_client::secret::RootSecretStrategy as _;
 use fedimint_client::Client;
 use fedimint_core::db::Database;
 use fedimint_core::invite_code::InviteCode;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use wallet_core::{
-    Action, ActiveProbeVerdict, Actor, AllocatorDecision, DiscoveryPolicy, DiscoverySource,
-    ExecutionSummary, FederationId, FeeBreakdown, IdempotencyKey, IntentStatus, Journal, Msat,
-    Occurrence, OperationKind, OperationRecord, OperationStatus, ProbePolicy, RawOpUpdate,
-    ReasonCode,
+    adaptive_sleep_ms, Action, ActiveProbeVerdict, Actor, AdaptiveSleepDeadlines,
+    AllocatorDecision, DiscoveryPolicy, DiscoverySource, ExecutionSummary, FederationId,
+    FeeBreakdown, IdempotencyKey, IntentStatus, Journal, Msat, Occurrence, OperationKind,
+    OperationRecord, OperationStatus, ProbeBudget, ProbePolicy, RawOpUpdate, ReasonCode,
+    WatchPolicy,
 };
 use wallet_fedimint::{
     parse_invoice, AutoJoinReport, CandidateSource, CandidateState, DiscoverReport,
     DiscoverSourceReport, FedimintJournal, FinalizeOutcome, GatewayUrl, Invoice,
     LedgerRepairOracle, ManualSource, MoveOutcome, MultiClient, ObserverSource, OperationId,
     OperationRef, ProbeOutcome, ReceiveState, Runtime, ScoredFed, SendOutcome, SendState,
-    TickPolicy, JOIN_NOOP_REOPEN_NOTE,
+    TickPolicy, WatchCycleReport, WatchDiscoverOutcome, WatchProbeOutcome, WatchReconcileOutcome,
+    WatchTickOutcome, JOIN_NOOP_REOPEN_NOTE,
 };
 
 #[derive(Parser)]
@@ -299,6 +302,57 @@ enum Command {
         /// auto-registered.
         #[arg(long)]
         gateway: Option<String>,
+    },
+    /// Run the unattended wallet agent loop: reconcile, tick, scheduled probes, and discovery.
+    Watch {
+        #[command(flatten)]
+        policy: PolicyFlags,
+        /// Shared lnv2 gateway URL routing tick and probe moves.
+        #[arg(long)]
+        gateway: Option<String>,
+        /// Source to use. Repeat for multiple sources. Defaults to manual when --invite is
+        /// present, otherwise observer.
+        #[arg(long = "source", value_enum)]
+        source: Vec<DiscoverSourceArg>,
+        /// Observer API base URL.
+        #[arg(long, default_value = "https://observer.fedimint.org/api")]
+        observer_url: String,
+        /// Manual invite code(s) to discover.
+        #[arg(long = "invite")]
+        invite: Vec<String>,
+        /// Auto-join structurally-passing discovered candidates within the configured caps.
+        #[arg(long)]
+        auto_join: bool,
+        /// Allow regtest/signet in the structural scorer. Intended for devimint.
+        #[arg(long)]
+        scorer_allow_regtest: bool,
+        /// Maximum successful Agent auto-joins in the trailing 7 days.
+        #[arg(long)]
+        max_auto_joins_per_week: Option<u32>,
+        /// Lifetime cap on successful Agent-created partitions.
+        #[arg(long)]
+        lifetime_cap: Option<u32>,
+        /// Routine rebalance cadence upper bound.
+        #[arg(long)]
+        base_interval_secs: Option<u64>,
+        /// Routine cadence floor and subscription no-op cooldown.
+        #[arg(long)]
+        min_interval_secs: Option<u64>,
+        /// Wake this many seconds before a corroborated federation expiry.
+        #[arg(long)]
+        evacuation_lead_secs: Option<u64>,
+        /// Discovery cadence when there is no backlog.
+        #[arg(long)]
+        discover_every_secs: Option<u64>,
+        /// Maximum money-moving Agent probe attempts in the trailing week.
+        #[arg(long)]
+        max_probe_attempts_per_week: Option<u32>,
+        /// Maximum Agent probe spend in the trailing week.
+        #[arg(long)]
+        max_probe_spend_per_week_msat: Option<u64>,
+        /// Run one cycle and exit.
+        #[arg(long)]
+        once: bool,
     },
     /// Print the operation ledger newest-first (§11): one TAB-separated row per operation
     /// (`seq  updated_at  kind  status  amount_msat  recv_fee_msat  send_fee_quoted_msat  actor
@@ -1128,6 +1182,76 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        Command::Watch {
+            policy,
+            gateway,
+            source,
+            observer_url,
+            invite,
+            auto_join,
+            scorer_allow_regtest,
+            max_auto_joins_per_week,
+            lifetime_cap,
+            base_interval_secs,
+            min_interval_secs,
+            evacuation_lead_secs,
+            discover_every_secs,
+            max_probe_attempts_per_week,
+            max_probe_spend_per_week_msat,
+            once,
+        } => {
+            refuse_on_partial_open(&joined_ids, &open_ids)?;
+            let tick_policy = build_tick_policy(&policy, &joined_ids, &open_ids)?;
+            let mut discovery_policy = DiscoveryPolicy {
+                auto_join,
+                require_mainnet: !scorer_allow_regtest,
+                ..DiscoveryPolicy::default()
+            };
+            if let Some(max) = max_auto_joins_per_week {
+                discovery_policy.max_auto_joins_per_week = max;
+            }
+            if let Some(cap) = lifetime_cap {
+                discovery_policy.auto_join_lifetime_cap = cap;
+            }
+            let watch_policy = build_watch_policy(
+                base_interval_secs,
+                min_interval_secs,
+                evacuation_lead_secs,
+                discover_every_secs,
+                max_probe_attempts_per_week,
+                max_probe_spend_per_week_msat,
+            )?;
+            let sources = build_discover_sources(source, observer_url, invite)?;
+            let runtime = Runtime::new(
+                multi_client.clone(),
+                journal.clone(),
+                gateway.map(GatewayUrl),
+                Some(tick_policy.per_fed_cap),
+                perform_timeout,
+            );
+            if once {
+                let report = runtime
+                    .watch_once(
+                        &tick_policy,
+                        &watch_policy,
+                        &sources,
+                        &discovery_policy,
+                        true,
+                    )
+                    .await?;
+                print_watch_report(&report);
+            } else {
+                run_watch_loop(
+                    &runtime,
+                    multi_client.as_ref(),
+                    &tick_policy,
+                    &watch_policy,
+                    &sources,
+                    &discovery_policy,
+                )
+                .await?;
+            }
+        }
         // §11: dispatched OFFLINE before any client setup (see the top of `main`).
         Command::History { .. }
         | Command::Show { .. }
@@ -1448,6 +1572,335 @@ fn build_tick_policy(
         );
     }
     Ok(policy)
+}
+
+fn build_watch_policy(
+    base_interval_secs: Option<u64>,
+    min_interval_secs: Option<u64>,
+    evacuation_lead_secs: Option<u64>,
+    discover_every_secs: Option<u64>,
+    max_probe_attempts_per_week: Option<u32>,
+    max_probe_spend_per_week_msat: Option<u64>,
+) -> anyhow::Result<WatchPolicy> {
+    let mut policy = WatchPolicy::default();
+    if let Some(secs) = base_interval_secs {
+        anyhow::ensure!(secs > 0, "--base-interval-secs must be greater than zero");
+        policy.base_interval_ms = secs.saturating_mul(1000);
+    }
+    if let Some(secs) = min_interval_secs {
+        anyhow::ensure!(secs > 0, "--min-interval-secs must be greater than zero");
+        policy.min_interval_ms = secs.saturating_mul(1000);
+    }
+    if let Some(secs) = evacuation_lead_secs {
+        policy.evacuation_lead_ms = secs.saturating_mul(1000);
+    }
+    if let Some(secs) = discover_every_secs {
+        policy.discover_every_ms = secs.saturating_mul(1000);
+    }
+    if max_probe_attempts_per_week.is_some() || max_probe_spend_per_week_msat.is_some() {
+        policy.probe_budget = ProbeBudget {
+            max_probe_attempts_per_week: max_probe_attempts_per_week
+                .unwrap_or(policy.probe_budget.max_probe_attempts_per_week),
+            max_probe_spend_per_week_msat: max_probe_spend_per_week_msat
+                .unwrap_or(policy.probe_budget.max_probe_spend_per_week_msat),
+        };
+    }
+    Ok(policy)
+}
+
+async fn run_watch_loop(
+    runtime: &Runtime,
+    multi_client: &MultiClient,
+    tick_policy: &TickPolicy,
+    watch_policy: &WatchPolicy,
+    sources: &[Box<dyn CandidateSource>],
+    discovery_policy: &DiscoveryPolicy,
+) -> anyhow::Result<()> {
+    let (wake_tx, mut wake_rx) = tokio::sync::mpsc::channel(32);
+    let mut expiry_wake_feds = BTreeSet::new();
+    multi_client.spawn_expiry_wake_tasks(&mut expiry_wake_feds, wake_tx.clone());
+    let wake_tx_keepalive = wake_tx;
+    let mut shutdown = Box::pin(shutdown_signal());
+    let mut last_subscription_noop_ms = None;
+    let mut triggered_by_subscription = false;
+
+    loop {
+        let report = runtime
+            .watch_once(tick_policy, watch_policy, sources, discovery_policy, true)
+            .await?;
+        print_watch_report(&report);
+        multi_client.spawn_expiry_wake_tasks(&mut expiry_wake_feds, wake_tx_keepalive.clone());
+        if triggered_by_subscription && report.subscription_noop() {
+            last_subscription_noop_ms = Some(cli_now_ms());
+        }
+        triggered_by_subscription = false;
+        let mut deadlines = report.deadlines;
+
+        'wait_for_cycle: loop {
+            let now = cli_now_ms();
+            let sleep_ms = adaptive_sleep_ms(now, watch_policy, &deadlines);
+            print_next_wake(now, sleep_ms, watch_policy, &deadlines);
+
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => break,
+                wake = wake_rx.recv() => {
+                    let Some((fed, hinted_expiry_ms)) = wake else {
+                        continue;
+                    };
+                    print_wake_hint(fed, hinted_expiry_ms);
+                    let now = cli_now_ms();
+                    deadlines = runtime
+                        .watch_deadlines_reusing_probe_schedule(now, &deadlines, hinted_expiry_ms)
+                        .await?;
+                    let recomputed = adaptive_sleep_ms(now, watch_policy, &deadlines);
+                    let (mut delay, mut delayed_cycle_is_subscription) = coalesced_subscription_delay_ms(
+                        now,
+                        last_subscription_noop_ms,
+                        watch_policy.min_interval_ms,
+                        recomputed,
+                    );
+                    if delay == 0 {
+                        triggered_by_subscription = delayed_cycle_is_subscription;
+                        break 'wait_for_cycle;
+                    }
+
+                    loop {
+                        if delayed_cycle_is_subscription {
+                            eprintln!("next_wake_ms={delay} reason=subscription-cooldown");
+                        } else {
+                            print_next_wake(cli_now_ms(), delay, watch_policy, &deadlines);
+                        }
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(delay)) => {
+                                triggered_by_subscription = delayed_cycle_is_subscription;
+                                break 'wait_for_cycle;
+                            }
+                            _ = &mut shutdown => {
+                                eprintln!("shutdown requested; exiting after completed cycle");
+                                return Ok(());
+                            }
+                            wake = wake_rx.recv() => {
+                                let Some((fed, hinted_expiry_ms)) = wake else {
+                                    continue 'wait_for_cycle;
+                                };
+                                print_wake_hint(fed, hinted_expiry_ms);
+                                let now = cli_now_ms();
+                                deadlines = runtime
+                                    .watch_deadlines_reusing_probe_schedule(
+                                        now,
+                                        &deadlines,
+                                        hinted_expiry_ms,
+                                    )
+                                    .await?;
+                                let recomputed = adaptive_sleep_ms(now, watch_policy, &deadlines);
+                                let (next_delay, next_is_subscription) = coalesced_subscription_delay_ms(
+                                    now,
+                                    last_subscription_noop_ms,
+                                    watch_policy.min_interval_ms,
+                                    recomputed,
+                                );
+                                if next_delay == 0 {
+                                    triggered_by_subscription = next_is_subscription;
+                                    break 'wait_for_cycle;
+                                }
+                                delay = next_delay;
+                                delayed_cycle_is_subscription = next_is_subscription;
+                            }
+                        }
+                    }
+                }
+                _ = &mut shutdown => {
+                    eprintln!("shutdown requested; exiting after completed cycle");
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+fn coalesced_subscription_delay_ms(
+    now_ms: u64,
+    last_subscription_noop_ms: Option<u64>,
+    min_interval_ms: u64,
+    recomputed_sleep_ms: u64,
+) -> (u64, bool) {
+    let Some(last_noop) = last_subscription_noop_ms else {
+        return (0, true);
+    };
+    let cooldown_until = last_noop.saturating_add(min_interval_ms);
+    if now_ms >= cooldown_until {
+        (0, true)
+    } else {
+        let cooldown_remaining = cooldown_until - now_ms;
+        if recomputed_sleep_ms < cooldown_remaining {
+            (recomputed_sleep_ms, false)
+        } else {
+            (cooldown_remaining, true)
+        }
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+fn print_next_wake(
+    now_ms: u64,
+    sleep_ms: u64,
+    policy: &WatchPolicy,
+    deadlines: &AdaptiveSleepDeadlines,
+) {
+    eprintln!(
+        "next_wake_ms={sleep_ms} reason={}",
+        next_wake_reason(now_ms, policy, deadlines)
+    );
+}
+
+fn print_wake_hint(fed: FederationId, hinted_expiry_ms: Option<u64>) {
+    match hinted_expiry_ms {
+        Some(expiry_ms) => eprintln!("wake_hint fed={} expiry_ms={expiry_ms}", fed.to_hex()),
+        None => eprintln!("wake_hint fed={} expiry_ms=none", fed.to_hex()),
+    }
+}
+
+fn next_wake_reason(
+    now_ms: u64,
+    policy: &WatchPolicy,
+    deadlines: &AdaptiveSleepDeadlines,
+) -> &'static str {
+    let discover_delay = if deadlines.discover_backlog {
+        policy.min_interval_ms
+    } else {
+        deadlines
+            .last_discover_ms
+            .saturating_add(policy.discover_every_ms)
+            .saturating_sub(now_ms)
+    };
+    let routine_reason = if discover_delay <= policy.base_interval_ms {
+        if deadlines.discover_backlog {
+            "discover-backlog"
+        } else {
+            "discover"
+        }
+    } else {
+        "base"
+    };
+    let routine = policy
+        .base_interval_ms
+        .min(discover_delay)
+        .max(policy.min_interval_ms)
+        .min(policy.base_interval_ms);
+
+    let mut concrete: Option<(u64, &'static str)> = None;
+    for delay in deadlines.expiries_ms.iter().map(|expiry| {
+        expiry
+            .saturating_sub(policy.evacuation_lead_ms)
+            .saturating_sub(now_ms)
+    }) {
+        if concrete.is_none_or(|(best, _)| delay < best) {
+            concrete = Some((delay, "expiry"));
+        }
+    }
+    for delay in deadlines
+        .probe_due_ms
+        .iter()
+        .map(|deadline| deadline.saturating_sub(now_ms))
+    {
+        if concrete.is_none_or(|(best, _)| delay < best) {
+            concrete = Some((delay, "probe"));
+        }
+    }
+
+    if let Some((delay, reason)) = concrete {
+        if delay < routine {
+            return reason;
+        }
+    }
+    routine_reason
+}
+
+fn print_watch_report(report: &WatchCycleReport) {
+    eprintln!("watch occurrence={}", report.occurrence.0);
+    match &report.reconcile {
+        WatchReconcileOutcome::Ran(summary) => eprintln!(
+            "reconcile performed={} failed={} skipped={} retryable={} awaiting={}",
+            summary.performed, summary.failed, summary.skipped, summary.retryable, summary.awaiting
+        ),
+        WatchReconcileOutcome::Failed(error) => eprintln!("reconcile failed={error}"),
+    }
+    match &report.tick {
+        WatchTickOutcome::Ran(tick) => eprintln!(
+            "tick decisions={} performed={} failed={} retryable={} spending={} standby={}",
+            tick.decisions.len(),
+            tick.summary.performed,
+            tick.summary.failed,
+            tick.summary.retryable,
+            opt_fed_hex(tick.spending_fed),
+            opt_fed_hex(tick.standby_fed)
+        ),
+        WatchTickOutcome::SkippedPendingRetry { retryable } => {
+            eprintln!("tick skipped=pending-retry retryable={retryable}");
+        }
+        WatchTickOutcome::SkippedReconcileFailed => {
+            eprintln!("tick skipped=reconcile-failed");
+        }
+        WatchTickOutcome::Failed(error) => eprintln!("tick failed={error}"),
+    }
+    for probe in &report.probes {
+        eprintln!(
+            "probe fed={} verdict={} due_ms={} outcome={}",
+            probe.fed.to_hex(),
+            active_probe_label(probe.verdict),
+            probe.due_ms,
+            watch_probe_outcome_label(&probe.outcome)
+        );
+    }
+    match &report.discover {
+        WatchDiscoverOutcome::Disabled => eprintln!("discover disabled"),
+        WatchDiscoverOutcome::NotDue { next_due_ms } => {
+            eprintln!("discover not_due next_due_ms={next_due_ms}")
+        }
+        WatchDiscoverOutcome::Ran(discover) => eprintln!(
+            "discover ran sources={} auto_joined={} backlog={} next_cursor={}",
+            discover.sources.len(),
+            discover.auto_join.joined,
+            discover.progress.backlog,
+            discover
+                .progress
+                .next_cursor
+                .map(|cursor| cursor.to_hex())
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+        WatchDiscoverOutcome::Failed(error) => eprintln!("discover failed={error}"),
+    }
+    eprintln!(
+        "probe_budget attempts={} spend_msat={}",
+        report.budget_usage.attempts, report.budget_usage.spend_msat
+    );
+}
+
+fn watch_probe_outcome_label(outcome: &WatchProbeOutcome) -> &'static str {
+    match outcome {
+        WatchProbeOutcome::Passed => "passed",
+        WatchProbeOutcome::NotDue => "not-due",
+        WatchProbeOutcome::NoSource => "no-source",
+        WatchProbeOutcome::BudgetBlocked => "budget-blocked",
+        WatchProbeOutcome::DeferredByInFlight => "deferred-by-in-flight",
+        WatchProbeOutcome::Attempted => "attempted",
+        WatchProbeOutcome::Failed(_) => "failed",
+    }
 }
 
 /// Print each allocator decision on its own `decision: …` line, or `decisions: none` when the
@@ -3189,6 +3642,113 @@ mod tests {
         let policy = build_tick_policy(&flags, &[a, b], &[a, b]).expect("single pin is valid");
         assert_eq!(policy.spending_fed, Some(a));
         assert_eq!(policy.standby_fed, None);
+    }
+
+    #[test]
+    fn watch_once_flag_plumbs_through_parser() {
+        let cli = Cli::try_parse_from([
+            "wallet-cli",
+            "--data-dir",
+            "/tmp/wallet-test",
+            "watch",
+            "--once",
+            "--base-interval-secs",
+            "12",
+            "--max-probe-attempts-per-week",
+            "3",
+        ])
+        .expect("watch --once parses");
+
+        match cli.command {
+            Command::Watch {
+                once,
+                base_interval_secs,
+                max_probe_attempts_per_week,
+                ..
+            } => {
+                assert!(once);
+                assert_eq!(base_interval_secs, Some(12));
+                assert_eq!(max_probe_attempts_per_week, Some(3));
+            }
+            _ => panic!("expected watch command"),
+        }
+    }
+
+    #[test]
+    fn subscription_noop_coalescing_honors_min_interval_without_delaying_real_deadline() {
+        assert_eq!(
+            coalesced_subscription_delay_ms(1_000, None, 30_000, 30_000),
+            (0, true)
+        );
+        assert_eq!(
+            coalesced_subscription_delay_ms(20_000, Some(1_000), 30_000, 30_000),
+            (11_000, true)
+        );
+        assert_eq!(
+            coalesced_subscription_delay_ms(20_000, Some(1_000), 30_000, 5_000),
+            (5_000, false)
+        );
+        assert_eq!(
+            coalesced_subscription_delay_ms(20_000, Some(1_000), 30_000, 0),
+            (0, false)
+        );
+        assert_eq!(
+            coalesced_subscription_delay_ms(31_000, Some(1_000), 30_000, 30_000),
+            (0, true)
+        );
+    }
+
+    #[test]
+    fn subscription_noop_coalescing_recomputes_remaining_cooldown_after_repeated_wake() {
+        let last_noop = Some(1_000);
+        assert_eq!(
+            coalesced_subscription_delay_ms(20_000, last_noop, 30_000, 30_000),
+            (11_000, true)
+        );
+        assert_eq!(
+            coalesced_subscription_delay_ms(25_000, last_noop, 30_000, 30_000),
+            (6_000, true)
+        );
+        assert_eq!(
+            coalesced_subscription_delay_ms(25_000, last_noop, 30_000, 2_000),
+            (2_000, false)
+        );
+    }
+
+    #[test]
+    fn next_wake_reason_matches_the_deadline_that_bounds_sleep() {
+        let policy = WatchPolicy::default();
+        let now = 1_700_000_000_000;
+        let deadlines = AdaptiveSleepDeadlines {
+            last_discover_ms: now,
+            discover_backlog: true,
+            expiries_ms: vec![now + policy.evacuation_lead_ms + 5_000],
+            probe_due_ms: vec![now + 10_000],
+        };
+
+        assert_eq!(adaptive_sleep_ms(now, &policy, &deadlines), 5_000);
+        assert_eq!(next_wake_reason(now, &policy, &deadlines), "expiry");
+
+        let deadlines = AdaptiveSleepDeadlines {
+            last_discover_ms: now,
+            discover_backlog: true,
+            expiries_ms: vec![now + policy.evacuation_lead_ms + 10_000],
+            probe_due_ms: vec![now + 5_000],
+        };
+
+        assert_eq!(adaptive_sleep_ms(now, &policy, &deadlines), 5_000);
+        assert_eq!(next_wake_reason(now, &policy, &deadlines), "probe");
+    }
+
+    #[test]
+    fn build_watch_policy_rejects_zero_loop_intervals() {
+        let err = build_watch_policy(Some(0), None, None, None, None, None)
+            .expect_err("zero base interval must be rejected");
+        assert!(err.to_string().contains("--base-interval-secs"), "{err}");
+
+        let err = build_watch_policy(None, Some(0), None, None, None, None)
+            .expect_err("zero min interval must be rejected");
+        assert!(err.to_string().contains("--min-interval-secs"), "{err}");
     }
 
     #[test]

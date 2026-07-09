@@ -1,9 +1,9 @@
 use wallet_core::{
     adaptive_sleep_ms, discover_pass_plan, probe_budget_ok, probe_budget_usage, probe_next_due,
-    probe_next_due_at, probe_pass_expiry_anchor_ms, probe_verdict, ActiveProbeVerdict as V, Actor,
-    AdaptiveSleepDeadlines, FederationId, FeeBreakdown, IdempotencyKey, Msat, Occurrence,
-    OperationKind, OperationRecord, OperationStatus, ProbeAttempt, ProbeBudget, ProbePolicy,
-    ReasonCode, WatchPolicy, WATCH_BUSY_SPIN_FLOOR_MS,
+    probe_next_due_at, probe_pass_expiry_anchor_ms, probe_verdict, probe_wake_due_ms,
+    ActiveProbeVerdict as V, Actor, AdaptiveSleepDeadlines, FederationId, FeeBreakdown,
+    IdempotencyKey, Msat, Occurrence, OperationKind, OperationRecord, OperationStatus,
+    ProbeAttempt, ProbeBudget, ProbePolicy, ReasonCode, WatchPolicy, WATCH_BUSY_SPIN_FLOOR_MS,
 };
 
 const SECOND: u64 = 1_000;
@@ -96,6 +96,96 @@ fn adaptive_sleep_applies_routine_floor_but_concrete_deadlines_bypass_it() {
     assert_eq!(
         adaptive_sleep_ms(now, &policy, &due_now),
         WATCH_BUSY_SPIN_FLOOR_MS
+    );
+}
+
+#[test]
+fn adaptive_sleep_floors_in_window_expiry_to_min_interval_not_busy_spin() {
+    let policy = policy();
+    let now = 10 * HOUR;
+
+    // An expiry whose evacuation point is already behind `now` — the pre-shutdown
+    // window the watch loop exists to handle. The tick evacuates on this cycle, so a
+    // sub-min_interval re-wake buys nothing; without a floor this pins the loop to the
+    // 1s busy-spin floor for the whole (default 1h) window. It must re-check at the min
+    // interval instead.
+    let in_window_expiry = AdaptiveSleepDeadlines {
+        last_discover_ms: now,
+        expiries_ms: vec![now + policy.evacuation_lead_ms - 5 * SECOND],
+        ..AdaptiveSleepDeadlines::default()
+    };
+    assert_ne!(
+        adaptive_sleep_ms(now, &policy, &in_window_expiry),
+        WATCH_BUSY_SPIN_FLOOR_MS,
+        "an in-window expiry must not busy-spin"
+    );
+    assert_eq!(
+        adaptive_sleep_ms(now, &policy, &in_window_expiry),
+        policy.min_interval_ms,
+        "an in-window expiry re-checks at min_interval"
+    );
+
+    // Exactly at the evacuation point also floors to min_interval (delay == 0).
+    let at_evac_point = AdaptiveSleepDeadlines {
+        last_discover_ms: now,
+        expiries_ms: vec![now + policy.evacuation_lead_ms],
+        ..AdaptiveSleepDeadlines::default()
+    };
+    assert_eq!(
+        adaptive_sleep_ms(now, &policy, &at_evac_point),
+        policy.min_interval_ms
+    );
+}
+
+#[test]
+fn adaptive_sleep_in_window_expiry_never_sleeps_past_a_short_notice_shutdown() {
+    // When the evacuation window is shorter than the min interval, flooring an in-window
+    // expiry to min_interval would sleep past the shutdown and eat a load-bearing
+    // evacuation retry. The wake must be capped at the time remaining until expiry.
+    let mut policy = policy();
+    policy.evacuation_lead_ms = 10 * SECOND;
+    policy.min_interval_ms = 30 * SECOND;
+    let now = 10 * HOUR;
+
+    // In-window (evac point = now - 2s) with the actual shutdown only 8s away.
+    let imminent_shutdown = AdaptiveSleepDeadlines {
+        last_discover_ms: now,
+        expiries_ms: vec![now + 8 * SECOND],
+        ..AdaptiveSleepDeadlines::default()
+    };
+    let sleep = adaptive_sleep_ms(now, &policy, &imminent_shutdown);
+    assert_eq!(sleep, 8 * SECOND, "wake lands before the 8s shutdown");
+    assert!(
+        sleep < policy.min_interval_ms,
+        "a short-notice shutdown bypasses the min_interval floor"
+    );
+
+    // Sub-second time-to-shutdown must be honored exactly, not rounded up to the 1s
+    // busy-spin floor (which would sleep past the expiry and lose the last retry).
+    let sub_second = AdaptiveSleepDeadlines {
+        last_discover_ms: now,
+        expiries_ms: vec![now + 500],
+        ..AdaptiveSleepDeadlines::default()
+    };
+    let sleep = adaptive_sleep_ms(now, &policy, &sub_second);
+    assert_eq!(
+        sleep, 500,
+        "a 500ms-to-shutdown wake is not floored past the expiry"
+    );
+    assert!(sleep < WATCH_BUSY_SPIN_FLOOR_MS);
+
+    // Freshly entered a long (default) window: still capped at min_interval, no busy-spin.
+    let mut long_window = policy;
+    long_window.evacuation_lead_ms = HOUR;
+    let entering_long_window = AdaptiveSleepDeadlines {
+        last_discover_ms: now,
+        expiries_ms: vec![now + HOUR - SECOND],
+        ..AdaptiveSleepDeadlines::default()
+    };
+    assert_eq!(
+        adaptive_sleep_ms(now, &long_window, &entering_long_window),
+        long_window.min_interval_ms,
+        "a long evacuation window re-checks at min_interval, not 1s"
     );
 }
 
@@ -389,6 +479,49 @@ fn probe_budget_counts_only_agent_money_moving_probe_rows() {
 }
 
 #[test]
+fn budget_blocked_never_probed_wake_is_floored_to_min_interval() {
+    let policy = policy();
+    let gate = gate_policy();
+    let now = 10 * HOUR;
+    let due = probe_next_due_at(V::NeverProbed, None, None, now, &policy, &gate);
+    assert_eq!(due, now);
+
+    let wake_due = probe_wake_due_ms(due, now, false, None, &policy);
+    assert_eq!(wake_due, now + policy.min_interval_ms);
+
+    let sleep = adaptive_sleep_ms(
+        now,
+        &policy,
+        &AdaptiveSleepDeadlines {
+            last_discover_ms: now,
+            probe_due_ms: vec![wake_due],
+            ..AdaptiveSleepDeadlines::default()
+        },
+    );
+    assert_eq!(sleep, policy.min_interval_ms);
+    assert_ne!(sleep, WATCH_BUSY_SPIN_FLOOR_MS);
+}
+
+#[test]
+fn budget_blocked_probe_wake_waits_for_due_and_budget_reset() {
+    let policy = policy();
+    let now = 10 * HOUR;
+    let next_due = now + 5 * MINUTE;
+    let reset_after_due = now + HOUR;
+
+    assert_eq!(
+        probe_wake_due_ms(next_due, now, false, Some(reset_after_due), &policy),
+        reset_after_due
+    );
+
+    let reset_before_due = now + MINUTE;
+    assert_eq!(
+        probe_wake_due_ms(next_due, now, false, Some(reset_before_due), &policy),
+        next_due
+    );
+}
+
+#[test]
 fn discover_pass_plan_bounds_window_advances_cursor_and_defers_overflow() {
     let ids = vec![fed(1), fed(2), fed(3), fed(4)];
 
@@ -401,6 +534,17 @@ fn discover_pass_plan_bounds_window_advances_cursor_and_defers_overflow() {
     assert_eq!(second.window, vec![fed(3), fed(4)]);
     assert_eq!(second.next_cursor, Some(fed(4)));
     assert!(second.wrapped);
+}
+
+#[test]
+fn discover_pass_plan_zero_cap_does_not_advance_cursor() {
+    let ids = vec![fed(1), fed(2), fed(3), fed(4)];
+
+    let plan = discover_pass_plan(Some(fed(2)), &ids, 0);
+
+    assert!(plan.window.is_empty());
+    assert_eq!(plan.next_cursor, None);
+    assert!(!plan.wrapped);
 }
 
 #[test]

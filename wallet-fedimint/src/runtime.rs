@@ -27,7 +27,8 @@ use crate::discovery::{
 };
 use crate::executor::FedimintExecutor;
 use crate::journal::{
-    CandidateListReport, CandidateState, FedimintJournal, OperationRef, ProbeSession,
+    CandidateListReport, CandidateState, FedimintJournal, OperationRef, ProbeRecord, ProbeSession,
+    WatchState,
 };
 use crate::move_protocol::{MovePhase, MoveRecord};
 use crate::multi_client::{JoinDeadlineOutcome, MultiClient, ReceiveState};
@@ -49,11 +50,13 @@ use std::{
     sync::Arc,
 };
 use wallet_core::{
-    probe_verdict, score, Action, ActiveProbeVerdict, Actor, AllocatorDecision, AllocatorSnapshot,
-    DiscoveryPolicy, ExecError, ExecutionSummary, Executor, FederationFacts, FederationId,
-    IdempotencyKey, Intent, IntentStatus, Journal, Module, Msat, Occurrence, OperationKind,
-    OperationStatus, PerformOutcome, ProbeAttempt, ProbePolicy, ReasonCode, ScorerPolicy,
-    WatchPolicy,
+    probe_budget_ok, probe_budget_usage, probe_next_due_at, probe_pass_expiry_anchor_ms,
+    probe_verdict, probe_wake_due_ms, score, Action, ActiveProbeVerdict, Actor,
+    AdaptiveSleepDeadlines, AllocatorDecision, AllocatorSnapshot, DiscoveryPolicy, ExecError,
+    ExecutionSummary, Executor, FederationFacts, FederationId, IdempotencyKey, Intent,
+    IntentStatus, Journal, Module, Msat, Occurrence, OperationKind, OperationRecord,
+    OperationStatus, PerformOutcome, ProbeAttempt, ProbeBudgetUsage, ProbePolicy, ReasonCode,
+    ScorerPolicy, WatchPolicy,
 };
 
 /// Wall-clock in unix millis for the ledger's `created_at_ms` (§8/§9.4). `seq` is the
@@ -65,6 +68,8 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+const PROBE_BUDGET_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// A fresh 128-bit nonce as 32 lowercase-hex chars for a per-attempt ledger key (§10.1 — a
 /// 32-bit nonce risks birthday collisions over a wallet lifetime, aliasing two attempts onto
@@ -126,6 +131,165 @@ pub struct ReconcileSummary {
     pub retryable: usize,
     pub awaiting: usize,
     pub awaiting_keys: Vec<IdempotencyKey>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WatchCycleReport {
+    pub occurrence: Occurrence,
+    pub reconcile: WatchReconcileOutcome,
+    pub tick: WatchTickOutcome,
+    pub probes: Vec<WatchProbeReport>,
+    pub discover: WatchDiscoverOutcome,
+    pub budget_usage: ProbeBudgetUsage,
+    pub watch_state: WatchState,
+    pub deadlines: AdaptiveSleepDeadlines,
+}
+
+impl WatchCycleReport {
+    pub fn subscription_noop(&self) -> bool {
+        let reconcile_noop = match &self.reconcile {
+            WatchReconcileOutcome::Ran(summary) => {
+                summary.performed == 0
+                    && summary.failed == 0
+                    && summary.skipped == 0
+                    && summary.retryable == 0
+                    && summary.awaiting == 0
+            }
+            WatchReconcileOutcome::Failed(_) => false,
+        };
+        let tick_noop = match &self.tick {
+            WatchTickOutcome::Ran(report) => {
+                report.decisions.is_empty()
+                    && report.summary.performed == 0
+                    && report.summary.failed == 0
+                    && report.summary.terminal_failed_skipped == 0
+                    && report.summary.retryable == 0
+            }
+            WatchTickOutcome::SkippedPendingRetry { .. }
+            | WatchTickOutcome::SkippedReconcileFailed
+            | WatchTickOutcome::Failed(_) => false,
+        };
+        let probes_noop = self.probes.iter().all(|probe| {
+            matches!(
+                &probe.outcome,
+                WatchProbeOutcome::NotDue
+                    | WatchProbeOutcome::Passed
+                    | WatchProbeOutcome::NoSource
+                    | WatchProbeOutcome::BudgetBlocked
+                    | WatchProbeOutcome::DeferredByInFlight
+            )
+        });
+        let discover_noop = matches!(
+            &self.discover,
+            WatchDiscoverOutcome::Disabled | WatchDiscoverOutcome::NotDue { .. }
+        );
+        reconcile_noop && tick_noop && probes_noop && discover_noop
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum WatchReconcileOutcome {
+    Ran(ReconcileSummary),
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum WatchTickOutcome {
+    Ran(TickReport),
+    SkippedPendingRetry { retryable: usize },
+    SkippedReconcileFailed,
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchProbeReport {
+    pub fed: FederationId,
+    pub verdict: ActiveProbeVerdict,
+    pub due_ms: u64,
+    pub outcome: WatchProbeOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WatchProbeOutcome {
+    Passed,
+    NotDue,
+    NoSource,
+    BudgetBlocked,
+    DeferredByInFlight,
+    Attempted,
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum WatchDiscoverOutcome {
+    Disabled,
+    NotDue { next_due_ms: u64 },
+    Ran(DiscoverReport),
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+struct ProbeScheduleContext {
+    last_invocations: BTreeMap<(FederationId, FederationId), u64>,
+    budget_usage: ProbeBudgetUsage,
+    budget_ok: bool,
+    budget_reset_ms: Option<u64>,
+    fresh_probe_defer_until_ms: Option<u64>,
+}
+
+impl ProbeScheduleContext {
+    fn new(
+        budget_usage: ProbeBudgetUsage,
+        budget_reset_ms: Option<u64>,
+        policy: &WatchPolicy,
+    ) -> Self {
+        let budget_ok = probe_budget_ok(
+            budget_usage.attempts,
+            budget_usage.spend_msat,
+            &policy.probe_budget,
+        );
+        Self {
+            last_invocations: BTreeMap::new(),
+            budget_usage,
+            budget_ok,
+            budget_reset_ms,
+            fresh_probe_defer_until_ms: None,
+        }
+    }
+
+    fn record_invocation(
+        &mut self,
+        candidate: FederationId,
+        spending: FederationId,
+        invoked_at_ms: u64,
+    ) {
+        self.last_invocations
+            .entry((candidate, spending))
+            .and_modify(|last| *last = (*last).max(invoked_at_ms))
+            .or_insert(invoked_at_ms);
+    }
+
+    fn record_budget_attempt(&mut self, cost_msat: u64, created_at_ms: u64, policy: &WatchPolicy) {
+        self.budget_usage.attempts = self.budget_usage.attempts.saturating_add(1);
+        self.budget_usage.spend_msat = self.budget_usage.spend_msat.saturating_add(cost_msat);
+        let reset_ms = created_at_ms.saturating_add(PROBE_BUDGET_WINDOW_MS);
+        self.budget_reset_ms = Some(
+            self.budget_reset_ms
+                .map_or(reset_ms, |old| old.min(reset_ms)),
+        );
+        self.budget_ok = probe_budget_ok(
+            self.budget_usage.attempts,
+            self.budget_usage.spend_msat,
+            &policy.probe_budget,
+        );
+    }
+
+    fn defer_fresh_probes_until(&mut self, ready_ms: u64) {
+        self.fresh_probe_defer_until_ms = Some(
+            self.fresh_probe_defer_until_ms
+                .map_or(ready_ms, |existing| existing.max(ready_ms)),
+        );
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -445,10 +609,556 @@ impl Runtime {
             DiscoverPassResume {
                 cursor: None,
                 rotation: &[],
+                occurrence: Occurrence(0),
             },
         )
         .await?;
         Ok(outcome.report)
+    }
+
+    pub async fn watch_once(
+        &self,
+        tick_policy: &TickPolicy,
+        watch_policy: &WatchPolicy,
+        sources: &[Box<dyn CandidateSource>],
+        discovery_policy: &DiscoveryPolicy,
+        discover_enabled: bool,
+    ) -> anyhow::Result<WatchCycleReport> {
+        let reconcile = match self.reconcile().await {
+            Ok(summary) => WatchReconcileOutcome::Ran(summary),
+            Err(e) => {
+                tracing::warn!(error = ?e, "watch: reconcile failed; continuing cycle");
+                WatchReconcileOutcome::Failed(e.to_string())
+            }
+        };
+
+        let advanced = self
+            .journal
+            .advance_watch_occurrence()
+            .await
+            .map_err(exec_err)?;
+        let occurrence = Occurrence(advanced.occurrence);
+        let mut cycle_tick_policy = tick_policy.clone();
+        cycle_tick_policy.occurrence = occurrence;
+
+        let tick = match &reconcile {
+            // Reconcile faulted, so the pending-move state is unknown. Running the tick
+            // now could re-issue a still-`Pending` prior-occurrence move under this
+            // cycle's fresh occurrence (a distinct idempotency key). Fail safe: skip the
+            // tick and let the next cycle re-drive once reconcile succeeds.
+            WatchReconcileOutcome::Failed(_) => {
+                tracing::warn!("watch: reconcile failed; skipping tick to avoid duplicate intents");
+                WatchTickOutcome::SkippedReconcileFailed
+            }
+            WatchReconcileOutcome::Ran(summary) if summary.retryable > 0 => {
+                tracing::warn!(
+                    retryable = summary.retryable,
+                    "watch: skipping tick while retryable pending work remains"
+                );
+                WatchTickOutcome::SkippedPendingRetry {
+                    retryable: summary.retryable,
+                }
+            }
+            WatchReconcileOutcome::Ran(_) => match self.tick(&cycle_tick_policy).await {
+                Ok(report) => WatchTickOutcome::Ran(report),
+                Err(e) => {
+                    tracing::warn!(error = ?e, "watch: tick failed; continuing cycle");
+                    WatchTickOutcome::Failed(e.to_string())
+                }
+            },
+        };
+        let spending = match &tick {
+            WatchTickOutcome::Ran(report) => report.spending_fed,
+            WatchTickOutcome::SkippedPendingRetry { .. }
+            | WatchTickOutcome::SkippedReconcileFailed
+            | WatchTickOutcome::Failed(_) => self
+                .status(&cycle_tick_policy)
+                .await
+                .map(|status| status.spending_fed)
+                .unwrap_or(cycle_tick_policy.spending_fed),
+        };
+
+        let probe_now = now_ms();
+        let mut probe_context = self.probe_schedule_context(probe_now, watch_policy).await?;
+        let (mut probes, budget_usage) = self
+            .run_scheduled_probes(
+                occurrence,
+                spending,
+                &cycle_tick_policy,
+                watch_policy,
+                probe_now,
+                &mut probe_context,
+            )
+            .await?;
+
+        let state_before_discover = self.journal.get_watch_state().await.map_err(exec_err)?;
+        let now = now_ms();
+        let discover = if !discover_enabled {
+            WatchDiscoverOutcome::Disabled
+        } else if !discovery_due(&state_before_discover, watch_policy, now) {
+            WatchDiscoverOutcome::NotDue {
+                next_due_ms: state_before_discover
+                    .last_discover_ms
+                    .saturating_add(watch_policy.discover_every_ms),
+            }
+        } else {
+            let nonce = ledger_nonce();
+            match run_discover_pass_bounded_with_rotation(
+                sources,
+                discovery_policy,
+                self,
+                now,
+                &nonce,
+                watch_policy,
+                DiscoverPassResume {
+                    cursor: state_before_discover.discover_cursor,
+                    rotation: &state_before_discover.discover_rotation,
+                    occurrence,
+                },
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    let progress = outcome.report.progress;
+                    self.journal
+                        .put_watch_discovery_state(
+                            progress.next_cursor,
+                            progress.backlog,
+                            Some(now),
+                            outcome.next_rotation,
+                        )
+                        .await
+                        .map_err(exec_err)?;
+                    WatchDiscoverOutcome::Ran(outcome.report)
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "watch: discover failed; backing off");
+                    // Advance the discovery clock AND clear the backlog flag so a persistent
+                    // discover fault backs off by `discover_every` instead of retrying every
+                    // cycle — `discovery_due`/`adaptive_sleep_ms` both short-circuit on
+                    // backlog, so leaving it set would defeat the backoff. Preserve the
+                    // cursor/rotation (the pass did not complete, so resume where it left
+                    // off); a still-overflowing rotation re-sets backlog on the next
+                    // SUCCESSFUL pass, so no deferred work is lost.
+                    self.journal
+                        .put_watch_discovery_state(
+                            state_before_discover.discover_cursor,
+                            false,
+                            Some(now),
+                            state_before_discover.discover_rotation.clone(),
+                        )
+                        .await
+                        .map_err(exec_err)?;
+                    WatchDiscoverOutcome::Failed(e.to_string())
+                }
+            }
+        };
+
+        let final_state = self.journal.get_watch_state().await.map_err(exec_err)?;
+        let deadlines = self
+            .watch_deadlines_with_context(
+                &cycle_tick_policy,
+                watch_policy,
+                now_ms(),
+                Some(&probe_context),
+            )
+            .await?;
+        probes.sort_by_key(|probe| probe.fed);
+        Ok(WatchCycleReport {
+            occurrence,
+            reconcile,
+            tick,
+            probes,
+            discover,
+            budget_usage,
+            watch_state: final_state,
+            deadlines,
+        })
+    }
+
+    pub async fn watch_deadlines(
+        &self,
+        tick_policy: &TickPolicy,
+        watch_policy: &WatchPolicy,
+        now_ms: u64,
+    ) -> anyhow::Result<AdaptiveSleepDeadlines> {
+        self.watch_deadlines_with_context(tick_policy, watch_policy, now_ms, None)
+            .await
+    }
+
+    pub async fn watch_deadlines_reusing_probe_schedule(
+        &self,
+        now_ms: u64,
+        previous: &AdaptiveSleepDeadlines,
+        hinted_expiry_ms: Option<u64>,
+    ) -> anyhow::Result<AdaptiveSleepDeadlines> {
+        let state = self.journal.get_watch_state().await.map_err(exec_err)?;
+        let mut deadlines = AdaptiveSleepDeadlines {
+            last_discover_ms: state.last_discover_ms,
+            discover_backlog: state.discover_backlog,
+            expiries_ms: previous
+                .expiries_ms
+                .iter()
+                .copied()
+                .filter(|expiry_ms| *expiry_ms > now_ms)
+                .collect(),
+            probe_due_ms: previous.probe_due_ms.clone(),
+        };
+        if let Some(expiry_ms) = hinted_expiry_ms {
+            add_expiry_deadline(&mut deadlines, expiry_ms, now_ms);
+        }
+        Ok(deadlines)
+    }
+
+    async fn watch_deadlines_with_context(
+        &self,
+        tick_policy: &TickPolicy,
+        watch_policy: &WatchPolicy,
+        now_ms: u64,
+        context: Option<&ProbeScheduleContext>,
+    ) -> anyhow::Result<AdaptiveSleepDeadlines> {
+        let state = self.journal.get_watch_state().await.map_err(exec_err)?;
+        let mut deadlines = AdaptiveSleepDeadlines {
+            last_discover_ms: state.last_discover_ms,
+            discover_backlog: state.discover_backlog,
+            ..AdaptiveSleepDeadlines::default()
+        };
+
+        let raw_probes = self.probe_all().await;
+        add_expiry_deadlines(&mut deadlines, &raw_probes, now_ms);
+
+        let spending = match self
+            .plan_tick_from_probes(tick_policy, &ScorerPolicy::default(), raw_probes)
+            .await
+        {
+            Ok(plan) => plan.snapshot.spending_fed,
+            Err(e) => {
+                tracing::warn!(error = ?e, "watch: planning failed while computing probe deadlines");
+                tick_policy.spending_fed
+            }
+        };
+        let context_storage;
+        let context = match context {
+            Some(context) => context,
+            None => {
+                context_storage = self.probe_schedule_context(now_ms, watch_policy).await?;
+                &context_storage
+            }
+        };
+        for (_candidate, source, _verdict, due_ms, post_in_resume) in self
+            .probe_schedule_inputs(
+                spending,
+                &tick_policy.probe_gate_policy,
+                watch_policy,
+                now_ms,
+                &context.last_invocations,
+            )
+            .await?
+        {
+            if source.is_none() {
+                continue;
+            }
+            deadlines.probe_due_ms.push(if post_in_resume {
+                due_ms
+            } else {
+                let budget_due_ms = probe_wake_due_ms(
+                    due_ms,
+                    now_ms,
+                    context.budget_ok,
+                    context.budget_reset_ms,
+                    watch_policy,
+                );
+                context
+                    .fresh_probe_defer_until_ms
+                    .map_or(budget_due_ms, |defer_until| budget_due_ms.max(defer_until))
+            });
+        }
+        Ok(deadlines)
+    }
+
+    async fn run_scheduled_probes(
+        &self,
+        occurrence: Occurrence,
+        spending: Option<FederationId>,
+        tick_policy: &TickPolicy,
+        watch_policy: &WatchPolicy,
+        now: u64,
+        context: &mut ProbeScheduleContext,
+    ) -> anyhow::Result<(Vec<WatchProbeReport>, ProbeBudgetUsage)> {
+        let mut reports = Vec::new();
+        let inputs = self
+            .probe_schedule_inputs(
+                spending,
+                &tick_policy.probe_gate_policy,
+                watch_policy,
+                now,
+                &context.last_invocations,
+            )
+            .await?;
+        for (candidate, source, verdict, due_ms, post_in_resume) in inputs {
+            let Some(source) = source else {
+                reports.push(WatchProbeReport {
+                    fed: candidate,
+                    verdict,
+                    due_ms,
+                    outcome: WatchProbeOutcome::NoSource,
+                });
+                continue;
+            };
+            let outcome = if !post_in_resume && due_ms > now {
+                if verdict == ActiveProbeVerdict::Passed {
+                    WatchProbeOutcome::Passed
+                } else {
+                    WatchProbeOutcome::NotDue
+                }
+            } else if !post_in_resume
+                && context
+                    .fresh_probe_defer_until_ms
+                    .is_some_and(|defer_until| defer_until > now)
+            {
+                WatchProbeOutcome::DeferredByInFlight
+            } else if !post_in_resume && !context.budget_ok {
+                let reason = "watch probe skipped: weekly probe budget exhausted";
+                if let Err(e) = self
+                    .record_watch_probe_skip(
+                        candidate,
+                        source,
+                        tick_policy.probe_gate_policy.amount_msat,
+                        occurrence,
+                        budget_skip_diagnostic_bucket_ms(now, context.budget_reset_ms),
+                        reason,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        federation = %candidate.to_hex(),
+                        error = ?e,
+                        "watch: recording budget-blocked probe skip failed"
+                    );
+                }
+                WatchProbeOutcome::BudgetBlocked
+            } else {
+                match self
+                    .active_probe(
+                        candidate,
+                        source,
+                        &tick_policy.probe_gate_policy,
+                        Actor::Agent { occurrence },
+                    )
+                    .await
+                {
+                    Ok(report) => {
+                        context.record_invocation(candidate, report.source, now);
+                        if let Some(cost) = report.cost_msat {
+                            context.record_budget_attempt(cost.0, now, watch_policy);
+                        }
+                        WatchProbeOutcome::Attempted
+                    }
+                    Err(e) => {
+                        let retained_source = self.active_probe_source(candidate).await?;
+                        let actual_source = retained_source.unwrap_or(source);
+                        context.record_invocation(candidate, actual_source, now);
+                        if retained_source.is_some() {
+                            context.defer_fresh_probes_until(
+                                now.saturating_add(watch_policy.min_interval_ms),
+                            );
+                        }
+                        tracing::warn!(
+                            federation = %candidate.to_hex(),
+                            error = ?e,
+                            "watch: scheduled probe failed; continuing cycle"
+                        );
+                        WatchProbeOutcome::Failed(e.to_string())
+                    }
+                }
+            };
+            reports.push(WatchProbeReport {
+                fed: candidate,
+                verdict,
+                due_ms,
+                outcome,
+            });
+        }
+        Ok((reports, context.budget_usage))
+    }
+
+    async fn probe_schedule_inputs(
+        &self,
+        spending: Option<FederationId>,
+        gate_policy: &ProbePolicy,
+        watch_policy: &WatchPolicy,
+        now_ms: u64,
+        last_invocations: &BTreeMap<(FederationId, FederationId), u64>,
+    ) -> anyhow::Result<
+        Vec<(
+            FederationId,
+            Option<FederationId>,
+            ActiveProbeVerdict,
+            u64,
+            bool,
+        )>,
+    > {
+        let mut out = Vec::new();
+        for candidate in self.auto_joined_candidates().await? {
+            let record = self
+                .journal
+                .probe_record(&candidate)
+                .await
+                .map_err(exec_err)?
+                .unwrap_or_default();
+            let source = match record.in_flight.as_ref() {
+                Some(session) => session.from,
+                None => match spending {
+                    Some(spending) if candidate != spending => spending,
+                    Some(_) => continue,
+                    None => {
+                        out.push((
+                            candidate,
+                            None,
+                            ActiveProbeVerdict::NeverProbed,
+                            now_ms,
+                            false,
+                        ));
+                        continue;
+                    }
+                },
+            };
+            let post_in_resume = match record.in_flight.as_ref() {
+                Some(session) => self.probe_session_has_leg_in(candidate, session).await?,
+                None => false,
+            };
+            let verdict = probe_verdict(&record.attempts, source, now_ms, gate_policy);
+            let last_invocation = last_invocations.get(&(candidate, source)).copied();
+            let due_base = probe_due_base_ms(verdict, &record, source, now_ms, gate_policy);
+            let mut due_ms = probe_next_due_at(
+                verdict,
+                due_base,
+                last_invocation,
+                now_ms,
+                watch_policy,
+                gate_policy,
+            );
+            if post_in_resume {
+                due_ms = now_ms;
+            }
+            out.push((candidate, Some(source), verdict, due_ms, post_in_resume));
+        }
+        // Resume retained in-flight probe sessions before starting fresh probes: a failed
+        // resume defers fresh probes for the rest of the cycle, so in-flight money-moving
+        // work is always driven to completion first. Stable sort keeps the deterministic
+        // per-candidate order within each group.
+        out.sort_by_key(|input| !input.4);
+        Ok(out)
+    }
+
+    async fn probe_schedule_context(
+        &self,
+        now_ms: u64,
+        watch_policy: &WatchPolicy,
+    ) -> anyhow::Result<ProbeScheduleContext> {
+        let scan_horizon_ms = PROBE_BUDGET_WINDOW_MS.max(watch_policy.probe_retry_backoff_ms);
+        let rows = self
+            .journal
+            .probe_schedule_ledger_rows(now_ms, scan_horizon_ms)
+            .await
+            .map_err(exec_err)?;
+        let budget_effective_at_ms =
+            |row: &OperationRecord| row.created_at_ms.max(row.updated_at_ms);
+        let budget_rows = rows.iter().filter(|row| {
+            now_ms.saturating_sub(budget_effective_at_ms(row)) < PROBE_BUDGET_WINDOW_MS
+        });
+        let budget_usage = probe_budget_usage(budget_rows);
+        let budget_reset_ms = rows
+            .iter()
+            .filter(|row| {
+                now_ms.saturating_sub(budget_effective_at_ms(row)) < PROBE_BUDGET_WINDOW_MS
+            })
+            .filter(|row| budget_counted_probe_cost_msat(row).is_some())
+            .map(|row| budget_effective_at_ms(row).saturating_add(PROBE_BUDGET_WINDOW_MS))
+            .min();
+        let mut context = ProbeScheduleContext::new(budget_usage, budget_reset_ms, watch_policy);
+        for row in rows {
+            if matches!(row.actor, Actor::Agent { .. }) && row.reason == ReasonCode::ActiveProbe {
+                if let OperationKind::Probe { fed, from, .. } = &row.kind {
+                    let invoked_at = row.created_at_ms.max(row.updated_at_ms);
+                    context.record_invocation(*fed, *from, invoked_at);
+                }
+            }
+        }
+        context.budget_ok = probe_budget_ok(
+            context.budget_usage.attempts,
+            context.budget_usage.spend_msat,
+            &watch_policy.probe_budget,
+        );
+        Ok(context)
+    }
+
+    async fn probe_session_has_leg_in(
+        &self,
+        candidate: FederationId,
+        session: &ProbeSession,
+    ) -> anyhow::Result<bool> {
+        if session.out_net_msat.is_some() {
+            return Ok(true);
+        }
+        let occurrence = occurrence_from_nonce(&session.nonce)?;
+        let in_key = move_key(
+            &session.from,
+            &candidate,
+            Msat(session.amount_msat),
+            Msat(session.leg_fee_cap_msat),
+            occurrence,
+        );
+        Ok(self.journal.get(&in_key).await.map_err(exec_err)?.is_some())
+    }
+
+    async fn active_probe_source(
+        &self,
+        candidate: FederationId,
+    ) -> anyhow::Result<Option<FederationId>> {
+        Ok(self
+            .journal
+            .probe_record(&candidate)
+            .await
+            .map_err(exec_err)?
+            .and_then(|record| record.in_flight.map(|session| session.from)))
+    }
+
+    async fn record_watch_probe_skip(
+        &self,
+        candidate: FederationId,
+        spending: FederationId,
+        amount_msat: u64,
+        occurrence: Occurrence,
+        diagnostic_bucket_ms: u64,
+        reason: &str,
+    ) -> Result<(), ExecError> {
+        let key = IdempotencyKey(format!(
+            "watch-probe-skip:{}:{}:{}:{}",
+            candidate.to_hex(),
+            spending.to_hex(),
+            amount_msat,
+            diagnostic_bucket_ms
+        ));
+        let now = now_ms();
+        self.journal
+            .record_started(
+                &key,
+                OperationKind::Probe {
+                    fed: candidate,
+                    from: spending,
+                    amount_msat: Msat(amount_msat),
+                    cost_msat: None,
+                },
+                Actor::Agent { occurrence },
+                ReasonCode::StandingInstruction,
+                now,
+                None,
+            )
+            .await?;
+        self.journal
+            .record_terminal(&key, OperationStatus::Failed, now, Some(reason), None)
+            .await
     }
 
     /// Run ONE active probe of `candidate` from spending federation `from` (phase 5
@@ -559,6 +1269,10 @@ impl Runtime {
             effective_policy,
             started_at_ms: session.started_at_ms,
         };
+        self.journal
+            .record_probe_invocation(&run.umbrella_key, probe_kind(&run, None), actor, now_ms())
+            .await
+            .map_err(exec_err)?;
 
         // §5.0.5 step 1 — umbrella row then preflight, for a FRESH probe or a pre-leg-IN
         // resume ONLY (both re-enter here; §5.0.4's disambiguation): once leg IN is
@@ -577,20 +1291,6 @@ impl Runtime {
                     "probe: resuming a pre-leg-IN session; re-running the preflight"
                 );
             }
-            // Session-first, umbrella second (§5.0.5): `record_started` is idempotent, so
-            // a pre-umbrella resume recreates the row here; recording must succeed before
-            // any money moves (the phase-4 auditability contract).
-            self.journal
-                .record_started(
-                    &run.umbrella_key,
-                    probe_kind(&run, None),
-                    actor,
-                    ReasonCode::ActiveProbe,
-                    now_ms(),
-                    None,
-                )
-                .await
-                .map_err(exec_err)?;
             if let Err(diagnostic) = self.probe_preflight(&session, candidate).await {
                 return self.finish_probe_no_attempt(&run, &diagnostic, None).await;
             }
@@ -845,9 +1545,11 @@ impl Runtime {
         Self::note_probe_commit(committed, &run.nonce);
         let after = self.probe_attempts(&candidate).await?;
         Ok(ProbeReport {
+            source: run.source,
             verdict_before: run.verdict_before,
             outcome: ProbeOutcome::Attempt(attempt),
             verdict_after: probe_verdict(&after, run.source, now_ms(), &run.effective_policy),
+            cost_msat: cost,
             in_key: run.in_key,
             out_key: Some(out_key),
         })
@@ -951,9 +1653,11 @@ impl Runtime {
         Self::note_probe_commit(committed, &run.nonce);
         // No attempt was recorded, so the trust verdict is unchanged from the run's start.
         Ok(ProbeReport {
+            source: run.source,
             verdict_before: run.verdict_before,
             outcome: ProbeOutcome::NoAttempt(diagnostic.to_string()),
             verdict_after: run.verdict_before,
+            cost_msat: cost,
             in_key: run.in_key.clone(),
             out_key: None,
         })
@@ -1011,6 +1715,7 @@ impl Runtime {
                 Self::note_probe_commit(committed, &run.nonce);
                 let after = self.probe_attempts(&run.candidate).await?;
                 Ok(ProbeReport {
+                    source: run.source,
                     verdict_before: run.verdict_before,
                     outcome: ProbeOutcome::Attempt(attempt),
                     verdict_after: probe_verdict(
@@ -1019,6 +1724,7 @@ impl Runtime {
                         now_ms(),
                         &run.effective_policy,
                     ),
+                    cost_msat: cost,
                     in_key: run.in_key.clone(),
                     out_key,
                 })
@@ -1314,6 +2020,8 @@ impl Runtime {
         Ok(TickReport {
             decisions: plan.decisions,
             summary,
+            spending_fed: plan.snapshot.spending_fed,
+            standby_fed: plan.snapshot.standby_fed,
         })
     }
 
@@ -1427,6 +2135,16 @@ impl Runtime {
         scorer_policy: &ScorerPolicy,
     ) -> anyhow::Result<TickPlan> {
         let raw_probes = self.probe_all().await;
+        self.plan_tick_from_probes(policy, scorer_policy, raw_probes)
+            .await
+    }
+
+    async fn plan_tick_from_probes(
+        &self,
+        policy: &TickPolicy,
+        scorer_policy: &ScorerPolicy,
+        raw_probes: Vec<(FederationId, ProbeResult)>,
+    ) -> anyhow::Result<TickPlan> {
         let mut probes = raw_probes.clone();
         let auto_joined = self.auto_joined_candidates().await?;
         let mut route_revisions = 0usize;
@@ -2101,6 +2819,66 @@ fn facts_from_client_config(id: FederationId, config: &ClientConfig) -> Federati
     }
 }
 
+fn discovery_due(state: &WatchState, policy: &WatchPolicy, now_ms: u64) -> bool {
+    state.discover_backlog
+        || now_ms
+            >= state
+                .last_discover_ms
+                .saturating_add(policy.discover_every_ms)
+}
+
+fn add_expiry_deadlines(
+    deadlines: &mut AdaptiveSleepDeadlines,
+    raw_probes: &[(FederationId, ProbeResult)],
+    now_ms: u64,
+) {
+    for (_, probe) in raw_probes {
+        for expiry_ms in [
+            probe
+                .config_expiry_secs
+                .map(|secs| secs.saturating_mul(1000)),
+            probe
+                .meta_module_expiry_secs
+                .map(|secs| secs.saturating_mul(1000)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            add_expiry_deadline(deadlines, expiry_ms, now_ms);
+        }
+    }
+}
+
+fn add_expiry_deadline(deadlines: &mut AdaptiveSleepDeadlines, expiry_ms: u64, now_ms: u64) {
+    if expiry_ms > now_ms {
+        deadlines.expiries_ms.push(expiry_ms);
+    }
+}
+
+fn probe_due_base_ms(
+    verdict: ActiveProbeVerdict,
+    record: &ProbeRecord,
+    source: FederationId,
+    now_ms: u64,
+    policy: &ProbePolicy,
+) -> Option<u64> {
+    match verdict {
+        ActiveProbeVerdict::NeverProbed => None,
+        ActiveProbeVerdict::Passed => {
+            probe_pass_expiry_anchor_ms(&record.attempts, source, now_ms, policy)
+        }
+        ActiveProbeVerdict::Insufficient
+        | ActiveProbeVerdict::Expired
+        | ActiveProbeVerdict::Failed
+        | ActiveProbeVerdict::FailedSinceLastPass => record
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.from == source)
+            .map(|attempt| attempt.at_ms)
+            .max(),
+    }
+}
+
 fn threshold_for_endpoints(num_endpoints: usize) -> u32 {
     if num_endpoints == 0 {
         return 0;
@@ -2195,14 +2973,15 @@ fn move_key(
     ))
 }
 
-/// The §5.0.5 probe report: the verdicts around ONE recorded attempt plus the leg keys.
-/// Returned only when an attempt was recorded (a pass, or a demoting candidate-fault
-/// failure); no-attempt terminal exits and transient still-pending legs are errors.
+/// The §5.0.5 probe report: the verdicts around one terminal invocation plus the leg keys.
+/// `cost_msat` mirrors the terminal umbrella row's budget-counted cost, when money moved.
 #[derive(Clone, Debug)]
 pub struct ProbeReport {
+    pub source: FederationId,
     pub verdict_before: ActiveProbeVerdict,
     pub outcome: ProbeOutcome,
     pub verdict_after: ActiveProbeVerdict,
+    pub cost_msat: Option<Msat>,
     pub in_key: IdempotencyKey,
     /// `None` when the probe never reached leg OUT (a leg-IN failure).
     pub out_key: Option<IdempotencyKey>,
@@ -2630,13 +3409,35 @@ fn exec_err(e: ExecError) -> anyhow::Error {
     anyhow::anyhow!("{e:?}")
 }
 
+fn budget_counted_probe_cost_msat(row: &OperationRecord) -> Option<u64> {
+    if !matches!(row.actor, Actor::Agent { .. }) {
+        return None;
+    }
+    match &row.kind {
+        OperationKind::Probe {
+            cost_msat: Some(Msat(cost)),
+            ..
+        } => Some(*cost),
+        _ => None,
+    }
+}
+
+fn budget_skip_diagnostic_bucket_ms(now_ms: u64, budget_reset_ms: Option<u64>) -> u64 {
+    budget_reset_ms.unwrap_or_else(|| {
+        now_ms
+            .saturating_div(PROBE_BUDGET_WINDOW_MS)
+            .saturating_mul(PROBE_BUDGET_WINDOW_MS)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::FederationInfo;
     use fedimint_bip39::Mnemonic;
     use fedimint_core::db::mem_impl::MemDatabase;
     use fedimint_core::db::IRawDatabaseExt as _;
-    use wallet_core::{FederationId, Intent, Journal, Msat, Occurrence};
+    use wallet_core::{FederationId, Intent, Journal, Msat, Occurrence, ProbeBudget};
 
     const FED_A: FederationId = FederationId([0xAA; 32]);
     const FED_B: FederationId = FederationId([0xBB; 32]);
@@ -2753,6 +3554,170 @@ mod tests {
             occurrence: Occurrence(0),
             idempotency_key: IdempotencyKey(key.to_string()),
         }
+    }
+
+    fn federation_info() -> FederationInfo {
+        FederationInfo {
+            invite: "test invite not parsed by scheduler tests".to_owned(),
+            db_prefix: 0,
+            joined_at: 1,
+        }
+    }
+
+    fn due_discovery_watch_policy() -> WatchPolicy {
+        WatchPolicy {
+            discover_every_ms: 0,
+            max_candidates_per_pass: 2,
+            ..WatchPolicy::default()
+        }
+    }
+
+    fn raw_probe_with_expiry(
+        shutdown_scheduled: bool,
+        config_expiry_secs: Option<u64>,
+        meta_module_expiry_secs: Option<u64>,
+    ) -> ProbeResult {
+        ProbeResult {
+            guardian_count: 4,
+            threshold: 3,
+            is_mainnet: true,
+            module_kinds: vec!["mint".to_owned(), "wallet".to_owned(), "lnv2".to_owned()],
+            has_lnv2: true,
+            quorum_live: true,
+            latency_ms: 10,
+            gateway_available: true,
+            wallet_module_present: true,
+            expiry_timestamp_secs: config_expiry_secs,
+            config_expiry_secs,
+            meta_module_expiry_secs,
+            status_scheduled_shutdown: shutdown_scheduled,
+            shutdown_scheduled,
+            spendable_msat: 0,
+            in_flight_msat: 0,
+            claimable_msat: 0,
+        }
+    }
+
+    async fn seed_passed_probe(
+        journal: &FedimintJournal,
+        candidate: FederationId,
+        source: FederationId,
+        policy: &ProbePolicy,
+    ) {
+        let started_at_ms = now_ms().saturating_sub(40 * 60 * 1000);
+        let nonce = "00000000000000550000000000000000";
+        let session = ProbeSession {
+            nonce: nonce.to_owned(),
+            from: source,
+            amount_msat: policy.amount_msat,
+            leg_fee_cap_msat: policy.leg_fee_cap_msat,
+            c_spendable_before_in_msat: 0,
+            out_net_msat: None,
+            started_at_ms,
+        };
+        journal
+            .begin_probe_session(&candidate, &session)
+            .await
+            .expect("begin probe session");
+        let attempt = ProbeAttempt {
+            at_ms: started_at_ms,
+            ok: true,
+            from: source,
+            amount_msat: policy.amount_msat,
+            leg_fee_cap_msat: policy.leg_fee_cap_msat,
+            error: None,
+        };
+        journal
+            .record_probe_outcome(
+                &candidate,
+                nonce,
+                Some(attempt),
+                &probe_umbrella_key(&candidate, nonce),
+                OperationKind::Probe {
+                    fed: candidate,
+                    from: source,
+                    amount_msat: Msat(policy.amount_msat),
+                    cost_msat: Some(Msat(1)),
+                },
+                Actor::Agent {
+                    occurrence: Occurrence(0),
+                },
+                OperationStatus::Succeeded,
+                None,
+            )
+            .await
+            .expect("record probe outcome");
+    }
+
+    async fn seed_pre_leg_probe_session(
+        journal: &FedimintJournal,
+        candidate: FederationId,
+        source: FederationId,
+        policy: &ProbePolicy,
+    ) {
+        let session = ProbeSession {
+            nonce: "00000000000000770000000000000000".to_owned(),
+            from: source,
+            amount_msat: policy.amount_msat,
+            leg_fee_cap_msat: policy.leg_fee_cap_msat,
+            c_spendable_before_in_msat: 0,
+            out_net_msat: None,
+            started_at_ms: now_ms(),
+        };
+        journal
+            .begin_probe_session(&candidate, &session)
+            .await
+            .expect("begin probe session");
+    }
+
+    async fn seed_post_in_probe_session(
+        journal: &FedimintJournal,
+        candidate: FederationId,
+        source: FederationId,
+        policy: &ProbePolicy,
+    ) -> IdempotencyKey {
+        let nonce = "00000000000000660000000000000000";
+        let occurrence = occurrence_from_nonce(nonce).expect("valid nonce occurrence");
+        let session = ProbeSession {
+            nonce: nonce.to_owned(),
+            from: source,
+            amount_msat: policy.amount_msat,
+            leg_fee_cap_msat: policy.leg_fee_cap_msat,
+            c_spendable_before_in_msat: 0,
+            out_net_msat: None,
+            started_at_ms: now_ms(),
+        };
+        journal
+            .begin_probe_session(&candidate, &session)
+            .await
+            .expect("begin probe session");
+        let in_key = move_key(
+            &source,
+            &candidate,
+            Msat(policy.amount_msat),
+            Msat(policy.leg_fee_cap_msat),
+            occurrence,
+        );
+        journal
+            .upsert(&Intent {
+                idempotency_key: in_key.clone(),
+                action: Action::Move {
+                    from: source,
+                    to: candidate,
+                    amount: Msat(policy.amount_msat),
+                    fee_cap: Msat(policy.leg_fee_cap_msat),
+                },
+                max_fee: Some(Msat(policy.leg_fee_cap_msat)),
+                status: IntentStatus::Done,
+                reason: ReasonCode::ActiveProbe,
+                actor: Actor::Agent {
+                    occurrence: Occurrence(1),
+                },
+                created_at_ms: now_ms(),
+            })
+            .await
+            .expect("seed leg-in intent");
+        in_key
     }
 
     #[test]
@@ -2960,6 +3925,877 @@ mod tests {
             .await
             .expect("an all-auto tick over an empty fed set is a clean no-op");
         assert!(report.decisions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn watch_once_advances_occurrence_and_persists_discovery_checkpoint() {
+        let (runtime, journal) = runtime_fixture().await;
+        let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+        let tick_policy = TickPolicy::default();
+        let watch_policy = due_discovery_watch_policy();
+        let discovery_policy = DiscoveryPolicy::default();
+
+        let first = runtime
+            .watch_once(
+                &tick_policy,
+                &watch_policy,
+                &sources,
+                &discovery_policy,
+                true,
+            )
+            .await
+            .expect("first watch cycle");
+        let second = runtime
+            .watch_once(
+                &tick_policy,
+                &watch_policy,
+                &sources,
+                &discovery_policy,
+                true,
+            )
+            .await
+            .expect("second watch cycle");
+
+        assert_eq!(first.occurrence, Occurrence(1));
+        assert_eq!(second.occurrence, Occurrence(2));
+        assert!(matches!(first.tick, WatchTickOutcome::Ran(_)));
+        assert!(matches!(second.tick, WatchTickOutcome::Ran(_)));
+        let WatchDiscoverOutcome::Ran(discover) = first.discover else {
+            panic!("due discovery should run");
+        };
+        assert!(discover.progress.wrapped);
+        assert!(!discover.progress.backlog);
+        let state = journal.get_watch_state().await.expect("watch state");
+        assert_eq!(state.occurrence, 2);
+        assert!(state.last_discover_ms > 0);
+        assert_eq!(state.discover_cursor, None);
+        assert!(!state.discover_backlog);
+        assert!(state.discover_rotation.is_empty());
+    }
+
+    #[tokio::test]
+    async fn watch_once_records_tick_error_but_still_runs_due_discovery() {
+        let (runtime, _journal) = runtime_fixture().await;
+        let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+        let tick_policy = TickPolicy {
+            spending_fed: Some(FED_A),
+            ..TickPolicy::default()
+        };
+
+        let report = runtime
+            .watch_once(
+                &tick_policy,
+                &due_discovery_watch_policy(),
+                &sources,
+                &DiscoveryPolicy::default(),
+                true,
+            )
+            .await
+            .expect("watch cycle continues after tick failure");
+
+        assert!(matches!(report.reconcile, WatchReconcileOutcome::Ran(_)));
+        assert!(matches!(report.tick, WatchTickOutcome::Failed(_)));
+        assert!(matches!(report.discover, WatchDiscoverOutcome::Ran(_)));
+        assert_eq!(report.occurrence, Occurrence(1));
+    }
+
+    #[tokio::test]
+    async fn watch_once_skips_tick_when_reconcile_leaves_retryable_pending_work() {
+        let (runtime, journal) = runtime_fixture().await;
+        let decision = tick_move_decision("move-retryable-pending", FED_A, FED_B);
+        journal
+            .upsert(&Intent::from_decision(
+                &decision,
+                Actor::Agent {
+                    occurrence: Occurrence(0),
+                },
+                0,
+            ))
+            .await
+            .expect("seed pending move");
+        let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+
+        let report = runtime
+            .watch_once(
+                &TickPolicy::default(),
+                &due_discovery_watch_policy(),
+                &sources,
+                &DiscoveryPolicy::default(),
+                true,
+            )
+            .await
+            .expect("watch cycle continues after retryable reconcile");
+
+        assert!(matches!(
+            &report.reconcile,
+            WatchReconcileOutcome::Ran(summary) if summary.retryable == 1
+        ));
+        assert!(matches!(
+            &report.tick,
+            WatchTickOutcome::SkippedPendingRetry { retryable: 1 }
+        ));
+        assert!(matches!(&report.discover, WatchDiscoverOutcome::Ran(_)));
+        assert_eq!(report.occurrence, Occurrence(1));
+        let rows = journal.history(usize::MAX, None).await.expect("history");
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(row.kind, OperationKind::Tick { .. })),
+            "a retryable pending move must not start a fresh tick occurrence"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_once_records_budget_exhausted_probe_skip() {
+        let (runtime, journal) = runtime_fixture().await;
+        journal
+            .put_federation(&FED_B, &federation_info())
+            .await
+            .expect("put auto-joined fed");
+        journal
+            .record_started(
+                &IdempotencyKey("probe-budget-row".to_owned()),
+                OperationKind::Probe {
+                    fed: FED_C,
+                    from: FED_A,
+                    amount_msat: Msat(20_000),
+                    cost_msat: Some(Msat(1)),
+                },
+                Actor::Agent {
+                    occurrence: Occurrence(0),
+                },
+                ReasonCode::ActiveProbe,
+                now_ms(),
+                None,
+            )
+            .await
+            .expect("seed budget row");
+        let tick_policy = TickPolicy {
+            spending_fed: Some(FED_A),
+            ..TickPolicy::default()
+        };
+        let watch_policy = WatchPolicy {
+            probe_budget: ProbeBudget {
+                max_probe_attempts_per_week: 1,
+                max_probe_spend_per_week_msat: 1_000,
+            },
+            ..WatchPolicy::default()
+        };
+
+        let report = runtime
+            .watch_once(
+                &tick_policy,
+                &watch_policy,
+                &[],
+                &DiscoveryPolicy::default(),
+                false,
+            )
+            .await
+            .expect("watch cycle");
+
+        assert_eq!(report.probes.len(), 1);
+        assert_eq!(report.probes[0].fed, FED_B);
+        assert_eq!(report.probes[0].verdict, ActiveProbeVerdict::NeverProbed);
+        assert_eq!(report.probes[0].outcome, WatchProbeOutcome::BudgetBlocked);
+        assert_eq!(report.budget_usage.attempts, 1);
+        runtime
+            .watch_once(
+                &tick_policy,
+                &watch_policy,
+                &[],
+                &DiscoveryPolicy::default(),
+                false,
+            )
+            .await
+            .expect("second watch cycle");
+        let rows = journal.history(usize::MAX, None).await.expect("history");
+        let skip_rows = rows
+            .iter()
+            .filter(|row| {
+                row.reason == ReasonCode::StandingInstruction
+                    && row.status == OperationStatus::Failed
+                    && matches!(row.kind, OperationKind::Probe { fed, cost_msat: None, .. } if fed == FED_B)
+            })
+            .count();
+        assert_eq!(
+            skip_rows, 1,
+            "budget-blocked probe diagnostics are idempotent within the same budget bucket"
+        );
+        assert!(rows.iter().any(|row| {
+            row.reason == ReasonCode::StandingInstruction
+                && row.status == OperationStatus::Failed
+                && matches!(row.kind, OperationKind::Probe { fed, cost_msat: None, .. } if fed == FED_B)
+        }));
+    }
+
+    #[tokio::test]
+    async fn watch_once_resumes_post_in_probe_when_budget_is_exhausted() {
+        let (runtime, journal) = runtime_fixture().await;
+        journal
+            .put_federation(&FED_B, &federation_info())
+            .await
+            .expect("put auto-joined fed");
+        let gate_policy = ProbePolicy::default();
+        let in_key = seed_post_in_probe_session(journal.as_ref(), FED_B, FED_A, &gate_policy).await;
+        journal
+            .record_started(
+                &IdempotencyKey("probe-budget-row-for-resume".to_owned()),
+                OperationKind::Probe {
+                    fed: FED_C,
+                    from: FED_A,
+                    amount_msat: Msat(20_000),
+                    cost_msat: Some(Msat(1)),
+                },
+                Actor::Agent {
+                    occurrence: Occurrence(0),
+                },
+                ReasonCode::ActiveProbe,
+                now_ms(),
+                None,
+            )
+            .await
+            .expect("seed budget row");
+        let tick_policy = TickPolicy {
+            spending_fed: Some(FED_A),
+            probe_gate_policy: gate_policy,
+            ..TickPolicy::default()
+        };
+        let watch_policy = WatchPolicy {
+            probe_budget: ProbeBudget {
+                max_probe_attempts_per_week: 1,
+                max_probe_spend_per_week_msat: 1_000,
+            },
+            ..WatchPolicy::default()
+        };
+
+        let report = runtime
+            .watch_once(
+                &tick_policy,
+                &watch_policy,
+                &[],
+                &DiscoveryPolicy::default(),
+                false,
+            )
+            .await
+            .expect("watch cycle");
+
+        assert_eq!(report.probes.len(), 1);
+        assert_eq!(report.probes[0].fed, FED_B);
+        assert!(matches!(
+            report.probes[0].outcome,
+            WatchProbeOutcome::Failed(_)
+        ));
+        assert_ne!(report.probes[0].outcome, WatchProbeOutcome::BudgetBlocked);
+        assert!(
+            report.probes[0].due_ms <= now_ms(),
+            "post-IN sessions are due immediately for cleanup"
+        );
+        let rows = journal.history(usize::MAX, None).await.expect("history");
+        assert!(rows.iter().any(|row| {
+            row.reason == ReasonCode::ActiveProbe
+                && matches!(row.kind, OperationKind::Probe { fed, from, cost_msat: None, .. } if fed == FED_B && from == FED_A)
+        }));
+        assert!(journal
+            .get(&in_key)
+            .await
+            .expect("leg-in intent remains readable")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn watch_once_defers_fresh_probes_after_retained_in_flight_probe() {
+        let (runtime, journal) = runtime_fixture().await;
+        for fed in [FED_B, FED_C] {
+            journal
+                .put_federation(&fed, &federation_info())
+                .await
+                .expect("put auto-joined fed");
+        }
+        let gate_policy = ProbePolicy::default();
+        seed_post_in_probe_session(journal.as_ref(), FED_B, FED_A, &gate_policy).await;
+        let tick_policy = TickPolicy {
+            spending_fed: Some(FED_A),
+            probe_gate_policy: gate_policy,
+            ..TickPolicy::default()
+        };
+
+        let report = runtime
+            .watch_once(
+                &tick_policy,
+                &WatchPolicy::default(),
+                &[],
+                &DiscoveryPolicy::default(),
+                false,
+            )
+            .await
+            .expect("watch cycle");
+
+        assert_eq!(report.probes.len(), 2);
+        assert_eq!(report.probes[0].fed, FED_B);
+        assert!(matches!(
+            report.probes[0].outcome,
+            WatchProbeOutcome::Failed(_)
+        ));
+        assert_eq!(report.probes[1].fed, FED_C);
+        assert_eq!(
+            report.probes[1].outcome,
+            WatchProbeOutcome::DeferredByInFlight
+        );
+        let rows = journal.history(usize::MAX, None).await.expect("history");
+        assert!(
+            !rows.iter().any(|row| {
+                row.reason == ReasonCode::ActiveProbe
+                    && matches!(row.kind, OperationKind::Probe { fed, .. } if fed == FED_C)
+            }),
+            "the second due candidate must not launch a fresh scheduled probe in the same cycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_once_resumes_in_flight_probe_without_current_spending_fed() {
+        let (runtime, journal) = runtime_fixture().await;
+        journal
+            .put_federation(&FED_B, &federation_info())
+            .await
+            .expect("put auto-joined fed");
+        let gate_policy = ProbePolicy::default();
+        seed_post_in_probe_session(journal.as_ref(), FED_B, FED_A, &gate_policy).await;
+        let tick_policy = TickPolicy {
+            probe_gate_policy: gate_policy,
+            ..TickPolicy::default()
+        };
+
+        let report = runtime
+            .watch_once(
+                &tick_policy,
+                &WatchPolicy::default(),
+                &[],
+                &DiscoveryPolicy::default(),
+                false,
+            )
+            .await
+            .expect("watch cycle");
+
+        assert_eq!(report.probes.len(), 1);
+        assert_eq!(report.probes[0].fed, FED_B);
+        assert!(matches!(
+            report.probes[0].outcome,
+            WatchProbeOutcome::Failed(_)
+        ));
+        let rows = journal.history(usize::MAX, None).await.expect("history");
+        assert!(rows.iter().any(|row| {
+            row.reason == ReasonCode::ActiveProbe
+                && matches!(row.kind, OperationKind::Probe { fed, from, cost_msat: None, .. } if fed == FED_B && from == FED_A)
+        }));
+    }
+
+    #[tokio::test]
+    async fn watch_once_checks_in_flight_session_before_skipping_self_probe() {
+        let (runtime, journal) = runtime_fixture().await;
+        journal
+            .put_federation(&FED_B, &federation_info())
+            .await
+            .expect("put auto-joined fed");
+        let gate_policy = ProbePolicy::default();
+        seed_post_in_probe_session(journal.as_ref(), FED_B, FED_A, &gate_policy).await;
+        let tick_policy = TickPolicy {
+            spending_fed: Some(FED_B),
+            probe_gate_policy: gate_policy,
+            ..TickPolicy::default()
+        };
+
+        let report = runtime
+            .watch_once(
+                &tick_policy,
+                &WatchPolicy::default(),
+                &[],
+                &DiscoveryPolicy::default(),
+                false,
+            )
+            .await
+            .expect("watch cycle");
+
+        assert_eq!(report.probes.len(), 1);
+        assert_eq!(report.probes[0].fed, FED_B);
+        assert!(matches!(
+            report.probes[0].outcome,
+            WatchProbeOutcome::Failed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn scheduled_probe_backoff_is_scoped_to_source_fed() {
+        let (runtime, journal) = runtime_fixture().await;
+        journal
+            .put_federation(&FED_B, &federation_info())
+            .await
+            .expect("put auto-joined fed");
+        let now = now_ms();
+        journal
+            .record_probe_invocation(
+                &IdempotencyKey("probe-other-source".to_owned()),
+                OperationKind::Probe {
+                    fed: FED_B,
+                    from: FED_C,
+                    amount_msat: Msat(20_000),
+                    cost_msat: None,
+                },
+                Actor::Agent {
+                    occurrence: Occurrence(0),
+                },
+                now,
+            )
+            .await
+            .expect("seed other-source invocation");
+        let tick_policy = TickPolicy {
+            spending_fed: Some(FED_A),
+            ..TickPolicy::default()
+        };
+
+        let deadlines = runtime
+            .watch_deadlines(&tick_policy, &WatchPolicy::default(), now)
+            .await
+            .expect("watch deadlines");
+
+        assert_eq!(deadlines.probe_due_ms.len(), 1);
+        assert!(
+            deadlines.probe_due_ms[0] <= now,
+            "a probe from FED_C must not back off FED_A's first scheduled probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_once_records_resumed_probe_backoff_under_session_source() {
+        let (runtime, journal) = runtime_fixture().await;
+        journal
+            .put_federation(&FED_B, &federation_info())
+            .await
+            .expect("put auto-joined fed");
+        let gate_policy = ProbePolicy::default();
+        seed_pre_leg_probe_session(journal.as_ref(), FED_B, FED_C, &gate_policy).await;
+        let tick_policy = TickPolicy {
+            spending_fed: Some(FED_A),
+            probe_gate_policy: gate_policy,
+            ..TickPolicy::default()
+        };
+
+        let report = runtime
+            .watch_once(
+                &tick_policy,
+                &WatchPolicy::default(),
+                &[],
+                &DiscoveryPolicy::default(),
+                false,
+            )
+            .await
+            .expect("watch cycle");
+
+        assert_eq!(report.probes.len(), 1);
+        assert_eq!(report.probes[0].fed, FED_B);
+        assert!(matches!(
+            report.probes[0].outcome,
+            WatchProbeOutcome::Attempted
+        ));
+        assert_eq!(report.deadlines.probe_due_ms.len(), 1);
+        assert!(
+            report.deadlines.probe_due_ms[0] <= now_ms(),
+            "resuming a FED_C session must not back off FED_A's first scheduled probe"
+        );
+        let rows = journal.history(usize::MAX, None).await.expect("history");
+        assert!(rows.iter().any(|row| {
+            row.reason == ReasonCode::ActiveProbe
+                && matches!(row.kind, OperationKind::Probe { fed, from, cost_msat: None, .. } if fed == FED_B && from == FED_C)
+        }));
+    }
+
+    #[tokio::test]
+    async fn in_flight_probe_backoff_uses_session_source() {
+        let (runtime, journal) = runtime_fixture().await;
+        journal
+            .put_federation(&FED_B, &federation_info())
+            .await
+            .expect("put auto-joined fed");
+        let gate_policy = ProbePolicy::default();
+        seed_pre_leg_probe_session(journal.as_ref(), FED_B, FED_C, &gate_policy).await;
+        let now = now_ms();
+        let watch_policy = WatchPolicy::default();
+        journal
+            .record_probe_invocation(
+                &IdempotencyKey("probe-in-flight-source".to_owned()),
+                OperationKind::Probe {
+                    fed: FED_B,
+                    from: FED_C,
+                    amount_msat: Msat(20_000),
+                    cost_msat: None,
+                },
+                Actor::Agent {
+                    occurrence: Occurrence(0),
+                },
+                now,
+            )
+            .await
+            .expect("seed session-source invocation");
+        let tick_policy = TickPolicy {
+            spending_fed: Some(FED_A),
+            probe_gate_policy: gate_policy,
+            ..TickPolicy::default()
+        };
+
+        let deadlines = runtime
+            .watch_deadlines(&tick_policy, &watch_policy, now)
+            .await
+            .expect("watch deadlines");
+
+        assert_eq!(deadlines.probe_due_ms.len(), 1);
+        assert_eq!(
+            deadlines.probe_due_ms[0],
+            now.saturating_add(watch_policy.probe_retry_backoff_ms),
+            "an in-flight FED_C session must not be scheduled as FED_A's first probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_probe_backoff_uses_touched_invocation_timestamp() {
+        let (runtime, journal) = runtime_fixture().await;
+        journal
+            .put_federation(&FED_B, &federation_info())
+            .await
+            .expect("put auto-joined fed");
+        let watch_policy = WatchPolicy::default();
+        let now = now_ms();
+        let key = IdempotencyKey("probe-touched".to_owned());
+        journal
+            .record_started(
+                &key,
+                OperationKind::Probe {
+                    fed: FED_B,
+                    from: FED_A,
+                    amount_msat: Msat(20_000),
+                    cost_msat: None,
+                },
+                Actor::Agent {
+                    occurrence: Occurrence(0),
+                },
+                ReasonCode::ActiveProbe,
+                now.saturating_sub(watch_policy.probe_retry_backoff_ms * 2),
+                None,
+            )
+            .await
+            .expect("seed old invocation");
+        journal
+            .record_probe_invocation(
+                &key,
+                OperationKind::Probe {
+                    fed: FED_B,
+                    from: FED_A,
+                    amount_msat: Msat(20_000),
+                    cost_msat: None,
+                },
+                Actor::Agent {
+                    occurrence: Occurrence(1),
+                },
+                now,
+            )
+            .await
+            .expect("touch invocation");
+        journal
+            .record_started(
+                &IdempotencyKey("probe-old-higher-seq".to_owned()),
+                OperationKind::Probe {
+                    fed: FED_C,
+                    from: FED_A,
+                    amount_msat: Msat(20_000),
+                    cost_msat: None,
+                },
+                Actor::Agent {
+                    occurrence: Occurrence(0),
+                },
+                ReasonCode::ActiveProbe,
+                now.saturating_sub(watch_policy.probe_retry_backoff_ms * 2),
+                None,
+            )
+            .await
+            .expect("seed old higher-seq row");
+        let tick_policy = TickPolicy {
+            spending_fed: Some(FED_A),
+            ..TickPolicy::default()
+        };
+
+        let deadlines = runtime
+            .watch_deadlines(&tick_policy, &watch_policy, now)
+            .await
+            .expect("watch deadlines");
+
+        assert_eq!(deadlines.probe_due_ms.len(), 1);
+        assert_eq!(
+            deadlines.probe_due_ms[0],
+            now.saturating_add(watch_policy.probe_retry_backoff_ms),
+            "the scheduler should back off from the touched retry timestamp, not original creation"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_schedule_context_counts_only_windowed_budget_rows() {
+        let (runtime, journal) = runtime_fixture().await;
+        let now = now_ms();
+        let old = now.saturating_sub(PROBE_BUDGET_WINDOW_MS + 1);
+        for (key, created_at_ms) in [("old-probe-budget", old), ("new-probe-budget", now)] {
+            journal
+                .record_started(
+                    &IdempotencyKey(key.to_owned()),
+                    OperationKind::Probe {
+                        fed: FED_B,
+                        from: FED_A,
+                        amount_msat: Msat(20_000),
+                        cost_msat: Some(Msat(3)),
+                    },
+                    Actor::Agent {
+                        occurrence: Occurrence(0),
+                    },
+                    ReasonCode::ActiveProbe,
+                    created_at_ms,
+                    None,
+                )
+                .await
+                .expect("seed budget row");
+        }
+
+        let context = runtime
+            .probe_schedule_context(now, &WatchPolicy::default())
+            .await
+            .expect("probe schedule context");
+
+        assert_eq!(
+            context.budget_usage,
+            ProbeBudgetUsage {
+                attempts: 1,
+                spend_msat: 3
+            }
+        );
+        assert_eq!(
+            context.budget_reset_ms,
+            Some(now.saturating_add(PROBE_BUDGET_WINDOW_MS))
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_schedule_context_counts_resumed_probe_spend_at_updated_time() {
+        let (runtime, journal) = runtime_fixture().await;
+        let now = now_ms();
+        let old = now.saturating_sub(PROBE_BUDGET_WINDOW_MS + 1);
+        let key = IdempotencyKey("resumed-probe-budget".to_owned());
+        journal
+            .record_started(
+                &key,
+                OperationKind::Probe {
+                    fed: FED_B,
+                    from: FED_A,
+                    amount_msat: Msat(20_000),
+                    cost_msat: Some(Msat(7)),
+                },
+                Actor::Agent {
+                    occurrence: Occurrence(0),
+                },
+                ReasonCode::ActiveProbe,
+                old,
+                None,
+            )
+            .await
+            .expect("seed old probe row");
+        journal
+            .record_terminal(&key, OperationStatus::Succeeded, now, None, None)
+            .await
+            .expect("touch terminal probe row");
+
+        let context = runtime
+            .probe_schedule_context(now, &WatchPolicy::default())
+            .await
+            .expect("probe schedule context");
+
+        assert_eq!(
+            context.budget_usage,
+            ProbeBudgetUsage {
+                attempts: 1,
+                spend_msat: 7
+            }
+        );
+        assert_eq!(
+            context.budget_reset_ms,
+            Some(now.saturating_add(PROBE_BUDGET_WINDOW_MS))
+        );
+    }
+
+    #[test]
+    fn subscription_noop_treats_budget_blocked_probe_as_coalescible() {
+        let report = WatchCycleReport {
+            occurrence: Occurrence(1),
+            reconcile: WatchReconcileOutcome::Ran(ReconcileSummary::default()),
+            tick: WatchTickOutcome::Ran(TickReport {
+                decisions: Vec::new(),
+                summary: ExecutionSummary::default(),
+                spending_fed: Some(FED_A),
+                standby_fed: None,
+            }),
+            probes: vec![WatchProbeReport {
+                fed: FED_B,
+                verdict: ActiveProbeVerdict::NeverProbed,
+                due_ms: 0,
+                outcome: WatchProbeOutcome::BudgetBlocked,
+            }],
+            discover: WatchDiscoverOutcome::Disabled,
+            budget_usage: ProbeBudgetUsage::default(),
+            watch_state: WatchState::default(),
+            deadlines: AdaptiveSleepDeadlines::default(),
+        };
+
+        assert!(report.subscription_noop());
+    }
+
+    #[test]
+    fn shutdown_flag_without_expiry_does_not_add_busy_spin_deadline() {
+        let now = 1_700_000_000_000;
+        let mut no_expiry = AdaptiveSleepDeadlines::default();
+        add_expiry_deadlines(
+            &mut no_expiry,
+            &[(FED_A, raw_probe_with_expiry(true, None, None))],
+            now,
+        );
+        assert!(
+            no_expiry.expiries_ms.is_empty(),
+            "a shutdown boolean without a concrete expiry is not an adaptive deadline"
+        );
+
+        let mut with_expiry = AdaptiveSleepDeadlines::default();
+        let expiry_secs = (now + 2 * 60 * 60 * 1000) / 1000;
+        add_expiry_deadlines(
+            &mut with_expiry,
+            &[(FED_A, raw_probe_with_expiry(true, Some(expiry_secs), None))],
+            now,
+        );
+
+        assert_eq!(with_expiry.expiries_ms, vec![expiry_secs * 1000]);
+        assert_ne!(with_expiry.expiries_ms, vec![now]);
+
+        let mut past_expiry = AdaptiveSleepDeadlines::default();
+        add_expiry_deadlines(
+            &mut past_expiry,
+            &[(
+                FED_A,
+                raw_probe_with_expiry(true, Some((now - 1_000) / 1000), None),
+            )],
+            now,
+        );
+        assert!(
+            past_expiry.expiries_ms.is_empty(),
+            "past expiry timestamps must not pin the watch loop to the busy-spin floor"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_hint_deadline_reuse_keeps_probe_schedule_and_adds_hint_without_probe_scan() {
+        let (runtime, _journal) = runtime_fixture().await;
+        let now = now_ms();
+        let previous = AdaptiveSleepDeadlines {
+            last_discover_ms: now.saturating_sub(10_000),
+            discover_backlog: false,
+            expiries_ms: vec![now.saturating_sub(1), now.saturating_add(10_000)],
+            probe_due_ms: vec![now.saturating_add(20_000)],
+        };
+
+        let deadlines = runtime
+            .watch_deadlines_reusing_probe_schedule(now, &previous, Some(now.saturating_add(5_000)))
+            .await
+            .expect("reuse deadlines");
+
+        assert_eq!(deadlines.probe_due_ms, previous.probe_due_ms);
+        assert_eq!(
+            deadlines.expiries_ms,
+            vec![now.saturating_add(10_000), now.saturating_add(5_000)]
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_deadlines_include_passed_probe_refresh() {
+        let (runtime, journal) = runtime_fixture().await;
+        journal
+            .put_federation(&FED_B, &federation_info())
+            .await
+            .expect("put auto-joined fed");
+        let gate_policy = ProbePolicy {
+            min_successes: 1,
+            min_span_ms: 0,
+            ttl_ms: 60 * 60 * 1000,
+            ..ProbePolicy::default()
+        };
+        seed_passed_probe(journal.as_ref(), FED_B, FED_A, &gate_policy).await;
+        let tick_policy = TickPolicy {
+            spending_fed: Some(FED_A),
+            probe_gate_policy: gate_policy,
+            ..TickPolicy::default()
+        };
+        let watch_policy = WatchPolicy {
+            probe_retry_backoff_ms: 0,
+            ..WatchPolicy::default()
+        };
+        let now = now_ms();
+
+        let deadlines = runtime
+            .watch_deadlines(&tick_policy, &watch_policy, now)
+            .await
+            .expect("watch deadlines");
+
+        assert_eq!(deadlines.probe_due_ms.len(), 1);
+        assert!(
+            deadlines.probe_due_ms[0] <= now,
+            "passed refresh should be due immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_once_attempts_due_passed_probe_refresh() {
+        let (runtime, journal) = runtime_fixture().await;
+        journal
+            .put_federation(&FED_B, &federation_info())
+            .await
+            .expect("put auto-joined fed");
+        let gate_policy = ProbePolicy {
+            min_successes: 1,
+            min_span_ms: 0,
+            ttl_ms: 60 * 60 * 1000,
+            ..ProbePolicy::default()
+        };
+        seed_passed_probe(journal.as_ref(), FED_B, FED_A, &gate_policy).await;
+        let tick_policy = TickPolicy {
+            spending_fed: Some(FED_A),
+            probe_gate_policy: gate_policy,
+            ..TickPolicy::default()
+        };
+        let watch_policy = WatchPolicy {
+            probe_retry_backoff_ms: 0,
+            ..WatchPolicy::default()
+        };
+
+        let report = runtime
+            .watch_once(
+                &tick_policy,
+                &watch_policy,
+                &[],
+                &DiscoveryPolicy::default(),
+                false,
+            )
+            .await
+            .expect("watch cycle");
+
+        assert_eq!(report.probes.len(), 1);
+        assert_eq!(report.probes[0].fed, FED_B);
+        assert_eq!(report.probes[0].verdict, ActiveProbeVerdict::Passed);
+        assert!(
+            matches!(
+                report.probes[0].outcome,
+                WatchProbeOutcome::Attempted | WatchProbeOutcome::Failed(_)
+            ),
+            "due Passed probe should enter the active probe path, not be skipped as Passed"
+        );
     }
 
     #[tokio::test]

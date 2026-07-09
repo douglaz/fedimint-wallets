@@ -570,6 +570,43 @@ impl FedimintJournal {
         Ok(())
     }
 
+    /// Create or touch an active-probe umbrella row for a scheduler/manual invocation.
+    /// Resumed probes keep the original correlation key, so `updated_at_ms` is the retry
+    /// timestamp the watch scheduler uses for backoff.
+    pub async fn record_probe_invocation(
+        &self,
+        key: &IdempotencyKey,
+        kind: OperationKind,
+        actor: Actor,
+        now_ms: u64,
+    ) -> Result<(), ExecError> {
+        let mut dbtx = self.db.begin_transaction().await;
+        ledger_upsert_in(&mut dbtx, key, |existing, seq| match existing {
+            Some(existing) if existing.status.is_terminal() => None,
+            Some(existing) => {
+                let mut next = existing.clone();
+                next.updated_at_ms = now_ms;
+                Some(next)
+            }
+            None => Some(OperationRecord {
+                seq,
+                correlation_key: key.clone(),
+                kind,
+                actor,
+                reason: ReasonCode::ActiveProbe,
+                status: OperationStatus::Started,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                fees: FeeBreakdown::default(),
+                error: None,
+                repaired: false,
+            }),
+        })
+        .await?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(())
+    }
+
     /// Enrich a raw op's ledger row (§9.3): fill op-id/gateway/amount/hash/fees. When the op id
     /// first appears the row advances `Started → Awaiting` (the federation accepted the op — a
     /// distinct, surfaced state); otherwise it is a same-status enrichment (the post-parse
@@ -840,6 +877,35 @@ impl FedimintJournal {
             .filter(|r| before_seq.is_none_or(|b| r.seq < b))
             .take(limit)
             .collect())
+    }
+
+    /// Newest-first time-windowed ledger rows needed by the watch probe scheduler.
+    pub async fn probe_schedule_ledger_rows(
+        &self,
+        now_ms: u64,
+        horizon_ms: u64,
+    ) -> Result<Vec<OperationRecord>, ExecError> {
+        let cutoff_ms = now_ms.saturating_sub(horizon_ms);
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        let mut stream = dbtx
+            .raw_find_by_prefix_sorted_descending(&[TAG_LEDGER_ROW])
+            .await
+            .map_err(db_err)?;
+        let mut rows = Vec::new();
+        while let Some((raw_key, value)) = stream.next().await {
+            match decode_row_result::<OperationRecord>("ledger row", &raw_key, &value) {
+                Ok(rec) => {
+                    if rec.created_at_ms < cutoff_ms && rec.updated_at_ms < cutoff_ms {
+                        continue;
+                    }
+                    rows.push(rec);
+                }
+                Err(e) => {
+                    tracing::warn!(?raw_key, error = ?e, "journal: skipping undecodable ledger row")
+                }
+            }
+        }
+        Ok(rows)
     }
 
     /// Resolve a single ledger row by correlation key OR seq (§9.3, for `show`).
@@ -1656,6 +1722,7 @@ impl FedimintJournal {
     }
 
     /// Store the complete watch-state checkpoint.
+    #[cfg(test)]
     pub async fn put_watch_state(&self, state: &WatchState) -> Result<(), ExecError> {
         let mut dbtx = self.db.begin_transaction().await;
         dbtx.raw_insert_bytes(&watch_state_key(), &encode_row(state)?)
@@ -1699,7 +1766,10 @@ impl FedimintJournal {
         let mut dbtx = self.db.begin_transaction().await;
         let mut state = match dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? {
             Some(bytes) => decode_row_result::<WatchState>("watch state", &raw_key, &bytes)?,
-            None => WatchState::default(),
+            None => WatchState {
+                occurrence: max_tick_occurrence_in(&mut dbtx).await?,
+                ..WatchState::default()
+            },
         };
         state.occurrence = state.occurrence.saturating_add(1);
         dbtx.raw_insert_bytes(&raw_key, &encode_row(&state)?)
@@ -1708,6 +1778,29 @@ impl FedimintJournal {
         dbtx.commit_tx_result().await.map_err(db_err)?;
         Ok(state)
     }
+}
+
+async fn max_tick_occurrence_in(
+    dbtx: &mut impl IDatabaseTransactionOpsCore,
+) -> Result<u64, ExecError> {
+    let mut stream = dbtx
+        .raw_find_by_prefix(&[TAG_LEDGER_ROW])
+        .await
+        .map_err(db_err)?;
+    let mut max_occurrence = 0;
+    while let Some((raw_key, value)) = stream.next().await {
+        let row = match decode_row_result::<OperationRecord>("ledger row", &raw_key, &value) {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!(?raw_key, error = ?e, "journal: skipping undecodable ledger row");
+                continue;
+            }
+        };
+        if let OperationKind::Tick { occurrence, .. } = row.kind {
+            max_occurrence = max_occurrence.max(occurrence.0);
+        }
+    }
+    Ok(max_occurrence)
 }
 
 // --- repair support (spec §10.3) -------------------------------------------------------
@@ -1746,7 +1839,10 @@ fn classify_key(key: &IdempotencyKey) -> KeyClass {
         KeyClass::Join
     } else if s.starts_with("tick:") {
         KeyClass::Tick
-    } else if s.starts_with("discover:") || s.starts_with("autojoin:") || s.starts_with("approve:")
+    } else if s.starts_with("discover:")
+        || s.starts_with("autojoin:")
+        || s.starts_with("approve:")
+        || s.starts_with("watch-probe-skip:")
     {
         KeyClass::Discovery
     } else if s.starts_with("pay:") || s.starts_with("recv:") {

@@ -239,19 +239,30 @@ async fn watch_state_roundtrip_and_default_seed() {
         WatchState::default()
     );
 
-    let state = WatchState {
-        occurrence: 7,
-        last_discover_ms: 1_700_000_000_000,
-        discover_cursor: Some(fed(0x42)),
-        discover_backlog: true,
-        discover_rotation: vec![fed(0x41), fed(0x42), fed(0x43)],
-    };
-    journal
-        .put_watch_state(&state)
+    let updated = journal
+        .put_watch_discovery_state(
+            Some(fed(0x42)),
+            true,
+            Some(1_700_000_000_000),
+            vec![fed(0x41), fed(0x42), fed(0x43)],
+        )
         .await
-        .expect("put watch state");
+        .expect("put discovery state");
 
-    assert_eq!(journal.get_watch_state().await.expect("watch state"), state);
+    assert_eq!(
+        updated,
+        WatchState {
+            occurrence: 0,
+            last_discover_ms: 1_700_000_000_000,
+            discover_cursor: Some(fed(0x42)),
+            discover_backlog: true,
+            discover_rotation: vec![fed(0x41), fed(0x42), fed(0x43)],
+        }
+    );
+    assert_eq!(
+        journal.get_watch_state().await.expect("watch state"),
+        updated
+    );
 }
 
 #[tokio::test]
@@ -263,17 +274,15 @@ async fn watch_state_occurrence_advance_is_monotonic_and_preserves_discovery_fie
         .expect("advance seeded state");
     assert_eq!(first.occurrence, 1);
 
-    let seeded = WatchState {
-        occurrence: 41,
-        last_discover_ms: 10_000,
-        discover_cursor: Some(fed(0x99)),
-        discover_backlog: true,
-        discover_rotation: vec![fed(0x98), fed(0x99)],
-    };
-    journal
-        .put_watch_state(&seeded)
+    let seeded = journal
+        .put_watch_discovery_state(
+            Some(fed(0x99)),
+            true,
+            Some(10_000),
+            vec![fed(0x98), fed(0x99)],
+        )
         .await
-        .expect("put watch state");
+        .expect("put discovery fields");
     let advanced = journal
         .advance_watch_occurrence()
         .await
@@ -282,7 +291,7 @@ async fn watch_state_occurrence_advance_is_monotonic_and_preserves_discovery_fie
     assert_eq!(
         advanced,
         WatchState {
-            occurrence: 42,
+            occurrence: 2,
             ..seeded
         }
     );
@@ -293,19 +302,66 @@ async fn watch_state_occurrence_advance_is_monotonic_and_preserves_discovery_fie
 }
 
 #[tokio::test]
+async fn watch_state_absent_row_seeds_occurrence_from_tick_history() {
+    let db = MemDatabase::new().into_database();
+    let journal = FedimintJournal::new(db.clone());
+    journal
+        .record_tick_started(
+            &IdempotencyKey("tick:7:test".to_owned()),
+            Occurrence(7),
+            1_000,
+        )
+        .await
+        .expect("seed tick row");
+    let app_db = db.with_prefix(vec![0x00]);
+    let mut dbtx = app_db.begin_transaction().await;
+    dbtx.raw_insert_bytes(&tagged_key(0x05, &999_u64.to_be_bytes()), b"not valid json")
+        .await
+        .expect("insert corrupt ledger row");
+    dbtx.commit_tx_result()
+        .await
+        .expect("commit corrupt ledger row");
+
+    let first = journal
+        .advance_watch_occurrence()
+        .await
+        .expect("advance seeded from tick history");
+
+    assert_eq!(first.occurrence, 8);
+    assert_eq!(
+        journal
+            .get_watch_state()
+            .await
+            .expect("persisted watch state"),
+        first
+    );
+}
+
+#[tokio::test]
 async fn watch_state_discovery_update_preserves_advanced_occurrence() {
     let journal = mem_journal();
-    let seeded = WatchState {
-        occurrence: 7,
-        last_discover_ms: 10_000,
-        discover_cursor: Some(fed(0x10)),
-        discover_backlog: false,
-        discover_rotation: vec![fed(0x10), fed(0x20)],
-    };
     journal
-        .put_watch_state(&seeded)
+        .record_tick_started(
+            &IdempotencyKey("tick:6:test".to_owned()),
+            Occurrence(6),
+            1_000,
+        )
         .await
-        .expect("put watch state");
+        .expect("seed tick row");
+    let seeded_occurrence = journal
+        .advance_watch_occurrence()
+        .await
+        .expect("advance seeded from tick history");
+    assert_eq!(seeded_occurrence.occurrence, 7);
+    let seeded = journal
+        .put_watch_discovery_state(
+            Some(fed(0x10)),
+            false,
+            Some(10_000),
+            vec![fed(0x10), fed(0x20)],
+        )
+        .await
+        .expect("put discovery fields");
     let stale_pre_pass_state = journal
         .get_watch_state()
         .await
@@ -325,7 +381,7 @@ async fn watch_state_discovery_update_preserves_advanced_occurrence() {
         .await
         .expect("put discovery state");
 
-    assert_eq!(stale_pre_pass_state.occurrence, 7);
+    assert_eq!(stale_pre_pass_state, seeded);
     assert_eq!(
         updated,
         WatchState {

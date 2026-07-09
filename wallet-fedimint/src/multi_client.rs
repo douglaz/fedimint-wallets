@@ -33,7 +33,7 @@ use fedimint_lnv2_client::{
 use futures::lock::Mutex;
 use futures::{FutureExt, StreamExt};
 use lightning_invoice::Bolt11Invoice;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::str::FromStr as _;
 use std::sync::{Arc, RwLock};
@@ -263,6 +263,44 @@ impl MultiClient {
             .keys()
             .copied()
             .collect()
+    }
+
+    pub fn spawn_expiry_wake_tasks(
+        &self,
+        subscribed: &mut BTreeSet<FederationId>,
+        wake_tx: tokio::sync::mpsc::Sender<(FederationId, Option<u64>)>,
+    ) {
+        let clients = self
+            .clients
+            .read()
+            .expect("client map lock poisoned")
+            .iter()
+            .map(|(id, client)| (*id, client.clone()))
+            .collect::<Vec<_>>();
+        for (id, client) in clients {
+            if !subscribed.insert(id) {
+                continue;
+            }
+            let wake_tx = wake_tx.clone();
+            runtime::spawn("wallet-watch-expiry-wake", async move {
+                let meta_service = client.meta_service().clone();
+                let mut stream = Box::pin(
+                    meta_service
+                        .subscribe_to_field::<u64>(client.db(), "federation_expiry_timestamp"),
+                );
+                if stream.next().await.is_none() {
+                    return;
+                }
+                while let Some(value) = stream.next().await {
+                    let expiry_ms = value
+                        .and_then(|value| value.value)
+                        .map(|secs| secs.saturating_mul(1000));
+                    if wake_tx.send((id, expiry_ms)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
     }
 
     /// Fetch and authenticate a federation config from an invite without joining or writing a

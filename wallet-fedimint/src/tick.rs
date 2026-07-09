@@ -435,6 +435,8 @@ pub struct ScoredFed {
 pub struct TickReport {
     pub decisions: Vec<AllocatorDecision>,
     pub summary: ExecutionSummary,
+    pub spending_fed: Option<FederationId>,
+    pub standby_fed: Option<FederationId>,
 }
 
 /// The result of [`crate::runtime::Runtime::status`]: the per-fed scored view, the

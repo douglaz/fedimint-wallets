@@ -1136,6 +1136,7 @@ async fn repair_soft_fails_stale_discover_and_autojoin_rows_after_1h() {
     let j = FedimintJournal::with_clock(MemDatabase::new().into_database(), clock_base_plus_2h);
     let discover = key("discover:manual:n");
     let autojoin = key("autojoin:n");
+    let probe_skip = key("watch-probe-skip:0202:0101:20000:1700000000000");
     j.record_started(
         &discover,
         OperationKind::Discover {
@@ -1172,10 +1173,27 @@ async fn repair_soft_fails_stale_discover_and_autojoin_rows_after_1h() {
     )
     .await
     .expect("autojoin started");
+    j.record_started(
+        &probe_skip,
+        OperationKind::Probe {
+            fed: fed(2),
+            from: fed(1),
+            amount_msat: Msat(20_000),
+            cost_msat: None,
+        },
+        Actor::Agent {
+            occurrence: Occurrence(7),
+        },
+        ReasonCode::StandingInstruction,
+        BASE,
+        None,
+    )
+    .await
+    .expect("probe skip started");
 
     let summary = j.repair_ledger(&empty_oracle()).await.expect("repair");
-    assert_eq!(summary.repaired, 2);
-    for k in [&discover, &autojoin] {
+    assert_eq!(summary.repaired, 3);
+    for k in [&discover, &autojoin, &probe_skip] {
         let rec = op_of(&j, k).await;
         assert_eq!(rec.status, OperationStatus::Failed);
         assert!(rec.repaired);
