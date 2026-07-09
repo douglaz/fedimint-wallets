@@ -344,6 +344,12 @@ enum Command {
         /// Discovery cadence when there is no backlog.
         #[arg(long)]
         discover_every_secs: Option<u64>,
+        /// Minimum seconds between scheduled money-moving probes of the SAME candidate (the
+        /// invocation-backoff floor that stops a probe hot-loop). Default 1h; lower it to accept a
+        /// tighter scheduled-probe cadence (this is how a live test drives probes without an hourly
+        /// wait). The funding-gate window (--probe-min-span-secs) is a SEPARATE knob.
+        #[arg(long)]
+        probe_retry_backoff_secs: Option<u64>,
         /// Maximum money-moving Agent probe attempts in the trailing week.
         #[arg(long)]
         max_probe_attempts_per_week: Option<u32>,
@@ -1196,6 +1202,7 @@ async fn main() -> anyhow::Result<()> {
             min_interval_secs,
             evacuation_lead_secs,
             discover_every_secs,
+            probe_retry_backoff_secs,
             max_probe_attempts_per_week,
             max_probe_spend_per_week_msat,
             once,
@@ -1218,6 +1225,7 @@ async fn main() -> anyhow::Result<()> {
                 min_interval_secs,
                 evacuation_lead_secs,
                 discover_every_secs,
+                probe_retry_backoff_secs,
                 max_probe_attempts_per_week,
                 max_probe_spend_per_week_msat,
             )?;
@@ -1579,6 +1587,7 @@ fn build_watch_policy(
     min_interval_secs: Option<u64>,
     evacuation_lead_secs: Option<u64>,
     discover_every_secs: Option<u64>,
+    probe_retry_backoff_secs: Option<u64>,
     max_probe_attempts_per_week: Option<u32>,
     max_probe_spend_per_week_msat: Option<u64>,
 ) -> anyhow::Result<WatchPolicy> {
@@ -1596,6 +1605,13 @@ fn build_watch_policy(
     }
     if let Some(secs) = discover_every_secs {
         policy.discover_every_ms = secs.saturating_mul(1000);
+    }
+    if let Some(secs) = probe_retry_backoff_secs {
+        anyhow::ensure!(
+            secs > 0,
+            "--probe-retry-backoff-secs must be greater than zero"
+        );
+        policy.probe_retry_backoff_ms = secs.saturating_mul(1000);
     }
     if max_probe_attempts_per_week.is_some() || max_probe_spend_per_week_msat.is_some() {
         policy.probe_budget = ProbeBudget {
@@ -3742,13 +3758,24 @@ mod tests {
 
     #[test]
     fn build_watch_policy_rejects_zero_loop_intervals() {
-        let err = build_watch_policy(Some(0), None, None, None, None, None)
+        let err = build_watch_policy(Some(0), None, None, None, None, None, None)
             .expect_err("zero base interval must be rejected");
         assert!(err.to_string().contains("--base-interval-secs"), "{err}");
 
-        let err = build_watch_policy(None, Some(0), None, None, None, None)
+        let err = build_watch_policy(None, Some(0), None, None, None, None, None)
             .expect_err("zero min interval must be rejected");
         assert!(err.to_string().contains("--min-interval-secs"), "{err}");
+
+        let err = build_watch_policy(None, None, None, None, Some(0), None, None)
+            .expect_err("zero probe retry backoff must be rejected");
+        assert!(
+            err.to_string().contains("--probe-retry-backoff-secs"),
+            "{err}"
+        );
+
+        let policy = build_watch_policy(None, None, None, None, Some(2), None, None)
+            .expect("a positive probe retry backoff is accepted");
+        assert_eq!(policy.probe_retry_backoff_ms, 2000);
     }
 
     #[test]
