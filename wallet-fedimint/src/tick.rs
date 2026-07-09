@@ -68,6 +68,12 @@ pub struct TickPolicy {
     /// today; carrying it on the policy keeps the snapshot's clock a single, pure input
     /// so any future time-based decision stays testable without a real clock.
     pub now: u64,
+    /// The active-probe policy the §5.1.3 FUNDING GATE evaluates a discovered (`AutoJoined`)
+    /// fed's sustained-pass verdict under — a standing-instruction knob like `per_fed_cap`.
+    /// Default is the conservative `ProbePolicy::default()` (3 successes spanning >= 24h within
+    /// a 7d ttl); an operator may loosen the window (they own the risk tradeoff), which is also
+    /// how a live gate demonstrates the probe-pass -> fund path without a 24h wait.
+    pub probe_gate_policy: wallet_core::ProbePolicy,
 }
 
 impl Default for TickPolicy {
@@ -81,6 +87,7 @@ impl Default for TickPolicy {
             spending_fed: None,
             standby_fed: None,
             now: 0,
+            probe_gate_policy: wallet_core::ProbePolicy::default(),
         }
     }
 }

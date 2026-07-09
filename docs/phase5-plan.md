@@ -713,6 +713,14 @@ cheap proxy is fine for feds the user chose).
   a `Passed` probe.
 - This is the one `if` §5.0.6 prepared. It is PURE (the pinned/auto-joined sets + verdict are
   inputs), so it is golden-tested in `tick.rs` without any I/O.
+- **The gate's probe policy is an operator knob** (found by the live gate): the funding gate
+  evaluates the discovered fed's sustained-pass verdict under a `ProbePolicy` carried on
+  `TickPolicy` (`probe_gate_policy`), defaulting to the conservative `ProbePolicy::default()`
+  (3 successes spanning >= 24h within a 7d ttl). `tick`/`status` expose
+  `--probe-min-span-secs`/`--probe-min-successes`/`--probe-ttl-secs` to tune the sustained
+  WINDOW (amount/fee-cap STRENGTH stay at default so real probes qualify). A conservative
+  operator keeps the 24h window; loosening it is an explicit risk choice — and is how the live
+  gate funds a just-probed fed without a 24h wait.
 - A PIN of an auto-joined-discovered fed does NOT bypass the probe gate (`probe_gate_ok`
   ignores pinning): the agent must not fund an unproven discovered fed, and a pin cannot
   vouch for empirical redeemability the way it vouches for a user's own fed. A user who wants
