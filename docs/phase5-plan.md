@@ -967,7 +967,11 @@ The sleep before the next cycle is `min` over EVERY configured deadline (a large
 - for every joined fed with a corroborated expiry, `expiry - now - evacuation_lead` (default lead
   1h): wake in time to EVACUATE before shutdown, not after;
 - for every `Passed` verdict, `ttl_deadline - probe_refresh_lead - now` — wake to REFRESH BEFORE
-  it lapses, not at the moment it goes stale.
+  it lapses, not at the moment it goes stale;
+- for every non-`Passed` auto-joined fed, its next PROBE-RETRY deadline: `0` (wake at
+  `min_interval`) for a `NeverProbed`/`Insufficient`/`Expired` fed that is due now, or
+  `last_attempt + probe_retry_backoff - now` for a `Failed`/`FailedSinceLastPass` fed in backoff
+  — so a large `base_interval` never sleeps past the moment a fed becomes probe-eligible again.
 Clamped to `[min_interval, base_interval]` (default min 30s) so the loop neither busy-spins nor
 oversleeps a deadline. A fed already INSIDE its evacuation window forces `min_interval` until it
 is evacuated or gone. This is the whole "reactive" behavior — no push subscription.
@@ -975,9 +979,15 @@ is evacuated or gone. This is the whole "reactive" behavior — no push subscrip
 ### 5.2.3 Probe scheduling + the global probe budget
 
 The scheduler is the ONLY unattended probe initiator (a manual `wallet-cli probe` stays
-un-budgeted — the operator owns that spend). It re-probes a fed when the verdict is `Expired`
-or the newest qualifying success is within `probe_refresh_lead` (default 12h) of `ttl_ms`.
-Bounded by a GLOBAL `ProbeBudget` in `WatchPolicy`:
+un-budgeted — the operator owns that spend). A fed is PROBE-DUE when it is an auto-joined
+candidate that is NOT fundably `Passed` and its last attempt (if any) is older than the retry
+backoff, OR it is `Passed` with its newest qualifying success within `probe_refresh_lead`
+(default 12h) of `ttl_ms`. Concretely, by verdict: `NeverProbed` -> probe now (the initial
+probe); `Insufficient` -> keep probing (accumulate the sustained window); `Failed` /
+`FailedSinceLastPass` -> retry only after `probe_retry_backoff` (default 1h) since the last
+attempt (never hammer a persistently-failing fed); `Expired` -> re-probe now; `Passed` ->
+refresh within `probe_refresh_lead` of the TTL. Bounded by a GLOBAL `ProbeBudget` in
+`WatchPolicy` AND the per-fed backoff:
 - `max_probe_attempts_per_week` (default 50): count of `Agent` probe umbrella rows in the
   trailing 7d.
 - `max_probe_spend_per_week_msat` (default 50_000): sum of those rows' `cost_msat` (the
@@ -996,10 +1006,17 @@ hostile Observer must not stall the whole agent):
 - `discover_pass_deadline` (default 60s): a WHOLE-PASS wall-clock budget. `Runtime::discover`
   previews candidates SERIALLY (`authenticate_first_valid` awaits each in turn), so a per-preview
   timeout alone is not enough — `256 x 20s ~ 85 min` would exceed the 1h evacuation lead and
-  starve a tick/evacuation. The pass stops early once this deadline elapses (processing what it
-  reached, DEFERRING the rest to the next pass with a `log` of how many were skipped), keeping
-  the loop's discovery step << `min_interval` and the evacuation lead. Discovery runs LAST in the
-  cycle precisely so it is the step preempted, never a tick or evacuation.
+  starve a tick/evacuation. The pass stops early once this deadline elapses, keeping the loop's
+  discovery step << `min_interval` and the evacuation lead. Discovery runs LAST in the cycle
+  precisely so it is the step preempted, never a tick or evacuation.
+  - **Fairness (a resume CURSOR, not just "defer"):** `Runtime::discover` walks candidates in
+    deterministic sorted order (a `BTreeMap`), so a bare "stop at the deadline, defer the rest"
+    would re-process the SAME slow head every pass and STARVE the tail forever. The scheduler
+    persists a `discover_cursor` (the last fed id it authenticated) in the `0x0a` watch-state and
+    RESUMES the next pass AFTER it — a round-robin over the candidate set that wraps to the start,
+    so every candidate is reached within a bounded number of passes regardless of a slow head.
+    (Fresh NEW-id announcements are still processed first each pass — the cursor only rotates the
+    RE-fetch/re-floor of KNOWN candidates, the work the deadline bounds.)
 - `per_preview_timeout` (default 20s): each authenticated config `preview` is ALSO wrapped in a
   timeout, so one unresponsive guardian set cannot consume the whole pass deadline — a timed-out
   preview is the same TRANSIENT skip as a fetch failure (retry next pass, no row downgrade).
@@ -1011,8 +1028,9 @@ hostile Observer must not stall the whole agent):
 The loop advances a monotonic `occurrence` each cycle so successive ticks re-decide with fresh
 idempotency keys (the tick's stale-occurrence guard otherwise wedges a repeated same-key
 decision, §step-2.3). The occurrence is PERSISTED (a small `0x0a` watch-state row: `{ occurrence,
-last_discover_ms }`) so a restart continues the sequence rather than colliding with a journaled
-decision from the pre-crash cycle. On start: load the watch-state (or seed it), `reconcile`, then
+last_discover_ms, discover_cursor }`) so a restart continues the sequence rather than colliding
+with a journaled decision from the pre-crash cycle, and the discovery round-robin (5.2.4) resumes
+where it left off. On start: load the watch-state (or seed it), `reconcile`, then
 enter the loop. Recovery is the same single-writer sequential story as every other verb — no new
 concurrency.
 
@@ -1076,8 +1094,9 @@ wallet-cli watch [POLICY FLAGS: --spending --standby --per-fed-cap --spending-ta
 
 1. **5.2a — the pure scheduler + watch-state** (no loop, no I/O): `WatchPolicy`/`ProbeBudget`,
    the adaptive-wake `min`, the probe-refresh predicate, the budget predicate, the candidate-cap
-   truncation, the `0x0a` watch-state registry (occurrence + last_discover_ms). Golden +
-   MemDatabase tests. The Observer candidate-cap + per-preview timeout in `discovery.rs`.
+   truncation, the `0x0a` watch-state registry (occurrence + last_discover_ms + discover_cursor). Golden +
+   MemDatabase tests. The Observer candidate-cap + per-preview timeout + the whole-pass deadline
+   with the resume-cursor rotation in `discovery.rs`.
 2. **5.2b — `Runtime::watch_once` + the `wallet-cli watch` loop:** one cycle
    (reconcile→tick→scheduled probes→scheduled discover) wired to the pure scheduler, the
    adaptive sleep, `--once` vs the running loop, SIGINT/SIGTERM checkpoint. Fixture `--once`
