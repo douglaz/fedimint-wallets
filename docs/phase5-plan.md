@@ -968,10 +968,11 @@ The sleep before the next cycle is `min` over EVERY configured deadline (a large
   1h): wake in time to EVACUATE before shutdown, not after;
 - for every `Passed` verdict, `ttl_deadline - probe_refresh_lead - now` — wake to REFRESH BEFORE
   it lapses, not at the moment it goes stale;
-- for every non-`Passed` auto-joined fed, its next PROBE-RETRY deadline: `0` (wake at
-  `min_interval`) for a `NeverProbed`/`Insufficient`/`Expired` fed that is due now, or
-  `last_attempt + probe_retry_backoff - now` for a `Failed`/`FailedSinceLastPass` fed in backoff
-  — so a large `base_interval` never sleeps past the moment a fed becomes probe-eligible again.
+- for every non-`Passed` auto-joined fed, its next PROBE-DUE deadline per 5.2.3: `0` (wake at
+  `min_interval`) only for a `NeverProbed` fed, `last_attempt + probe_build_interval - now` for
+  `Insufficient`/`Expired`, `last_attempt + probe_retry_backoff - now` for `Failed`/
+  `FailedSinceLastPass` — so a large `base_interval` never sleeps past re-eligibility, and the
+  loop never busy-wakes a fed that cannot yet make progress toward its sustained pass.
 Clamped to `[min_interval, base_interval]` (default min 30s) so the loop neither busy-spins nor
 oversleeps a deadline. A fed already INSIDE its evacuation window forces `min_interval` until it
 is evacuated or gone. This is the whole "reactive" behavior — no push subscription.
@@ -982,12 +983,16 @@ The scheduler is the ONLY unattended probe initiator (a manual `wallet-cli probe
 un-budgeted — the operator owns that spend). A fed is PROBE-DUE when it is an auto-joined
 candidate that is NOT fundably `Passed` and its last attempt (if any) is older than the retry
 backoff, OR it is `Passed` with its newest qualifying success within `probe_refresh_lead`
-(default 12h) of `ttl_ms`. Concretely, by verdict: `NeverProbed` -> probe now (the initial
-probe); `Insufficient` -> keep probing (accumulate the sustained window); `Failed` /
-`FailedSinceLastPass` -> retry only after `probe_retry_backoff` (default 1h) since the last
-attempt (never hammer a persistently-failing fed); `Expired` -> re-probe now; `Passed` ->
-refresh within `probe_refresh_lead` of the TTL. Bounded by a GLOBAL `ProbeBudget` in
-`WatchPolicy` AND the per-fed backoff:
+(default 12h) of `ttl_ms`. Concretely, by verdict, the NEXT-DUE time is:
+`NeverProbed` -> now (the one initial probe). `Insufficient` / `Expired` (have evidence, must
+BUILD the sustained window) -> `last_attempt + probe_build_interval`, where
+`probe_build_interval = max(min_interval, min_span_ms / max(1, min_successes - 1))` (default
+`24h / 2 = 12h`): probing every `min_interval` here would be futile AND ruinous — it cannot
+shorten the 24h span requirement and would burn the whole weekly budget in ~25 min, so probes
+are SPACED to accrue `min_successes` successes across `min_span_ms` in the minimum number of
+attempts. `Failed` / `FailedSinceLastPass` -> `last_attempt + probe_retry_backoff` (default 1h;
+never hammer a persistently-failing fed). `Passed` -> refresh within `probe_refresh_lead` of the
+TTL. Bounded by a GLOBAL `ProbeBudget` in `WatchPolicy` AND these per-verdict cadences:
 - `max_probe_attempts_per_week` (default 50): count of `Agent` probe umbrella rows in the
   trailing 7d.
 - `max_probe_spend_per_week_msat` (default 50_000): sum of those rows' `cost_msat` (the
@@ -1015,8 +1020,10 @@ hostile Observer must not stall the whole agent):
     persists a `discover_cursor` (the last fed id it authenticated) in the `0x0a` watch-state and
     RESUMES the next pass AFTER it — a round-robin over the candidate set that wraps to the start,
     so every candidate is reached within a bounded number of passes regardless of a slow head.
-    (Fresh NEW-id announcements are still processed first each pass — the cursor only rotates the
-    RE-fetch/re-floor of KNOWN candidates, the work the deadline bounds.)
+    Fresh NEW-id announcements do NOT jump the queue: they join the SAME bounded rotation (a new
+    id is inserted into the sorted candidate order and reached when the cursor arrives). Otherwise
+    a hostile Observer emitting enough new feds to fill the deadline/cap every pass would starve
+    known candidates' rechecks and deferred auto-joins forever — the exact adversary this bounds.
 - `per_preview_timeout` (default 20s): each authenticated config `preview` is ALSO wrapped in a
   timeout, so one unresponsive guardian set cannot consume the whole pass deadline — a timed-out
   preview is the same TRANSIENT skip as a fetch failure (retry next pass, no row downgrade).
