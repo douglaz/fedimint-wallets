@@ -940,10 +940,14 @@ reads each cycle. (A true meta push-subscription is a later refinement; noted, n
    both proactive rebalancing AND evacuation of a shutdown-flagged fed (§15.1/Phase 3.A), so the
    loop gets evacuation for free — it just has to tick promptly enough (5.2.2). Each cycle uses a
    FRESH occurrence (5.2.5) so the tick's stale-occurrence guard never wedges the loop.
-3. **Schedule probes** (5.2.3): for each candidate/discovered fed whose active-probe verdict is
-   `Expired` or within `probe_refresh_lead` of its TTL, run a `probe` (source = the designated
-   spending fed) — bounded by the global probe budget. Keeping verdicts fresh is what keeps a
-   probe-gated fed fundable across ticks.
+3. **Schedule probes** (5.2.3): for each AUTO-JOINED fed that is NOT yet fundably `Passed`, run a
+   `probe` (source = the designated spending fed) to DRIVE it toward a pass — bounded by the
+   global probe budget AND a per-fed retry backoff. This covers the INITIAL probe (a freshly
+   auto-joined fed is `NeverProbed`), continued probing (`Insufficient` — accumulate the
+   sustained window), RECOVERY (`Failed`/`FailedSinceLastPass` — retry after the backoff, do not
+   hammer), and REFRESH (a `Passed` fed within `probe_refresh_lead` of its TTL, so its verdict
+   never lapses). Without initial/recovery probing the discover -> probe -> fund pipeline would
+   stall on every newly discovered fed.
 4. **Discover** (5.2.4), on a longer sub-cadence (`discover_every`): run `Runtime::discover` over
    the configured sources with bounded auto-join, so the candidate universe refreshes unattended.
 
@@ -955,12 +959,16 @@ error (lock lost, DB corruption) stops the loop.
 
 ### 5.2.2 Adaptive wake — reactive to expiry and TTL
 
-The sleep before the next cycle is `min` over:
+The sleep before the next cycle is `min` over EVERY configured deadline (a larger
+`base_interval` must never sleep PAST a sub-cadence):
 - `base_interval` (default 10 min) — the routine rebalance cadence;
-- for every joined fed with a corroborated expiry, `expiry - now - evacuation_lead` (default
-  lead 1h): wake in time to EVACUATE before the fed shuts down, not after;
-- for every fresh-enough verdict, `ttl_deadline - now` so a re-probe fires before it lapses.
-Clamped to `[min_interval, base_interval]` (default min 30s) so the loop never busy-spins nor
+- `next_discover_due = last_discover_ms + discover_every - now` — so a long base interval cannot
+  skip a scheduled discovery pass;
+- for every joined fed with a corroborated expiry, `expiry - now - evacuation_lead` (default lead
+  1h): wake in time to EVACUATE before shutdown, not after;
+- for every `Passed` verdict, `ttl_deadline - probe_refresh_lead - now` — wake to REFRESH BEFORE
+  it lapses, not at the moment it goes stale.
+Clamped to `[min_interval, base_interval]` (default min 30s) so the loop neither busy-spins nor
 oversleeps a deadline. A fed already INSIDE its evacuation window forces `min_interval` until it
 is evacuated or gone. This is the whole "reactive" behavior — no push subscription.
 
@@ -985,11 +993,18 @@ On the `discover_every` sub-cadence (default 6h), run `Runtime::discover` with t
 `DiscoveryPolicy` (auto-join within its caps). This is where the 5.1b-DEFERRED untrusted-source
 VOLUME/TIME bounds land, because the loop makes them load-bearing (an unattended discover over a
 hostile Observer must not stall the whole agent):
+- `discover_pass_deadline` (default 60s): a WHOLE-PASS wall-clock budget. `Runtime::discover`
+  previews candidates SERIALLY (`authenticate_first_valid` awaits each in turn), so a per-preview
+  timeout alone is not enough — `256 x 20s ~ 85 min` would exceed the 1h evacuation lead and
+  starve a tick/evacuation. The pass stops early once this deadline elapses (processing what it
+  reached, DEFERRING the rest to the next pass with a `log` of how many were skipped), keeping
+  the loop's discovery step << `min_interval` and the evacuation lead. Discovery runs LAST in the
+  cycle precisely so it is the step preempted, never a tick or evacuation.
+- `per_preview_timeout` (default 20s): each authenticated config `preview` is ALSO wrapped in a
+  timeout, so one unresponsive guardian set cannot consume the whole pass deadline — a timed-out
+  preview is the same TRANSIENT skip as a fetch failure (retry next pass, no row downgrade).
 - `max_candidates_per_pass` (default 256): cap the reconciled candidate set per pass; a source
   returning more has the excess DROPPED with a `log` of how many (no silent truncation).
-- `per_preview_timeout` (default 20s): each authenticated config `preview` is wrapped in a
-  timeout, so one slow/unresponsive guardian set cannot hang the cycle — a timed-out preview is
-  the same TRANSIENT skip as a fetch failure (retry next pass, no row downgrade).
 
 ### 5.2.5 Occurrence + crash recovery
 
@@ -1008,13 +1023,16 @@ wallet-cli watch [POLICY FLAGS: --spending --standby --per-fed-cap --spending-ta
                   --standby-target --max-fee --gateway --probe-min-span-secs ...]
                  [--base-interval-secs S] [--min-interval-secs S] [--evacuation-lead-secs S]
                  [--discover-every-secs S] [--source observer|manual] [--observer-url URL]
-                 [--invite <code>]... [--auto-join]
+                 [--invite <code>]... [--auto-join] [--scorer-allow-regtest]
+                 [--max-auto-joins-per-week N] [--lifetime-cap N]
                  [--max-probe-attempts-per-week N] [--max-probe-spend-per-week-msat N]
                  [--once]
 ```
 - Reuses the SAME `PolicyFlags` the `tick`/`status`/`probe` verbs take (designation, targets,
-  gateway, the §5.1.3 gate-policy knobs) — the loop is those verbs on a timer, so it must be
-  configured identically. `--once` runs a SINGLE cycle and exits (the testable/cron-friendly
+  gateway, the §5.1.3 gate-policy knobs) AND the full `discover` knob set
+  (`--scorer-allow-regtest`, `--max-auto-joins-per-week`, `--lifetime-cap`, sources) — the loop
+  is those verbs on a timer, so unattended discovery must be configurable IDENTICALLY to the
+  manual `discover` (and the exit gate needs `--scorer-allow-regtest` to auto-join regtest feds). `--once` runs a SINGLE cycle and exits (the testable/cron-friendly
   unit; the exit gate drives `--once` repeatedly rather than a real sleep).
 - Runs until SIGINT/SIGTERM: on signal, finish the in-flight op, checkpoint the watch-state, and
   exit 0 (a clean shutdown a supervisor can restart). A fatal loop error exits non-zero.
