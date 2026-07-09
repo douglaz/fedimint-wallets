@@ -163,6 +163,51 @@ pub fn probe_verdict(
     ActiveProbeVerdict::Insufficient
 }
 
+/// The qualifying success whose TTL expiry would first demote the current
+/// [`ActiveProbeVerdict::Passed`] verdict, if no newer attempts arrive.
+pub fn probe_pass_expiry_anchor_ms(
+    attempts: &[ProbeAttempt],
+    source: FederationId,
+    now_ms: u64,
+    policy: &ProbePolicy,
+) -> Option<u64> {
+    let mut sorted: Vec<&ProbeAttempt> = attempts.iter().collect();
+    sorted.sort_by_key(|a| a.at_ms);
+
+    let window_start = sorted.partition_point(|a| now_ms.saturating_sub(a.at_ms) > policy.ttl_ms);
+    let window = &sorted[window_start..];
+    if window.is_empty() {
+        return None;
+    }
+
+    let suffix = match window.iter().rposition(|a| !a.ok) {
+        Some(pos) => &window[pos + 1..],
+        None => window,
+    };
+    let qualifying: Vec<&ProbeAttempt> = suffix
+        .iter()
+        .filter(|a| qualifies(a, source, policy))
+        .copied()
+        .collect();
+    if !qualifying_slice_passes(&qualifying, policy) {
+        return None;
+    }
+
+    let mut index = 0;
+    while index < qualifying.len() {
+        let anchor = qualifying[index].at_ms;
+        let mut next = index + 1;
+        while next < qualifying.len() && qualifying[next].at_ms == anchor {
+            next += 1;
+        }
+        if !qualifying_slice_passes(&qualifying[next..], policy) {
+            return Some(anchor);
+        }
+        index = next;
+    }
+    None
+}
+
 /// A success counting toward `Passed` for `source` (§5.0.3's qualifying rule): pair-proven
 /// (same source) and at least as strong as the evaluating policy's money parameters.
 fn qualifies(a: &ProbeAttempt, source: FederationId, policy: &ProbePolicy) -> bool {
@@ -185,10 +230,18 @@ fn prior_qualifying_pass(
 }
 
 fn run_qualifies(run: &[&ProbeAttempt], source: FederationId, policy: &ProbePolicy) -> bool {
-    let qualifying: Vec<&&ProbeAttempt> = run
+    let qualifying: Vec<&ProbeAttempt> = run
         .iter()
         .filter(|a| qualifies(a, source, policy))
+        .copied()
         .collect();
+    qualifying_slice_passes(&qualifying, policy)
+}
+
+fn qualifying_slice_passes<T>(qualifying: &[T], policy: &ProbePolicy) -> bool
+where
+    T: std::ops::Deref<Target = ProbeAttempt>,
+{
     match (qualifying.first(), qualifying.last()) {
         (Some(first), Some(last)) => {
             qualifying.len() as u64 >= u64::from(policy.min_successes)

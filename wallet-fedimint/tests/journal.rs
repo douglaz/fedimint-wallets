@@ -19,7 +19,8 @@ use wallet_core::{
 };
 use wallet_fedimint::{
     CandidateRecord, CandidateState, FederationInfo, FedimintJournal, GatewayUrl, Invoice,
-    MovePhase, MoveRecord, OperationId, Preimage, StructuralOutcome, JOIN_NOOP_REOPEN_NOTE,
+    MovePhase, MoveRecord, OperationId, Preimage, StructuralOutcome, WatchState,
+    JOIN_NOOP_REOPEN_NOTE,
 };
 
 fn mem_journal() -> FedimintJournal {
@@ -224,6 +225,142 @@ async fn set_status_if_cas() {
         .set_status_if(&missing, IntentStatus::Pending, IntentStatus::Executing)
         .await
         .expect("set_status_if"));
+}
+
+#[tokio::test]
+async fn watch_state_roundtrip_and_default_seed() {
+    let journal = mem_journal();
+
+    assert_eq!(
+        journal
+            .get_watch_state()
+            .await
+            .expect("default watch state"),
+        WatchState::default()
+    );
+
+    let state = WatchState {
+        occurrence: 7,
+        last_discover_ms: 1_700_000_000_000,
+        discover_cursor: Some(fed(0x42)),
+        discover_backlog: true,
+        discover_rotation: vec![fed(0x41), fed(0x42), fed(0x43)],
+    };
+    journal
+        .put_watch_state(&state)
+        .await
+        .expect("put watch state");
+
+    assert_eq!(journal.get_watch_state().await.expect("watch state"), state);
+}
+
+#[tokio::test]
+async fn watch_state_occurrence_advance_is_monotonic_and_preserves_discovery_fields() {
+    let journal = mem_journal();
+    let first = journal
+        .advance_watch_occurrence()
+        .await
+        .expect("advance seeded state");
+    assert_eq!(first.occurrence, 1);
+
+    let seeded = WatchState {
+        occurrence: 41,
+        last_discover_ms: 10_000,
+        discover_cursor: Some(fed(0x99)),
+        discover_backlog: true,
+        discover_rotation: vec![fed(0x98), fed(0x99)],
+    };
+    journal
+        .put_watch_state(&seeded)
+        .await
+        .expect("put watch state");
+    let advanced = journal
+        .advance_watch_occurrence()
+        .await
+        .expect("advance watch state");
+
+    assert_eq!(
+        advanced,
+        WatchState {
+            occurrence: 42,
+            ..seeded
+        }
+    );
+    assert_eq!(
+        journal.get_watch_state().await.expect("persisted advance"),
+        advanced
+    );
+}
+
+#[tokio::test]
+async fn watch_state_discovery_update_preserves_advanced_occurrence() {
+    let journal = mem_journal();
+    let seeded = WatchState {
+        occurrence: 7,
+        last_discover_ms: 10_000,
+        discover_cursor: Some(fed(0x10)),
+        discover_backlog: false,
+        discover_rotation: vec![fed(0x10), fed(0x20)],
+    };
+    journal
+        .put_watch_state(&seeded)
+        .await
+        .expect("put watch state");
+    let stale_pre_pass_state = journal
+        .get_watch_state()
+        .await
+        .expect("read watch state before pass");
+
+    journal
+        .advance_watch_occurrence()
+        .await
+        .expect("advance occurrence during pass");
+    let updated = journal
+        .put_watch_discovery_state(
+            Some(fed(0x20)),
+            true,
+            Some(20_000),
+            vec![fed(0x20), fed(0x30)],
+        )
+        .await
+        .expect("put discovery state");
+
+    assert_eq!(stale_pre_pass_state.occurrence, 7);
+    assert_eq!(
+        updated,
+        WatchState {
+            occurrence: 8,
+            last_discover_ms: 20_000,
+            discover_cursor: Some(fed(0x20)),
+            discover_backlog: true,
+            discover_rotation: vec![fed(0x20), fed(0x30)],
+        }
+    );
+    assert_eq!(
+        journal.get_watch_state().await.expect("persisted update"),
+        updated
+    );
+}
+
+#[tokio::test]
+async fn watch_state_fails_closed_on_corrupt_row() {
+    let db = MemDatabase::new().into_database();
+    let journal = FedimintJournal::new(db.clone());
+    let app_db = db.with_prefix(vec![0x00]);
+    let mut dbtx = app_db.begin_transaction().await;
+    dbtx.raw_insert_bytes(&[0x0a], b"not valid json")
+        .await
+        .expect("corrupt watch row");
+    dbtx.commit_tx_result().await.expect("commit corrupt row");
+
+    let err = journal
+        .get_watch_state()
+        .await
+        .expect_err("corrupt watch state fails closed");
+    assert!(
+        matches!(err, ExecError::Permanent(_)),
+        "expected permanent corruption error, got {err:?}"
+    );
 }
 
 /// Test 3: `pending()` returns Pending|Executing only — Done and Failed are excluded.

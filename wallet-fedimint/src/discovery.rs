@@ -12,13 +12,15 @@ use crate::journal::{CandidateRecord, CandidateState, StructuralOutcome};
 use crate::multi_client::{bridge_federation_id, JoinOutcome};
 use async_trait::async_trait;
 use fedimint_core::invite_code::InviteCode;
+use fedimint_core::runtime;
 use fedimint_core::BitcoinHash as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr as _;
+use std::time::{Duration, Instant};
 use wallet_core::{
-    auto_join_budget, score_structural, Actor, BudgetVerdict, DiscoveryPolicy, DiscoverySource,
-    FederationFacts, FederationId, IdempotencyKey, Occurrence, OperationKind, ReasonCode,
-    ScorerPolicy, SourceStatus,
+    auto_join_budget, discover_pass_plan, score_structural, Actor, BudgetVerdict, DiscoveryPolicy,
+    DiscoverySource, FederationFacts, FederationId, IdempotencyKey, Occurrence, OperationKind,
+    ReasonCode, ScorerPolicy, SourceStatus, WatchPolicy,
 };
 
 /// One untrusted candidate announcement (§5.1.0): a federation id + invite + network hint.
@@ -60,6 +62,23 @@ pub trait CandidateSource: Send + Sync {
 pub struct DiscoverReport {
     pub sources: Vec<DiscoverSourceReport>,
     pub auto_join: AutoJoinReport,
+    pub progress: DiscoverPassProgress,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiscoverPassProgress {
+    pub next_cursor: Option<FederationId>,
+    pub wrapped: bool,
+    pub backlog: bool,
+    pub attempted: u32,
+    pub deferred: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BoundedDiscoverReport {
+    pub report: DiscoverReport,
+    pub progress: DiscoverPassProgress,
+    pub next_rotation: Vec<FederationId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +97,26 @@ pub struct AutoJoinReport {
     pub blocked_concurrent: u32,
     pub blocked_weekly: u32,
     pub blocked_lifetime: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AutoJoinOutcome {
+    report: AutoJoinReport,
+    candidate_ids: BTreeSet<FederationId>,
+    completed_window: bool,
+    stopped_for_budget: bool,
+}
+
+pub(crate) enum AutoJoinAttempt {
+    Joined(JoinOutcome),
+    Failed(anyhow::Error),
+    DeadlineElapsed,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DiscoverPassResume<'a> {
+    pub cursor: Option<FederationId>,
+    pub rotation: &'a [FederationId],
 }
 
 #[derive(Clone, Debug)]
@@ -109,7 +148,8 @@ pub(crate) trait DiscoveryBackend {
         invite: InviteCode,
         occurrence: Occurrence,
         now_ms: u64,
-    ) -> anyhow::Result<JoinOutcome>;
+        join_timeout: Duration,
+    ) -> AutoJoinAttempt;
     async fn record_discover(
         &self,
         key: IdempotencyKey,
@@ -132,11 +172,89 @@ struct AuthenticatedAnnouncement {
     preview: PreviewedCandidate,
 }
 
+struct AuthenticationResult {
+    authenticated: Option<AuthenticatedAnnouncement>,
+    attempted_preview: bool,
+}
+
 struct IndexedAnnouncement {
     report_index: usize,
     announcement: CandidateAnnouncement,
 }
 
+struct AutoJoinBounds<'a> {
+    timing: DiscoverTiming,
+    window: Vec<FederationId>,
+    attempted_ids: &'a mut BTreeSet<FederationId>,
+}
+
+#[derive(Clone, Copy)]
+struct DiscoverTiming {
+    pass_started_at: Instant,
+    pass_deadline: Duration,
+    preview_timeout: Duration,
+}
+
+impl DiscoverTiming {
+    fn deadline_elapsed(self) -> bool {
+        self.pass_started_at.elapsed() >= self.pass_deadline
+    }
+
+    fn remaining_budget(self) -> Option<Duration> {
+        let remaining = self
+            .pass_deadline
+            .checked_sub(self.pass_started_at.elapsed())?;
+        if remaining.is_zero() {
+            None
+        } else {
+            Some(remaining)
+        }
+    }
+
+    fn preview_budget(self) -> Option<Duration> {
+        self.remaining_budget()
+            .map(|remaining| remaining.min(self.preview_timeout))
+    }
+
+    fn source_budget(self, sources_remaining: usize) -> Option<Duration> {
+        let remaining = self.remaining_budget()?;
+        let sources_remaining = u32::try_from(sources_remaining.max(1)).unwrap_or(u32::MAX);
+        let fair_share = remaining / sources_remaining;
+        Some(if fair_share.is_zero() {
+            remaining.min(Duration::from_millis(1))
+        } else {
+            fair_share
+        })
+    }
+}
+
+async fn source_candidates_with_deadline(
+    source_adapter: &dyn CandidateSource,
+    source: DiscoverySource,
+    timing: DiscoverTiming,
+    sources_remaining: usize,
+) -> SourceResult {
+    let Some(budget) = timing.source_budget(sources_remaining) else {
+        return SourceResult {
+            candidates: Vec::new(),
+            status: SourceStatus::Failed(
+                "discover pass deadline elapsed before source collection".to_owned(),
+            ),
+        };
+    };
+    match runtime::timeout(budget, source_adapter.candidates()).await {
+        Ok(result) => result,
+        Err(_elapsed) => SourceResult {
+            candidates: Vec::new(),
+            status: SourceStatus::Failed(format!(
+                "{source:?} source collection exceeded {}ms source budget",
+                budget.as_millis()
+            )),
+        },
+    }
+}
+
+#[cfg(test)]
 pub(crate) async fn run_discover_pass(
     sources: &[Box<dyn CandidateSource>],
     policy: &DiscoveryPolicy,
@@ -144,12 +262,72 @@ pub(crate) async fn run_discover_pass(
     now_ms: u64,
     nonce: &str,
 ) -> anyhow::Result<DiscoverReport> {
+    Ok(run_discover_pass_bounded(
+        sources,
+        policy,
+        backend,
+        now_ms,
+        nonce,
+        &WatchPolicy::default(),
+        None,
+    )
+    .await?
+    .report)
+}
+
+#[cfg(test)]
+pub(crate) async fn run_discover_pass_bounded(
+    sources: &[Box<dyn CandidateSource>],
+    policy: &DiscoveryPolicy,
+    backend: &impl DiscoveryBackend,
+    now_ms: u64,
+    nonce: &str,
+    watch_policy: &WatchPolicy,
+    cursor: Option<FederationId>,
+) -> anyhow::Result<BoundedDiscoverReport> {
+    run_discover_pass_bounded_with_rotation(
+        sources,
+        policy,
+        backend,
+        now_ms,
+        nonce,
+        watch_policy,
+        DiscoverPassResume {
+            cursor,
+            rotation: &[],
+        },
+    )
+    .await
+}
+
+pub(crate) async fn run_discover_pass_bounded_with_rotation(
+    sources: &[Box<dyn CandidateSource>],
+    policy: &DiscoveryPolicy,
+    backend: &impl DiscoveryBackend,
+    now_ms: u64,
+    nonce: &str,
+    watch_policy: &WatchPolicy,
+    resume: DiscoverPassResume<'_>,
+) -> anyhow::Result<BoundedDiscoverReport> {
+    let cursor = resume.cursor;
+    let timing = DiscoverTiming {
+        pass_started_at: Instant::now(),
+        pass_deadline: Duration::from_millis(watch_policy.discover_pass_deadline_ms),
+        preview_timeout: Duration::from_millis(watch_policy.per_preview_timeout_ms),
+    };
     let mut reports = Vec::with_capacity(sources.len());
     let mut grouped: BTreeMap<FederationId, Vec<IndexedAnnouncement>> = BTreeMap::new();
 
-    for source in sources {
-        let result = source.candidates().await;
-        let source = source.source();
+    for (source_index, source_adapter) in sources.iter().enumerate() {
+        let source = source_adapter.source();
+        let sources_remaining = sources.len().saturating_sub(source_index);
+        let result = source_candidates_with_deadline(
+            source_adapter.as_ref(),
+            source,
+            timing,
+            sources_remaining,
+        )
+        .await;
         let report_index = reports.len();
         reports.push(DiscoverSourceReport {
             source,
@@ -174,29 +352,94 @@ pub(crate) async fn run_discover_pass(
     recover_agent_joined_candidates(&joined, &joined_invites, backend, now_ms).await?;
     let scorer_policy = discovery_scorer_policy(policy);
     let mut floored_this_pass = BTreeSet::new();
+    let auto_join_candidate_ids = if policy.auto_join {
+        load_auto_join_candidate_ids(backend, &joined).await?
+    } else {
+        BTreeSet::new()
+    };
+    let all_candidate_ids = grouped
+        .keys()
+        .copied()
+        .chain(auto_join_candidate_ids.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let rotation_plan = discover_pass_plan_preserving_rotation(
+        cursor,
+        &all_candidate_ids,
+        resume.rotation,
+        watch_policy.max_candidates_per_pass,
+    );
+    let plan = rotation_plan.plan;
+    let mut progress = DiscoverPassProgress {
+        next_cursor: cursor,
+        wrapped: false,
+        backlog: false,
+        attempted: 0,
+        deferred: 0,
+    };
 
-    for (claimed_id, announcements) in grouped {
+    let planned_wrap = plan.wrapped;
+    let planned_next_cursor = plan.next_cursor;
+    let planned_window = plan.window;
+    let mut structural_attempted_ids = BTreeSet::new();
+    let mut completed_window = true;
+    for claimed_id in planned_window.iter().copied() {
+        if timing.deadline_elapsed() {
+            completed_window = false;
+            break;
+        }
+        let Some(announcements) = grouped.get(&claimed_id) else {
+            continue;
+        };
         let existing = backend.get_candidate(claimed_id).await?;
+        if timing.deadline_elapsed() {
+            completed_window = false;
+            break;
+        }
         if joined.contains(&claimed_id) {
-            if joined_needs_refresh(existing.as_ref(), &announcements) {
-                if let Some(auth) =
-                    authenticate_first_valid(&announcements, backend, &mut reports).await?
-                {
+            if joined_needs_refresh(existing.as_ref(), announcements) {
+                let result =
+                    authenticate_first_valid(announcements, backend, &mut reports, timing).await?;
+                if let Some(auth) = result.authenticated {
+                    mark_attempted(&mut structural_attempted_ids, claimed_id);
                     handle_joined_candidate(auth, existing, backend, now_ms).await?;
+                } else if result.attempted_preview {
+                    mark_attempted(&mut structural_attempted_ids, claimed_id);
+                } else {
+                    completed_window = false;
+                    break;
                 }
+            } else {
+                mark_attempted(&mut structural_attempted_ids, claimed_id);
             }
             continue;
         }
 
-        let needs_fetch = needs_structural_fetch(&announcements, existing.as_ref(), now_ms, policy);
+        let needs_fetch = needs_structural_fetch(announcements, existing.as_ref(), now_ms, policy);
         if !needs_fetch {
+            mark_attempted(&mut structural_attempted_ids, claimed_id);
             continue;
         }
 
-        let Some(auth) = authenticate_first_valid(&announcements, backend, &mut reports).await?
-        else {
-            continue;
-        };
+        let auth =
+            match authenticate_first_valid(announcements, backend, &mut reports, timing).await? {
+                AuthenticationResult {
+                    authenticated: Some(auth),
+                    ..
+                } => auth,
+                AuthenticationResult {
+                    attempted_preview, ..
+                } => {
+                    if attempted_preview {
+                        mark_attempted(&mut structural_attempted_ids, claimed_id);
+                        continue;
+                    }
+                    completed_window = false;
+                    break;
+                }
+            };
+        mark_attempted(&mut structural_attempted_ids, claimed_id);
 
         let verdict = score_structural(&auth.preview.facts, &scorer_policy);
         let structural = if verdict.eligible_to_fund {
@@ -247,24 +490,65 @@ pub(crate) async fn run_discover_pass(
         }
     }
 
+    let mut auto_join_attempted_ids = BTreeSet::new();
     let auto_join = if policy.auto_join {
-        run_auto_join(
-            policy,
-            backend,
-            &scorer_policy,
-            &joined,
-            &floored_this_pass,
-            now_ms,
+        Some(
+            run_auto_join(
+                policy,
+                backend,
+                &scorer_policy,
+                &joined,
+                &floored_this_pass,
+                now_ms,
+                AutoJoinBounds {
+                    timing,
+                    window: planned_window.clone(),
+                    attempted_ids: &mut auto_join_attempted_ids,
+                },
+            )
+            .await?,
         )
-        .await?
     } else {
-        AutoJoinReport::default()
+        None
     };
+    let cursor_attempted_ids = cursor_progress_attempts(
+        &structural_attempted_ids,
+        auto_join.as_ref(),
+        &auto_join_attempted_ids,
+    );
+    finalize_progress_attempts(
+        &mut progress,
+        cursor,
+        planned_next_cursor,
+        &planned_window,
+        &cursor_attempted_ids,
+    );
+    let auto_join_completed = auto_join
+        .as_ref()
+        .is_none_or(|outcome| outcome.completed_window || outcome.stopped_for_budget);
+    progress.wrapped =
+        all_candidate_ids.is_empty() || (completed_window && auto_join_completed && planned_wrap);
+    progress.backlog = !progress.wrapped && !all_candidate_ids.is_empty();
+    progress.deferred = deferred_count(
+        all_candidate_ids.len(),
+        progress.attempted,
+        progress.wrapped,
+    );
+    if progress.deferred > 0 {
+        tracing::info!(
+            deferred = progress.deferred,
+            attempted = progress.attempted,
+            "discover: deferred candidates to a later pass"
+        );
+    }
+    let auto_join_report = auto_join
+        .as_ref()
+        .map_or_else(AutoJoinReport::default, |outcome| outcome.report.clone());
     if let Err(e) = backend
         .record_auto_join(
             IdempotencyKey(format!("autojoin:{nonce}")),
             Occurrence(0),
-            &auto_join,
+            &auto_join_report,
             now_ms,
         )
         .await
@@ -272,10 +556,34 @@ pub(crate) async fn run_discover_pass(
         tracing::warn!(error = ?e, "discover: recording auto-join ledger row failed");
     }
 
-    Ok(DiscoverReport {
-        sources: reports,
-        auto_join,
+    Ok(BoundedDiscoverReport {
+        report: DiscoverReport {
+            sources: reports,
+            auto_join: auto_join_report,
+            progress,
+        },
+        progress,
+        next_rotation: if progress.backlog {
+            rotation_plan.rotation
+        } else {
+            Vec::new()
+        },
     })
+}
+
+async fn load_auto_join_candidate_ids(
+    backend: &impl DiscoveryBackend,
+    joined: &BTreeSet<FederationId>,
+) -> anyhow::Result<BTreeSet<FederationId>> {
+    Ok(backend
+        .list_candidates()
+        .await?
+        .into_iter()
+        .filter_map(|(_, record)| {
+            (record.state == CandidateState::Discovered && !joined.contains(&record.id))
+                .then_some(record.id)
+        })
+        .collect())
 }
 
 fn needs_structural_fetch(
@@ -300,9 +608,9 @@ fn needs_structural_fetch(
     // fetch every pass by advertising ever-changing alternate invites (the untrusted-source
     // volume/time class deferred to 5.2). A rotated invite is adopted within <= the backoff
     // window, and auto-join re-validates the invite with a fresh fetch regardless, so a truly
-    // dead stored invite self-corrects. (Codex adversarial P2 flagged the coexistence case as
-    // a bug against the spec's literal wording; rejected with this evidence and the spec's
-    // §5.1.2 step 1 refined to match — the strict-backoff behavior is the more robust design.)
+    // dead stored invite self-corrects. A prior review flagged the coexistence case as a bug
+    // against the spec's literal wording; rejected with this evidence and the spec's 5.1.2
+    // step 1 refined to match - the strict-backoff behavior is the more robust design.
     let stored_invite_announced = announcements
         .iter()
         .any(|indexed| indexed.announcement.invite == existing.invite);
@@ -313,26 +621,40 @@ async fn authenticate_first_valid(
     announcements: &[IndexedAnnouncement],
     backend: &impl DiscoveryBackend,
     reports: &mut [DiscoverSourceReport],
-) -> anyhow::Result<Option<AuthenticatedAnnouncement>> {
+    timing: DiscoverTiming,
+) -> anyhow::Result<AuthenticationResult> {
     let mut tried = Vec::<InviteCode>::new();
+    let mut attempted_preview = false;
     for indexed in announcements {
         let announcement = &indexed.announcement;
         if tried.contains(&announcement.invite) {
             continue;
         }
         tried.push(announcement.invite.clone());
-        let preview = match backend.preview(&announcement.invite).await {
-            Ok(preview) => preview,
-            Err(e) => {
-                tracing::warn!(
-                    source = ?announcement.source,
-                    federation = %announcement.claimed_id.to_hex(),
-                    error = ?e,
-                    "discover: config preview failed; leaving candidate unchanged"
-                );
-                continue;
-            }
+        let Some(preview_timeout) = timing.preview_budget() else {
+            tracing::info!(
+                federation = %announcement.claimed_id.to_hex(),
+                "discover: stopped candidate previews at pass deadline"
+            );
+            return Ok(AuthenticationResult {
+                authenticated: None,
+                attempted_preview,
+            });
         };
+        attempted_preview = true;
+        let preview =
+            match preview_with_timeout(backend, &announcement.invite, preview_timeout).await {
+                Ok(preview) => preview,
+                Err(e) => {
+                    tracing::warn!(
+                        source = ?announcement.source,
+                        federation = %announcement.claimed_id.to_hex(),
+                        error = ?e,
+                        "discover: config preview failed; leaving candidate unchanged"
+                    );
+                    continue;
+                }
+            };
         let invite_id = bridge_federation_id(announcement.invite.federation_id());
         if announcement.claimed_id != invite_id || preview.id != invite_id {
             increment_report(reports, indexed.report_index, |r| {
@@ -347,13 +669,183 @@ async fn authenticate_first_valid(
             );
             continue;
         }
-        return Ok(Some(AuthenticatedAnnouncement {
-            report_index: indexed.report_index,
-            announcement: announcement.clone(),
-            preview,
-        }));
+        return Ok(AuthenticationResult {
+            authenticated: Some(AuthenticatedAnnouncement {
+                report_index: indexed.report_index,
+                announcement: announcement.clone(),
+                preview,
+            }),
+            attempted_preview,
+        });
     }
-    Ok(None)
+    Ok(AuthenticationResult {
+        authenticated: None,
+        attempted_preview,
+    })
+}
+
+async fn preview_with_timeout(
+    backend: &impl DiscoveryBackend,
+    invite: &InviteCode,
+    preview_timeout: Duration,
+) -> anyhow::Result<PreviewedCandidate> {
+    match runtime::timeout(preview_timeout, backend.preview(invite)).await {
+        Ok(result) => result,
+        Err(_elapsed) => anyhow::bail!(
+            "config preview exceeded {}ms timeout",
+            preview_timeout.as_millis()
+        ),
+    }
+}
+
+fn deferred_count(total_candidates: usize, attempted: u32, wrapped: bool) -> u32 {
+    if total_candidates == 0 || wrapped {
+        return 0;
+    }
+    let attempted = usize::try_from(attempted).unwrap_or(usize::MAX);
+    count_saturating_u32(total_candidates.saturating_sub(attempted))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RotationPlan {
+    plan: wallet_core::DiscoverPassPlan,
+    rotation: Vec<FederationId>,
+}
+
+fn discover_pass_plan_preserving_rotation(
+    cursor: Option<FederationId>,
+    all_candidate_ids_sorted: &[FederationId],
+    previous_rotation: &[FederationId],
+    max_candidates_per_pass: usize,
+) -> RotationPlan {
+    if previous_rotation.is_empty() {
+        return RotationPlan {
+            plan: discover_pass_plan(cursor, all_candidate_ids_sorted, max_candidates_per_pass),
+            rotation: all_candidate_ids_sorted.to_vec(),
+        };
+    }
+
+    let current_ids = all_candidate_ids_sorted
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
+    let mut rotation = Vec::new();
+    for id in previous_rotation {
+        if seen.insert(*id) && (current_ids.contains(id) || cursor == Some(*id)) {
+            rotation.push(*id);
+        }
+    }
+    for id in all_candidate_ids_sorted {
+        if seen.insert(*id) {
+            rotation.push(*id);
+        }
+    }
+
+    let cursor_in_rotation = cursor
+        .map(|cursor| rotation.contains(&cursor))
+        .unwrap_or(true);
+    if rotation.is_empty() || !cursor_in_rotation {
+        return RotationPlan {
+            plan: discover_pass_plan(cursor, all_candidate_ids_sorted, max_candidates_per_pass),
+            rotation: all_candidate_ids_sorted.to_vec(),
+        };
+    }
+
+    let plan =
+        discover_pass_plan_from_rotation(cursor, &rotation, &current_ids, max_candidates_per_pass);
+    RotationPlan { plan, rotation }
+}
+
+fn discover_pass_plan_from_rotation(
+    cursor: Option<FederationId>,
+    rotation: &[FederationId],
+    current_ids: &BTreeSet<FederationId>,
+    max_candidates_per_pass: usize,
+) -> wallet_core::DiscoverPassPlan {
+    if current_ids.is_empty() {
+        return wallet_core::DiscoverPassPlan {
+            window: Vec::new(),
+            next_cursor: None,
+            wrapped: true,
+        };
+    }
+    if max_candidates_per_pass == 0 {
+        return wallet_core::DiscoverPassPlan {
+            window: Vec::new(),
+            next_cursor: cursor,
+            wrapped: false,
+        };
+    }
+
+    let cursor_index = cursor.and_then(|cursor| rotation.iter().position(|id| *id == cursor));
+    let start = cursor_index.map_or(0, |index| (index + 1) % rotation.len());
+    let take = max_candidates_per_pass.min(current_ids.len());
+    let mut window = Vec::with_capacity(take);
+    let mut crossed_rotation_end = false;
+    let mut index = start;
+
+    for _ in 0..rotation.len() {
+        if cursor_index.is_some() && start != 0 && index == rotation.len() - 1 {
+            crossed_rotation_end = true;
+        }
+        let id = rotation[index];
+        if current_ids.contains(&id) {
+            window.push(id);
+            if window.len() == take {
+                break;
+            }
+        }
+        index = (index + 1) % rotation.len();
+    }
+
+    wallet_core::DiscoverPassPlan {
+        next_cursor: window.last().copied(),
+        wrapped: window.len() == current_ids.len() || crossed_rotation_end,
+        window,
+    }
+}
+
+fn mark_attempted(attempted: &mut BTreeSet<FederationId>, candidate: FederationId) {
+    attempted.insert(candidate);
+}
+
+fn cursor_progress_attempts(
+    structural_attempted: &BTreeSet<FederationId>,
+    auto_join: Option<&AutoJoinOutcome>,
+    auto_join_attempted: &BTreeSet<FederationId>,
+) -> BTreeSet<FederationId> {
+    let mut attempted = structural_attempted.clone();
+    if let Some(outcome) = auto_join {
+        for candidate in &outcome.candidate_ids {
+            if !auto_join_attempted.contains(candidate) {
+                attempted.remove(candidate);
+            }
+        }
+        attempted.extend(auto_join_attempted.iter().copied());
+    }
+    attempted
+}
+
+fn finalize_progress_attempts(
+    progress: &mut DiscoverPassProgress,
+    cursor: Option<FederationId>,
+    empty_next_cursor: Option<FederationId>,
+    planned_window: &[FederationId],
+    attempted: &BTreeSet<FederationId>,
+) {
+    if planned_window.is_empty() {
+        progress.next_cursor = empty_next_cursor;
+        progress.attempted = 0;
+        return;
+    }
+    progress.next_cursor = planned_window
+        .iter()
+        .copied()
+        .take_while(|id| attempted.contains(id))
+        .last()
+        .or(cursor);
+    progress.attempted = count_saturating_u32(attempted.len());
 }
 
 async fn recover_agent_joined_candidates(
@@ -492,26 +984,52 @@ async fn run_auto_join(
     joined: &BTreeSet<FederationId>,
     floored_this_pass: &BTreeSet<FederationId>,
     now_ms: u64,
-) -> anyhow::Result<AutoJoinReport> {
+    bounds: AutoJoinBounds<'_>,
+) -> anyhow::Result<AutoJoinOutcome> {
     // Only NON-joined `Discovered` rows are auto-join candidates. A fed already in the joined
     // registry that still carries a `Discovered` row is user/restored-owned and must not be
     // re-joined as an Agent: that would record a no-op Agent join and push it behind the probe
     // gate + concurrent cap.
-    let mut candidates: Vec<CandidateRecord> = backend
+    let candidates: BTreeMap<FederationId, CandidateRecord> = backend
         .list_candidates()
         .await?
         .into_iter()
-        .map(|(_, record)| record)
-        .filter(|record| record.state == CandidateState::Discovered && !joined.contains(&record.id))
+        .filter(|(_, record)| {
+            record.state == CandidateState::Discovered && !joined.contains(&record.id)
+        })
+        .map(|(_, record)| (record.id, record))
         .collect();
-    candidates.sort_by_key(|record| (record.discovered_at_ms, record.id));
 
     let mut report = AutoJoinReport::default();
+    let candidate_ids = candidates.keys().copied().collect::<BTreeSet<_>>();
     if candidates.is_empty() {
-        return Ok(report);
+        return Ok(AutoJoinOutcome {
+            report,
+            candidate_ids,
+            completed_window: true,
+            stopped_for_budget: false,
+        });
     }
+    let AutoJoinBounds {
+        timing,
+        window,
+        attempted_ids,
+    } = bounds;
+    let mut completed_window = true;
+    let mut stopped_for_budget = false;
     let mut counts = backend.auto_join_counts(now_ms).await?;
-    for mut candidate in candidates {
+    for id in window {
+        if timing.deadline_elapsed() {
+            completed_window = false;
+            tracing::info!(
+                considered = report.considered,
+                "discover: auto-join stopped at pass deadline"
+            );
+            break;
+        }
+        let Some(mut candidate) = candidates.get(&id).cloned() else {
+            continue;
+        };
         report.considered = report.considered.saturating_add(1);
 
         match auto_join_budget(
@@ -522,21 +1040,35 @@ async fn run_auto_join(
         ) {
             BudgetVerdict::Allowed => {}
             BudgetVerdict::BlockedConcurrent => {
+                mark_attempted(attempted_ids, candidate.id);
                 report.blocked_concurrent = report.blocked_concurrent.saturating_add(1);
                 continue;
             }
             BudgetVerdict::BlockedWeekly => {
+                mark_attempted(attempted_ids, candidate.id);
                 report.blocked_weekly = report.blocked_weekly.saturating_add(1);
+                stopped_for_budget = true;
                 break;
             }
             BudgetVerdict::BlockedLifetime => {
+                mark_attempted(attempted_ids, candidate.id);
                 report.blocked_lifetime = report.blocked_lifetime.saturating_add(1);
+                stopped_for_budget = true;
                 break;
             }
         }
 
         if !floored_this_pass.contains(&candidate.id) {
-            match backend.preview(&candidate.invite).await {
+            let Some(preview_timeout) = timing.preview_budget() else {
+                completed_window = false;
+                tracing::info!(
+                    considered = report.considered,
+                    "discover: auto-join stopped at pass deadline"
+                );
+                break;
+            };
+            mark_attempted(attempted_ids, candidate.id);
+            match preview_with_timeout(backend, &candidate.invite, preview_timeout).await {
                 Ok(preview) => {
                     let invite_id = bridge_federation_id(candidate.invite.federation_id());
                     if preview.id != candidate.id || preview.id != invite_id {
@@ -571,18 +1103,12 @@ async fn run_auto_join(
                     continue;
                 }
             }
+        } else {
+            mark_attempted(attempted_ids, candidate.id);
         }
 
-        match backend
-            .join_as_agent(
-                candidate.id,
-                candidate.invite.clone(),
-                Occurrence(0),
-                now_ms,
-            )
-            .await
-        {
-            Ok(outcome) => {
+        match join_as_agent_with_timeout(backend, &candidate, now_ms, timing).await {
+            AutoJoinAttempt::Joined(outcome) => {
                 if outcome.newly_joined {
                     candidate.state = CandidateState::AutoJoined;
                     candidate.updated_at_ms = now_ms;
@@ -598,14 +1124,48 @@ async fn run_auto_join(
                     );
                 }
             }
-            Err(e) => tracing::warn!(
+            AutoJoinAttempt::Failed(e) => tracing::warn!(
                 federation = %candidate.id.to_hex(),
                 error = ?e,
                 "discover: auto-join failed; leaving candidate discovered"
             ),
+            AutoJoinAttempt::DeadlineElapsed => {
+                completed_window = false;
+                tracing::info!(
+                    considered = report.considered,
+                    federation = %candidate.id.to_hex(),
+                    "discover: auto-join stopped at pass deadline"
+                );
+                break;
+            }
         }
     }
-    Ok(report)
+    Ok(AutoJoinOutcome {
+        report,
+        candidate_ids,
+        completed_window,
+        stopped_for_budget,
+    })
+}
+
+async fn join_as_agent_with_timeout(
+    backend: &impl DiscoveryBackend,
+    candidate: &CandidateRecord,
+    now_ms: u64,
+    timing: DiscoverTiming,
+) -> AutoJoinAttempt {
+    let Some(join_timeout) = timing.remaining_budget() else {
+        return AutoJoinAttempt::DeadlineElapsed;
+    };
+    backend
+        .join_as_agent(
+            candidate.id,
+            candidate.invite.clone(),
+            Occurrence(0),
+            now_ms,
+            join_timeout,
+        )
+        .await
 }
 
 fn discovery_scorer_policy(policy: &DiscoveryPolicy) -> ScorerPolicy {
@@ -900,7 +1460,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::str::FromStr;
     use std::sync::Mutex;
-    use wallet_core::Module;
+    use std::time::Duration;
+    use wallet_core::{Module, WatchPolicy};
 
     fn test_invite() -> InviteCode {
         InviteCode::from_str(
@@ -970,6 +1531,13 @@ mod tests {
     enum PreviewReply {
         Ok(PreviewedCandidate),
         Fail(&'static str),
+        Pending,
+        SleepThenOk(Duration, PreviewedCandidate),
+    }
+
+    #[derive(Clone)]
+    enum JoinReply {
+        Pending,
     }
 
     struct FakeSource {
@@ -991,13 +1559,36 @@ mod tests {
         }
     }
 
+    struct SlowSource {
+        source: DiscoverySource,
+        delay: Duration,
+        result: SourceResult,
+    }
+
+    #[async_trait]
+    impl CandidateSource for SlowSource {
+        fn source(&self) -> DiscoverySource {
+            self.source
+        }
+
+        async fn candidates(&self) -> SourceResult {
+            fedimint_core::runtime::sleep(self.delay).await;
+            SourceResult {
+                candidates: self.result.candidates.clone(),
+                status: self.result.status.clone(),
+            }
+        }
+    }
+
     #[derive(Default)]
     struct FakeBackend {
         joined: Mutex<BTreeSet<FederationId>>,
         joined_invites: Mutex<BTreeMap<FederationId, InviteCode>>,
         candidates: Mutex<BTreeMap<FederationId, CandidateRecord>>,
+        get_candidate_delay: Mutex<Option<Duration>>,
         previews: Mutex<BTreeMap<String, PreviewReply>>,
         previewed: Mutex<Vec<String>>,
+        join_replies: Mutex<BTreeMap<FederationId, JoinReply>>,
         counts: Mutex<AutoJoinCounts>,
         count_calls: Mutex<u32>,
         agent_created: Mutex<BTreeSet<FederationId>>,
@@ -1015,11 +1606,25 @@ mod tests {
                 .insert(invite.to_string(), reply);
         }
 
+        fn with_join(&self, id: FederationId, reply: JoinReply) {
+            self.join_replies
+                .lock()
+                .expect("join replies lock")
+                .insert(id, reply);
+        }
+
         fn put_existing(&self, record: CandidateRecord) {
             self.candidates
                 .lock()
                 .expect("candidates lock")
                 .insert(record.id, record);
+        }
+
+        fn delay_get_candidate(&self, delay: Duration) {
+            *self
+                .get_candidate_delay
+                .lock()
+                .expect("get-candidate delay lock") = Some(delay);
         }
 
         fn put_joined(&self, id: FederationId, invite: InviteCode) {
@@ -1058,6 +1663,13 @@ mod tests {
         }
 
         async fn get_candidate(&self, id: FederationId) -> anyhow::Result<Option<CandidateRecord>> {
+            let delay = *self
+                .get_candidate_delay
+                .lock()
+                .expect("get-candidate delay lock");
+            if let Some(delay) = delay {
+                fedimint_core::runtime::sleep(delay).await;
+            }
             Ok(self
                 .candidates
                 .lock()
@@ -1097,15 +1709,21 @@ mod tests {
                 .lock()
                 .expect("previewed lock")
                 .push(invite.to_string());
-            match self
-                .previews
-                .lock()
-                .expect("previews lock")
-                .get(&invite.to_string())
-                .cloned()
-            {
+            let reply = {
+                self.previews
+                    .lock()
+                    .expect("previews lock")
+                    .get(&invite.to_string())
+                    .cloned()
+            };
+            match reply {
                 Some(PreviewReply::Ok(preview)) => Ok(preview),
                 Some(PreviewReply::Fail(reason)) => anyhow::bail!("{reason}"),
+                Some(PreviewReply::Pending) => std::future::pending().await,
+                Some(PreviewReply::SleepThenOk(duration, preview)) => {
+                    fedimint_core::runtime::sleep(duration).await;
+                    Ok(preview)
+                }
                 None => anyhow::bail!("no preview fixture"),
             }
         }
@@ -1122,12 +1740,25 @@ mod tests {
             _invite: InviteCode,
             _occurrence: Occurrence,
             _now_ms: u64,
-        ) -> anyhow::Result<JoinOutcome> {
+            join_timeout: Duration,
+        ) -> AutoJoinAttempt {
             self.joins.lock().expect("joins lock").push(id);
-            Ok(JoinOutcome {
-                id,
-                newly_joined: true,
-            })
+            let reply = self
+                .join_replies
+                .lock()
+                .expect("join replies lock")
+                .get(&id)
+                .cloned();
+            match reply {
+                Some(JoinReply::Pending) => {
+                    let _ = runtime::timeout(join_timeout, std::future::pending::<()>()).await;
+                    AutoJoinAttempt::DeadlineElapsed
+                }
+                None => AutoJoinAttempt::Joined(JoinOutcome {
+                    id,
+                    newly_joined: true,
+                }),
+            }
         }
 
         async fn record_discover(
@@ -1790,14 +2421,17 @@ mod tests {
             },
         })];
 
-        let report = run_discover_pass(
+        let outcome = run_discover_pass_bounded(
             &sources,
             &DiscoveryPolicy::default(),
             &backend,
             10_000,
             "0000000000000007",
+            &WatchPolicy::default(),
+            None,
         )
         .await?;
+        let report = &outcome.report;
 
         assert_eq!(report.sources[0].source, DiscoverySource::Observer);
         assert_eq!(
@@ -1810,6 +2444,244 @@ mod tests {
             .lock()
             .expect("candidates lock")
             .is_empty());
+        assert!(outcome.progress.wrapped);
+        assert!(!outcome.progress.backlog);
+        assert_eq!(outcome.progress.next_cursor, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_pass_resets_stale_cursor_before_later_lower_ids() -> anyhow::Result<()> {
+        let backend = FakeBackend::default();
+        let empty_sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(FakeSource {
+            source: DiscoverySource::Observer,
+            result: SourceResult {
+                candidates: Vec::new(),
+                status: SourceStatus::Ok,
+            },
+        })];
+        let watch = WatchPolicy {
+            max_candidates_per_pass: 2,
+            ..WatchPolicy::default()
+        };
+
+        let empty = run_discover_pass_bounded(
+            &empty_sources,
+            &DiscoveryPolicy::default(),
+            &backend,
+            10_250,
+            "0000000000000008",
+            &watch,
+            Some(fed(0x15)),
+        )
+        .await?;
+
+        assert!(empty.progress.wrapped);
+        assert!(!empty.progress.backlog);
+        assert_eq!(empty.progress.next_cursor, None);
+
+        let ids = [fed(0x10), fed(0x11), fed(0x20), fed(0x21)];
+        let invites = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| invite_for(*id, &format!("after-empty-{index}")))
+            .collect::<Vec<_>>();
+        for (id, invite) in ids.iter().zip(invites.iter()) {
+            backend.with_preview(
+                invite,
+                PreviewReply::Ok(PreviewedCandidate {
+                    id: *id,
+                    facts: good_facts(*id),
+                }),
+            );
+        }
+        let later_sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(FakeSource {
+            source: DiscoverySource::Observer,
+            result: SourceResult {
+                candidates: ids
+                    .iter()
+                    .zip(invites.iter())
+                    .map(|(id, invite)| {
+                        announcement(*id, invite.clone(), DiscoverySource::Observer)
+                    })
+                    .collect(),
+                status: SourceStatus::Ok,
+            },
+        })];
+
+        let later = run_discover_pass_bounded(
+            &later_sources,
+            &DiscoveryPolicy::default(),
+            &backend,
+            10_500,
+            "0000000000000009",
+            &watch,
+            empty.progress.next_cursor,
+        )
+        .await?;
+
+        assert_eq!(later.progress.attempted, 2);
+        assert_eq!(later.progress.next_cursor, Some(ids[1]));
+        assert!(!later.progress.wrapped);
+        assert!(later.progress.backlog);
+        assert_eq!(
+            backend.previewed.lock().expect("previewed lock").as_slice(),
+            [invites[0].to_string(), invites[1].to_string()]
+        );
+        assert!(backend.get_record(ids[0]).is_some());
+        assert!(backend.get_record(ids[1]).is_some());
+        assert!(backend.get_record(ids[2]).is_none());
+        assert!(backend.get_record(ids[3]).is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zero_sized_candidate_window_preserves_cursor() -> anyhow::Result<()> {
+        let backend = FakeBackend::default();
+        let cursor = fed(0x15);
+        let id = fed(0x16);
+        let invite = invite_for(id, "paused-window");
+        let sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(FakeSource {
+            source: DiscoverySource::Observer,
+            result: SourceResult {
+                candidates: vec![announcement(id, invite, DiscoverySource::Observer)],
+                status: SourceStatus::Ok,
+            },
+        })];
+        let watch = WatchPolicy {
+            max_candidates_per_pass: 0,
+            ..WatchPolicy::default()
+        };
+
+        let outcome = run_discover_pass_bounded(
+            &sources,
+            &DiscoveryPolicy::default(),
+            &backend,
+            10_375,
+            "000000000000000a",
+            &watch,
+            Some(cursor),
+        )
+        .await?;
+
+        assert_eq!(outcome.progress.attempted, 0);
+        assert_eq!(outcome.progress.next_cursor, Some(cursor));
+        assert!(!outcome.progress.wrapped);
+        assert!(outcome.progress.backlog);
+        assert_eq!(outcome.progress.deferred, 1);
+        assert!(backend.previewed.lock().expect("previewed lock").is_empty());
+        assert!(backend.get_record(id).is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_collection_uses_the_whole_pass_deadline() -> anyhow::Result<()> {
+        let backend = FakeBackend::default();
+        let id = fed(0x08);
+        let invite = invite_for(id, "slow-source");
+        let sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(SlowSource {
+            source: DiscoverySource::Observer,
+            delay: Duration::from_millis(50),
+            result: SourceResult {
+                candidates: vec![announcement(id, invite.clone(), DiscoverySource::Observer)],
+                status: SourceStatus::Ok,
+            },
+        })];
+        let watch = WatchPolicy {
+            discover_pass_deadline_ms: 1,
+            per_preview_timeout_ms: 100,
+            ..WatchPolicy::default()
+        };
+
+        let outcome = run_discover_pass_bounded(
+            &sources,
+            &DiscoveryPolicy::default(),
+            &backend,
+            10_500,
+            "0000000000000008",
+            &watch,
+            None,
+        )
+        .await?;
+
+        match &outcome.report.sources[0].status {
+            SourceStatus::Failed(reason) => {
+                assert!(reason.contains("source collection exceeded"), "{reason}")
+            }
+            status => panic!("expected source timeout, got {status:?}"),
+        }
+        assert_eq!(outcome.report.sources[0].found, 0);
+        assert!(outcome.progress.wrapped);
+        assert!(!outcome.progress.backlog);
+        assert_eq!(outcome.progress.next_cursor, None);
+        assert!(backend.get_record(id).is_none());
+        assert!(backend.previewed.lock().expect("previewed lock").is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn slow_source_collection_does_not_starve_later_sources() -> anyhow::Result<()> {
+        let backend = FakeBackend::default();
+        let id = fed(0x09);
+        let invite = invite_for(id, "later-source");
+        backend.with_preview(
+            &invite,
+            PreviewReply::Ok(PreviewedCandidate {
+                id,
+                facts: good_facts(id),
+            }),
+        );
+        let sources: Vec<Box<dyn CandidateSource>> = vec![
+            Box::new(SlowSource {
+                source: DiscoverySource::Observer,
+                delay: Duration::from_millis(100),
+                result: SourceResult {
+                    candidates: Vec::new(),
+                    status: SourceStatus::Ok,
+                },
+            }),
+            Box::new(FakeSource {
+                source: DiscoverySource::Manual,
+                result: SourceResult {
+                    candidates: vec![announcement(id, invite.clone(), DiscoverySource::Manual)],
+                    status: SourceStatus::Ok,
+                },
+            }),
+        ];
+        let watch = WatchPolicy {
+            discover_pass_deadline_ms: 80,
+            per_preview_timeout_ms: 20,
+            ..WatchPolicy::default()
+        };
+
+        let outcome = run_discover_pass_bounded(
+            &sources,
+            &DiscoveryPolicy::default(),
+            &backend,
+            10_750,
+            "0000000000000009",
+            &watch,
+            None,
+        )
+        .await?;
+
+        match &outcome.report.sources[0].status {
+            SourceStatus::Failed(reason) => {
+                assert!(reason.contains("source collection exceeded"), "{reason}")
+            }
+            status => panic!("expected source timeout, got {status:?}"),
+        }
+        assert_eq!(outcome.report.sources[0].found, 0);
+        assert_eq!(outcome.report.sources[1].status, SourceStatus::Ok);
+        assert_eq!(outcome.report.sources[1].found, 1);
+        assert_eq!(outcome.progress.attempted, 1);
+        assert!(outcome.progress.wrapped);
+        assert!(!outcome.progress.backlog);
+        assert!(backend.get_record(id).is_some());
+        assert_eq!(
+            backend.previewed.lock().expect("previewed lock").as_slice(),
+            [invite.to_string()]
+        );
         Ok(())
     }
 
@@ -1971,6 +2843,1069 @@ mod tests {
         let recovered = backend.get_record(id).expect("candidate recovered");
         assert_eq!(recovered.state, CandidateState::AutoJoined);
         assert_eq!(recovered.structural, StructuralOutcome::Passed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn candidate_cap_defers_overflow_without_dropping_it() -> anyhow::Result<()> {
+        let backend = FakeBackend::default();
+        let ids = [fed(0x51), fed(0x52), fed(0x53), fed(0x54)];
+        let invites = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| invite_for(*id, &format!("cap-{i}")))
+            .collect::<Vec<_>>();
+        for (id, invite) in ids.iter().zip(invites.iter()) {
+            backend.with_preview(
+                invite,
+                PreviewReply::Ok(PreviewedCandidate {
+                    id: *id,
+                    facts: good_facts(*id),
+                }),
+            );
+        }
+        let source = Box::new(FakeSource {
+            source: DiscoverySource::Observer,
+            result: SourceResult {
+                candidates: ids
+                    .iter()
+                    .zip(invites.iter())
+                    .map(|(id, invite)| {
+                        announcement(*id, invite.clone(), DiscoverySource::Observer)
+                    })
+                    .collect(),
+                status: SourceStatus::Ok,
+            },
+        });
+        let sources: Vec<Box<dyn CandidateSource>> = vec![source];
+        let watch = WatchPolicy {
+            max_candidates_per_pass: 2,
+            ..WatchPolicy::default()
+        };
+
+        let first = run_discover_pass_bounded(
+            &sources,
+            &DiscoveryPolicy::default(),
+            &backend,
+            20_000,
+            "0000000000000051",
+            &watch,
+            None,
+        )
+        .await?;
+
+        assert_eq!(first.progress.attempted, 2);
+        assert_eq!(first.progress.next_cursor, Some(ids[1]));
+        assert!(first.progress.backlog);
+        assert_eq!(first.progress.deferred, 2);
+        assert_eq!(
+            backend.previewed.lock().expect("previewed lock").as_slice(),
+            [invites[0].to_string(), invites[1].to_string()]
+        );
+        assert!(backend.get_record(ids[0]).is_some());
+        assert!(backend.get_record(ids[1]).is_some());
+        assert!(backend.get_record(ids[2]).is_none());
+        assert!(backend.get_record(ids[3]).is_none());
+
+        let second = run_discover_pass_bounded(
+            &sources,
+            &DiscoveryPolicy::default(),
+            &backend,
+            21_000,
+            "0000000000000052",
+            &watch,
+            first.progress.next_cursor,
+        )
+        .await?;
+
+        assert_eq!(second.progress.attempted, 2);
+        assert_eq!(second.progress.next_cursor, Some(ids[3]));
+        assert!(second.progress.wrapped);
+        assert!(!second.progress.backlog);
+        assert_eq!(second.progress.deferred, 0);
+        assert!(backend.get_record(ids[2]).is_some());
+        assert!(backend.get_record(ids[3]).is_some());
+        assert_eq!(
+            backend.previewed.lock().expect("previewed lock").as_slice(),
+            [
+                invites[0].to_string(),
+                invites[1].to_string(),
+                invites[2].to_string(),
+                invites[3].to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rotation_snapshot_keeps_fresh_ids_behind_deferred_source_ids() -> anyhow::Result<()> {
+        let backend = FakeBackend::default();
+        let original_ids = [fed(0x51), fed(0x60), fed(0x70)];
+        let original_invites = original_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| invite_for(*id, &format!("original-rotation-{i}")))
+            .collect::<Vec<_>>();
+        for (id, invite) in original_ids.iter().zip(original_invites.iter()) {
+            backend.with_preview(
+                invite,
+                PreviewReply::Ok(PreviewedCandidate {
+                    id: *id,
+                    facts: good_facts(*id),
+                }),
+            );
+        }
+        let watch = WatchPolicy {
+            max_candidates_per_pass: 1,
+            ..WatchPolicy::default()
+        };
+        let first_sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(FakeSource {
+            source: DiscoverySource::Observer,
+            result: SourceResult {
+                candidates: original_ids
+                    .iter()
+                    .zip(original_invites.iter())
+                    .map(|(id, invite)| {
+                        announcement(*id, invite.clone(), DiscoverySource::Observer)
+                    })
+                    .collect(),
+                status: SourceStatus::Ok,
+            },
+        })];
+
+        let first = run_discover_pass_bounded(
+            &first_sources,
+            &DiscoveryPolicy::default(),
+            &backend,
+            25_000,
+            "0000000000000057",
+            &watch,
+            None,
+        )
+        .await?;
+
+        assert_eq!(first.progress.next_cursor, Some(original_ids[0]));
+        assert!(first.progress.backlog);
+        assert_eq!(first.next_rotation, original_ids.to_vec());
+
+        let fresh_ids = [fed(0x52), fed(0x53)];
+        let fresh_invites = fresh_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| invite_for(*id, &format!("fresh-rotation-{i}")))
+            .collect::<Vec<_>>();
+        for (id, invite) in fresh_ids.iter().zip(fresh_invites.iter()) {
+            backend.with_preview(
+                invite,
+                PreviewReply::Ok(PreviewedCandidate {
+                    id: *id,
+                    facts: good_facts(*id),
+                }),
+            );
+        }
+        let second_sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(FakeSource {
+            source: DiscoverySource::Observer,
+            result: SourceResult {
+                candidates: original_ids
+                    .iter()
+                    .zip(original_invites.iter())
+                    .chain(fresh_ids.iter().zip(fresh_invites.iter()))
+                    .map(|(id, invite)| {
+                        announcement(*id, invite.clone(), DiscoverySource::Observer)
+                    })
+                    .collect(),
+                status: SourceStatus::Ok,
+            },
+        })];
+        let second_watch = WatchPolicy {
+            max_candidates_per_pass: 2,
+            ..WatchPolicy::default()
+        };
+
+        let second = run_discover_pass_bounded_with_rotation(
+            &second_sources,
+            &DiscoveryPolicy::default(),
+            &backend,
+            26_000,
+            "0000000000000058",
+            &second_watch,
+            DiscoverPassResume {
+                cursor: first.progress.next_cursor,
+                rotation: &first.next_rotation,
+            },
+        )
+        .await?;
+
+        assert_eq!(second.progress.next_cursor, Some(original_ids[2]));
+        assert!(backend.get_record(original_ids[1]).is_some());
+        assert!(backend.get_record(original_ids[2]).is_some());
+        assert!(backend.get_record(fresh_ids[0]).is_none());
+        assert!(backend.get_record(fresh_ids[1]).is_none());
+        assert_eq!(
+            backend.previewed.lock().expect("previewed lock").as_slice(),
+            [
+                original_invites[0].to_string(),
+                original_invites[1].to_string(),
+                original_invites[2].to_string(),
+            ]
+        );
+        assert_eq!(
+            second.next_rotation,
+            vec![
+                original_ids[0],
+                original_ids[1],
+                original_ids[2],
+                fresh_ids[0],
+                fresh_ids[1],
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn candidate_cap_keeps_backlog_when_cursor_at_max_starts_partial_window(
+    ) -> anyhow::Result<()> {
+        let backend = FakeBackend::default();
+        let ids = [fed(0x55), fed(0x56), fed(0x57), fed(0x58)];
+        let invites = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| invite_for(*id, &format!("cap-at-max-{i}")))
+            .collect::<Vec<_>>();
+        for (id, invite) in ids.iter().zip(invites.iter()) {
+            backend.with_preview(
+                invite,
+                PreviewReply::Ok(PreviewedCandidate {
+                    id: *id,
+                    facts: good_facts(*id),
+                }),
+            );
+        }
+        let sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(FakeSource {
+            source: DiscoverySource::Observer,
+            result: SourceResult {
+                candidates: ids
+                    .iter()
+                    .zip(invites.iter())
+                    .map(|(id, invite)| {
+                        announcement(*id, invite.clone(), DiscoverySource::Observer)
+                    })
+                    .collect(),
+                status: SourceStatus::Ok,
+            },
+        })];
+        let watch = WatchPolicy {
+            max_candidates_per_pass: 2,
+            ..WatchPolicy::default()
+        };
+
+        let outcome = run_discover_pass_bounded(
+            &sources,
+            &DiscoveryPolicy::default(),
+            &backend,
+            23_000,
+            "0000000000000055",
+            &watch,
+            Some(ids[3]),
+        )
+        .await?;
+
+        assert_eq!(outcome.progress.attempted, 2);
+        assert_eq!(outcome.progress.next_cursor, Some(ids[1]));
+        assert!(!outcome.progress.wrapped);
+        assert!(outcome.progress.backlog);
+        assert_eq!(outcome.progress.deferred, 2);
+        assert!(backend.get_record(ids[0]).is_some());
+        assert!(backend.get_record(ids[1]).is_some());
+        assert!(backend.get_record(ids[2]).is_none());
+        assert!(backend.get_record(ids[3]).is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn candidate_cap_keeps_backlog_when_stale_cursor_reaches_end_without_wrap(
+    ) -> anyhow::Result<()> {
+        let backend = FakeBackend::default();
+        let ids = [fed(0x50), fed(0x51), fed(0x53), fed(0x54)];
+        let invites = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| invite_for(*id, &format!("cap-stale-cursor-{i}")))
+            .collect::<Vec<_>>();
+        for (id, invite) in ids.iter().zip(invites.iter()) {
+            backend.with_preview(
+                invite,
+                PreviewReply::Ok(PreviewedCandidate {
+                    id: *id,
+                    facts: good_facts(*id),
+                }),
+            );
+        }
+        let sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(FakeSource {
+            source: DiscoverySource::Observer,
+            result: SourceResult {
+                candidates: ids
+                    .iter()
+                    .zip(invites.iter())
+                    .map(|(id, invite)| {
+                        announcement(*id, invite.clone(), DiscoverySource::Observer)
+                    })
+                    .collect(),
+                status: SourceStatus::Ok,
+            },
+        })];
+        let watch = WatchPolicy {
+            max_candidates_per_pass: 2,
+            ..WatchPolicy::default()
+        };
+
+        let outcome = run_discover_pass_bounded(
+            &sources,
+            &DiscoveryPolicy::default(),
+            &backend,
+            24_000,
+            "0000000000000056",
+            &watch,
+            Some(fed(0x52)),
+        )
+        .await?;
+
+        assert_eq!(outcome.progress.attempted, 2);
+        assert_eq!(outcome.progress.next_cursor, Some(ids[3]));
+        assert!(!outcome.progress.wrapped);
+        assert!(outcome.progress.backlog);
+        assert_eq!(outcome.progress.deferred, 2);
+        assert!(backend.get_record(ids[0]).is_none());
+        assert!(backend.get_record(ids[1]).is_none());
+        assert!(backend.get_record(ids[2]).is_some());
+        assert!(backend.get_record(ids[3]).is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn candidate_cap_defers_auto_join_overflow_without_dropping_it() -> anyhow::Result<()> {
+        let backend = FakeBackend::default();
+
+        let source_id = fed(0x91);
+        let source_invite = invite_for(source_id, "shared-cap-source");
+        let mut rejected_facts = good_facts(source_id);
+        rejected_facts.has_lnv2 = false;
+        backend.with_preview(
+            &source_invite,
+            PreviewReply::Ok(PreviewedCandidate {
+                id: source_id,
+                facts: rejected_facts,
+            }),
+        );
+
+        let later_auto_join = fed(0x92);
+        let later_invite = invite_for(later_auto_join, "shared-cap-auto-join");
+        backend.put_existing(candidate(
+            later_auto_join,
+            later_invite.clone(),
+            CandidateState::Discovered,
+            1_000,
+        ));
+        backend.with_preview(
+            &later_invite,
+            PreviewReply::Ok(PreviewedCandidate {
+                id: later_auto_join,
+                facts: good_facts(later_auto_join),
+            }),
+        );
+
+        let sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(FakeSource {
+            source: DiscoverySource::Observer,
+            result: SourceResult {
+                candidates: vec![announcement(
+                    source_id,
+                    source_invite.clone(),
+                    DiscoverySource::Observer,
+                )],
+                status: SourceStatus::Ok,
+            },
+        })];
+        let policy = DiscoveryPolicy {
+            auto_join: true,
+            ..DiscoveryPolicy::default()
+        };
+        let watch = WatchPolicy {
+            max_candidates_per_pass: 1,
+            ..WatchPolicy::default()
+        };
+
+        let first = run_discover_pass_bounded(
+            &sources,
+            &policy,
+            &backend,
+            50_000,
+            "0000000000000091",
+            &watch,
+            None,
+        )
+        .await?;
+
+        assert_eq!(first.progress.attempted, 1);
+        assert_eq!(first.progress.next_cursor, Some(source_id));
+        assert!(first.progress.backlog);
+        assert_eq!(first.progress.deferred, 1);
+        assert_eq!(first.report.auto_join.considered, 0);
+        assert!(backend.joins.lock().expect("joins lock").is_empty());
+        assert_eq!(
+            backend.get_record(source_id).expect("source record").state,
+            CandidateState::Rejected
+        );
+        assert_eq!(
+            backend.get_record(later_auto_join).expect("auto row").state,
+            CandidateState::Discovered
+        );
+
+        let second = run_discover_pass_bounded(
+            &sources,
+            &policy,
+            &backend,
+            51_000,
+            "0000000000000092",
+            &watch,
+            first.progress.next_cursor,
+        )
+        .await?;
+
+        assert_eq!(second.progress.attempted, 1);
+        assert_eq!(second.progress.next_cursor, Some(later_auto_join));
+        assert!(second.progress.wrapped);
+        assert!(!second.progress.backlog);
+        assert_eq!(second.progress.deferred, 0);
+        assert_eq!(second.report.auto_join.considered, 1);
+        assert_eq!(second.report.auto_join.joined, 1);
+        assert_eq!(
+            backend.joins.lock().expect("joins lock").as_slice(),
+            [later_auto_join]
+        );
+        assert_eq!(
+            backend.previewed.lock().expect("previewed lock").as_slice(),
+            [source_invite.to_string(), later_invite.to_string()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn per_preview_timeout_is_transient_and_advances_cursor() -> anyhow::Result<()> {
+        let backend = FakeBackend::default();
+        let id = fed(0x61);
+        let invite = invite_for(id, "timeout");
+        backend.with_preview(&invite, PreviewReply::Pending);
+        let sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(FakeSource {
+            source: DiscoverySource::Observer,
+            result: SourceResult {
+                candidates: vec![announcement(id, invite.clone(), DiscoverySource::Observer)],
+                status: SourceStatus::Ok,
+            },
+        })];
+        let watch = WatchPolicy {
+            per_preview_timeout_ms: 1,
+            ..WatchPolicy::default()
+        };
+
+        let outcome = run_discover_pass_bounded(
+            &sources,
+            &DiscoveryPolicy::default(),
+            &backend,
+            30_000,
+            "0000000000000061",
+            &watch,
+            None,
+        )
+        .await?;
+
+        assert_eq!(outcome.progress.attempted, 1);
+        assert_eq!(outcome.progress.next_cursor, Some(id));
+        assert!(outcome.progress.wrapped);
+        assert!(!outcome.progress.backlog);
+        assert!(backend.get_record(id).is_none());
+        assert_eq!(
+            backend.previewed.lock().expect("previewed lock").as_slice(),
+            [invite.to_string()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whole_pass_deadline_stops_early_and_signals_backlog() -> anyhow::Result<()> {
+        let backend = FakeBackend::default();
+        let slow = fed(0x71);
+        let deferred = fed(0x72);
+        let slow_invite = invite_for(slow, "slow");
+        let deferred_invite = invite_for(deferred, "deferred");
+        backend.with_preview(
+            &slow_invite,
+            PreviewReply::SleepThenOk(
+                Duration::from_millis(100),
+                PreviewedCandidate {
+                    id: slow,
+                    facts: good_facts(slow),
+                },
+            ),
+        );
+        backend.with_preview(
+            &deferred_invite,
+            PreviewReply::Ok(PreviewedCandidate {
+                id: deferred,
+                facts: good_facts(deferred),
+            }),
+        );
+        let sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(FakeSource {
+            source: DiscoverySource::Observer,
+            result: SourceResult {
+                candidates: vec![
+                    announcement(slow, slow_invite.clone(), DiscoverySource::Observer),
+                    announcement(deferred, deferred_invite.clone(), DiscoverySource::Observer),
+                ],
+                status: SourceStatus::Ok,
+            },
+        })];
+        let watch = WatchPolicy {
+            discover_pass_deadline_ms: 50,
+            per_preview_timeout_ms: 100,
+            max_candidates_per_pass: 10,
+            ..WatchPolicy::default()
+        };
+
+        let outcome = run_discover_pass_bounded(
+            &sources,
+            &DiscoveryPolicy::default(),
+            &backend,
+            40_000,
+            "0000000000000071",
+            &watch,
+            None,
+        )
+        .await?;
+
+        assert_eq!(outcome.progress.attempted, 1);
+        assert_eq!(outcome.progress.next_cursor, Some(slow));
+        assert!(!outcome.progress.wrapped);
+        assert!(outcome.progress.backlog);
+        assert_eq!(outcome.progress.deferred, 1);
+        assert!(backend.get_record(slow).is_none());
+        assert!(backend.get_record(deferred).is_none());
+        assert_eq!(
+            backend.previewed.lock().expect("previewed lock").as_slice(),
+            [slow_invite.to_string()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deadline_before_preview_does_not_advance_source_cursor() -> anyhow::Result<()> {
+        let backend = FakeBackend::default();
+        backend.delay_get_candidate(Duration::from_millis(50));
+        let id = fed(0x70);
+        let invite = invite_for(id, "delayed-row");
+        backend.with_preview(
+            &invite,
+            PreviewReply::Ok(PreviewedCandidate {
+                id,
+                facts: good_facts(id),
+            }),
+        );
+        let sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(FakeSource {
+            source: DiscoverySource::Observer,
+            result: SourceResult {
+                candidates: vec![announcement(id, invite, DiscoverySource::Observer)],
+                status: SourceStatus::Ok,
+            },
+        })];
+        let watch = WatchPolicy {
+            discover_pass_deadline_ms: 10,
+            per_preview_timeout_ms: 100,
+            max_candidates_per_pass: 10,
+            ..WatchPolicy::default()
+        };
+
+        let outcome = run_discover_pass_bounded(
+            &sources,
+            &DiscoveryPolicy::default(),
+            &backend,
+            40_250,
+            "0000000000000070",
+            &watch,
+            None,
+        )
+        .await?;
+
+        assert_eq!(outcome.progress.attempted, 0);
+        assert_eq!(outcome.progress.next_cursor, None);
+        assert!(!outcome.progress.wrapped);
+        assert!(outcome.progress.backlog);
+        assert_eq!(outcome.progress.deferred, 1);
+        assert!(backend.previewed.lock().expect("previewed lock").is_empty());
+        assert!(backend.get_record(id).is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whole_pass_deadline_caps_alternate_invites_for_one_candidate() -> anyhow::Result<()> {
+        let backend = FakeBackend::default();
+        let id = fed(0x73);
+        let slow_invite = invite_for(id, "slow-alt");
+        let valid_invite = invite_for(id, "valid-alt");
+        backend.with_preview(&slow_invite, PreviewReply::Pending);
+        backend.with_preview(
+            &valid_invite,
+            PreviewReply::Ok(PreviewedCandidate {
+                id,
+                facts: good_facts(id),
+            }),
+        );
+        let sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(FakeSource {
+            source: DiscoverySource::Observer,
+            result: SourceResult {
+                candidates: vec![
+                    announcement(id, slow_invite.clone(), DiscoverySource::Observer),
+                    announcement(id, valid_invite.clone(), DiscoverySource::Observer),
+                ],
+                status: SourceStatus::Ok,
+            },
+        })];
+        let watch = WatchPolicy {
+            discover_pass_deadline_ms: 50,
+            per_preview_timeout_ms: 100,
+            max_candidates_per_pass: 10,
+            ..WatchPolicy::default()
+        };
+
+        let outcome = run_discover_pass_bounded(
+            &sources,
+            &DiscoveryPolicy::default(),
+            &backend,
+            40_500,
+            "0000000000000073",
+            &watch,
+            None,
+        )
+        .await?;
+
+        assert_eq!(outcome.progress.attempted, 1);
+        assert_eq!(outcome.progress.next_cursor, Some(id));
+        assert!(outcome.progress.wrapped);
+        assert!(!outcome.progress.backlog);
+        assert!(backend.get_record(id).is_none());
+        assert_eq!(
+            backend.previewed.lock().expect("previewed lock").as_slice(),
+            [slow_invite.to_string()],
+            "the second invite must not get a fresh per-preview timeout after the pass deadline"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auto_join_deadline_sets_backlog_even_after_source_window_wraps() -> anyhow::Result<()>
+    {
+        let backend = FakeBackend::default();
+        let slow = fed(0x78);
+        let deferred = fed(0x79);
+        let slow_invite = invite_for(slow, "slow-auto-join");
+        let deferred_invite = invite_for(deferred, "deferred-auto-join");
+        backend.put_existing(candidate(
+            slow,
+            slow_invite.clone(),
+            CandidateState::Discovered,
+            1_000,
+        ));
+        backend.put_existing(candidate(
+            deferred,
+            deferred_invite.clone(),
+            CandidateState::Discovered,
+            1_000,
+        ));
+        backend.with_preview(
+            &slow_invite,
+            PreviewReply::SleepThenOk(
+                Duration::from_millis(50),
+                PreviewedCandidate {
+                    id: slow,
+                    facts: good_facts(slow),
+                },
+            ),
+        );
+        backend.with_preview(
+            &deferred_invite,
+            PreviewReply::Ok(PreviewedCandidate {
+                id: deferred,
+                facts: good_facts(deferred),
+            }),
+        );
+        let policy = DiscoveryPolicy {
+            auto_join: true,
+            ..DiscoveryPolicy::default()
+        };
+        let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+        let watch = WatchPolicy {
+            discover_pass_deadline_ms: 20,
+            per_preview_timeout_ms: 100,
+            ..WatchPolicy::default()
+        };
+
+        let outcome = run_discover_pass_bounded(
+            &sources,
+            &policy,
+            &backend,
+            40_750,
+            "0000000000000078",
+            &watch,
+            None,
+        )
+        .await?;
+
+        assert_eq!(outcome.progress.next_cursor, Some(slow));
+        assert!(!outcome.progress.wrapped);
+        assert!(outcome.progress.backlog);
+        assert_eq!(outcome.progress.deferred, 1);
+        assert_eq!(outcome.report.auto_join.joined, 0);
+        assert!(backend.joins.lock().expect("joins lock").is_empty());
+        let previewed = backend.previewed.lock().expect("previewed lock").clone();
+        assert!(previewed.len() <= 1);
+        assert!(!previewed.contains(&deferred_invite.to_string()));
+
+        let continuation = run_discover_pass_bounded(
+            &sources,
+            &policy,
+            &backend,
+            40_800,
+            "0000000000000079",
+            &watch,
+            outcome.progress.next_cursor,
+        )
+        .await?;
+
+        assert_eq!(
+            backend.joins.lock().expect("joins lock").first().copied(),
+            Some(deferred)
+        );
+        assert_eq!(continuation.report.auto_join.joined, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auto_join_deadline_does_not_advance_cursor_past_deferred_auto_join(
+    ) -> anyhow::Result<()> {
+        let backend = FakeBackend::default();
+        let slow = fed(0x74);
+        let deferred = fed(0x75);
+        let slow_invite = invite_for(slow, "slow-source-auto-join");
+        let deferred_invite = invite_for(deferred, "deferred-source-auto-join");
+        backend.put_existing(candidate(
+            slow,
+            slow_invite.clone(),
+            CandidateState::Discovered,
+            10_000,
+        ));
+        backend.put_existing(candidate(
+            deferred,
+            deferred_invite.clone(),
+            CandidateState::Discovered,
+            10_000,
+        ));
+        backend.with_preview(
+            &slow_invite,
+            PreviewReply::SleepThenOk(
+                Duration::from_millis(50),
+                PreviewedCandidate {
+                    id: slow,
+                    facts: good_facts(slow),
+                },
+            ),
+        );
+        backend.with_preview(
+            &deferred_invite,
+            PreviewReply::Ok(PreviewedCandidate {
+                id: deferred,
+                facts: good_facts(deferred),
+            }),
+        );
+        let sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(FakeSource {
+            source: DiscoverySource::Observer,
+            result: SourceResult {
+                candidates: vec![
+                    announcement(slow, slow_invite.clone(), DiscoverySource::Observer),
+                    announcement(deferred, deferred_invite.clone(), DiscoverySource::Observer),
+                ],
+                status: SourceStatus::Ok,
+            },
+        })];
+        let policy = DiscoveryPolicy {
+            auto_join: true,
+            ..DiscoveryPolicy::default()
+        };
+        let watch = WatchPolicy {
+            discover_pass_deadline_ms: 20,
+            per_preview_timeout_ms: 100,
+            max_candidates_per_pass: 10,
+            ..WatchPolicy::default()
+        };
+
+        let first = run_discover_pass_bounded(
+            &sources,
+            &policy,
+            &backend,
+            40_850,
+            "0000000000000074",
+            &watch,
+            None,
+        )
+        .await?;
+
+        assert_eq!(first.progress.attempted, 1);
+        assert_eq!(first.progress.next_cursor, Some(slow));
+        assert!(!first.progress.wrapped);
+        assert!(first.progress.backlog);
+        assert_eq!(first.progress.deferred, 1);
+        assert!(backend.joins.lock().expect("joins lock").is_empty());
+        assert_eq!(
+            backend.previewed.lock().expect("previewed lock").as_slice(),
+            [slow_invite.to_string()]
+        );
+
+        let second = run_discover_pass_bounded(
+            &sources,
+            &policy,
+            &backend,
+            40_900,
+            "0000000000000075",
+            &watch,
+            first.progress.next_cursor,
+        )
+        .await?;
+
+        assert_eq!(
+            backend.joins.lock().expect("joins lock").first().copied(),
+            Some(deferred)
+        );
+        assert_eq!(second.report.auto_join.joined, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auto_join_deadline_stops_cursor_before_deferred_gap_despite_later_attempt(
+    ) -> anyhow::Result<()> {
+        let backend = FakeBackend::default();
+        let first_auto_join = fed(0x84);
+        let deferred_auto_join = fed(0x85);
+        let later_rejected = fed(0x86);
+        let first_invite = invite_for(first_auto_join, "first-gap-auto-join");
+        let deferred_invite = invite_for(deferred_auto_join, "deferred-gap-auto-join");
+        let rejected_invite = invite_for(later_rejected, "later-gap-rejected");
+        backend.put_existing(candidate(
+            first_auto_join,
+            first_invite.clone(),
+            CandidateState::Discovered,
+            10_000,
+        ));
+        backend.put_existing(candidate(
+            deferred_auto_join,
+            deferred_invite,
+            CandidateState::Discovered,
+            10_000,
+        ));
+        backend.with_preview(
+            &first_invite,
+            PreviewReply::Ok(PreviewedCandidate {
+                id: first_auto_join,
+                facts: good_facts(first_auto_join),
+            }),
+        );
+        backend.with_join(first_auto_join, JoinReply::Pending);
+        let mut rejected_facts = good_facts(later_rejected);
+        rejected_facts.has_lnv2 = false;
+        backend.with_preview(
+            &rejected_invite,
+            PreviewReply::Ok(PreviewedCandidate {
+                id: later_rejected,
+                facts: rejected_facts,
+            }),
+        );
+        let sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(FakeSource {
+            source: DiscoverySource::Observer,
+            result: SourceResult {
+                candidates: vec![announcement(
+                    later_rejected,
+                    rejected_invite.clone(),
+                    DiscoverySource::Observer,
+                )],
+                status: SourceStatus::Ok,
+            },
+        })];
+        let policy = DiscoveryPolicy {
+            auto_join: true,
+            ..DiscoveryPolicy::default()
+        };
+        let watch = WatchPolicy {
+            discover_pass_deadline_ms: 20,
+            per_preview_timeout_ms: 100,
+            max_candidates_per_pass: 10,
+            ..WatchPolicy::default()
+        };
+
+        let outcome = run_discover_pass_bounded(
+            &sources,
+            &policy,
+            &backend,
+            41_000,
+            "0000000000000084",
+            &watch,
+            None,
+        )
+        .await?;
+
+        assert_eq!(outcome.progress.attempted, 2);
+        assert_eq!(outcome.progress.next_cursor, Some(first_auto_join));
+        assert!(!outcome.progress.wrapped);
+        assert!(outcome.progress.backlog);
+        assert_eq!(outcome.progress.deferred, 1);
+        assert_eq!(
+            backend
+                .get_record(later_rejected)
+                .expect("rejected row")
+                .state,
+            CandidateState::Rejected
+        );
+        assert_eq!(
+            backend.previewed.lock().expect("previewed lock").as_slice(),
+            [rejected_invite.to_string(), first_invite.to_string()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auto_join_attempt_uses_remaining_pass_deadline() -> anyhow::Result<()> {
+        let backend = FakeBackend::default();
+        let id = fed(0x7A);
+        let invite = invite_for(id, "slow-join");
+        backend.put_existing(candidate(
+            id,
+            invite.clone(),
+            CandidateState::Discovered,
+            1_000,
+        ));
+        backend.with_preview(
+            &invite,
+            PreviewReply::Ok(PreviewedCandidate {
+                id,
+                facts: good_facts(id),
+            }),
+        );
+        backend.with_join(id, JoinReply::Pending);
+        let policy = DiscoveryPolicy {
+            auto_join: true,
+            ..DiscoveryPolicy::default()
+        };
+        let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+        let watch = WatchPolicy {
+            discover_pass_deadline_ms: 50,
+            per_preview_timeout_ms: 100,
+            ..WatchPolicy::default()
+        };
+
+        let outcome = run_discover_pass_bounded(
+            &sources,
+            &policy,
+            &backend,
+            40_900,
+            "000000000000007a",
+            &watch,
+            None,
+        )
+        .await?;
+
+        assert_eq!(outcome.progress.next_cursor, Some(id));
+        assert!(!outcome.progress.wrapped);
+        assert!(outcome.progress.backlog);
+        assert_eq!(outcome.report.auto_join.considered, 1);
+        assert_eq!(outcome.report.auto_join.joined, 0);
+        assert_eq!(backend.joins.lock().expect("joins lock").as_slice(), [id]);
+        assert_eq!(
+            backend.get_record(id).expect("candidate remains").state,
+            CandidateState::Discovered
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deadline_after_max_id_does_not_clear_backlog_before_window_completes(
+    ) -> anyhow::Result<()> {
+        let backend = FakeBackend::default();
+        let a = fed(0x81);
+        let b = fed(0x82);
+        let c = fed(0x83);
+        let a_invite = invite_for(a, "wrapped-a");
+        let b_invite = invite_for(b, "wrapped-b");
+        let c_invite = invite_for(c, "wrapped-c");
+        backend.with_preview(
+            &c_invite,
+            PreviewReply::SleepThenOk(
+                Duration::from_millis(100),
+                PreviewedCandidate {
+                    id: c,
+                    facts: good_facts(c),
+                },
+            ),
+        );
+        backend.with_preview(
+            &a_invite,
+            PreviewReply::Ok(PreviewedCandidate {
+                id: a,
+                facts: good_facts(a),
+            }),
+        );
+        backend.with_preview(
+            &b_invite,
+            PreviewReply::Ok(PreviewedCandidate {
+                id: b,
+                facts: good_facts(b),
+            }),
+        );
+        let sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(FakeSource {
+            source: DiscoverySource::Observer,
+            result: SourceResult {
+                candidates: vec![
+                    announcement(a, a_invite.clone(), DiscoverySource::Observer),
+                    announcement(b, b_invite.clone(), DiscoverySource::Observer),
+                    announcement(c, c_invite.clone(), DiscoverySource::Observer),
+                ],
+                status: SourceStatus::Ok,
+            },
+        })];
+        let watch = WatchPolicy {
+            discover_pass_deadline_ms: 50,
+            per_preview_timeout_ms: 100,
+            max_candidates_per_pass: 10,
+            ..WatchPolicy::default()
+        };
+
+        let outcome = run_discover_pass_bounded(
+            &sources,
+            &DiscoveryPolicy::default(),
+            &backend,
+            41_000,
+            "0000000000000081",
+            &watch,
+            Some(b),
+        )
+        .await?;
+
+        assert_eq!(outcome.progress.attempted, 1);
+        assert_eq!(outcome.progress.next_cursor, Some(c));
+        assert!(!outcome.progress.wrapped);
+        assert!(outcome.progress.backlog);
+        assert_eq!(outcome.progress.deferred, 2);
+        assert!(backend.get_record(c).is_none());
+        assert!(backend.get_record(a).is_none());
+        assert!(backend.get_record(b).is_none());
+        assert_eq!(
+            backend.previewed.lock().expect("previewed lock").as_slice(),
+            [c_invite.to_string()]
+        );
         Ok(())
     }
 }
