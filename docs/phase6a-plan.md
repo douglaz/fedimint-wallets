@@ -93,13 +93,22 @@ enum Command {
     Snapshot { scope: SnapshotScope, reply: … },              // balances/policies for detached readers
     ResolveAwait { key: IntentKey, waiter: oneshot::Sender<OpOutcome> },  // pending-map insert
     // scheduler bookkeeping
-    DecideTick { facts: ProbeFacts, reply: … },
-        // score+decide+journal intents; spawns nothing. Verified ms-scale: plan_tick's
-        // route-revision/evacuation-fallback loop (runtime.rs:2150) iterates over ALREADY-
-        // SENSED probe facts — no network inside the loop — so it moves into this command
-        // whole; probe_all (the IO) runs in the workflow daemon beforehand. A route that
-        // fails at DRIVE time feeds the next cycle's facts, exactly as 5.2 behaves today.
-    ReconcileDecide { reply: oneshot::Sender<Vec<Orphan>> },  // TL-3/TL-4: orphan list = Pending ∧ no registry entry
+    DecideTickRound { facts: ProbeFacts, route_failures: Vec<MoveRouteProblem>, reply: … },
+        // PURE decide: build_snapshot + allocator over sensed facts + accumulated route
+        // failures; returns candidate decisions; journals nothing. Spec review pass 2
+        // corrected pass 1 here: plan_tick's revision loop AWAITS NETWORK inside —
+        // first_move_route_problem → validate_executor_move_route (runtime.rs:2352, 2363)
+        // is the §15.6 gateway scan — so the LOOP lives in the workflow daemon:
+        //   daemon: probe_all (IO) → DecideTickRound (ms) → validate routes (IO) →
+        //   loop with failures → CommitTick when clean (or revisions exhausted).
+    CommitTick { decisions: Vec<AllocatorDecision>, reply: … },
+        // journal the intents + register + spawn their drivers (agent lane), atomically
+        // within the actor critical section.
+    ReconcileDecide { reply: oneshot::Sender<Vec<Orphan>> },
+        // TL-3/TL-4: orphan set = EXACTLY today's re-drive set minus live drivers —
+        // (Pending ∨ Executing) ∧ no registry entry. journal.pending() already returns
+        // Pending|Executing (executor.rs:457); a crash after the Pending→Executing CAS
+        // must re-drive on restart, same as today — "Pending only" would strand it.
     Shutdown { reply: … },
 }
 ```
@@ -114,10 +123,18 @@ unbounded scans. The terminal `JournalTransition` also resolves that key's await
 
 One spawned task per in-flight money operation (user or agent — no special agent status):
 
-- `DecideOp` returns ⇒ the handler spawns the driver and the actor records
-  `registry[key] = DriverEntry` before replying. The driver owns the network work: it walks
-  the existing `next_step`/`MoveStep` machinery, journaling each artifact via
-  `JournalTransition`, then the terminal.
+- **The actor itself spawns the driver** inside the `DecideOp`/`CommitTick` critical
+  section — journal write, registry insert, and `tokio::spawn` are one atomic actor-side
+  sequence (spec review pass 2: if the HTTP handler spawned it, a cancelled handler —
+  client disconnect between reply and spawn — would leave a phantom registry entry whose
+  Drop guard never fires, and reconcile would skip the journaled intent forever). The
+  driver owns the network work: it walks the existing `next_step`/`MoveStep` machinery,
+  journaling each artifact via `JournalTransition`, then the terminal.
+- **`Awaiting` rehydration:** an `Awaiting` DirectInflow is subscription-owned (§9.5), not
+  re-driven — in the CLI world `await-move` re-subscribes on demand; the daemon must do it
+  itself. At boot and after each reconcile pass, every `Awaiting` intent without a live
+  registry entry gets an **awaiter driver** spawned (the recv_op subscription), so a paid
+  invoice terminalizes and resolves its `?wait=true` waiters without any client action.
 - **Drop guard:** the driver task's wrapper holds a guard that removes `registry[key]` on
   EVERY exit — Ok, Err, panic-unwind. Registry = `std::sync::Mutex<HashMap<…>>` (plain
   mutex: sync bookkeeping, never held across await; Drop can't await).
@@ -153,7 +170,11 @@ Implemented inside `DecideOp`'s critical section: reservations derive from
 `DirectInflow` invoice would otherwise be invisible and a concurrent move into the same
 destination could jointly over-cap it when the payer eventually pays (spec review pass 1).
 Each intent's `MoveRecord` phase supplies the row; no new in-memory state to rebuild on
-restart. The allocator's same-tick `reserved`/`credited` maps stay for intra-decision
+restart. **For this scan to see raw ops, EVERY walletd money operation journals an Intent**
+(spec review pass 2): raw `pay`/`receive` gain intent kinds instead of being ledger-only —
+one uniform lifecycle (decide → intent → driver → terminal) for user pays, moves, inflows,
+and probes alike; the append-only ledger stays the audit layer on top, as today. Two
+concurrent raw pays from one fed therefore size against each other like any other pair. The allocator's same-tick `reserved`/`credited` maps stay for intra-decision
 batches; this table governs cross-operation sizing. Getting this table wrong in the strict
 direction re-creates the smoke_tick over-reservation failure (allocator refuses affordable
 moves); in the loose direction it can overdraw — goldens for every row (§6a.9).
@@ -169,9 +190,12 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
   the actor only for `DecideTick`/`DecideProbe`/`ReconcileDecide` round-trips; money work
   spawns ordinary registered drivers in the **cap-1 agent lane** — at most one agent money
   op in flight, ever.
-- The TL-1 probe hold: `DecideProbe` marks the candidate held; any `DecideOp` spending FROM
-  that fed refuses with a clear reason while the probe session lives; the hold dies with the
-  probe driver (terminal or Drop guard).
+- The TL-1 probe hold: the hold IS the durable `0x08` session's `in_flight` marker — any
+  `DecideOp` spending FROM that fed refuses with a clear reason while the session lives.
+  The hold is released ONLY by the session resolving (terminal attempt, `NoAttempt`
+  clear, or the evacuation preemption) — **never by the Drop guard** (a panicked
+  post-leg-IN driver leaves `C` held until the session resumes, exactly what no-sweep
+  needs; spec review pass 2 caught the earlier wording contradicting this).
 - Exactly one scheduler instance, started at boot after `reconcile` seeding — TL-5.
 
 ## 6a.6 `wallet-api` + the HTTP surface
