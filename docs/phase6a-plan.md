@@ -100,7 +100,12 @@ enum Command {
         // check-then-park INSIDE the critical section (spec review pass 5): if the
         // intent is already terminal, reply immediately; only a live intent parks in
         // the pending map — otherwise a wait=true issued after the terminal
-        // JournalTransition would hang to its deadline.
+        // JournalTransition would hang to its deadline. The same mechanism serves
+        // ARTIFACT waits (pass 7): a waiter may target the intent's INVOICE artifact
+        // instead of its terminal — this is how /v1/receive blocks for the BOLT11 with
+        // the mint IO in the driver (off-actor): decide+spawn, park an invoice-artifact
+        // waiter with the §6a.6 hard deadline, and the driver's artifact
+        // JournalTransition resolves it.
     // scheduler bookkeeping
     DecideTickRound { facts: ProbeFacts, route_failures: Vec<MoveRouteProblem>, reply: … },
         // PURE decide: build_snapshot + allocator over sensed facts + accumulated route
@@ -122,13 +127,25 @@ enum Command {
         // caught that per-decision-vs-current-state alone lets two decisions jointly
         // overdraw/over-cap). Any decision that no longer fits is DROPPED with a recorded
         // refusal (the next cycle replans), never force-committed. Fitting decisions are
-        // journaled + registered + spawned (agent lane) atomically. Same philosophy as
-        // the phase-4 TOCTOU re-checks.
-    ReconcileDecide { reply: oneshot::Sender<Vec<Orphan>> },
+        // ALL journaled atomically, but their drivers dispatch through the cap-1 agent
+        // lane ONE AT A TIME (pass 7: the allocator can emit several executable moves per
+        // tick — e.g. top-up + fund-standby — and spawning them all would violate the
+        // lane): CommitTick registers + spawns the FIRST; the lane dispatcher (workflow
+        // daemon) spawns the next when the previous terminalizes. A journaled agent
+        // intent awaiting its turn is simply Pending-with-no-registry-entry — the normal
+        // re-drivable state, and the lane dispatcher is its re-driver. Same philosophy
+        // as the phase-4 TOCTOU re-checks.
+    ReconcileDecide { reply: oneshot::Sender<ReconcileReport> },
         // TL-3/TL-4: orphan set = EXACTLY today's re-drive set minus live drivers —
         // (Pending ∨ Executing) ∧ no registry entry. journal.pending() already returns
         // Pending|Executing (executor.rs:457); a crash after the Pending→Executing CAS
         // must re-drive on restart, same as today — "Pending only" would strand it.
+        // The actor REGISTERS + SPAWNS the re-drive drivers inside this critical section
+        // and replies with a report of what it did (pass 7: returning an orphan LIST for
+        // the caller to spawn lets overlapping reconcile invocations — the scheduler +
+        // POST /v1/reconcile — double-drive the same intent; actor-side registration
+        // makes the second caller see zero orphans). Agent-lane intents dispatch through
+        // the lane as above; awaiter rehydration (§6a.3) rides the same pass.
     Shutdown { reply: … },
 }
 ```
