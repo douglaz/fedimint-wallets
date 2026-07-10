@@ -105,7 +105,9 @@ enum Command {
         // instead of its terminal — this is how /v1/receive blocks for the BOLT11 with
         // the mint IO in the driver (off-actor): decide+spawn, park an invoice-artifact
         // waiter with the §6a.6 hard deadline, and the driver's artifact
-        // JournalTransition resolves it.
+        // JournalTransition resolves it. Check-then-park applies to artifacts too
+        // (pass 8): if the invoice artifact is ALREADY journaled — the idempotent-retry
+        // case, where the durable BOLT11 exists — reply immediately, don't park.
     // scheduler bookkeeping
     DecideTickRound { facts: ProbeFacts, route_failures: Vec<MoveRouteProblem>, reply: … },
         // PURE decide: build_snapshot + allocator over sensed facts + accumulated route
@@ -131,7 +133,11 @@ enum Command {
         // lane ONE AT A TIME (pass 7: the allocator can emit several executable moves per
         // tick — e.g. top-up + fund-standby — and spawning them all would violate the
         // lane): CommitTick registers + spawns the FIRST; the lane dispatcher (workflow
-        // daemon) spawns the next when the previous terminalizes. A journaled agent
+        // daemon) spawns the next when the previous terminalizes. CommitTick also KEEPS
+        // the stale-occurrence guard (ensure_fresh_tick_decisions): a same-occurrence
+        // terminal replay fails the tick step LOUDLY, exactly today's semantics (pass 8)
+        // — the watch cycle's per-cycle occurrence advance makes it rare, never silent.
+        // A journaled agent
         // intent awaiting its turn is simply Pending-with-no-registry-entry — the normal
         // re-drivable state, and the lane dispatcher is its re-driver. Same philosophy
         // as the phase-4 TOCTOU re-checks.
@@ -280,6 +286,11 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
   as today; `receive`/`direct-inflow` → (to, amount, **required client nonce** — minting is
   repeatable by nature, so the caller must distinguish repeats). No optional-nonce
   ambiguity: verbs with a natural anchor take none; verbs without one require it.
+  **Pay sizing inputs (pass 8):** the `/v1/pay` request carries an `amount` — REQUIRED for
+  an amountless BOLT11, and if present on an amount-carrying invoice it must match — plus a
+  fee cap (defaulted from `WalletConfig`'s per-move cap), so the §6a.4 pre-fund reservation
+  (`amount + fee_cap`) is always computable; an amountless invoice with no stated amount is
+  refused at decide time, never admitted un-reserved.
 - The `202` key = the ledger's correlation key — the async API and the audit trail share one
   keyspace.
 
