@@ -168,8 +168,8 @@ Sizing reads live balances (probe facts) PLUS journal-visible in-flight work. Th
 | `Sending` (pay issued ⇒ source already debited) | nothing (balance absorbed it) | amount (still undelivered) |
 | `Settled`/terminal · `Refunded` | nothing | nothing (balance reflects reality) |
 | `DirectInflow` `Awaiting` | n/a (no source spend) | amount toward cap room |
-| Raw `pay` (lnv2 send), pre-fund | amount + fee cap (two concurrent pays from one fed must size against each other — the second 202 sees the first's reservation) | n/a |
-| Raw `pay`, post-fund · raw `receive` | nothing (balance absorbed it) | claim credit toward cap at decide time |
+| Raw `pay` (lnv2 send), pre-fund — **no send-op artifact journaled yet** | amount + fee cap (two concurrent pays from one fed must size against each other — the second 202 sees the first's reservation) | n/a |
+| Raw `pay`, post-fund — **send-op artifact journaled** · raw `receive` | nothing (balance absorbed it) | claim credit toward cap at decide time |
 | Probe umbrella (in-flight session) | per its legs, same table | per its legs + the TL-1 probe hold |
 
 Implemented inside `DecideOp`'s critical section: reservations derive from
@@ -182,7 +182,16 @@ restart. **For this scan to see raw ops, EVERY walletd money operation journals 
 (spec review pass 2): raw `pay`/`receive` gain intent kinds instead of being ledger-only —
 one uniform lifecycle (decide → intent → driver → terminal) for user pays, moves, inflows,
 and probes alike; the append-only ledger stays the audit layer on top, as today. Two
-concurrent raw pays from one fed therefore size against each other like any other pair. The allocator's same-tick `reserved`/`credited` maps stay for intra-decision
+concurrent raw pays from one fed therefore size against each other like any other pair.
+Two hardening rules from spec review pass 4: (a) a raw pay's **pre/post-fund boundary is a
+durable journal artifact** — the driver journals the lnv2 send op id via
+`JournalTransition` the moment the pay is issued, exactly as MoveRecords record their leg
+op ids, so restart/admission always knows which reservation row applies; (b) the
+reservation scan **fails CLOSED**: today's `Journal::pending()` is infallible
+(`-> Vec<Intent>`, executor.rs:133), so a storage read error could masquerade as "zero
+reservations" and admit an overdraw — walletd's decide path uses fallible
+`pending()`/`awaiting()` reads (greenfield: change the trait), and `DecideOp` REFUSES with
+a storage error when the scan errs, never sizing against an empty default. The allocator's same-tick `reserved`/`credited` maps stay for intra-decision
 batches; this table governs cross-operation sizing. Getting this table wrong in the strict
 direction re-creates the smoke_tick over-reservation failure (allocator refuses affordable
 moves); in the loose direction it can overdraw — goldens for every row (§6a.9).
@@ -199,7 +208,10 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
   spawns ordinary registered drivers in the **cap-1 agent lane** — at most one agent money
   op in flight, ever.
 - The TL-1 probe hold: the hold IS the durable `0x08` session's `in_flight` marker — any
-  `DecideOp` spending FROM that fed refuses with a clear reason while the session lives.
+  `DecideOp` spending FROM that fed refuses with a clear reason while the session lives,
+  **except operations belonging to the holding session itself** (the hold carries the
+  probe's intent key; the probe's own leg OUT `C→S` is exempt — spec review pass 4 caught
+  the blanket rule deadlocking every probe after leg IN).
   The hold is released ONLY by the session resolving (terminal attempt, `NoAttempt`
   clear, or the evacuation preemption) — **never by the Drop guard** (a panicked
   post-leg-IN driver leaves `C` held until the session resumes, exactly what no-sweep
