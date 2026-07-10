@@ -87,7 +87,12 @@ enum Command {
     DecideOp { req: OpRequest, reply: oneshot::Sender<Result<DecidedOp, RefuseReason>> },
         // sizing + caps + phase-aware reservations + probe-hold check (TL-1) +
         // journal the Pending intent + register the driver slot; returns the intent key
-    DecideProbe { candidate: FederationId, reply: … },       // TL-2: budget check + umbrella row, atomic
+    DecideProbe { candidate: FederationId, reply: … },
+        // TL-2: budget check + umbrella row + THE DURABLE 0x08 in_flight SESSION MARKER,
+        // all in this one critical section (pass 6: the session marker IS the TL-1 hold
+        // predicate — writing it later, from the driver, would leave a pre-hold window
+        // where a concurrent C-spend breaks no-sweep). The hold exists before this
+        // command returns.
     JournalTransition { key: IntentKey, t: Transition, reply: … },  // drivers' per-leg + terminal writes
     // reads (all bounded; O(ledger) scans NEVER here)
     Snapshot { scope: SnapshotScope, reply: … },              // balances/policies for detached readers
@@ -111,10 +116,14 @@ enum Command {
         // so CommitTick re-runs THE SAME admission guard DecideOp uses (one shared
         // function: §6a.4 reservations + per-fed caps + the TL-1 probe hold — pass 5
         // caught that a caps-only recheck would let an agent move spend from a held C)
-        // against CURRENT state inside its critical section; any decision that no longer
-        // fits is DROPPED with a recorded refusal (the next cycle replans), never
-        // force-committed. Fitting decisions are journaled + registered + spawned
-        // (agent lane) atomically. Same philosophy as the phase-4 TOCTOU re-checks.
+        // against CURRENT state inside its critical section, applied SEQUENTIALLY across
+        // the batch — each accepted decision folds into the running reservation view
+        // before the next is checked (the allocator's push_and_reserve discipline; pass 6
+        // caught that per-decision-vs-current-state alone lets two decisions jointly
+        // overdraw/over-cap). Any decision that no longer fits is DROPPED with a recorded
+        // refusal (the next cycle replans), never force-committed. Fitting decisions are
+        // journaled + registered + spawned (agent lane) atomically. Same philosophy as
+        // the phase-4 TOCTOU re-checks.
     ReconcileDecide { reply: oneshot::Sender<Vec<Orphan>> },
         // TL-3/TL-4: orphan set = EXACTLY today's re-drive set minus live drivers —
         // (Pending ∨ Executing) ∧ no registry entry. journal.pending() already returns
