@@ -102,8 +102,14 @@ enum Command {
         //   daemon: probe_all (IO) → DecideTickRound (ms) → validate routes (IO) →
         //   loop with failures → CommitTick when clean (or revisions exhausted).
     CommitTick { decisions: Vec<AllocatorDecision>, reply: … },
-        // journal the intents + register + spawn their drivers (agent lane), atomically
-        // within the actor critical section.
+        // RE-CHECK then commit (spec review pass 3): the daemon-side revision loop takes
+        // network time, and user intents accepted meanwhile change the reservation
+        // picture — so CommitTick re-runs the §6a.4 sizing/cap guard against CURRENT
+        // reservations inside its critical section; any decision that no longer fits is
+        // DROPPED with a recorded refusal (the next cycle replans from fresh facts),
+        // never force-committed. Fitting decisions are journaled + registered + spawned
+        // (agent lane) atomically. Same decision-time/perform-time philosophy as the
+        // phase-4 TOCTOU re-checks.
     ReconcileDecide { reply: oneshot::Sender<Vec<Orphan>> },
         // TL-3/TL-4: orphan set = EXACTLY today's re-drive set minus live drivers —
         // (Pending ∨ Executing) ∧ no registry entry. journal.pending() already returns
@@ -139,9 +145,11 @@ One spawned task per in-flight money operation (user or agent — no special age
   EVERY exit — Ok, Err, panic-unwind. Registry = `std::sync::Mutex<HashMap<…>>` (plain
   mutex: sync bookkeeping, never held across await; Drop can't await).
 - **Perform-timeout in-daemon:** the deadline aborts the driver task; the Drop guard fires;
-  the intent stays Pending; the NEXT reconcile re-drives it (registry entry gone). Today's
-  "abandon then process-exit" becomes "abandon then guard-cleanup" — same recovery, no
-  double-drive (TL-3).
+  the intent stays in whatever status it had reached — `Pending` OR `Executing` (the
+  `Pending→Executing` CAS may have won before the abort) — and the NEXT reconcile re-drives
+  it because the orphan predicate is `(Pending ∨ Executing) ∧ no registry entry` (§6a.2).
+  Today's "abandon then process-exit" becomes "abandon then guard-cleanup" — same recovery,
+  no double-drive (TL-3).
 - Concurrency caps: user lane ~32 concurrent drivers (log-and-reject above — admission
   control, not a bottleneck); agent lane cap-1 (§6a.5).
 - Cross-restart exactly-once is NOT the registry's job: it rests on the proven durable
