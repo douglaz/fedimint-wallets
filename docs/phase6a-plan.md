@@ -85,8 +85,14 @@ One tokio task owns the `Runtime` (and through it the journal + MultiClient). Cl
 enum Command {
     // money-op lifecycle (each = one serialized critical section)
     DecideOp { req: OpRequest, reply: oneshot::Sender<Result<DecidedOp, RefuseReason>> },
+        // FIRST: same-key short-circuit (pass 9) — if the derived intent key already
+        // exists as Pending/Executing, reply with the existing key/status (attach, spawn
+        // nothing new — the registry/lane already owns it); if terminal, reply terminal
+        // (phase-1 dedup: Failed stays terminal). Only a genuinely new key proceeds to:
         // sizing + caps + phase-aware reservations + probe-hold check (TL-1) +
-        // journal the Pending intent + register the driver slot; returns the intent key
+        // journal the Pending intent + register + spawn; returns the intent key.
+        // Without the short-circuit, an idempotent retry's own reservation could refuse
+        // itself against the original's.
     DecideProbe { candidate: FederationId, reply: … },
         // TL-2: budget check + umbrella row + THE DURABLE 0x08 in_flight SESSION MARKER,
         // all in this one critical section (pass 6: the session marker IS the TL-1 hold
@@ -286,11 +292,14 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
   as today; `receive`/`direct-inflow` → (to, amount, **required client nonce** — minting is
   repeatable by nature, so the caller must distinguish repeats). No optional-nonce
   ambiguity: verbs with a natural anchor take none; verbs without one require it.
-  **Pay sizing inputs (pass 8):** the `/v1/pay` request carries an `amount` — REQUIRED for
-  an amountless BOLT11, and if present on an amount-carrying invoice it must match — plus a
-  fee cap (defaulted from `WalletConfig`'s per-move cap), so the §6a.4 pre-fund reservation
-  (`amount + fee_cap`) is always computable; an amountless invoice with no stated amount is
-  refused at decide time, never admitted un-reserved.
+  **Pay sizing inputs (passes 8-9):** the `/v1/pay` request carries an `amount` — REQUIRED
+  for an amountless BOLT11, and if present on an amount-carrying invoice it must match — a
+  fee cap (defaulted from `WalletConfig`'s per-move cap), and the **source `fed`**
+  (defaulted to the designated spending fed), so the §6a.4 pre-fund reservation
+  (`amount + fee_cap` against that fed) and the TL-1 held-fed refusal are both enforceable
+  BEFORE the `202`. The intent records the fed; a retry naming a different fed for the same
+  `payment_hash` is refused as a conflict with the existing intent. An amountless invoice
+  with no stated amount is refused at decide time, never admitted un-reserved.
 - The `202` key = the ledger's correlation key — the async API and the audit trail share one
   keyspace.
 
