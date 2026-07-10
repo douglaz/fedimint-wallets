@@ -116,6 +116,19 @@ the claim**, not a refund-on-timeout. (In recurringdv2 LNURL receives the
 contract `expiration` field encodes the gateway fee, not a real expiry.)
 _Avoid_: implying funds "bounce back" if not claimed quickly
 
+**Operation**:
+The user-facing unit of wallet activity — a pay, receive, move, join, probe —
+identified by its **operation key** and listed by `history`. Every API/CLI/app
+surface speaks of operations; money operations are driven internally by an
+**Intent**.
+_Avoid_: "intent" in any user-facing surface, "transaction"
+
+**Intent**:
+The internal durable, executable record inside a money **Operation**'s
+lifecycle: an idempotency-keyed decision driven Pending → Executing → terminal,
+crash-resumable via reconcile. Never appears in API type names or user copy.
+_Avoid_: exposing "intent" outside the engine
+
 
 
 

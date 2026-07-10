@@ -66,10 +66,10 @@ must re-establish each one explicitly; the spec sections cited own the mechanism
 | # | Property (source) | Old guarantee | 6a disposition |
 |---|---|---|---|
 | TL-1 | **Probe no-sweep isolation** (phase5-plan §5.0, lines 55-68 — "flagged as a Phase-6 precondition") | both probe legs ran synchronously in one process; nothing could spend from candidate `C` between legs, so leg OUT never sweeps pre-existing funds | a **per-fed probe hold** in the actor (§6a.5), with three sharpenings from spec review pass 1: (a) **durable, not registry-bound** — the hold predicate is the probe session's `in_flight` marker in the durable `0x08` record, so a panicked/abandoned driver leaves `C` held until the session resumes or terminalizes (the crash-total session already persists exactly this); (b) **retroactive** — `DecideProbe` DEFERS the probe when any in-flight intent already spends from `C` (visible in the same decide-time scan §6a.4 uses); (c) **evacuation preempts the hold** — `Evacuate(C→safe)` is exempt and drains `C` including the probe delta (rescuing real money outranks a ~20-sat accounting round); the probe then resolves umbrella-only `NoAttempt`/aborted with **no candidate demotion** (insufficient-funds-because-we-evacuated is our fault, not `C`'s). User pays from the spending fed are never affected |
-| TL-2 | **Weekly probe budget** (phase5-plan §5.1b rejection: "concurrent-runs budget overrun = v1-unreachable") | one process = one probe at a time; check-then-record could not race | budget check + umbrella-row journal happen in ONE actor command (§6a.2 `DecideProbe`) before the driver spawns — atomic by actor serialization; the agent lane is cap-1 besides (§6a.5) |
+| TL-2 | **Weekly probe budget** (phase5-plan §5.1b rejection: "concurrent-runs budget overrun = v1-unreachable") | one process = one probe at a time; check-then-record could not race | budget check + umbrella-row journal happen in ONE actor command (§6a.2 `DecideProbe`) before the driver spawns — atomic by actor serialization; concurrent probes of different candidates are safe under the same reservations/holds |
 | TL-3 | **Exactly-one perform per intent** (phase1-spec "Single-writer guard": dir lock + `Pending→Executing` CAS) | the dir lock serialized processes; the CAS serialized apply-vs-reconcile within one | the CAS **stays** (belt and braces); all transitions now flow through the actor (single-threaded by construction); the registry adds the missing piece — an ABANDONED driver (perform-timeout) cannot be re-driven while its task lives (re-drive ⇔ no registry entry; Drop guard makes the entry's lifetime equal the task's, §6a.3) |
 | TL-4 | **Ledger repair vs concurrent writers** (phase4-impl-spec §546/§598: "single-writer by convention, but repair must not corrupt if that breaks") | one-shot process; repair could not overlap money ops | repair's writes are actor commands like everything else; `POST /v1/reconcile` and the scheduler's reconcile step both funnel into the same idempotent actor decide (§6a.6) — overlapping requests coalesce, and the phase-4 repair CAS hardening remains |
-| TL-5 | **The watch loop never races itself** (phase5-plan §5.2.0: the loop "IS the single writer") | one loop, sequential cycles, occurrence advanced per cycle | exactly ONE workflow daemon task, started once at boot (§6a.5); the cap-1 agent lane serializes agent money ops; occurrence semantics unchanged |
+| TL-5 | **The watch loop never races itself** (phase5-plan §5.2.0: the loop "IS the single writer") | one loop, sequential cycles, occurrence advanced per cycle | exactly ONE workflow daemon task, started once at boot (§6a.5) — one decision cadence, though the money ops it spawns run concurrently like any others (owner ruling: an evacuation is just a send and never queues); occurrence semantics unchanged |
 | TL-6 | **O(ledger) per-cycle scans + coalescing bypass** (phase5-plan §5.2.8 deferrals) | bounded by short-lived processes / accepted for 5.2 | still deferred as performance (no money impact), BUT all O(ledger) reads move OFF-actor (§6a.2) so growth degrades throughput, never pay latency; the soak (§6a.9) is the instrument that decides if an index is needed |
 
 New invariant introduced by 6a itself: **phase-aware reservations** (§6a.4) — the async
@@ -143,18 +143,16 @@ enum Command {
         // caught that per-decision-vs-current-state alone lets two decisions jointly
         // overdraw/over-cap). Any decision that no longer fits is DROPPED with a recorded
         // refusal (the next cycle replans), never force-committed. Fitting decisions are
-        // ALL journaled atomically, but their drivers dispatch through the cap-1 agent
-        // lane ONE AT A TIME (pass 7: the allocator can emit several executable moves per
-        // tick — e.g. top-up + fund-standby — and spawning them all would violate the
-        // lane): CommitTick registers + spawns the FIRST; the lane dispatcher (workflow
-        // daemon) spawns the next when the previous terminalizes. CommitTick also KEEPS
-        // the stale-occurrence guard (ensure_fresh_tick_decisions): a same-occurrence
-        // terminal replay fails the tick step LOUDLY, exactly today's semantics (pass 8)
-        // — the watch cycle's per-cycle occurrence advance makes it rare, never silent.
-        // A journaled agent
-        // intent awaiting its turn is simply Pending-with-no-registry-entry — the normal
-        // re-drivable state, and the lane dispatcher is its re-driver. Same philosophy
-        // as the phase-4 TOCTOU re-checks.
+        // ALL journaled atomically AND their drivers ALL spawned immediately (owner
+        // ruling, grill session: an evacuation is just a send — agent money ops run
+        // concurrently exactly like user ops; there is NO agent lane and no queued
+        // dispatch. The batch is safe concurrent because every decision's reservations
+        // were folded in sequentially at this commit — the sizing already accounts for
+        // all of them). CommitTick also KEEPS the stale-occurrence guard
+        // (ensure_fresh_tick_decisions): a same-occurrence terminal replay fails the
+        // tick step LOUDLY, exactly today's semantics (pass 8) — the watch cycle's
+        // per-cycle occurrence advance makes it rare, never silent. Same philosophy as
+        // the phase-4 TOCTOU re-checks.
     ReconcileDecide { reply: oneshot::Sender<ReconcileReport> },
         // TL-3/TL-4: orphan set = EXACTLY today's re-drive set minus live drivers —
         // (Pending ∨ Executing) ∧ no registry entry. journal.pending() already returns
@@ -201,8 +199,11 @@ One spawned task per in-flight money operation (user or agent — no special age
   it because the orphan predicate is `(Pending ∨ Executing) ∧ no registry entry` (§6a.2).
   Today's "abandon then process-exit" becomes "abandon then guard-cleanup" — same recovery,
   no double-drive (TL-3).
-- Concurrency caps: user lane ~32 concurrent drivers (log-and-reject above — admission
-  control, not a bottleneck); agent lane cap-1 (§6a.5).
+- Concurrency cap: ONE global cap, ~32 concurrent drivers, user and agent alike
+  (log-and-reject above — admission control against runaway scripts, not a bottleneck).
+  There is deliberately NO per-origin lane and NO agent serialization (owner ruling: an
+  evacuation is just a send; no money operation ever queues behind another — the
+  reservations/holds are the safety mechanism, not serialization).
 - Cross-restart exactly-once is NOT the registry's job: it rests on the proven durable
   mechanisms — deterministic op ids + lnv2 dedup + op-log backfill, live-validated at all
   four crash killpoints.
@@ -256,8 +257,9 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
 
 - Steps run in the daemon's own time (probe sweeps, discovery previews = its IO), reaching
   the actor only for `DecideTick`/`DecideProbe`/`ReconcileDecide` round-trips; money work
-  spawns ordinary registered drivers in the **cap-1 agent lane** — at most one agent money
-  op in flight, ever.
+  spawns **ordinary registered drivers, concurrent like any user op** (no agent lane —
+  two simultaneous evacuations both start immediately; the scheduler is single, its
+  spawned money ops are not).
 - The TL-1 probe hold: the hold IS the durable `0x08` session's `in_flight` marker — any
   `DecideOp` spending FROM that fed refuses with a clear reason while the session lives,
   **except operations belonging to the holding session itself** (the hold carries the
@@ -284,7 +286,7 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
 | history / show | `GET /v1/history` · `/v1/operations/{key}` | detached ledger read |
 | status (dry-run) | `GET /v1/status` | detached (probes network); inputs via snapshot |
 | watch observability | `GET /v1/watch/status` · `/v1/health` | health = actor queue depth, registry size, scheduler liveness |
-| pay / move | `POST /v1/pay` · `/v1/move` | `202` + intent key ≤250 ms; driver async |
+| pay / move | `POST /v1/pay` · `/v1/move` | `202` + **operation key** ≤250 ms; driver async ("operation" is the public term — CONTEXT.md; "intent" stays internal) |
 | receive / direct-inflow | `POST /v1/receive` · `/v1/direct-inflow` | blocks for the invoice mint under a hard deadline (bounded seconds → timeout error); BOLT11 is the response; settlement async |
 | await | `GET /v1/operations/{key}?wait=true` | pending-map long-poll; mandatory deadline; drained-with-error on shutdown |
 | join / approve / candidates | `POST /v1/join` · `/v1/approve` · `GET /v1/candidates` | join async like money ops |
