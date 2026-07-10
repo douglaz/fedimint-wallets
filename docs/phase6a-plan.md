@@ -305,8 +305,10 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
   fee cap (defaulted from `WalletConfig`'s per-move cap), and the **source `fed`**
   (defaulted to the designated spending fed), so the §6a.4 pre-fund reservation
   (`amount + fee_cap` against that fed) and the TL-1 held-fed refusal are both enforceable
-  BEFORE the `202`. The intent records the fed; a retry naming a different fed for the same
-  `payment_hash` is refused as a conflict with the existing intent. An amountless invoice
+  BEFORE the `202`. The intent records ALL its sizing fields, and the same-key attach
+  (§6a.2) verifies EVERY one of them — fed, amount, fee cap — against the existing intent
+  (pass 11: a fed-only conflict check would let an attach drive money under different
+  bounds than the original reserved); any mismatch is refused as a conflict. An amountless invoice
   with no stated amount is refused at decide time, never admitted un-reserved.
 - The `202` key = the ledger's correlation key — the async API and the audit trail share one
   keyspace.
