@@ -162,8 +162,8 @@ enum Command {
         // and replies with a report of what it did (pass 7: returning an orphan LIST for
         // the caller to spawn lets overlapping reconcile invocations — the scheduler +
         // POST /v1/reconcile — double-drive the same intent; actor-side registration
-        // makes the second caller see zero orphans). Agent-lane intents dispatch through
-        // the lane as above; awaiter rehydration (§6a.3) rides the same pass.
+        // makes the second caller see zero orphans). Re-drive drivers spawn concurrently
+        // like all others; awaiter rehydration (§6a.3) rides the same pass.
     Shutdown { reply: … },
 }
 ```
