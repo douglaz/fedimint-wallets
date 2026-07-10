@@ -311,6 +311,17 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
 | discover / probe (manual) | — deferred from v1 | agent covers both; standalone CLI for one-offs |
 | tick (manual) | — deliberate omission | the scheduler owns cadence |
 
+- **Error taxonomy (galtland layered results — house style, applied):** `wallet-api`
+  errors keep three layers distinctly matchable, never flattened at the boundary:
+  (outer) **transport** — daemon unreachable/timeout, produced by the client itself;
+  (middle) **refused** — a decide-time `RefuseReason` (insufficient-after-reservations,
+  held fed, cap, budget, sizing-field conflict, fail-closed storage error): nothing was
+  journaled, safe to retry after fixing the cause; (inner) **failed** — an in-flight
+  driver terminal carrying the operation key: durable, visible in history, retry = a new
+  deliberate operation. The CLI maps the three to distinct exit codes and messages.
+- **Deadline defaults** (constants, not policy): invoice-mint hard deadline **30 s**;
+  await long-poll default **60 s** per request (clients re-poll; the waiter's mandatory
+  deadline is the request's, so shutdown-drain and timeout semantics stay uniform).
 - **Idempotency for client retries — per-verb derivation (spec review pass 1):** each verb
   keys off its natural anchor so a timed-out retry ALWAYS collides and a deliberate repeat
   ALWAYS diverges: `pay` → the invoice's **payment_hash** (same invoice = same key however
