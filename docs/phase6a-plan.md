@@ -291,7 +291,7 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
     file path, log level: things that exist before the DB does or that the host, not the
     user, decides. `walletd init` scaffolds it + the 0600 token. Edit + restart.
   - **Shipped policy defaults (owner-set):** `per_fed_cap` **1,500,000 sats** ·
-    `spending_target` **500,000 sats** · `standby_target` 15,000 sats · `max_fee`/move
+    `spending_target` **500,000 sats** · `standby_target` **150,000 sats** · `max_fee`/move
     200 sats · probe amount 20 sats · probe budget 10 attempts / 500 sats per week ·
     `evacuation_lead` 1h.
 - **Endpoints** (bearer token on every route):
