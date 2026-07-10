@@ -129,6 +129,14 @@ lifecycle: an idempotency-keyed decision driven Pending → Executing → termin
 crash-resumable via reconcile. Never appears in API type names or user copy.
 _Avoid_: exposing "intent" outside the engine
 
+**Policy**:
+The **Standing instruction**'s parameters — the user-decided targets, caps,
+fees, and budgets the Allocator runs under. User data: stored in the wallet DB
+(seeded with defaults, edited at runtime through the wallet's own surfaces),
+never in a host config file.
+_Avoid_: "settings"/"config" for these (reserve those for host/deployment
+concerns like paths and ports, which do live in a config file)
+
 
 
 

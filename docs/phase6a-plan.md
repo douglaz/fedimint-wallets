@@ -275,9 +275,25 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
 
 - **Wire DTOs** with `From<core>` impls (core report types stay serde-free); reuse the
   serde-capable primitives (`Msat`, `FederationId`, ledger rows) inside them.
-- **`WalletConfig`** — ONE struct deriving `serde::Deserialize` (TOML) + `clap::Args`
-  (standalone flags), single conversions into `TickPolicy`/`WatchPolicy`/`DiscoveryPolicy`.
-  `walletd init` scaffolds `<data-dir>/walletd.toml` + the 0600 token. Edit + restart.
+- **Configuration splits by WHO decides it (owner ruling, grill session):**
+  - **Policy = user data, lives in the DB.** Everything the user decides — targets, caps,
+    fees, probe budgets, cadences, discovery caps, spending/standby pins — is ONE `Policy`
+    struct in `wallet-api`, stored as a journal row (new partition), **seeded with
+    defaults by `walletd init`**, read by the actor at decide time, and **mutable at
+    runtime via `GET/PUT /v1/policy`** (+ a `wallet-cli policy` verb) — effective from the
+    next decide, no restart. Rationale: the policy IS the standing instruction's
+    parameters (ADR-0014) — user data that must version with the journal, ride the
+    Phase-7 encrypted app-state backup, and be editable by the future app (which cannot
+    edit files). The DRY principle from the eng review survives: the one struct serves
+    the DB row, the API DTO, and per-invocation smoke-test flag overrides on the
+    standalone verbs.
+  - **`walletd.toml` = host/deployment config ONLY** — data dir, bind address/port, token
+    file path, log level: things that exist before the DB does or that the host, not the
+    user, decides. `walletd init` scaffolds it + the 0600 token. Edit + restart.
+  - **Shipped policy defaults (owner-set):** `per_fed_cap` **1,500,000 sats** ·
+    `spending_target` **500,000 sats** · `standby_target` 15,000 sats · `max_fee`/move
+    200 sats · probe amount 20 sats · probe budget 10 attempts / 500 sats per week ·
+    `evacuation_lead` 1h.
 - **Endpoints** (bearer token on every route):
 
 | Verb | Endpoint | Semantics |
@@ -291,6 +307,7 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
 | await | `GET /v1/operations/{key}?wait=true` | pending-map long-poll; mandatory deadline; drained-with-error on shutdown |
 | join / approve / candidates | `POST /v1/join` · `/v1/approve` · `GET /v1/candidates` | join async like money ops |
 | reconcile (admin) | `POST /v1/reconcile` | idempotent crash-recovery pass on demand — the "it's wedged" button |
+| policy | `GET /v1/policy` · `PUT /v1/policy` | the standing instruction's parameters (DB-stored `Policy` struct); PUT validates + journals the change, effective next decide |
 | discover / probe (manual) | — deferred from v1 | agent covers both; standalone CLI for one-offs |
 | tick (manual) | — deliberate omission | the scheduler owns cadence |
 
@@ -309,7 +326,7 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
   conflict, never silently attached.
   **Pay sizing inputs (passes 8-9):** the `/v1/pay` request carries an `amount` — REQUIRED
   for an amountless BOLT11, and if present on an amount-carrying invoice it must match — a
-  fee cap (defaulted from `WalletConfig`'s per-move cap), and the **source `fed`**
+  fee cap (defaulted from the DB `Policy`'s per-move cap), and the **source `fed`**
   (defaulted to the designated spending fed), so the §6a.4 pre-fund reservation
   (`amount + fee_cap` against that fed) and the TL-1 held-fed refusal are both enforceable
   BEFORE the `202`. The intent records ALL its sizing fields, and the same-key attach
@@ -361,8 +378,9 @@ concurrent-move joint over-cap case, and two concurrent raw pays from one fed (t
 sizes against the first's reservation). TL-1 probe-hold goldens: op-from-held-fed refuses;
 the hold survives a panicked driver (durable session predicate); `DecideProbe` defers on a
 pre-existing in-flight C-spend; **evacuation preempts the hold** and the probe resolves
-NoAttempt without demoting the candidate. Pending-map: coalescing, deadline, shutdown drain. WalletConfig
-TOML/flags equivalence golden. Scheduler: ported 5.2 unit tests unchanged; abort arm; wake-
+NoAttempt without demoting the candidate. Pending-map: coalescing, deadline, shutdown drain. Policy: default
+seeding at `walletd init`; `PUT /v1/policy` validation goldens; standalone flag-override
+equivalence; `walletd.toml` (host config) parse. Scheduler: ported 5.2 unit tests unchanged; abort arm; wake-
 hint shortens sleep. axum: per-endpoint happy+error, 401, 202-contract, invoice deadline.
 CLI: verbs against a mock server; error UX.
 
@@ -384,7 +402,7 @@ real sats" and 6a.2 (NWC).
 
 Lanes (worktree-parallel): **A** perform-path restructure (wallet-core executor +
 runtime split; the hardest chunk — the existing suite is its gate) ∥ **B** `wallet-api`
-(DTOs + WalletConfig). Then **C** `wallet-daemon` (actor, drivers+registry, scheduler port,
+(DTOs + Policy struct + walletd.toml). Then **C** `wallet-daemon` (actor, drivers+registry, scheduler port,
 axum) ∥ **D** `wallet-cli` client + standalone. Then the gates, then the soak.
 
 Non-goals (v1): NWC (6a.2, soak-gated) · TLS/remote/multi-user · streaming events ·
