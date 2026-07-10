@@ -91,7 +91,11 @@ enum Command {
     JournalTransition { key: IntentKey, t: Transition, reply: … },  // drivers' per-leg + terminal writes
     // reads (all bounded; O(ledger) scans NEVER here)
     Snapshot { scope: SnapshotScope, reply: … },              // balances/policies for detached readers
-    ResolveAwait { key: IntentKey, waiter: oneshot::Sender<OpOutcome> },  // pending-map insert
+    ResolveAwait { key: IntentKey, waiter: oneshot::Sender<OpOutcome> },
+        // check-then-park INSIDE the critical section (spec review pass 5): if the
+        // intent is already terminal, reply immediately; only a live intent parks in
+        // the pending map — otherwise a wait=true issued after the terminal
+        // JournalTransition would hang to its deadline.
     // scheduler bookkeeping
     DecideTickRound { facts: ProbeFacts, route_failures: Vec<MoveRouteProblem>, reply: … },
         // PURE decide: build_snapshot + allocator over sensed facts + accumulated route
@@ -102,14 +106,15 @@ enum Command {
         //   daemon: probe_all (IO) → DecideTickRound (ms) → validate routes (IO) →
         //   loop with failures → CommitTick when clean (or revisions exhausted).
     CommitTick { decisions: Vec<AllocatorDecision>, reply: … },
-        // RE-CHECK then commit (spec review pass 3): the daemon-side revision loop takes
-        // network time, and user intents accepted meanwhile change the reservation
-        // picture — so CommitTick re-runs the §6a.4 sizing/cap guard against CURRENT
-        // reservations inside its critical section; any decision that no longer fits is
-        // DROPPED with a recorded refusal (the next cycle replans from fresh facts),
-        // never force-committed. Fitting decisions are journaled + registered + spawned
-        // (agent lane) atomically. Same decision-time/perform-time philosophy as the
-        // phase-4 TOCTOU re-checks.
+        // RE-CHECK then commit (spec review passes 3+5): the daemon-side revision loop
+        // takes network time, and user intents accepted meanwhile change the picture —
+        // so CommitTick re-runs THE SAME admission guard DecideOp uses (one shared
+        // function: §6a.4 reservations + per-fed caps + the TL-1 probe hold — pass 5
+        // caught that a caps-only recheck would let an agent move spend from a held C)
+        // against CURRENT state inside its critical section; any decision that no longer
+        // fits is DROPPED with a recorded refusal (the next cycle replans), never
+        // force-committed. Fitting decisions are journaled + registered + spawned
+        // (agent lane) atomically. Same philosophy as the phase-4 TOCTOU re-checks.
     ReconcileDecide { reply: oneshot::Sender<Vec<Orphan>> },
         // TL-3/TL-4: orphan set = EXACTLY today's re-drive set minus live drivers —
         // (Pending ∨ Executing) ∧ no registry entry. journal.pending() already returns
