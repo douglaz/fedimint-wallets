@@ -56,7 +56,26 @@ into the gate, discovered federations are surface/manual-join only.
 **Gate:** discover → structural floor → ACTIVE probe → score → rebalance runs unattended
 against devimint, fully recorded; a candidate failing only the active probe is never funded.
 
-### Phase 6 — Android frontend (Slint) + the WoS-simple surface
+### Phase 6a — `walletd`: the 24/7 daemon + local API (Android postponed; re-sequenced 2026-07-10)
+The working-wallet milestone while device issues block the Android build. One process owns
+the DB permanently (`db.lock` forbids a 24/7 watch loop + operational commands as separate
+processes): new `wallet-daemon` crate (axum on 127.0.0.1 + bearer-token file; a Runtime-
+owning actor whose command enum is ms-scale bookkeeping ONLY — never network IO; per-
+operation IO driver tasks with a Drop-guard in-flight registry; the 5.2 watch scheduler as
+a workflow daemon) + new `wallet-api` crate (wire DTOs + the single `WalletConfig` knob
+source) + `wallet-cli` as thin client with a standalone fallback. Core premise: the fully-
+async intent model — LN hold invoices mean in-flight payments can last HOURS, so no money
+operation's network IO may ever block another operation's start. The buildable spec is
+authored as `docs/phase6a-plan.md` from the approved design (eng-review 2026-07-10,
+`~/.gstack/projects/fedimint-wallets/master-main-design-20260710-031905.md`).
+**Gate (merge):** existing live gates rerun through the daemon + the responsiveness gate —
+a pay issued mid-probe starts (first external call) <250 ms, instrumented by a
+misbehaving-gateway test double (accepts-contract-never-provides-preimage) that holds a
+probe in flight deterministically. **Gate (real sats):** a 24h+ soak burn-in.
+**6a.2 (fast-follow, gated on the soak):** the NWC facade (NIP-47) so existing phone
+clients drive the wallet — no UI code.
+
+### Phase 6b — Android frontend (Slint) + the WoS-simple surface
 The locked architecture (pure Rust, Slint, thin JNI shims). First-run standing-instruction
 acknowledgement (ADR-0014 — the consent record, gating any receive); one balance +
 send/receive with QR (camera spike first — the known feasibility risk); activity screen = the
@@ -65,9 +84,25 @@ view, report §0.5); instant-view/auth-to-send (ADR-0011); WorkManager tick trig
 (Doze-timing spike). **Gate:** receive → auto-allocate → pay on a real device, agent actions
 visible in the activity screen with reasons.
 
+Carried from the retired TODOS.md (2026-07-10 — backlog now lives in the phase specs, then
+in `br` beads at build time): the pre-build feasibility spikes with written kill criteria +
+fallbacks (Slint camera preview → system-scanner intent; Doze/WorkManager → FCM wake;
+Block Store recovery → forced manual seed export); the three trust-critical screen specs
+(standing-instruction as spending-limit cards, evacuation alert money-centric/past-tense,
+success-that-looks-like-loss middle states) + a notification inventory; the UI copy canon
+(ban "risk engine", "safe", "bank", "mint", "curated", "anonymous"; honest "~2 active feds"
+copy per ADR-0006); discrete events on `mpsc`/`broadcast` (never `watch`, it coalesces);
+budget 5-6 real JNI/platform modules; auth-to-send holds agent intents pending biometric
+approval (the deleted `requires_auth` concept returns HERE, not earlier).
+
 ### Phase 7 — durability + recovery
 What all four surveyed wallets got wrong: seed encrypted at rest (Android Keystore +
 BiometricPrompt), silent backup of the federation set + standing instruction (ADR-0003).
+Carried from the retired TODOS.md: detect "no lockscreen" at onboarding and force a backup
+path (never silently degrade to no-backup with funds incoming); prompt manual seed export
+at a balance threshold; degraded-infra behavior (public recurringd/gateway unavailable,
+illiquid, censored) instrumented with real-world availability data before claiming
+"reliable", with one non-sticky recurringd fallback decided.
 Honest scope (per `fedimint-mechanics.md`): fedimint seed recovery restores ECASH per
 federation — NOT operation history, in-flight coordination, or the journal/ledger. So Phase 7
 adds an **encrypted app-state backup** (journal + ledger + federation registry — the same
@@ -82,7 +117,10 @@ The CEO-review hard gates before real users: fee-vs-risk EV computed at $50–$5
 (may conclude the engine defaults OFF at small balances — honor that); jurisdiction-specific
 legal opinion on the ADR-0014 posture; refreshed Observer/Nostr fixtures; threat-model pass
 (malicious federation, malicious gateway, poisoned discovery feed); repro release builds +
-AGPL compliance (ADR-0008/0009). **Gate:** an outside-voice review finds no P1s.
+AGPL compliance (ADR-0008/0009). Carried from the retired TODOS.md: a demand signal from
+the v1 closed beta (real WoS/Blink users activating + repeat-paying) gates the engine
+default; finalize the ADR-0017 probe-gating selection spec alongside the legal opinion.
+**Gate:** an outside-voice review finds no P1s.
 
 ## Definition of "fully featured v1"
 
