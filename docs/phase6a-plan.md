@@ -86,8 +86,10 @@ enum Command {
     // money-op lifecycle (each = one serialized critical section)
     DecideOp { req: OpRequest, reply: oneshot::Sender<Result<DecidedOp, RefuseReason>> },
         // FIRST: same-key short-circuit (pass 9) — if the derived intent key already
-        // exists as Pending/Executing, reply with the existing key/status (attach, spawn
-        // nothing new — the registry/lane already owns it); if terminal, reply terminal
+        // exists as Pending/Executing, reply with the existing key/status; if it has NO
+        // live registry entry (its driver timed out or panicked), register + spawn its
+        // re-drive driver right here (pass 10: attach means ENSURE DRIVEN, not wait for
+        // the next reconcile); if terminal, reply terminal
         // (phase-1 dedup: Failed stays terminal). Only a genuinely new key proceeds to:
         // sizing + caps + phase-aware reservations + probe-hold check (TL-1) +
         // journal the Pending intent + register + spawn; returns the intent key.
@@ -102,7 +104,8 @@ enum Command {
     JournalTransition { key: IntentKey, t: Transition, reply: … },  // drivers' per-leg + terminal writes
     // reads (all bounded; O(ledger) scans NEVER here)
     Snapshot { scope: SnapshotScope, reply: … },              // balances/policies for detached readers
-    ResolveAwait { key: IntentKey, waiter: oneshot::Sender<OpOutcome> },
+    ResolveAwait { key: IntentKey, target: AwaitTarget /* Terminal | InvoiceArtifact */,
+                   waiter: oneshot::Sender<OpOutcome> },
         // check-then-park INSIDE the critical section (spec review pass 5): if the
         // intent is already terminal, reply immediately; only a live intent parks in
         // the pending map — otherwise a wait=true issued after the terminal
@@ -117,7 +120,12 @@ enum Command {
     // scheduler bookkeeping
     DecideTickRound { facts: ProbeFacts, route_failures: Vec<MoveRouteProblem>, reply: … },
         // PURE decide: build_snapshot + allocator over sensed facts + accumulated route
-        // failures; returns candidate decisions; journals nothing. Spec review pass 2
+        // failures; returns candidate decisions; journals nothing. Its JOURNAL-side
+        // inputs — the auto-join probe gate (joined − UserApproved via the 0x09
+        // registry), active-probe verdicts, and the gate policy — are read INSIDE this
+        // command (ms-scale journal reads), exactly as plan_tick reads them today
+        // (pass 10: omitting them from the contract would let the daemon tick fund an
+        // auto-joined fed pre-probe). Only NETWORK facts arrive from the daemon. Spec review pass 2
         // corrected pass 1 here: plan_tick's revision loop AWAITS NETWORK inside —
         // first_move_route_problem → validate_executor_move_route (runtime.rs:2352, 2363)
         // is the §15.6 gateway scan — so the LOOP lives in the workflow daemon:
