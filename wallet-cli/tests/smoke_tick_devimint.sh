@@ -94,7 +94,10 @@ GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
 FUND_MSAT=500000       # fund fed A with 500 sat via direct-inflow (must exceed target + move + fees)
 SPENDING_TARGET=100000 # keep >=100 sat on the spending fed; A's SURPLUS above this funds the standby
 STANDBY_TARGET=100000  # fund the empty standby toward 100 sat -> the expected fund-standby move size
-MAX_FEE=1000000        # 1000 sat: a generous per-move fee cap so the cap-check never bites on devimint
+MAX_FEE=100000         # 100 sat: generous vs the ~10-sat devimint move fee, yet WELL under A's surplus
+                       # above target. The allocator reserves the FULL fee cap from that surplus when
+                       # sizing a fund-standby move (available = spendable - target - max_fee), so a
+                       # cap larger than the surplus saturates `available` to 0 and the move is refused.
 RECV_SLACK=1000        # 1 sat — bounds lnv2 receive-fee-quote under-estimate on B (per the other smokes)
 A_FEE_HEADROOM=50000   # 50 sat — generous upper bound on the TOTAL move fee A pays on top of the move
 
