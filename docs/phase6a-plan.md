@@ -65,7 +65,7 @@ must re-establish each one explicitly; the spec sections cited own the mechanism
 
 | # | Property (source) | Old guarantee | 6a disposition |
 |---|---|---|---|
-| TL-1 | **Probe no-sweep isolation** (phase5-plan §5.0, lines 55-68 — "flagged as a Phase-6 precondition") | both probe legs ran synchronously in one process; nothing could spend from candidate `C` between legs, so leg OUT never sweeps pre-existing funds | a **per-fed probe hold** in the actor (§6a.5): while a probe session on `C` is in flight, the actor refuses (clear error) any NEW intent that SPENDS FROM `C`. Holds only the candidate — user pays from the spending fed are unaffected (leg IN's S-side spend completes inside the probe's own driver). Released by the probe's terminal command or its Drop-guard deregistration |
+| TL-1 | **Probe no-sweep isolation** (phase5-plan §5.0, lines 55-68 — "flagged as a Phase-6 precondition") | both probe legs ran synchronously in one process; nothing could spend from candidate `C` between legs, so leg OUT never sweeps pre-existing funds | a **per-fed probe hold** in the actor (§6a.5), with three sharpenings from spec review pass 1: (a) **durable, not registry-bound** — the hold predicate is the probe session's `in_flight` marker in the durable `0x08` record, so a panicked/abandoned driver leaves `C` held until the session resumes or terminalizes (the crash-total session already persists exactly this); (b) **retroactive** — `DecideProbe` DEFERS the probe when any in-flight intent already spends from `C` (visible in the same decide-time scan §6a.4 uses); (c) **evacuation preempts the hold** — `Evacuate(C→safe)` is exempt and drains `C` including the probe delta (rescuing real money outranks a ~20-sat accounting round); the probe then resolves umbrella-only `NoAttempt`/aborted with **no candidate demotion** (insufficient-funds-because-we-evacuated is our fault, not `C`'s). User pays from the spending fed are never affected |
 | TL-2 | **Weekly probe budget** (phase5-plan §5.1b rejection: "concurrent-runs budget overrun = v1-unreachable") | one process = one probe at a time; check-then-record could not race | budget check + umbrella-row journal happen in ONE actor command (§6a.2 `DecideProbe`) before the driver spawns — atomic by actor serialization; the agent lane is cap-1 besides (§6a.5) |
 | TL-3 | **Exactly-one perform per intent** (phase1-spec "Single-writer guard": dir lock + `Pending→Executing` CAS) | the dir lock serialized processes; the CAS serialized apply-vs-reconcile within one | the CAS **stays** (belt and braces); all transitions now flow through the actor (single-threaded by construction); the registry adds the missing piece — an ABANDONED driver (perform-timeout) cannot be re-driven while its task lives (re-drive ⇔ no registry entry; Drop guard makes the entry's lifetime equal the task's, §6a.3) |
 | TL-4 | **Ledger repair vs concurrent writers** (phase4-impl-spec §546/§598: "single-writer by convention, but repair must not corrupt if that breaks") | one-shot process; repair could not overlap money ops | repair's writes are actor commands like everything else; `POST /v1/reconcile` and the scheduler's reconcile step both funnel into the same idempotent actor decide (§6a.6) — overlapping requests coalesce, and the phase-4 repair CAS hardening remains |
@@ -93,7 +93,12 @@ enum Command {
     Snapshot { scope: SnapshotScope, reply: … },              // balances/policies for detached readers
     ResolveAwait { key: IntentKey, waiter: oneshot::Sender<OpOutcome> },  // pending-map insert
     // scheduler bookkeeping
-    DecideTick { facts: ProbeFacts, reply: … },               // score+decide+journal intents; spawns nothing
+    DecideTick { facts: ProbeFacts, reply: … },
+        // score+decide+journal intents; spawns nothing. Verified ms-scale: plan_tick's
+        // route-revision/evacuation-fallback loop (runtime.rs:2150) iterates over ALREADY-
+        // SENSED probe facts — no network inside the loop — so it moves into this command
+        // whole; probe_all (the IO) runs in the workflow daemon beforehand. A route that
+        // fails at DRIVE time feeds the next cycle's facts, exactly as 5.2 behaves today.
     ReconcileDecide { reply: oneshot::Sender<Vec<Orphan>> },  // TL-3/TL-4: orphan list = Pending ∧ no registry entry
     Shutdown { reply: … },
 }
@@ -138,11 +143,17 @@ Sizing reads live balances (probe facts) PLUS journal-visible in-flight work. Th
 | `Sending` (pay issued ⇒ source already debited) | nothing (balance absorbed it) | amount (still undelivered) |
 | `Settled`/terminal · `Refunded` | nothing | nothing (balance reflects reality) |
 | `DirectInflow` `Awaiting` | n/a (no source spend) | amount toward cap room |
+| Raw `pay` (lnv2 send), pre-fund | amount + fee cap (two concurrent pays from one fed must size against each other — the second 202 sees the first's reservation) | n/a |
+| Raw `pay`, post-fund · raw `receive` | nothing (balance absorbed it) | claim credit toward cap at decide time |
 | Probe umbrella (in-flight session) | per its legs, same table | per its legs + the TL-1 probe hold |
 
 Implemented inside `DecideOp`'s critical section: reservations derive from
-`journal.pending()` + each intent's `MoveRecord` phase — no new in-memory state to rebuild
-on restart. The allocator's same-tick `reserved`/`credited` maps stay for intra-decision
+**`journal.pending()` ∪ `journal.awaiting()`** — `Awaiting` is deliberately excluded from
+`pending()` (executor.rs:12-14, reconcile does not re-drive it), so an unpaid
+`DirectInflow` invoice would otherwise be invisible and a concurrent move into the same
+destination could jointly over-cap it when the payer eventually pays (spec review pass 1).
+Each intent's `MoveRecord` phase supplies the row; no new in-memory state to rebuild on
+restart. The allocator's same-tick `reserved`/`credited` maps stay for intra-decision
 batches; this table governs cross-operation sizing. Getting this table wrong in the strict
 direction re-creates the smoke_tick over-reservation failure (allocator refuses affordable
 moves); in the loose direction it can overdraw — goldens for every row (§6a.9).
@@ -186,11 +197,14 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
 | discover / probe (manual) | — deferred from v1 | agent covers both; standalone CLI for one-offs |
 | tick (manual) | — deliberate omission | the scheduler owns cadence |
 
-- **Idempotency for client retries:** intent keys derive deterministically from the
-  request's logical fields (kind, feds, amount, occurrence) exactly as the CLI derives them
-  today — a timed-out client that retries the same logical request hits the same intent
-  (dedup), never a second spend. Requests carry an optional client nonce folded into the
-  derivation for deliberate repeats.
+- **Idempotency for client retries — per-verb derivation (spec review pass 1):** each verb
+  keys off its natural anchor so a timed-out retry ALWAYS collides and a deliberate repeat
+  ALWAYS diverges: `pay` → the invoice's **payment_hash** (same invoice = same key however
+  many times it's submitted; same amount + different invoice never collides; lnv2's own
+  contract dedup backs it); `move`/`evacuate` → (from, to, amount, fee_cap, **occurrence**)
+  as today; `receive`/`direct-inflow` → (to, amount, **required client nonce** — minting is
+  repeatable by nature, so the caller must distinguish repeats). No optional-nonce
+  ambiguity: verbs with a natural anchor take none; verbs without one require it.
 - The `202` key = the ledger's correlation key — the async API and the audit trail share one
   keyspace.
 
@@ -222,8 +236,12 @@ dedups on the intent key.
 **Unit:** every `Command` variant round-trips on a fixture journal; no IO reachable from the
 handler match; `None` from `recv()` exits cleanly. Registry Drop-guard on Ok/Err/panic;
 orphan re-drive. Reservation goldens for EVERY row of the §6a.4 table, both directions
-(no over-reservation, no overdraw). TL-1 probe-hold: op-from-held-fed refuses; hold released
-on terminal AND on panic. Pending-map: coalescing, deadline, shutdown drain. WalletConfig
+(no over-reservation, no overdraw) — explicitly including: the `Awaiting` DirectInflow +
+concurrent-move joint over-cap case, and two concurrent raw pays from one fed (the second
+sizes against the first's reservation). TL-1 probe-hold goldens: op-from-held-fed refuses;
+the hold survives a panicked driver (durable session predicate); `DecideProbe` defers on a
+pre-existing in-flight C-spend; **evacuation preempts the hold** and the probe resolves
+NoAttempt without demoting the candidate. Pending-map: coalescing, deadline, shutdown drain. WalletConfig
 TOML/flags equivalence golden. Scheduler: ported 5.2 unit tests unchanged; abort arm; wake-
 hint shortens sleep. axum: per-endpoint happy+error, 401, 202-contract, invoice deadline.
 CLI: verbs against a mock server; error UX.
