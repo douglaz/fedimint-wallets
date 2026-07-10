@@ -300,6 +300,11 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
   as today; `receive`/`direct-inflow` → (to, amount, **required client nonce** — minting is
   repeatable by nature, so the caller must distinguish repeats). No optional-nonce
   ambiguity: verbs with a natural anchor take none; verbs without one require it.
+  **Universal attach rule (passes 11-12):** for EVERY verb, the §6a.2 same-key attach
+  verifies ALL sizing fields of the request (fed, amount, fee cap) against the existing
+  intent — the key identifies the operation, the sizing check guards its bounds; any
+  mismatch (e.g. same receive nonce/to/amount with a changed fee cap) is refused as a
+  conflict, never silently attached.
   **Pay sizing inputs (passes 8-9):** the `/v1/pay` request carries an `amount` — REQUIRED
   for an amountless BOLT11, and if present on an amount-carrying invoice it must match — a
   fee cap (defaulted from `WalletConfig`'s per-move cap), and the **source `fed`**
