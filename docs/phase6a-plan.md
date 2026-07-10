@@ -322,12 +322,20 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
 
 ## 6a.7 `wallet-cli`: thin client + standalone
 
-Every operational verb becomes an HTTP call against `wallet-api` types (daemon URL + token
-from config/env); `pay`/`move` print the intent key and `await-*` long-polls, preserving
-today's two-phase stdout contracts so the smoke scripts port mechanically. Standalone mode
-(daemon stopped; `db.lock` enforces mutual exclusion) **spins up the same actor + driver
-components in-process**, runs the one command, shuts down — one code path, no legacy fork.
-Clear errors: daemon-not-running (with the two options), 401 (bad token), lock-held.
+One binary, two modes, **explicitly selected** (grill session): **client mode is the
+default** — every operational verb becomes an HTTP call against `wallet-api` types (daemon
+URL + token from config/env); if the daemon isn't running the verb fails with a clear
+"start walletd, or rerun with `--standalone`" error — never a silent fallback.
+**`--standalone` is a deliberate flag** (it takes the exclusive `db.lock`; a silent
+fallback would quietly block a supervisor-restarting daemon behind a lock race the user
+didn't choose): it spins up the same actor + driver components in-process (minus HTTP),
+runs the one command, shuts down — one code path, no legacy fork. `pay`/`move` print the
+operation key and `await-*` long-polls, preserving today's two-phase stdout contracts so
+the smoke scripts port mechanically. **The `watch` verb is DELETED** — the daemon IS the
+watch: redundant in client mode, a daemon-without-an-API in standalone mode (the 5.2c
+smoke is superseded by the 6a daemon gates, which re-validate the ported scheduler in its
+new home). Clear errors: daemon-not-running (with the two options), 401 (bad token),
+lock-held.
 
 ## 6a.8 Lifecycle + observability
 
