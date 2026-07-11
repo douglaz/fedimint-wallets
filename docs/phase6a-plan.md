@@ -290,6 +290,12 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
   - **`walletd.toml` = host/deployment config ONLY** — data dir, bind address/port, token
     file path, log level: things that exist before the DB does or that the host, not the
     user, decides. `walletd init` scaffolds it + the 0600 token. Edit + restart.
+  - **Names & defaults (owner-ratified):** binary **`walletd`** / systemd user unit
+    `walletd.service` ("walletd" is the working name; a product name at Phase 8 may
+    rename it — cheap now, costly later, accepted); default bind **`127.0.0.1:9736`**
+    (Lightning's 9735 + 1); default data dir **`~/.local/share/walletd`** (XDG — a
+    daemon needs an absolute home, not the CLI-era CWD-relative `./.wallet-cli-data`);
+    the CLI client finds the daemon via `~/.config/walletd/` (URL + token path).
   - **Shipped policy defaults (owner-set):** `per_fed_cap` **1,500,000 sats** ·
     `spending_target` **500,000 sats** · `standby_target` **150,000 sats** · `max_fee`/move
     200 sats · probe amount 20 sats · probe budget 10 attempts / 500 sats per week ·
