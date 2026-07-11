@@ -8,7 +8,8 @@ one process, one exclusive `db.lock`, strictly synchronous verbs — for a **ful
 intent model**: a single actor task owns the Runtime + journal and serializes ONLY
 ms-scale bookkeeping (sizing, caps, reservations, journal transitions); every money
 operation's network IO runs in its own concurrent driver task, unbounded in duration and
-count (one generous global admission cap). **Nothing ever queues behind another
+unbounded BY EACH OTHER — a generous admission cap bounds externally-submitted totals
+(runaway-script control); agent batches spawn regardless, bounded by policy. **Nothing ever queues behind another
 operation's IO — including the agent's own probes and evacuations.**
 
 ## The forcing fact

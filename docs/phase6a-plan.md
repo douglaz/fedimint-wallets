@@ -12,7 +12,9 @@ spec is the field-level authority; the design doc is narrative background.
 **GREENFIELD.** No backwards compatibility, no migration, no serde wire/compat shims. The
 journal schema may change or gain rows freely. The FROZEN thing is validated behavior: the
 existing unit suite and the live devimint gates (money path, crash gate at all four
-killpoints, tick, discovery, watch) stay green through every change here.
+killpoints, tick, discovery) stay green through every change here; the watch gate's
+validated behavior migrates to its daemon replacement gate (§6a.7 deletes the verb, §6a.9
+re-validates the ported scheduler).
 
 ## 6a.0 Shape + premises
 
@@ -104,6 +106,11 @@ enum Command {
     JournalTransition { key: IntentKey, t: Transition, reply: … },  // drivers' per-leg + terminal writes
     // reads (all bounded; O(ledger) scans NEVER here)
     Snapshot { scope: SnapshotScope, reply: … },              // balances/policies for detached readers
+    GetPolicy { reply: … },                                   // the DB Policy row
+    PutPolicy { policy: Policy, reply: … },
+        // broad review: validate + journal the new Policy in this critical section
+        // (serialized like every write), wake the scheduler (deadlines recompute from
+        // the new cadences/budgets), reply with the stored version.
     ResolveAwait { key: IntentKey, target: AwaitTarget /* Terminal | InvoiceArtifact */,
                    waiter: oneshot::Sender<OpOutcome> },
         // check-then-park INSIDE the critical section (spec review pass 5): if the
@@ -197,13 +204,23 @@ One spawned task per in-flight money operation (user or agent — no special age
   the intent stays in whatever status it had reached — `Pending` OR `Executing` (the
   `Pending→Executing` CAS may have won before the abort) — and the NEXT reconcile re-drives
   it because the orphan predicate is `(Pending ∨ Executing) ∧ no registry entry` (§6a.2).
+  **Observable behavior freeze (broad review):** the re-drive path normalizes an orphaned
+  `Executing` back to `Pending` FIRST, preserving today's asserted observable
+  (`perform_timeout_leaves_a_stalled_intent_pending`, runtime.rs:4930) — a timed-out
+  operation is seen as Pending, never as a phantom Executing.
   Today's "abandon then process-exit" becomes "abandon then guard-cleanup" — same recovery,
   no double-drive (TL-3).
-- Concurrency cap: ONE global cap, ~32 concurrent drivers, user and agent alike
-  (log-and-reject above — admission control against runaway scripts, not a bottleneck).
-  There is deliberately NO per-origin lane and NO agent serialization (owner ruling: an
-  evacuation is just a send; no money operation ever queues behind another — the
-  reservations/holds are the safety mechanism, not serialization).
+- Concurrency cap: ONE global cap, ~32 concurrent drivers (log-and-reject above —
+  admission control against runaway scripts, not a bottleneck). **Where it applies (broad
+  review):** at `DecideOp` admission — i.e. to externally-submitted requests. `CommitTick`
+  and `ReconcileDecide` spawn their batches regardless (both are bounded by policy — an
+  allocator tick emits a handful of decisions, re-drives are bounded by what's Pending);
+  refusing an evacuation because a script opened 32 pays would invert the priorities. The
+  actor mailbox is sized ≥ cap + headroom (e.g. 64) so full-capacity driver transitions
+  never back-pressure admission. There is deliberately NO per-origin lane and NO agent
+  serialization (owner ruling: an evacuation is just a send; no money operation ever
+  queues behind another — the reservations/holds are the safety mechanism, not
+  serialization).
 - Cross-restart exactly-once is NOT the registry's job: it rests on the proven durable
   mechanisms — deterministic op ids + lnv2 dedup + op-log backfill, live-validated at all
   four crash killpoints.
@@ -222,6 +239,7 @@ Sizing reads live balances (probe facts) PLUS journal-visible in-flight work. Th
 | `DirectInflow` `Awaiting` | n/a (no source spend) | amount toward cap room |
 | Raw `pay` (lnv2 send), pre-fund — **no send-op artifact journaled yet** | amount + fee cap (two concurrent pays from one fed must size against each other — the second 202 sees the first's reservation) | n/a |
 | Raw `pay`, post-fund — **send-op artifact journaled** · raw `receive` | nothing (balance absorbed it) | claim credit toward cap at decide time |
+| `Evacuate`, pre-fund | **nothing extra** — the amount IS the source's drain (fees sized inside it at perform time, `size_fresh_evacuation`; pre-reserving `amount + fee_cap` would refuse exactly the small dying-fed balances evacuation exists to drain — the allocator's §4.2 exemption, preserved verbatim; broad review) | amount toward cap room |
 | Probe umbrella (in-flight session) | per its legs, same table | per its legs + the TL-1 probe hold |
 
 Implemented inside `DecideOp`'s critical section: reservations derive from
@@ -296,6 +314,13 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
     (Lightning's 9735 + 1); default data dir **`~/.local/share/walletd`** (XDG — a
     daemon needs an absolute home, not the CLI-era CWD-relative `./.wallet-cli-data`);
     the CLI client finds the daemon via `~/.config/walletd/` (URL + token path).
+  - **Policy activation semantics (broad review):** decisions read the CURRENT policy at
+    decide time; an in-flight driver keeps its ADMITTED parameters (fee caps etc. are
+    journaled in its intent — immutable per operation). `PUT /v1/policy` wakes the
+    scheduler so cadences/budgets/deadlines recompute immediately. `walletd init` inserts
+    defaults ONLY if no Policy row exists (re-running init for token rotation never
+    resets policy). `Runtime`'s currently-immutable per-fed-cap/timeout constructor
+    fields become per-decide policy reads as part of the restructure.
   - **Shipped policy defaults (owner-set):** `per_fed_cap` **1,500,000 sats** ·
     `spending_target` **500,000 sats** · `standby_target` **150,000 sats** · `max_fee`/move
     200 sats · probe amount 20 sats · probe budget 10 attempts / 500 sats per week ·
@@ -311,7 +336,7 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
 | pay / move | `POST /v1/pay` · `/v1/move` | `202` + **operation key** ≤250 ms; driver async ("operation" is the public term — CONTEXT.md; "intent" stays internal) |
 | receive / direct-inflow | `POST /v1/receive` · `/v1/direct-inflow` | blocks for the invoice mint under a hard deadline (bounded seconds → timeout error); BOLT11 is the response; settlement async |
 | await | `GET /v1/operations/{key}?wait=true` | pending-map long-poll; mandatory deadline; drained-with-error on shutdown |
-| join / approve / candidates | `POST /v1/join` · `/v1/approve` · `GET /v1/candidates` | join async like money ops |
+| join / approve / candidates | `POST /v1/join` · `/v1/approve` · `GET /v1/candidates` | join async **with the full Intent lifecycle** (kind `join`: decide → intent → driver → terminal; a crash after the 202 re-drives via reconcile like any operation — broad review; the ledger join row stays the audit layer) |
 | reconcile (admin) | `POST /v1/reconcile` | idempotent crash-recovery pass on demand — the "it's wedged" button |
 | policy | `GET /v1/policy` · `PUT /v1/policy` | the standing instruction's parameters (DB-stored `Policy` struct); PUT validates + journals the change, effective next decide |
 | discover / probe (manual) | — deferred from v1 | agent covers both; standalone CLI for one-offs |
@@ -336,6 +361,11 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
   as today; `receive`/`direct-inflow` → (to, amount, **required client nonce** — minting is
   repeatable by nature, so the caller must distinguish repeats). No optional-nonce
   ambiguity: verbs with a natural anchor take none; verbs without one require it.
+  **Scope (broad review): this table derives USER API keys only.** Agent decision keys
+  keep TODAY's derivation untouched (per-logical-intent + occurrence, amount-free —
+  allocator.rs:308): folding amount/fee-cap into agent keys would let changed sizing under
+  the same occurrence mint a fresh key and bypass the stale-occurrence replay guard. The
+  two derivations coexist deliberately; the validated replay behavior is the frozen thing.
   **Universal attach rule (passes 11-12):** for EVERY verb, the §6a.2 same-key attach
   verifies ALL sizing fields of the request (fed, amount, fee cap) against the existing
   intent — the key identifies the operation, the sizing check guards its bounds; any
@@ -374,9 +404,11 @@ lock-held.
 ## 6a.8 Lifecycle + observability
 
 `walletd` runs under systemd (user unit); fatal = exit non-zero, supervisor restarts
-(§5.2.6 convention). SIGTERM: stop intake → drain the actor mailbox (ms; every submitted
-journal transition lands) → abort drivers → exit 0; restart reconciles (abandon-and-resume
-IS the model — hours-long IO makes draining it impossible by design). Observability v1:
+(§5.2.6 convention). SIGTERM (broad review, ordering matters): stop intake → **abort
+drivers first** → drain the actor mailbox (every already-submitted journal transition
+lands; nothing new can arrive after the aborts) → exit 0; restart reconciles
+(abandon-and-resume IS the model — hours-long IO makes draining it impossible by design).
+Drain-then-abort would let late driver transitions race the exit. Observability v1:
 `tracing` structured logs (per-op timelines keyed by intent key — the ledger is the durable
 timeline); `/v1/health` as above.
 
@@ -407,7 +439,10 @@ CLI: verbs against a mock server; error UX.
 - **The responsiveness gate:** watch active, a probe held in flight by a **misbehaving-
   gateway test double** (accepts-contract-never-provides-preimage); `POST /v1/pay` must
   reach its **first external fedimint call** (not just the 202) in <250 ms; two concurrent
-  pays never serialize on IO.
+  pays never serialize on IO. **Contention variant (broad review):** the same measurement
+  repeated at FULL designed capacity — the admission cap's worth of concurrent drivers
+  churning transitions through the mailbox — so the 250 ms bound is proven under load,
+  not just in the two-op happy case.
 - The 5.2c autonomous chain (discover→gate→probes→fund→evacuate) re-run under the daemon's
   scheduler.
 
@@ -423,7 +458,7 @@ runtime split; the hardest chunk — the existing suite is its gate) ∥ **B** `
 axum) ∥ **D** `wallet-cli` client + standalone. Then the gates, then the soak.
 
 Non-goals (v1): NWC (6a.2, soak-gated) · TLS/remote/multi-user · streaming events ·
-runtime reconfig · packages/releases (Phase 8) · manual discover/probe endpoints · any UI.
+runtime HOST reconfiguration (walletd.toml = edit + restart; user Policy IS runtime-mutable via PUT) · packages/releases (Phase 8) · manual discover/probe endpoints · any UI.
 
 Settled during the eng review (do not re-litigate): the 6a.0 de-risking spike was REJECTED
 (build directly; fedimint's state-machine executor is trusted for client-level concurrency —

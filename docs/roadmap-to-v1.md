@@ -62,8 +62,10 @@ the DB permanently (`db.lock` forbids a 24/7 watch loop + operational commands a
 processes): new `wallet-daemon` crate (axum on 127.0.0.1 + bearer-token file; a Runtime-
 owning actor whose command enum is ms-scale bookkeeping ONLY — never network IO; per-
 operation IO driver tasks with a Drop-guard in-flight registry; the 5.2 watch scheduler as
-a workflow daemon) + new `wallet-api` crate (wire DTOs + the single `WalletConfig` knob
-source) + `wallet-cli` as thin client with a standalone fallback. Core premise: the fully-
+a workflow daemon) + new `wallet-api` crate (wire DTOs + the `Policy` struct — user policy lives in the
+DB, runtime-mutable via `PUT /v1/policy`; `walletd.toml` carries host config only) +
+`wallet-cli` as thin client (client mode default; `--standalone` is an explicit flag; the
+`watch` verb is deleted — the daemon IS the watch). Core premise: the fully-
 async intent model — LN hold invoices mean in-flight payments can last HOURS, so no money
 operation's network IO may ever block another operation's start. The buildable spec is
 authored as `docs/phase6a-plan.md` from the approved design (eng-review 2026-07-10,
