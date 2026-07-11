@@ -7467,6 +7467,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wallet-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wallet-core",
+]
+
+[[package]]
 name = "wallet-cli"
 version = "0.1.0"
 dependencies = [

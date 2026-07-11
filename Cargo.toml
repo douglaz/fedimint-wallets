@@ -1,5 +1,5 @@
 [workspace]
-members = ["wallet-core", "wallet-fedimint", "wallet-cli"]
+members = ["wallet-core", "wallet-api", "wallet-fedimint", "wallet-cli"]
 resolver = "2"
 # Cargo resolves the workspace root by filesystem ancestry, ignoring .gitignore.
 # Exclude the analysis clones so `cargo` inside them isn't captured by this workspace.
