@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use wallet_core::{
     auto_join_budget, discover_pass_plan, discover_pass_plan_in_rotation, score_structural, Actor,
     BudgetVerdict, DiscoveryPolicy, DiscoverySource, FederationFacts, FederationId, IdempotencyKey,
-    Occurrence, OperationKind, ReasonCode, ScorerPolicy, SourceStatus, WatchPolicy,
+    Occurrence, OperationKind, ProbePolicy, ReasonCode, ScorerPolicy, SourceStatus, WatchPolicy,
 };
 
 /// One untrusted candidate announcement (§5.1.0): a federation id + invite + network hint.
@@ -141,7 +141,11 @@ pub(crate) trait DiscoveryBackend {
     async fn list_candidates(&self) -> anyhow::Result<Vec<(FederationId, CandidateRecord)>>;
     async fn agent_created_federation(&self, id: FederationId) -> anyhow::Result<bool>;
     async fn preview(&self, invite: &InviteCode) -> anyhow::Result<PreviewedCandidate>;
-    async fn auto_join_counts(&self, now_ms: u64) -> anyhow::Result<AutoJoinCounts>;
+    async fn auto_join_counts(
+        &self,
+        now_ms: u64,
+        probe_policy: &ProbePolicy,
+    ) -> anyhow::Result<AutoJoinCounts>;
     async fn join_as_agent(
         &self,
         id: FederationId,
@@ -305,6 +309,30 @@ pub(crate) async fn run_discover_pass_bounded(
 pub(crate) async fn run_discover_pass_bounded_with_rotation(
     sources: &[Box<dyn CandidateSource>],
     policy: &DiscoveryPolicy,
+    backend: &impl DiscoveryBackend,
+    now_ms: u64,
+    nonce: &str,
+    watch_policy: &WatchPolicy,
+    resume: DiscoverPassResume<'_>,
+) -> anyhow::Result<BoundedDiscoverReport> {
+    run_discover_pass_bounded_with_rotation_and_probe_policy(
+        sources,
+        policy,
+        &ProbePolicy::default(),
+        backend,
+        now_ms,
+        nonce,
+        watch_policy,
+        resume,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_discover_pass_bounded_with_rotation_and_probe_policy(
+    sources: &[Box<dyn CandidateSource>],
+    policy: &DiscoveryPolicy,
+    probe_policy: &ProbePolicy,
     backend: &impl DiscoveryBackend,
     now_ms: u64,
     nonce: &str,
@@ -498,6 +526,7 @@ pub(crate) async fn run_discover_pass_bounded_with_rotation(
         Some(
             run_auto_join(
                 policy,
+                probe_policy,
                 backend,
                 &scorer_policy,
                 &joined,
@@ -929,8 +958,10 @@ fn candidate_record(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_auto_join(
     policy: &DiscoveryPolicy,
+    probe_policy: &ProbePolicy,
     backend: &impl DiscoveryBackend,
     scorer_policy: &ScorerPolicy,
     joined: &BTreeSet<FederationId>,
@@ -970,7 +1001,7 @@ async fn run_auto_join(
     } = bounds;
     let mut completed_window = true;
     let mut stopped_for_budget = false;
-    let mut counts = backend.auto_join_counts(now_ms).await?;
+    let mut counts = backend.auto_join_counts(now_ms, probe_policy).await?;
     for id in window {
         if timing.deadline_elapsed() {
             completed_window = false;
@@ -1683,7 +1714,11 @@ mod tests {
             }
         }
 
-        async fn auto_join_counts(&self, _now_ms: u64) -> anyhow::Result<AutoJoinCounts> {
+        async fn auto_join_counts(
+            &self,
+            _now_ms: u64,
+            _probe_policy: &ProbePolicy,
+        ) -> anyhow::Result<AutoJoinCounts> {
             let mut calls = self.count_calls.lock().expect("count calls lock");
             *calls = calls.saturating_add(1);
             Ok(*self.counts.lock().expect("counts lock"))

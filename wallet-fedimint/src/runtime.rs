@@ -22,8 +22,9 @@
 
 use crate::discovery::{
     auto_join_kind, discover_kind, discovery_actor, run_discover_pass_bounded_with_rotation,
-    AutoJoinAttempt, AutoJoinCounts, CandidateSource, DiscoverPassResume, DiscoverReport,
-    DiscoveryBackend, PreviewedCandidate, DISCOVERY_REASON,
+    run_discover_pass_bounded_with_rotation_and_probe_policy, AutoJoinAttempt, AutoJoinCounts,
+    CandidateSource, DiscoverPassResume, DiscoverReport, DiscoveryBackend, PreviewedCandidate,
+    DISCOVERY_REASON,
 };
 use crate::executor::FedimintExecutor;
 use crate::journal::{
@@ -334,19 +335,20 @@ struct EvacuationFallback {
     plan: TickPlan,
 }
 
-struct MoveRouteProblem {
-    from: FederationId,
-    to: FederationId,
+#[derive(Clone, Debug)]
+pub struct MoveRouteProblem {
+    pub(crate) from: FederationId,
+    pub(crate) to: FederationId,
     /// The federation whose gateway is marked unavailable in the planning probe copy so
     /// `plan_tick` re-runs allocation onto a different route. This is ALWAYS the selected
     /// destination `to`: a destination that cannot receive is skipped directly, and a source
     /// leg that the destination-selected gateway cannot serve is retried against another
     /// eligible destination (an evacuation additionally captures a fallback plan first). There
     /// is no route problem that leaves the destination usable, so this is never absent.
-    mark_unavailable: FederationId,
-    gateway: Option<GatewayUrl>,
-    error: String,
-    evacuation_source_route: bool,
+    pub(crate) mark_unavailable: FederationId,
+    pub(crate) gateway: Option<GatewayUrl>,
+    pub(crate) error: String,
+    pub(crate) evacuation_source_route: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -434,6 +436,79 @@ impl Runtime {
     /// Service-layer journal handle used for actor decisions and lifecycle transitions.
     pub(crate) fn service_journal(&self) -> Arc<FedimintJournal> {
         self.journal.clone()
+    }
+
+    pub(crate) fn service_multi_client(&self) -> Arc<MultiClient> {
+        self.mc.clone()
+    }
+
+    pub(crate) async fn service_due_probes(
+        &self,
+        spending: Option<FederationId>,
+        tick_policy: &TickPolicy,
+        watch_policy: &WatchPolicy,
+        sampled_balances: &BTreeMap<FederationId, Msat>,
+        now_ms: u64,
+        occurrence: Occurrence,
+    ) -> anyhow::Result<(Vec<(FederationId, FederationId, Msat)>, bool)> {
+        let context = self.probe_schedule_context(now_ms, watch_policy).await?;
+        let inputs = self
+            .probe_schedule_inputs(
+                spending,
+                &tick_policy.probe_gate_policy,
+                watch_policy,
+                now_ms,
+                &context.last_invocations,
+            )
+            .await?;
+        let mut resumed = Vec::new();
+        let mut fresh = Vec::new();
+        for (candidate, source, _verdict, due_ms, post_in_resume) in inputs {
+            let Some(source) = source else {
+                continue;
+            };
+            if !post_in_resume && due_ms > now_ms {
+                continue;
+            }
+            if !post_in_resume && !context.budget_ok {
+                self.record_watch_probe_skip(
+                    candidate,
+                    source,
+                    tick_policy.probe_gate_policy.amount_msat,
+                    occurrence,
+                    budget_skip_diagnostic_bucket_ms(now_ms, context.budget_reset_ms),
+                    "watch probe skipped: weekly probe budget exhausted",
+                )
+                .await
+                .map_err(exec_err)?;
+                continue;
+            }
+            if let Some(session) = self
+                .journal
+                .probe_record(&candidate)
+                .await
+                .map_err(exec_err)?
+                .and_then(|record| record.in_flight)
+            {
+                resumed.push((candidate, source, Msat(session.c_spendable_before_in_msat)));
+            } else if let Some(baseline) = fresh_probe_baseline(
+                self.mc.has_client(&candidate),
+                sampled_balances.get(&candidate).copied(),
+            ) {
+                fresh.push((candidate, source, baseline));
+            } else {
+                tracing::warn!(
+                    federation = %candidate.to_hex(),
+                    "watch scheduler: skipping fresh probe because its open candidate baseline was not sampled"
+                );
+            }
+        }
+        // The synchronous 5.2 loop resumes retained probe money before starting anything
+        // fresh, and defers fresh probes when that resume remains in flight. Service probes
+        // return as soon as their driver is spawned, so a resumed session is necessarily still
+        // live for this cycle; admitting only the resume group is the async equivalent.
+        let resuming = !resumed.is_empty();
+        Ok((if resuming { resumed } else { fresh }, resuming))
     }
 
     /// Fresh step-2 executor for a detached service driver.
@@ -1111,9 +1186,10 @@ impl Runtime {
             }
         } else {
             let nonce = ledger_nonce();
-            match run_discover_pass_bounded_with_rotation(
+            match run_discover_pass_bounded_with_rotation_and_probe_policy(
                 sources,
                 discovery_policy,
+                &cycle_tick_policy.probe_gate_policy,
                 self,
                 now,
                 &nonce,
@@ -1169,6 +1245,9 @@ impl Runtime {
                 watch_policy,
                 now_ms(),
                 Some(&probe_context),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                false,
             )
             .await?;
         probes.sort_by_key(|probe| probe.fed);
@@ -1184,14 +1263,101 @@ impl Runtime {
         })
     }
 
+    pub(crate) async fn service_discover_cycle(
+        &self,
+        sources: &[Box<dyn CandidateSource>],
+        discovery_policy: &DiscoveryPolicy,
+        probe_policy: &ProbePolicy,
+        watch_policy: &WatchPolicy,
+        occurrence: Occurrence,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        let state = self.journal.get_watch_state().await.map_err(exec_err)?;
+        if !discovery_due(&state, watch_policy, now) {
+            return Ok(());
+        }
+        let nonce = ledger_nonce();
+        match run_discover_pass_bounded_with_rotation_and_probe_policy(
+            sources,
+            discovery_policy,
+            probe_policy,
+            self,
+            now,
+            &nonce,
+            watch_policy,
+            DiscoverPassResume {
+                cursor: state.discover_cursor,
+                rotation: &state.discover_rotation,
+                occurrence,
+            },
+        )
+        .await
+        {
+            Ok(outcome) => {
+                let progress = outcome.report.progress;
+                self.journal
+                    .put_watch_discovery_state(
+                        progress.next_cursor,
+                        progress.backlog,
+                        Some(now),
+                        outcome.next_rotation,
+                    )
+                    .await
+                    .map_err(exec_err)?;
+            }
+            Err(error) => {
+                tracing::warn!(?error, "watch: discover failed; backing off");
+                self.journal
+                    .put_watch_discovery_state(
+                        state.discover_cursor,
+                        false,
+                        Some(now),
+                        state.discover_rotation,
+                    )
+                    .await
+                    .map_err(exec_err)?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn watch_deadlines(
         &self,
         tick_policy: &TickPolicy,
         watch_policy: &WatchPolicy,
         now_ms: u64,
     ) -> anyhow::Result<AdaptiveSleepDeadlines> {
-        self.watch_deadlines_with_context(tick_policy, watch_policy, now_ms, None)
-            .await
+        self.watch_deadlines_with_context(
+            tick_policy,
+            watch_policy,
+            now_ms,
+            None,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn service_watch_deadlines(
+        &self,
+        tick_policy: &TickPolicy,
+        watch_policy: &WatchPolicy,
+        now_ms: u64,
+        registry_owned_probes: &BTreeSet<FederationId>,
+        retry_probes: &BTreeSet<FederationId>,
+        defer_fresh_probes: bool,
+    ) -> anyhow::Result<AdaptiveSleepDeadlines> {
+        self.watch_deadlines_with_context(
+            tick_policy,
+            watch_policy,
+            now_ms,
+            None,
+            registry_owned_probes,
+            retry_probes,
+            defer_fresh_probes,
+        )
+        .await
     }
 
     pub async fn watch_deadlines_reusing_probe_schedule(
@@ -1218,12 +1384,16 @@ impl Runtime {
         Ok(deadlines)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn watch_deadlines_with_context(
         &self,
         tick_policy: &TickPolicy,
         watch_policy: &WatchPolicy,
         now_ms: u64,
         context: Option<&ProbeScheduleContext>,
+        registry_owned_probes: &BTreeSet<FederationId>,
+        retry_probes: &BTreeSet<FederationId>,
+        defer_fresh_probes: bool,
     ) -> anyhow::Result<AdaptiveSleepDeadlines> {
         let state = self.journal.get_watch_state().await.map_err(exec_err)?;
         let mut deadlines = AdaptiveSleepDeadlines {
@@ -1253,7 +1423,7 @@ impl Runtime {
                 &context_storage
             }
         };
-        for (_candidate, source, _verdict, due_ms, post_in_resume) in self
+        for (candidate, source, _verdict, due_ms, post_in_resume) in self
             .probe_schedule_inputs(
                 spending,
                 &tick_policy.probe_gate_policy,
@@ -1266,7 +1436,13 @@ impl Runtime {
             if source.is_none() {
                 continue;
             }
-            deadlines.probe_due_ms.push(if post_in_resume {
+            // The standalone 5.2 loop drives a retained session to completion. The service
+            // actor returns as soon as it has attached that session to a live driver, so the
+            // scheduler must not immediately re-attach it while the actor still owns it.
+            if registry_owned_probes.contains(&candidate) {
+                continue;
+            }
+            let mut wake_ms = if post_in_resume {
                 due_ms
             } else {
                 let budget_due_ms = probe_wake_due_ms(
@@ -1279,7 +1455,19 @@ impl Runtime {
                 context
                     .fresh_probe_defer_until_ms
                     .map_or(budget_due_ms, |defer_until| budget_due_ms.max(defer_until))
-            });
+            };
+            if retry_probes.contains(&candidate) {
+                // `run_scheduled_probes` records a failed invocation in its schedule
+                // context, which applies this same retry backoff. Actor refusals journal no
+                // invocation, so carry that one-cycle fact explicitly into this recompute.
+                wake_ms = wake_ms.max(now_ms.saturating_add(watch_policy.probe_retry_backoff_ms));
+            } else if defer_fresh_probes {
+                // A retained session displaced the fresh group this cycle. This is the
+                // async equivalent of 5.2's `fresh_probe_defer_until_ms` after a retained
+                // probe remains in flight.
+                wake_ms = wake_ms.max(now_ms.saturating_add(watch_policy.min_interval_ms));
+            }
+            deadlines.probe_due_ms.push(wake_ms);
         }
         Ok(deadlines)
     }
@@ -2904,7 +3092,7 @@ impl Runtime {
     /// fails an evacuation source-route preflight, `plan_tick` falls back to the last
     /// evacuation plan and lets `apply` surface the real execution failure loudly instead of
     /// silently reporting that nothing needed to run.
-    async fn first_move_route_problem(
+    pub(crate) async fn first_move_route_problem(
         &self,
         decisions: &[AllocatorDecision],
     ) -> Option<MoveRouteProblem> {
@@ -3041,7 +3229,7 @@ impl Runtime {
     /// mirroring [`MultiClient::open_all`]'s poison-tolerance so one un-probeable fed cannot
     /// strand the whole tick. A skipped fed simply drops out of the snapshot — the allocator then
     /// cannot fund it or from it, which is the safe degradation (never a bad move).
-    async fn probe_all(&self) -> Vec<(FederationId, ProbeResult)> {
+    pub(crate) async fn probe_all(&self) -> Vec<(FederationId, ProbeResult)> {
         let runner =
             FedimintProbeRunner::with_pinned_gateway(self.mc.clone(), self.pinned_gateway.clone());
         let mut probes = Vec::new();
@@ -3107,6 +3295,10 @@ impl Runtime {
                 )
             })
     }
+}
+
+fn fresh_probe_baseline(candidate_is_open: bool, sampled: Option<Msat>) -> Option<Msat> {
+    sampled.or_else(|| (!candidate_is_open).then_some(Msat(0)))
 }
 
 #[async_trait]
@@ -3176,8 +3368,12 @@ impl DiscoveryBackend for Runtime {
         })
     }
 
-    async fn auto_join_counts(&self, now_ms: u64) -> anyhow::Result<AutoJoinCounts> {
-        let passed = self.passed_probe_feds(now_ms).await;
+    async fn auto_join_counts(
+        &self,
+        now_ms: u64,
+        probe_policy: &ProbePolicy,
+    ) -> anyhow::Result<AutoJoinCounts> {
+        let passed = self.passed_probe_feds(now_ms, probe_policy).await;
         Ok(AutoJoinCounts {
             concurrent_unproven: self
                 .journal
@@ -3311,7 +3507,11 @@ fn probe_gate_candidate_ids(report: &CandidateListReport) -> BTreeSet<Federation
 }
 
 impl Runtime {
-    async fn passed_probe_feds(&self, now_ms: u64) -> BTreeSet<FederationId> {
+    async fn passed_probe_feds(
+        &self,
+        now_ms: u64,
+        probe_policy: &ProbePolicy,
+    ) -> BTreeSet<FederationId> {
         let report = match self.journal.list_candidates_report().await {
             Ok(report) => report,
             Err(e) => {
@@ -3334,8 +3534,7 @@ impl Runtime {
             };
             let sources: BTreeSet<_> = attempts.iter().map(|attempt| attempt.from).collect();
             if sources.into_iter().any(|source| {
-                probe_verdict(&attempts, source, now_ms, &ProbePolicy::default())
-                    == ActiveProbeVerdict::Passed
+                probe_verdict(&attempts, source, now_ms, probe_policy) == ActiveProbeVerdict::Passed
             }) {
                 passed.insert(id);
             }
@@ -3760,7 +3959,7 @@ fn no_sweep_ok(c_spendable: Msat, baseline: Msat, delivered_in: Msat) -> bool {
 /// AutoJoined-rows-only) is what fails closed on the crash/restore windows where an
 /// agent-created member's `0x09` row is still `Discovered`/`Rejected`/absent — those would
 /// otherwise read as ungated on `tick` and fund pre-probe.
-fn probe_gated_members(
+pub(crate) fn probe_gated_members(
     joined: impl IntoIterator<Item = FederationId>,
     candidate_states: impl IntoIterator<Item = (FederationId, CandidateState)>,
 ) -> BTreeSet<FederationId> {
@@ -3879,7 +4078,10 @@ fn intent_status_label_opt(status: Option<IntentStatus>) -> &'static str {
     status.map_or("absent", intent_status_label)
 }
 
-fn mark_gateway_unavailable(probes: &mut [(FederationId, ProbeResult)], id: FederationId) -> bool {
+pub(crate) fn mark_gateway_unavailable(
+    probes: &mut [(FederationId, ProbeResult)],
+    id: FederationId,
+) -> bool {
     let Some((_, probe)) = probes.iter_mut().find(|(probe_id, _)| *probe_id == id) else {
         return false;
     };
@@ -4972,6 +5174,143 @@ mod tests {
             }),
             "the second due candidate must not launch a fresh scheduled probe in the same cycle"
         );
+    }
+
+    #[tokio::test]
+    async fn service_scheduler_defers_fresh_probes_while_resuming_a_session() {
+        let (runtime, journal) = runtime_fixture().await;
+        for fed in [FED_B, FED_C] {
+            journal
+                .put_federation(&fed, &federation_info())
+                .await
+                .expect("put auto-joined fed");
+        }
+        let gate_policy = ProbePolicy::default();
+        seed_post_in_probe_session(journal.as_ref(), FED_B, FED_A, &gate_policy).await;
+        let tick_policy = TickPolicy {
+            spending_fed: Some(FED_A),
+            probe_gate_policy: gate_policy,
+            ..TickPolicy::default()
+        };
+        let now = now_ms();
+
+        let (due, resuming) = runtime
+            .service_due_probes(
+                Some(FED_A),
+                &tick_policy,
+                &WatchPolicy::default(),
+                &BTreeMap::new(),
+                now,
+                Occurrence(1),
+            )
+            .await
+            .expect("service probe schedule");
+
+        assert_eq!(due, vec![(FED_B, FED_A, Msat(0))]);
+        assert!(resuming);
+    }
+
+    #[tokio::test]
+    async fn service_deadlines_do_not_reschedule_an_actor_owned_post_in_probe() {
+        let (runtime, journal) = runtime_fixture().await;
+        journal
+            .put_federation(&FED_B, &federation_info())
+            .await
+            .expect("put auto-joined fed");
+        let gate_policy = ProbePolicy::default();
+        seed_post_in_probe_session(journal.as_ref(), FED_B, FED_A, &gate_policy).await;
+        let tick_policy = TickPolicy {
+            spending_fed: Some(FED_A),
+            probe_gate_policy: gate_policy,
+            ..TickPolicy::default()
+        };
+        let watch_policy = WatchPolicy::default();
+        let now = now_ms();
+
+        let standalone = runtime
+            .watch_deadlines(&tick_policy, &watch_policy, now)
+            .await
+            .expect("standalone deadlines");
+        assert!(
+            standalone.probe_due_ms.iter().any(|due_ms| *due_ms <= now),
+            "the synchronous 5.2 loop still resumes the retained session immediately"
+        );
+
+        let service = runtime
+            .service_watch_deadlines(
+                &tick_policy,
+                &watch_policy,
+                now,
+                &BTreeSet::from([FED_B]),
+                &BTreeSet::new(),
+                true,
+            )
+            .await
+            .expect("service deadlines");
+        assert!(
+            service.probe_due_ms.is_empty(),
+            "an actor-owned post-IN session must not pin the daemon to its one-second floor"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_deadlines_defer_due_probes_not_started_by_the_actor() {
+        let (runtime, journal) = runtime_fixture().await;
+        for fed in [FED_B, FED_C] {
+            journal
+                .put_federation(&fed, &federation_info())
+                .await
+                .expect("put auto-joined fed");
+        }
+        let gate_policy = ProbePolicy::default();
+        seed_post_in_probe_session(journal.as_ref(), FED_B, FED_A, &gate_policy).await;
+        let tick_policy = TickPolicy {
+            spending_fed: Some(FED_A),
+            probe_gate_policy: gate_policy,
+            ..TickPolicy::default()
+        };
+        let watch_policy = WatchPolicy::default();
+        let now = now_ms();
+
+        let while_resuming = runtime
+            .service_watch_deadlines(
+                &tick_policy,
+                &watch_policy,
+                now,
+                &BTreeSet::from([FED_B]),
+                &BTreeSet::new(),
+                true,
+            )
+            .await
+            .expect("service deadlines while resuming");
+        assert!(while_resuming
+            .probe_due_ms
+            .iter()
+            .all(|due_ms| *due_ms >= now.saturating_add(watch_policy.min_interval_ms)));
+
+        let after_refusal = runtime
+            .service_watch_deadlines(
+                &tick_policy,
+                &watch_policy,
+                now,
+                &BTreeSet::new(),
+                &BTreeSet::from([FED_C]),
+                false,
+            )
+            .await
+            .expect("service deadlines after refusal");
+        let retry_at = now.saturating_add(watch_policy.probe_retry_backoff_ms);
+        assert!(after_refusal
+            .probe_due_ms
+            .iter()
+            .any(|due_ms| *due_ms >= retry_at));
+    }
+
+    #[test]
+    fn fresh_service_probe_requires_a_sample_for_an_open_candidate() {
+        assert_eq!(fresh_probe_baseline(true, None), None);
+        assert_eq!(fresh_probe_baseline(true, Some(Msat(42))), Some(Msat(42)));
+        assert_eq!(fresh_probe_baseline(false, None), Some(Msat(0)));
     }
 
     #[tokio::test]
@@ -6256,6 +6595,57 @@ mod tests {
         let ids = probe_gate_candidate_ids(&report);
         assert_eq!(ids, BTreeSet::from([auto, skipped]));
         assert!(!ids.contains(&discovered));
+    }
+
+    #[tokio::test]
+    async fn discovery_probe_gate_uses_the_supplied_policy() {
+        use fedimint_core::invite_code::InviteCode;
+        use fedimint_core::util::SafeUrl;
+        use fedimint_core::PeerId;
+        use std::str::FromStr as _;
+
+        let (runtime, journal) = runtime_fixture().await;
+        let fed_id = fedimint_core::config::FederationId::from_str(&FED_B.to_hex())
+            .expect("valid federation id");
+        journal
+            .put_candidate(&crate::CandidateRecord {
+                id: FED_B,
+                invite: InviteCode::new(
+                    SafeUrl::parse("https://probe-policy.example").expect("valid url"),
+                    PeerId::from(0),
+                    fed_id,
+                    None,
+                ),
+                source: wallet_core::DiscoverySource::Manual,
+                discovered_at_ms: 0,
+                structural: crate::StructuralOutcome::Passed,
+                structural_checked_at_ms: 0,
+                state: CandidateState::AutoJoined,
+                updated_at_ms: 0,
+            })
+            .await
+            .expect("put auto-joined candidate");
+        let one_success = ProbePolicy {
+            min_successes: 1,
+            min_span_ms: 0,
+            ttl_ms: 60 * 60 * 1000,
+            ..ProbePolicy::default()
+        };
+        seed_passed_probe(journal.as_ref(), FED_B, FED_A, &one_success).await;
+        let now = now_ms();
+        assert_eq!(
+            runtime.passed_probe_feds(now, &one_success).await,
+            BTreeSet::from([FED_B])
+        );
+
+        let two_successes = ProbePolicy {
+            min_successes: 2,
+            ..one_success
+        };
+        assert!(runtime
+            .passed_probe_feds(now, &two_successes)
+            .await
+            .is_empty());
     }
 
     #[test]

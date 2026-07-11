@@ -70,7 +70,7 @@ must re-establish each one explicitly; the spec sections cited own the mechanism
 | TL-1 | **Probe no-sweep isolation** (phase5-plan §5.0, lines 55-68 — "flagged as a Phase-6 precondition") | both probe legs ran synchronously in one process; nothing could spend from candidate `C` between legs, so leg OUT never sweeps pre-existing funds | a **per-fed probe hold** in the actor (§6a.5), with three sharpenings from spec review pass 1: (a) **durable, not registry-bound** — the hold predicate is the probe session's `in_flight` marker in the durable `0x08` record, so a panicked/abandoned driver leaves `C` held until the session resumes or terminalizes (the crash-total session already persists exactly this); (b) **retroactive** — `DecideProbe` DEFERS the probe when any in-flight intent already spends from `C` (visible in the same decide-time scan §6a.4 uses); (c) **evacuation preempts the hold** — `Evacuate(C→safe)` is exempt and drains `C` including the probe delta (rescuing real money outranks a ~20-sat accounting round); the probe then resolves umbrella-only `NoAttempt`/aborted with **no candidate demotion** (insufficient-funds-because-we-evacuated is our fault, not `C`'s). User pays from the spending fed are never affected |
 | TL-2 | **Weekly probe budget** (phase5-plan §5.1b rejection: "concurrent-runs budget overrun = v1-unreachable") | one process = one probe at a time; check-then-record could not race | budget check + umbrella-row journal happen in ONE actor command (§6a.2 `DecideProbe`) before the driver spawns — atomic by actor serialization; concurrent probes of different candidates are safe under the same reservations/holds |
 | TL-3 | **Exactly-one perform per intent** (phase1-spec "Single-writer guard": dir lock + `Pending→Executing` CAS) | the dir lock serialized processes; the CAS serialized apply-vs-reconcile within one | the CAS **stays** (belt and braces); all transitions now flow through the actor (single-threaded by construction); the registry adds the missing piece — an ABANDONED driver (perform-timeout) cannot be re-driven while its task lives (re-drive ⇔ no registry entry; Drop guard makes the entry's lifetime equal the task's, §6a.3) |
-| TL-4 | **Ledger repair vs concurrent writers** (phase4-impl-spec §546/§598: "single-writer by convention, but repair must not corrupt if that breaks") | one-shot process; repair could not overlap money ops | repair's writes are actor commands like everything else; `POST /v1/reconcile` and the scheduler's reconcile step both funnel into the same idempotent actor decide (§6a.6) — overlapping requests coalesce, and the phase-4 repair CAS hardening remains |
+| TL-4 | **Ledger repair vs concurrent writers** (phase4-impl-spec §546/§598: "single-writer by convention, but repair must not corrupt if that breaks") | one-shot process; repair could not overlap money ops | the **deliberate exception** to "the actor owns every journal write": `repair_ledger` is an O(ledger) op-log reconciliation of stuck raw-pay/receive/join/tick rows, so it must NOT run inside the actor's critical section (TL-6). The scheduler's `run_cycle` calls `journal.repair_ledger(mc)` DIRECTLY, off-actor, once per cycle right after the actor's intent-only `ReconcileDecide` (which re-drives orphans but does not repair ledger rows). Safety against the actor's concurrent transitions rests on the phase-4 repair CAS hardening — repair only advances a row it still finds non-terminal, so an actor transition that terminalizes it first makes repair a no-op. A repair I/O fault is logged and the cycle continues (best-effort; the intent re-drive already committed its own money-path progress). `POST /v1/reconcile` triggers the same off-actor repair after its actor reconcile |
 | TL-5 | **The watch loop never races itself** (phase5-plan §5.2.0: the loop "IS the single writer") | one loop, sequential cycles, occurrence advanced per cycle | exactly ONE workflow daemon task, started once at boot (§6a.5) — one decision cadence, though the money ops it spawns run concurrently like any others (owner ruling: an evacuation is just a send and never queues); occurrence semantics unchanged |
 | TL-6 | **O(ledger) per-cycle scans + coalescing bypass** (phase5-plan §5.2.8 deferrals) | bounded by short-lived processes / accepted for 5.2 | still deferred as performance (no money impact), BUT all O(ledger) reads move OFF-actor (§6a.2) so growth degrades throughput, never pay latency; the soak (§6a.9) is the instrument that decides if an index is needed |
 
@@ -126,6 +126,9 @@ enum Command {
         // case, where the durable BOLT11 exists — reply immediately, don't park.
     // scheduler bookkeeping
     DecideTickRound { facts: ProbeFacts, route_failures: Vec<MoveRouteProblem>, reply: … },
+        // Returns a TickRound STAMPED with planned_generation = the actor's policy
+        // generation at plan time (bumped on every accepted PutPolicy). The daemon carries
+        // it back into CommitTick so a policy change during route validation is caught (P1).
         // PURE decide: build_snapshot + allocator over sensed facts + accumulated route
         // failures; returns candidate decisions; journals nothing. Its JOURNAL-side
         // inputs — the auto-join probe gate (joined − UserApproved via the 0x09
@@ -138,7 +141,12 @@ enum Command {
         // is the §15.6 gateway scan — so the LOOP lives in the workflow daemon:
         //   daemon: probe_all (IO) → DecideTickRound (ms) → validate routes (IO) →
         //   loop with failures → CommitTick when clean (or revisions exhausted).
-    CommitTick { decisions: Vec<AllocatorDecision>, reply: … },
+    CommitTick { decisions: Vec<AllocatorDecision>, planned_generation: u64, reply: … },
+        // POLICY-GENERATION GUARD FIRST (P1): if planned_generation != the actor's current
+        // policy generation, a PutPolicy landed during the daemon's route validation and
+        // these decisions were sized against superseded caps/targets — refuse the WHOLE
+        // batch (RefuseReason::PolicySuperseded, journaling nothing), the next cycle replans
+        // under the current policy. No money op is admitted on stale sizing.
         // RE-CHECK then commit (spec review passes 3+5): the daemon-side revision loop
         // takes network time, and user intents accepted meanwhile change the picture —
         // so CommitTick re-runs THE SAME admission guard DecideOp uses (one shared

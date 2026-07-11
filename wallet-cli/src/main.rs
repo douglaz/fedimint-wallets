@@ -21,6 +21,7 @@ use wallet_core::{
     OperationRecord, OperationStatus, ProbeBudget, ProbePolicy, RawOpUpdate, ReasonCode,
     WatchPolicy,
 };
+use wallet_fedimint::service::coalesced_subscription_delay_ms;
 use wallet_fedimint::{
     parse_invoice, raw_receive_key, AutoJoinReport, CandidateSource, CandidateState,
     DiscoverReport, DiscoverSourceReport, FedimintJournal, FinalizeOutcome, GatewayUrl, Invoice,
@@ -1607,7 +1608,7 @@ async fn run_watch_loop(
 ) -> anyhow::Result<()> {
     let (wake_tx, mut wake_rx) = tokio::sync::mpsc::channel(32);
     let mut expiry_wake_feds = BTreeSet::new();
-    multi_client.spawn_expiry_wake_tasks(&mut expiry_wake_feds, wake_tx.clone());
+    drop(multi_client.spawn_expiry_wake_tasks(&mut expiry_wake_feds, wake_tx.clone()));
     let wake_tx_keepalive = wake_tx;
     let mut shutdown = Box::pin(shutdown_signal());
     let mut last_subscription_noop_ms = None;
@@ -1618,7 +1619,9 @@ async fn run_watch_loop(
             .watch_once(tick_policy, watch_policy, sources, discovery_policy, true)
             .await?;
         print_watch_report(&report);
-        multi_client.spawn_expiry_wake_tasks(&mut expiry_wake_feds, wake_tx_keepalive.clone());
+        drop(
+            multi_client.spawn_expiry_wake_tasks(&mut expiry_wake_feds, wake_tx_keepalive.clone()),
+        );
         if triggered_by_subscription && report.subscription_noop() {
             last_subscription_noop_ms = Some(cli_now_ms());
         }
@@ -1703,28 +1706,6 @@ async fn run_watch_loop(
                     return Ok(());
                 }
             }
-        }
-    }
-}
-
-fn coalesced_subscription_delay_ms(
-    now_ms: u64,
-    last_subscription_noop_ms: Option<u64>,
-    min_interval_ms: u64,
-    recomputed_sleep_ms: u64,
-) -> (u64, bool) {
-    let Some(last_noop) = last_subscription_noop_ms else {
-        return (0, true);
-    };
-    let cooldown_until = last_noop.saturating_add(min_interval_ms);
-    if now_ms >= cooldown_until {
-        (0, true)
-    } else {
-        let cooldown_remaining = cooldown_until - now_ms;
-        if recomputed_sleep_ms < cooldown_remaining {
-            (recomputed_sleep_ms, false)
-        } else {
-            (cooldown_remaining, true)
         }
     }
 }

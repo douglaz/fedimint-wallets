@@ -17,6 +17,7 @@
 //! - `0x03` `FederationKey(FederationId)`   → JSON row v1([`FederationInfo`])
 //! - `0x04` `PendingIndexKey(status, key)`  → `()` (empty) — drives the status scans
 //! - `0x0a` `WatchStateKey`                 → JSON row v1([`WatchState`])
+//! - `0x0b` `PolicyKey`                     → JSON row v1([`wallet_api::Policy`])
 //!
 //! `IdempotencyKey` is a `String`, so `id_bytes` is its UTF-8; `FederationId` is 32 bytes.
 //!
@@ -47,6 +48,7 @@ use futures::StreamExt;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use wallet_api::Policy;
 use wallet_core::{
     advance, kind_from_action, status_from_intent, Action, Actor, AllocatorDecision,
     DiscoverySource, ExecError, FederationId, FeeBreakdown, GatewayUrl, IdempotencyKey, Intent,
@@ -70,6 +72,7 @@ const TAG_LEDGER_COUNTER: u8 = 0x07; // `0x07` (single key) → be64(next_seq)
 const TAG_PROBE: u8 = 0x08; // `0x08 ++ fed_id` → JSON row v1(ProbeRecord) (phase 5 §5.0.4)
 const TAG_CANDIDATE: u8 = 0x09; // `0x09 ++ fed_id` → JSON row v1(CandidateRecord) (phase 5 §5.1.1)
 const TAG_WATCH_STATE: u8 = 0x0a; // `0x0a` → JSON row v1(WatchState) (phase 5 §5.2.5)
+const TAG_POLICY: u8 = 0x0b; // `0x0b` → JSON row v1(wallet_api::Policy) (phase 6a §6a.6)
 
 /// Rows older than this are eligible for reconcile's NEGATIVE-inference repairs (§10.3): a
 /// fresh non-terminal row may belong to an operation still in flight in another process, so
@@ -1024,6 +1027,52 @@ impl FedimintJournal {
             .await?;
             dbtx.commit_tx_result().await.map_err(db_err)?;
         }
+        Ok(())
+    }
+
+    /// Record an executable allocator decision that was valid at plan time but failed the
+    /// actor's current-state admission recheck at commit time.
+    pub async fn record_tick_dropped_refusal(
+        &self,
+        decision: &AllocatorDecision,
+        occurrence: Occurrence,
+        now_ms: u64,
+        message: &str,
+    ) -> Result<(), ExecError> {
+        let fed = match decision.action {
+            Action::Move { to, .. } => to,
+            Action::Evacuate { from, .. } => from,
+            Action::DirectInflow { to, .. } | Action::Receive { to, .. } => to,
+            Action::Pay { from, .. } => from,
+            Action::RefuseInflow { fed, .. } => fed,
+            Action::Join { federation, .. } => federation,
+        };
+        let key = IdempotencyKey(format!(
+            "tick-drop:{}:{}",
+            occurrence.0, decision.idempotency_key.0
+        ));
+        let mut dbtx = self.db.begin_transaction().await;
+        ledger_upsert_in(&mut dbtx, &key, |existing, seq| match existing {
+            Some(_) => None,
+            None => Some(OperationRecord {
+                seq,
+                correlation_key: key.clone(),
+                kind: OperationKind::Refusal { fed },
+                actor: Actor::Agent { occurrence },
+                reason: decision.reason,
+                status: OperationStatus::Succeeded,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                fees: FeeBreakdown::default(),
+                error: Some(format!(
+                    "commit-time admission refused {}: {message}",
+                    decision.idempotency_key.0
+                )),
+                repaired: false,
+            }),
+        })
+        .await?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -2092,6 +2141,46 @@ impl FedimintJournal {
         dbtx.commit_tx_result().await.map_err(db_err)?;
         Ok(state)
     }
+
+    // --- user policy (phase 6a §6a.6, tag 0x0b) ---
+
+    /// Load the stored standing instruction. Absence is distinct from the default so startup
+    /// can seed exactly once without resetting a policy edited by the user.
+    pub async fn get_policy(&self) -> Result<Option<Policy>, ExecError> {
+        let raw_key = policy_key();
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        let Some(bytes) = dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? else {
+            return Ok(None);
+        };
+        decode_row_result("policy", &raw_key, &bytes).map(Some)
+    }
+
+    /// Atomically insert `seed` only when no policy exists, returning the authoritative row.
+    pub async fn seed_policy(&self, seed: &Policy) -> Result<Policy, ExecError> {
+        let raw_key = policy_key();
+        let mut dbtx = self.db.begin_transaction().await;
+        let policy = match dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? {
+            Some(bytes) => decode_row_result("policy", &raw_key, &bytes)?,
+            None => {
+                dbtx.raw_insert_bytes(&raw_key, &encode_row(seed)?)
+                    .await
+                    .map_err(db_err)?;
+                seed.clone()
+            }
+        };
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(policy)
+    }
+
+    /// Replace the standing instruction in one durable row write.
+    pub async fn put_policy(&self, policy: &Policy) -> Result<(), ExecError> {
+        let mut dbtx = self.db.begin_transaction().await;
+        dbtx.raw_insert_bytes(&policy_key(), &encode_row(policy)?)
+            .await
+            .map_err(db_err)?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(())
+    }
 }
 
 async fn max_tick_occurrence_in(
@@ -2728,6 +2817,10 @@ fn candidate_key(id: &FederationId) -> Vec<u8> {
 
 fn watch_state_key() -> Vec<u8> {
     vec![TAG_WATCH_STATE]
+}
+
+fn policy_key() -> Vec<u8> {
+    vec![TAG_POLICY]
 }
 
 /// Whether `row` is an AGENT `join:` row that SUCCEEDED and created a NEW partition (§5.1.4):

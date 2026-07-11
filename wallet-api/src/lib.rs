@@ -334,10 +334,15 @@ pub enum RefuseReason {
     FedHeldByProbe,
     OverCap,
     BudgetExhausted,
-    SizingConflict { field: String },
+    SizingConflict {
+        field: String,
+    },
     AmountRequired,
     StorageError,
     PolicyInvalid,
+    /// A tick was planned under an earlier policy generation that a PutPolicy has
+    /// since superseded; the whole batch is refused so the next cycle replans.
+    PolicySuperseded,
     Conflict,
 }
 

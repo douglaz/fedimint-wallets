@@ -1,15 +1,16 @@
 use super::driver::{self, Registry};
 use super::*;
 use crate::runtime::{
-    ledger_nonce, move_key, now_ms, occurrence_from_nonce, probe_cost, probe_out_fee_cap,
-    probe_umbrella_key, PROBE_BUDGET_WINDOW_MS,
+    ledger_nonce, move_key, now_ms, occurrence_from_nonce, probe_cost, probe_gated_members,
+    probe_out_fee_cap, probe_umbrella_key, PROBE_BUDGET_WINDOW_MS,
 };
-use std::collections::HashMap;
+use crate::tick::{build_snapshot, decisions_to_apply, pinned_input_problems};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::Ordering;
 use tokio::task::JoinHandle;
 use wallet_core::{
-    admit_intent, Action, Actor, DecideAndJournal, IntentStatus, Journal, OperationKind,
-    OperationStatus, ProbePolicy,
+    admit_intent, probe_verdict, Action, Actor, DecideAndJournal, IntentStatus, Journal,
+    OperationKind, OperationStatus, ProbePolicy, ScorerPolicy,
 };
 
 struct PendingWaiter {
@@ -33,6 +34,15 @@ struct ProbeBudgetState {
     load_error: Option<String>,
 }
 
+struct TickBatch {
+    key: IdempotencyKey,
+    decisions: u32,
+    pending: BTreeSet<IdempotencyKey>,
+    performed: u32,
+    failed: u32,
+    error: Option<String>,
+}
+
 struct ActorState {
     runtime: Option<Arc<Runtime>>,
     journal: Arc<FedimintJournal>,
@@ -42,7 +52,13 @@ struct ActorState {
     policy: Policy,
     perform_timeout: Option<std::time::Duration>,
     generation: u64,
+    /// Bumped on every accepted PutPolicy. A tick round is stamped with the value it
+    /// planned under; CommitTick refuses if this has since advanced (§6a P1 ruling).
+    policy_generation: u64,
     probe_budget: ProbeBudgetState,
+    policy_wake: tokio::sync::watch::Sender<u64>,
+    tick_balances: Option<(wallet_core::Occurrence, BTreeMap<FederationId, Msat>)>,
+    tick_batches: Vec<TickBatch>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -56,7 +72,11 @@ pub(super) async fn run(
     policy: Policy,
     perform_timeout: Option<std::time::Duration>,
     registry: driver::Registry,
+    policy_wake: tokio::sync::watch::Sender<u64>,
 ) {
+    let executor = runtime.as_ref().map_or(executor, |runtime| {
+        Arc::new(runtime.service_executor(Some(policy.per_fed_cap)))
+    });
     let budget_journal = journal.clone();
     let budget_policy = policy.clone();
     let mut budget_loader = Some(tokio::spawn(async move {
@@ -71,10 +91,14 @@ pub(super) async fn run(
         policy,
         perform_timeout,
         generation: 0,
+        policy_generation: 0,
         probe_budget: ProbeBudgetState {
             entries: Vec::new(),
             load_error: Some("probe budget state is still loading".to_owned()),
         },
+        policy_wake,
+        tick_balances: None,
+        tick_batches: Vec::new(),
     };
 
     loop {
@@ -216,6 +240,8 @@ impl ActorState {
                     if resolve_waiters {
                         self.resolve_key(&key).await;
                     }
+                    self.observe_tick_outcome(&key, finished_generation.is_some())
+                        .await;
                 }
                 let _ = reply.send(result);
             }
@@ -245,6 +271,44 @@ impl ActorState {
                 };
                 let _ = reply.send(result);
             }
+            Command::DecideTickRound {
+                facts,
+                route_failures,
+                reply,
+            } => {
+                let result = if intake {
+                    self.decide_tick_round(facts, &route_failures).await
+                } else {
+                    Err(ServiceError::ShuttingDown)
+                };
+                let _ = reply.send(result);
+            }
+            Command::CommitTick {
+                decisions,
+                balances,
+                tick_key,
+                planned_generation,
+                reply,
+            } => {
+                let result = if intake {
+                    match client {
+                        Some(client) => {
+                            self.commit_tick(
+                                decisions,
+                                balances,
+                                tick_key,
+                                planned_generation,
+                                client,
+                            )
+                            .await
+                        }
+                        None => Err(ServiceError::ActorStopped),
+                    }
+                } else {
+                    Err(ServiceError::ShuttingDown)
+                };
+                let _ = reply.send(result);
+            }
             Command::Shutdown { reply } => {
                 let _ = reply.send(Err(ServiceError::ShuttingDown));
             }
@@ -255,21 +319,461 @@ impl ActorState {
                 let result = if !intake {
                     Err(ServiceError::ShuttingDown)
                 } else {
-                    policy
-                        .validate()
-                        .map_err(|error| ServiceError::Policy(error.to_string()))
-                        .map(|()| {
-                            if let Some(runtime) = &self.runtime {
-                                self.executor =
-                                    Arc::new(runtime.service_executor(Some(policy.per_fed_cap)));
+                    match policy.validate() {
+                        Err(error) => Err(refused(
+                            RefuseReason::PolicyInvalid,
+                            format!("invalid policy field {}: {error}", error.offending_field()),
+                        )),
+                        Ok(()) => match self.journal.put_policy(&policy).await {
+                            Err(error) => Err(storage(error)),
+                            Ok(()) => {
+                                if let Some(runtime) = &self.runtime {
+                                    self.executor = Arc::new(
+                                        runtime.service_executor(Some(policy.per_fed_cap)),
+                                    );
+                                }
+                                self.policy = policy.clone();
+                                self.policy_generation = self.policy_generation.wrapping_add(1);
+                                self.policy_wake.send_modify(|generation| {
+                                    *generation = generation.wrapping_add(1);
+                                });
+                                Ok(policy)
                             }
-                            self.policy = policy.clone();
-                            policy
-                        })
+                        },
+                    }
                 };
                 let _ = reply.send(result);
             }
         }
+    }
+
+    async fn decide_tick_round(
+        &mut self,
+        facts: ProbeFacts,
+        route_failures: &[crate::runtime::MoveRouteProblem],
+    ) -> ServiceResult<TickRound> {
+        let mut policy = TickPolicy::from(&self.policy);
+        policy.occurrence = facts.occurrence;
+        policy.now = facts.now_ms;
+        let reservations = self.project_reservations().await?;
+        let candidates = self
+            .journal
+            .list_candidates_report()
+            .await
+            .map_err(storage)?;
+        let joined = self.journal.list_federations().await.map_err(storage)?;
+        let auto_joined = probe_gated_members(
+            joined.into_iter().map(|(id, _)| id),
+            candidates
+                .candidates
+                .iter()
+                .map(|(id, record)| (*id, record.state)),
+        );
+        let balances = facts_from_probes(&facts.probes);
+        let mut probes = facts.probes;
+        let mut evacuation_fallback: Option<(FederationId, TickRound)> = None;
+        for failure in route_failures {
+            let round = self
+                .build_tick_round(&probes, &policy, &auto_joined, &reservations)
+                .await?;
+            if let Some((fallback_source, fallback)) = &evacuation_fallback {
+                let still_evacuating = round.decisions.iter().any(|decision| {
+                    matches!(decision.action, Action::Evacuate { from, .. } if from == *fallback_source)
+                });
+                if !still_evacuating {
+                    self.remember_tick_balances(facts.occurrence, &balances);
+                    return Ok(fallback.clone());
+                }
+            }
+            if failure.evacuation_source_route
+                && round.decisions.iter().any(|decision| {
+                    matches!(decision.action, Action::Evacuate { from, .. } if from == failure.from)
+                })
+            {
+                evacuation_fallback = Some((failure.from, round));
+            }
+            if !crate::runtime::mark_gateway_unavailable(&mut probes, failure.mark_unavailable) {
+                break;
+            }
+        }
+        let round = self
+            .build_tick_round(&probes, &policy, &auto_joined, &reservations)
+            .await?;
+        if let Some((fallback_source, fallback)) = evacuation_fallback {
+            let still_evacuating = round.decisions.iter().any(|decision| {
+                matches!(decision.action, Action::Evacuate { from, .. } if from == fallback_source)
+            });
+            if !still_evacuating {
+                self.remember_tick_balances(facts.occurrence, &balances);
+                return Ok(fallback);
+            }
+        }
+        self.remember_tick_balances(facts.occurrence, &balances);
+        Ok(round)
+    }
+
+    async fn build_tick_round(
+        &self,
+        probes: &[(FederationId, crate::probe::ProbeResult)],
+        policy: &TickPolicy,
+        auto_joined: &std::collections::BTreeSet<FederationId>,
+        reservations: &Reservations,
+    ) -> ServiceResult<TickRound> {
+        let preliminary = build_snapshot(
+            probes,
+            policy,
+            &ScorerPolicy::default(),
+            auto_joined,
+            &BTreeMap::new(),
+        );
+        let mut active_probes = BTreeMap::new();
+        if let Some(source) = preliminary.spending_fed {
+            for (id, _) in probes {
+                if *id == source {
+                    continue;
+                }
+                match self.journal.probe_record(id).await {
+                    Ok(record) => {
+                        active_probes.insert(
+                            *id,
+                            probe_verdict(
+                                &record.map(|record| record.attempts).unwrap_or_default(),
+                                source,
+                                policy.now,
+                                &policy.probe_gate_policy,
+                            ),
+                        );
+                    }
+                    Err(error) => tracing::warn!(
+                        federation = %id.to_hex(),
+                        ?error,
+                        "DecideTickRound: unreadable probe record; omitting verdict"
+                    ),
+                }
+            }
+        }
+        let mut snapshot = build_snapshot(
+            probes,
+            policy,
+            &ScorerPolicy::default(),
+            auto_joined,
+            &active_probes,
+        );
+        snapshot.reservations = reservations.clone();
+        let decisions = wallet_core::decide(&snapshot, policy.occurrence);
+        let problems = pinned_input_problems(policy, &snapshot, probes, &decisions);
+        if !problems.is_empty() {
+            return Err(ServiceError::Storage(format!(
+                "tick: {}",
+                problems.join("; ")
+            )));
+        }
+        Ok(TickRound {
+            decisions,
+            spending_fed: snapshot.spending_fed,
+            standby_fed: snapshot.standby_fed,
+            planned_generation: self.policy_generation,
+        })
+    }
+
+    fn remember_tick_balances(
+        &mut self,
+        occurrence: wallet_core::Occurrence,
+        balances: &BTreeMap<FederationId, Msat>,
+    ) {
+        self.tick_balances = Some((occurrence, balances.clone()));
+    }
+
+    async fn commit_tick(
+        &mut self,
+        decisions: Vec<AllocatorDecision>,
+        fresh_balances: Option<BTreeMap<FederationId, Msat>>,
+        existing_tick_key: Option<IdempotencyKey>,
+        planned_generation: u64,
+        client: &WalletClient,
+    ) -> ServiceResult<CommitTickReport> {
+        // Policy-generation guard (§6a P1): a PutPolicy may have landed while the daemon
+        // was validating routes over the network between DecideTickRound and here. These
+        // decisions were sized against caps/targets the operator has since changed, so we
+        // refuse the whole batch — journaling nothing — and let the next cycle replan
+        // under the current policy. No money op is admitted on stale sizing.
+        if planned_generation != self.policy_generation {
+            self.tick_balances = None;
+            let refused = decisions
+                .iter()
+                .map(|decision| TickRefusal {
+                    key: decision.idempotency_key.clone(),
+                    reason: RefuseReason::PolicySuperseded,
+                    message: format!(
+                        "tick planned under policy generation {planned_generation}, current is {}",
+                        self.policy_generation
+                    ),
+                })
+                .collect();
+            return Ok(CommitTickReport {
+                accepted: Vec::new(),
+                refused,
+            });
+        }
+        let occurrence = decisions
+            .first()
+            .map(|decision| decision.occurrence)
+            .or_else(|| {
+                self.tick_balances
+                    .as_ref()
+                    .map(|(occurrence, _)| *occurrence)
+            })
+            .ok_or_else(|| ServiceError::Storage("CommitTick: no decided round".to_owned()))?;
+        if decisions
+            .iter()
+            .any(|decision| decision.occurrence != occurrence)
+        {
+            return Err(ServiceError::Storage(
+                "CommitTick: decisions span multiple occurrences".to_owned(),
+            ));
+        }
+        let now = now_ms();
+        let tick_key = existing_tick_key
+            .unwrap_or_else(|| IdempotencyKey(format!("tick:{}:{}", occurrence.0, ledger_nonce())));
+        // The tick row is auxiliary bookkeeping, not admission for the money operations.
+        // Preserve the standalone tick invariant: a fault here must not suppress evacuations.
+        if let Err(error) = self
+            .journal
+            .record_tick_started(&tick_key, occurrence, now)
+            .await
+        {
+            tracing::warn!(?error, "CommitTick: recording the Started tick row failed");
+        }
+        if let Err(error) = self
+            .ensure_fresh_tick_decisions(&decisions, occurrence)
+            .await
+        {
+            self.record_tick_failed(&tick_key, &error.to_string()).await;
+            self.tick_balances = None;
+            return Err(error);
+        }
+        let balances = match fresh_balances {
+            Some(balances) => balances,
+            None => match self
+                .tick_balances
+                .as_ref()
+                .filter(|(planned, _)| *planned == occurrence)
+                .map(|(_, balances)| balances.clone())
+            {
+                Some(balances) => balances,
+                None => {
+                    let error = ServiceError::Storage(format!(
+                        "CommitTick: no decided balance facts for occurrence {}",
+                        occurrence.0
+                    ));
+                    self.record_tick_failed(&tick_key, &error.to_string()).await;
+                    self.tick_balances = None;
+                    return Err(error);
+                }
+            },
+        };
+        let mut report = CommitTickReport::default();
+        let mut first_error = None;
+        let mut failed = 0_u32;
+        for decision in decisions_to_apply(&decisions) {
+            // Advisory allocator decisions are durable refusal facts, not executable work.
+            // `record_refusals` below is their single ledger writer, matching the standalone
+            // executor path's `apply_with_admission` projection.
+            if !decision.action.is_executable() {
+                continue;
+            }
+            let request = OpRequest {
+                decision: decision.clone(),
+                actor: Actor::Agent { occurrence },
+                now_ms: now,
+                balances: balances.clone(),
+                probe_session_nonce: None,
+            };
+            match self.decide_op(request, client).await {
+                Ok(decided) => report.accepted.push(decided.key),
+                Err(ServiceError::Refused { reason, message }) => {
+                    if let Err(error) = self
+                        .journal
+                        .record_tick_dropped_refusal(&decision, occurrence, now, &message)
+                        .await
+                    {
+                        tracing::warn!(
+                            key = %decision.idempotency_key.0,
+                            ?error,
+                            "CommitTick: recording a dropped-decision refusal failed"
+                        );
+                    }
+                    report.refused.push(TickRefusal {
+                        key: decision.idempotency_key,
+                        reason,
+                        message,
+                    });
+                }
+                Err(error) => {
+                    failed = failed.saturating_add(1);
+                    tracing::warn!(
+                        key = %decision.idempotency_key.0,
+                        ?error,
+                        "CommitTick: decision failed; continuing batch"
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if let Err(error) = self
+            .journal
+            .record_refusals(&decisions, occurrence, now)
+            .await
+        {
+            tracing::warn!(?error, "CommitTick: recording advisory refusal rows failed");
+        }
+        let result = first_error.map_or_else(|| Ok(report.clone()), Err);
+        let batch = TickBatch {
+            key: tick_key,
+            decisions: decisions.len() as u32,
+            pending: report.accepted.iter().cloned().collect(),
+            performed: 0,
+            failed: (report.refused.len() as u32).saturating_add(failed),
+            error: result.as_ref().err().map(ToString::to_string),
+        };
+        if batch.pending.is_empty() {
+            self.finish_tick_batch(batch).await;
+        } else {
+            self.tick_batches.push(batch);
+        }
+        self.tick_balances = None;
+        result
+    }
+
+    async fn observe_tick_outcome(&mut self, key: &IdempotencyKey, driver_finished: bool) {
+        if !self
+            .tick_batches
+            .iter()
+            .any(|batch| batch.pending.contains(key))
+        {
+            return;
+        }
+        let intent = match self.journal.get(key).await {
+            Ok(Some(intent)) => intent,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(key = %key.0, ?error, "TickBatch: reading driver outcome failed");
+                return;
+            }
+        };
+        let outcome = match intent.status {
+            IntentStatus::Done | IntentStatus::Awaiting => Some((true, None)),
+            IntentStatus::Failed => Some((false, Some(format!("decision {} failed", key.0)))),
+            IntentStatus::Pending | IntentStatus::Executing if driver_finished => Some((
+                false,
+                Some(format!(
+                    "decision {} driver ended in {}",
+                    key.0,
+                    intent_status_label(intent.status)
+                )),
+            )),
+            IntentStatus::Pending | IntentStatus::Executing => None,
+        };
+        let Some((performed, error)) = outcome else {
+            return;
+        };
+        let mut completed = Vec::new();
+        for (index, batch) in self.tick_batches.iter_mut().enumerate() {
+            if !batch.pending.remove(key) {
+                continue;
+            }
+            if performed {
+                batch.performed = batch.performed.saturating_add(1);
+            } else {
+                batch.failed = batch.failed.saturating_add(1);
+                if batch.error.is_none() {
+                    batch.error = error.clone();
+                }
+            }
+            if batch.pending.is_empty() {
+                completed.push(index);
+            }
+        }
+        for index in completed.into_iter().rev() {
+            let batch = self.tick_batches.remove(index);
+            self.finish_tick_batch(batch).await;
+        }
+    }
+
+    async fn finish_tick_batch(&self, batch: TickBatch) {
+        let status = if batch.failed == 0 {
+            OperationStatus::Succeeded
+        } else {
+            OperationStatus::Failed
+        };
+        let generated_error = (batch.failed > 0).then(|| {
+            format!(
+                "tick: {} decision(s) did not apply (performed={} failed={})",
+                batch.failed, batch.performed, batch.failed
+            )
+        });
+        let error = batch.error.as_deref().or(generated_error.as_deref());
+        if let Err(record_error) = self
+            .journal
+            .record_tick_terminal(
+                &batch.key,
+                Some((batch.decisions, batch.performed, batch.failed)),
+                status,
+                error,
+                now_ms(),
+            )
+            .await
+        {
+            tracing::warn!(
+                tick = %batch.key.0,
+                ?record_error,
+                "TickBatch: recording the terminal tick row failed"
+            );
+        }
+    }
+
+    async fn record_tick_failed(&self, key: &IdempotencyKey, diagnostic: &str) {
+        if let Err(error) = self
+            .journal
+            .record_tick_terminal(
+                key,
+                None,
+                OperationStatus::Failed,
+                Some(diagnostic),
+                now_ms(),
+            )
+            .await
+        {
+            tracing::warn!(?error, "CommitTick: recording the failed tick row failed");
+        }
+    }
+
+    async fn ensure_fresh_tick_decisions(
+        &self,
+        decisions: &[AllocatorDecision],
+        occurrence: wallet_core::Occurrence,
+    ) -> ServiceResult<()> {
+        for decision in decisions_to_apply(decisions) {
+            if let Some(intent) = self
+                .journal
+                .get(&decision.idempotency_key)
+                .await
+                .map_err(storage)?
+            {
+                if matches!(
+                    intent.status,
+                    IntentStatus::Done | IntentStatus::Awaiting | IntentStatus::Failed
+                ) {
+                    return Err(ServiceError::Storage(format!(
+                        "tick: occurrence {} would replay already-terminal decision {}",
+                        occurrence.0, decision.idempotency_key.0
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn decide_op(
@@ -286,7 +790,7 @@ impl ActorState {
                 .await?;
         }
 
-        let external_admission = counts_against_external_cap(&req.decision);
+        let external_admission = counts_against_external_cap(&req.decision, req.actor);
         if external_admission && driver::external_len(&self.registry) >= EXTERNAL_DRIVER_CAP {
             tracing::warn!(key = %key.0, cap = EXTERNAL_DRIVER_CAP, "DecideOp: driver admission cap reached");
             return Err(refused(
@@ -338,7 +842,7 @@ impl ActorState {
         let key = existing.idempotency_key.clone();
         if existing.status == IntentStatus::Failed && req.actor == Actor::User {
             validate_manual_retry_anchor(&existing.action, &req.decision.action)?;
-            let external_admission = counts_against_external_cap(&req.decision);
+            let external_admission = counts_against_external_cap(&req.decision, req.actor);
             if external_admission && driver::external_len(&self.registry) >= EXTERNAL_DRIVER_CAP {
                 return Err(refused(
                     RefuseReason::Conflict,
@@ -385,7 +889,7 @@ impl ActorState {
                 .await?;
         }
         validate_live_attach(&existing.action, &req.decision.action)?;
-        let external_admission = counts_against_external_cap(&req.decision);
+        let external_admission = counts_against_external_cap(&req.decision, req.actor);
         let probe_session_nonce = req.probe_session_nonce;
 
         let result = wallet_core::decide_and_journal(
@@ -795,13 +1299,7 @@ impl ActorState {
     }
 
     fn probe_policy(&self) -> ProbePolicy {
-        ProbePolicy {
-            amount_msat: self.policy.probe_amount.0,
-            leg_fee_cap_msat: self.policy.max_fee.0,
-            min_successes: self.policy.probe_min_successes,
-            min_span_ms: self.policy.probe_min_span_secs.saturating_mul(1000),
-            ttl_ms: self.policy.probe_ttl_secs.saturating_mul(1000),
-        }
+        self.policy.probe_policy()
     }
 
     async fn apply_transition(
@@ -875,12 +1373,6 @@ impl ActorState {
         let intents = self.journal.reservation_intents().await.map_err(storage)?;
         let mut records = BTreeMap::new();
         for intent in &intents {
-            if !matches!(
-                intent.action,
-                Action::Move { .. } | Action::Evacuate { .. } | Action::DirectInflow { .. }
-            ) {
-                continue;
-            }
             if let Some(record) = self
                 .journal
                 .move_record(&intent.idempotency_key)
@@ -1333,13 +1825,34 @@ fn spending_federation(action: &Action) -> Option<FederationId> {
     }
 }
 
-fn counts_against_external_cap(decision: &wallet_core::AllocatorDecision) -> bool {
-    decision.reason != wallet_core::ReasonCode::ActiveProbe
+fn intent_status_label(status: IntentStatus) -> &'static str {
+    match status {
+        IntentStatus::Pending => "pending",
+        IntentStatus::Executing => "executing",
+        IntentStatus::Done => "done",
+        IntentStatus::Awaiting => "awaiting",
+        IntentStatus::Failed => "failed",
+    }
+}
+
+fn facts_from_probes(
+    probes: &[(FederationId, crate::probe::ProbeResult)],
+) -> BTreeMap<FederationId, Msat> {
+    probes
+        .iter()
+        .map(|(id, probe)| (*id, Msat(probe.spendable_msat)))
+        .collect()
+}
+
+fn counts_against_external_cap(decision: &wallet_core::AllocatorDecision, actor: Actor) -> bool {
+    actor == Actor::User
+        && decision.reason != wallet_core::ReasonCode::ActiveProbe
         && !matches!(decision.action, Action::Evacuate { .. })
 }
 
 fn counts_against_external_cap_for_intent(intent: &Intent) -> bool {
-    intent.reason != wallet_core::ReasonCode::ActiveProbe
+    intent.actor == Actor::User
+        && intent.reason != wallet_core::ReasonCode::ActiveProbe
         && !matches!(intent.action, Action::Evacuate { .. })
 }
 
@@ -1544,7 +2057,7 @@ fn transition_may_resolve(transition: &JournalTransition) -> bool {
     }
 }
 
-fn storage(error: ExecError) -> ServiceError {
+pub(super) fn storage(error: ExecError) -> ServiceError {
     let message = match error {
         ExecError::Retryable(message) | ExecError::Permanent(message) => message,
         ExecError::Unsupported => "journal operation is unsupported".to_owned(),

@@ -269,7 +269,7 @@ impl MultiClient {
         &self,
         subscribed: &mut BTreeSet<FederationId>,
         wake_tx: tokio::sync::mpsc::Sender<(FederationId, Option<u64>)>,
-    ) {
+    ) -> Vec<runtime::JoinHandle<()>> {
         let clients = self
             .clients
             .read()
@@ -277,12 +277,13 @@ impl MultiClient {
             .iter()
             .map(|(id, client)| (*id, client.clone()))
             .collect::<Vec<_>>();
+        let mut tasks = Vec::new();
         for (id, client) in clients {
             if !subscribed.insert(id) {
                 continue;
             }
             let wake_tx = wake_tx.clone();
-            runtime::spawn("wallet-watch-expiry-wake", async move {
+            tasks.push(runtime::spawn("wallet-watch-expiry-wake", async move {
                 let meta_service = client.meta_service().clone();
                 let mut stream = Box::pin(
                     meta_service
@@ -299,8 +300,9 @@ impl MultiClient {
                         break;
                     }
                 }
-            });
+            }));
         }
+        tasks
     }
 
     /// Fetch and authenticate a federation config from an invite without joining or writing a
