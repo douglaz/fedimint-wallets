@@ -16,7 +16,7 @@ macro_rules! fed {
     ($id:expr, $balance:expr, $probed:expr, $reputation:expr, $shutdown:expr, $healthy:expr, $elig:expr) => { FederationStatus { id: id!($id), balance: balance!($balance), probed_ok: $probed, reputation: $reputation, shutdown_notice: $shutdown, healthy: $healthy, eligible_to_fund: $elig } };
 }
 macro_rules! snap {
-    ([$($fed:expr),*], $spending:expr, $standby:expr, $cap:expr, $target:expr, $standby_target:expr, $now:expr) => { AllocatorSnapshot { federations: vec![$($fed),*], spending_fed: $spending, standby_fed: $standby, per_fed_cap: msat!($cap), target_spending_balance: msat!($target), standby_target: msat!($standby_target), max_fee: msat!(500), now: $now } };
+    ([$($fed:expr),*], $spending:expr, $standby:expr, $cap:expr, $target:expr, $standby_target:expr, $now:expr) => { AllocatorSnapshot { federations: vec![$($fed),*], spending_fed: $spending, standby_fed: $standby, per_fed_cap: msat!($cap), target_spending_balance: msat!($target), standby_target: msat!($standby_target), max_fee: msat!(500), reservations: Reservations::default(), now: $now } };
 }
 macro_rules! decision {
     ($action:expr, $reason:expr, $occurrence:expr, $key:expr) => { vec![AllocatorDecision { action: $action, reason: $reason, occurrence: $occurrence, idempotency_key: $key }] };
@@ -261,6 +261,54 @@ fn scorer_rejected_fed_is_never_an_evacuation_destination() {
     // to an advisory RefuseInflow rather than draining fed 1 into a distrusted fed.
     let snapshot = snap!([fed!(1, 50_000, true, true, true), fed!(2, 40_000, true, 0, false, true, false)], None, Some(id!(2)), 100_000, 100_000, 0, 500);
     assert_eq!(decide(&snapshot, occ(1)), decision!(refuse!(1, ReasonCode::ShutdownNotice), ReasonCode::ShutdownNotice, occ(1), refuse_key(1, ReasonCode::ShutdownNotice, 1)));
+}
+
+#[test]
+fn cross_operation_reservations_only_change_source_availability_and_cap_room() {
+    let mut snapshot = snap!([fed!(1, 100, true, false, true), fed!(2, 900, true, false, true)], Some(id!(1)), Some(id!(2)), 1_000, 500, 0, 600);
+    snapshot
+        .reservations
+        .per_fed_inbound
+        .insert(id!(1), msat!(200));
+    snapshot
+        .reservations
+        .per_fed_outbound
+        .insert(id!(2), msat!(150));
+
+    let decisions = decide(&snapshot, occ(1));
+    assert!(
+        decisions.iter().any(|decision| matches!(
+            decision.action,
+            Action::Move { amount: Msat(250), .. }
+        )),
+        "the source reservation reduces available funds without treating speculative inbound as target credit"
+    );
+
+    snapshot
+        .reservations
+        .per_fed_inbound
+        .insert(id!(1), msat!(900));
+    assert!(decide(&snapshot, occ(1))
+        .iter()
+        .all(|decision| !matches!(decision.action, Action::Move { .. })));
+}
+
+#[test]
+fn speculative_receive_reservation_does_not_suppress_a_needed_top_up() {
+    let mut snapshot = snap!([fed!(1, 100, true, false, true), fed!(2, 2_000, true, false, true)], Some(id!(1)), Some(id!(2)), 1_100, 500, 0, 601);
+    snapshot
+        .reservations
+        .per_fed_inbound
+        .insert(id!(1), msat!(500));
+
+    assert!(decide(&snapshot, occ(1)).iter().any(|decision| matches!(
+        decision.action,
+        Action::Move {
+            to,
+            amount: Msat(400),
+            ..
+        } if to == id!(1)
+    )));
 }
 
 // Sum of `Evacuate` amounts targeting `dest` across the emitted decisions.

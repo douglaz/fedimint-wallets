@@ -315,7 +315,7 @@ impl MultiClient {
         Ok(preview.config().clone())
     }
 
-    fn has_client(&self, id: &FederationId) -> bool {
+    pub(crate) fn has_client(&self, id: &FederationId) -> bool {
         self.clients
             .read()
             .expect("client map lock poisoned")
@@ -469,8 +469,8 @@ impl MultiClient {
     /// [`SendOutcome::AlreadyInFlight`]/[`SendOutcome::AlreadyPaid`] carrying the ORIGINAL
     /// op-id — never a double-pay (spec §4). `custom_meta` is committed into the operation
     /// meta. A failure is a typed [`SendError`] so the caller can tell a DETERMINISTIC
-    /// rejection (expired/wrong-currency/unsupported/fee-limit — re-paying the SAME invoice
-    /// can never succeed) from a TRANSPORT fault (retry may succeed) — §15.4.
+    /// rejection (expired/wrong-currency — re-paying the SAME invoice can never succeed) from a
+    /// retryable route/transport fault — §15.4.
     pub async fn pay(
         &self,
         id: &FederationId,
@@ -906,24 +906,24 @@ pub enum SendState {
 }
 
 /// Why an lnv2 `send` produced no [`SendOutcome`] (spec §15.4). Split so the executor can tell a
-/// DETERMINISTIC rejection — the invoice/gateway/currency is wrong, so re-paying the SAME invoice
-/// can never succeed (the move must fail terminally and a fresh occurrence re-mint) — from a
-/// TRANSPORT fault (the gateway is unreachable this attempt; a retry may succeed). Blanket-mapping
-/// every failure to `Retryable` (the old behavior) let `InvoiceExpired`/`WrongCurrency`/
-/// `FederationNotSupported`/fee-limit breaches livelock forever.
+/// DETERMINISTIC rejection from a transport fault. Route rejections remain distinct from immutable
+/// invoice rejections so raw pay may adopt a new pre-fund route without changing the frozen move
+/// disposition.
 #[derive(Debug)]
 pub enum SendError {
-    /// The federation deterministically rejected this invoice (expired / wrong currency /
-    /// unsupported / fee- or expiry-limit breach). Terminal for this invoice.
-    Rejected(String),
-    /// A transient transport / gateway-reachability fault; retry with the same invoice may succeed.
+    /// The invoice itself cannot become payable (expired / wrong currency / missing amount).
+    InvoiceRejected(String),
+    /// The selected gateway route was rejected. Terminal for a pinned move route, but an
+    /// unfunded raw pay may retry after adopting another gateway.
+    RouteRejected(String),
+    /// A transient funding or transport fault; retry may succeed.
     Transport(anyhow::Error),
 }
 
 impl std::fmt::Display for SendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SendError::Rejected(msg) => write!(f, "{msg}"),
+            SendError::InvoiceRejected(msg) | SendError::RouteRejected(msg) => write!(f, "{msg}"),
             SendError::Transport(e) => write!(f, "{e}"),
         }
     }
@@ -942,25 +942,31 @@ impl From<anyhow::Error> for SendError {
 
 /// Whether a [`SendPaymentError`] is a DETERMINISTIC rejection of the invoice — re-submitting the
 /// SAME BOLT11 can never succeed (verified against `modules/fedimint-lnv2-client/src/lib.rs`'s
-/// variants). Transport/gateway-reachability and funding faults are excluded (they may clear on a
-/// retry). The dedup variants are handled as OUTCOMES before this is consulted.
-fn is_deterministic_send_rejection(e: &SendPaymentError) -> bool {
+/// variants). Route policy, transport/gateway-reachability, and funding faults are excluded (they
+/// may clear on retry, and an unfunded raw-pay attach may replace its route). The dedup variants
+/// are handled as OUTCOMES before this is consulted.
+fn is_invoice_send_rejection(e: &SendPaymentError) -> bool {
     matches!(
         e,
         SendPaymentError::InvoiceMissingAmount
             | SendPaymentError::InvoiceExpired
-            | SendPaymentError::FederationNotSupported
-            | SendPaymentError::GatewayFeeExceedsLimit
-            | SendPaymentError::GatewayExpirationExceedsLimit
             | SendPaymentError::WrongCurrency { .. }
     )
 }
 
-/// Map lnv2 `send`'s result to a [`SendOutcome`] or a classified [`SendError`]: the two dedup
-/// errors become non-failure outcomes carrying the existing op-id; a deterministic rejection
-/// becomes [`SendError::Rejected`] (terminal), and every other failure stays
-/// [`SendError::Transport`] (retryable). Pure, so the classification is unit-tested without a live
-/// federation.
+fn is_route_send_rejection(e: &SendPaymentError) -> bool {
+    matches!(
+        e,
+        SendPaymentError::FederationNotSupported
+            | SendPaymentError::GatewayFeeExceedsLimit
+            | SendPaymentError::GatewayExpirationExceedsLimit
+    )
+}
+
+/// Map lnv2 `send`'s result to a [`SendOutcome`] or a classified [`SendError`]. Dedup errors become
+/// non-failure outcomes; immutable invoice rejections and changeable route rejections stay
+/// distinguishable; every other failure is transport-class. Pure, so this is unit-tested without a
+/// live federation.
 fn map_send_result(
     result: Result<FedimintOperationId, SendPaymentError>,
 ) -> Result<SendOutcome, SendError> {
@@ -972,8 +978,11 @@ fn map_send_result(
         Err(SendPaymentError::InvoiceAlreadyPaid(op)) => {
             Ok(SendOutcome::AlreadyPaid(bridge_op_id(op)))
         }
-        Err(e) if is_deterministic_send_rejection(&e) => Err(SendError::Rejected(format!(
+        Err(e) if is_invoice_send_rejection(&e) => Err(SendError::InvoiceRejected(format!(
             "lnv2 send deterministically rejected the invoice: {e}"
+        ))),
+        Err(e) if is_route_send_rejection(&e) => Err(SendError::RouteRejected(format!(
+            "lnv2 send rejected the selected gateway route: {e}"
         ))),
         Err(e) => Err(SendError::Transport(anyhow::anyhow!("lnv2 send: {e}"))),
     }
@@ -1008,7 +1017,7 @@ impl MultiClient {
         &self,
         fed: &FederationId,
         mut pred: impl FnMut(&LightningOperationMeta) -> bool,
-    ) -> anyhow::Result<Option<OperationId>> {
+    ) -> anyhow::Result<Option<(OperationId, LightningOperationMeta)>> {
         let client = self.client(fed)?;
         let log = client.operation_log();
         let mut last_seen: Option<ChronologicalOperationLogKey> = None;
@@ -1025,7 +1034,7 @@ impl MultiClient {
                     continue;
                 };
                 if pred(&meta) {
-                    return Ok(Some(bridge_op_id(key.operation_id)));
+                    return Ok(Some((bridge_op_id(key.operation_id), meta)));
                 }
             }
             if page_len < BACKFILL_PAGE_SIZE {
@@ -1033,6 +1042,35 @@ impl MultiClient {
             }
         }
         Ok(None)
+    }
+
+    /// Recover a raw receive's durable artifact from the operation log after a crash between
+    /// lnv2 committing the receive and the journal recording its op id + invoice.
+    pub(crate) async fn find_receive_artifact_by_correlation_key(
+        &self,
+        fed: &FederationId,
+        key: &IdempotencyKey,
+    ) -> Result<Option<(Invoice, OperationId)>, ExecError> {
+        let key = key.0.clone();
+        self.find_op_matching(fed, |meta| {
+            matches!(meta, LightningOperationMeta::Receive(_))
+                && meta_custom(meta)
+                    .and_then(|custom| custom.get("correlation_key"))
+                    .and_then(|value| value.as_str())
+                    == Some(key.as_str())
+        })
+        .await
+        .map_err(oracle_retryable)
+        .and_then(|artifact| match artifact {
+            Some((operation_id, LightningOperationMeta::Receive(receive))) => {
+                let LightningInvoice::Bolt11(invoice) = receive.invoice;
+                Ok(Some((bridge_invoice(&invoice), operation_id)))
+            }
+            Some(_) => Err(ExecError::Permanent(
+                "correlation-key lookup returned a non-receive operation".into(),
+            )),
+            None => Ok(None),
+        })
     }
 
     /// Non-blocking read of `fed_op`'s send-leg terminal state (§10.3): a cached outcome maps to
@@ -1082,6 +1120,7 @@ impl LedgerRepairOracle for MultiClient {
                 == Some(key.as_str())
         })
         .await
+        .map(|found| found.map(|(operation_id, _)| operation_id))
         .map_err(oracle_retryable)
     }
 
@@ -1098,6 +1137,7 @@ impl LedgerRepairOracle for MultiClient {
             _ => false,
         })
         .await
+        .map(|found| found.map(|(operation_id, _)| operation_id))
         .map_err(oracle_retryable)
     }
 
@@ -1494,14 +1534,11 @@ mod tests {
 
     #[test]
     fn send_result_classifies_deterministic_rejections_distinctly_from_transport() {
-        // §15.4: the deterministic invoice-level rejections must classify as `Rejected` so the
-        // executor fails the move terminally instead of livelocking a re-drive on a dead invoice.
+        // §15.4: deterministic invoice-level rejections must classify as `Rejected` so the
+        // executor fails terminally instead of re-driving an invoice that can never become valid.
         for err in [
             SendPaymentError::InvoiceMissingAmount,
             SendPaymentError::InvoiceExpired,
-            SendPaymentError::FederationNotSupported,
-            SendPaymentError::GatewayFeeExceedsLimit,
-            SendPaymentError::GatewayExpirationExceedsLimit,
             SendPaymentError::WrongCurrency {
                 invoice_currency: lightning_invoice::Currency::Bitcoin,
                 federation_currency: lightning_invoice::Currency::Regtest,
@@ -1510,9 +1547,25 @@ mod tests {
             assert!(
                 matches!(
                     map_send_result(Err(err.clone())),
-                    Err(SendError::Rejected(_))
+                    Err(SendError::InvoiceRejected(_))
                 ),
                 "{err:?} must classify as a deterministic Rejected, not Transport"
+            );
+        }
+
+        // Gateway policy failures are still deterministic rejections for the selected route, but
+        // remain distinct so raw pay can retry after adopting another route.
+        for err in [
+            SendPaymentError::FederationNotSupported,
+            SendPaymentError::GatewayFeeExceedsLimit,
+            SendPaymentError::GatewayExpirationExceedsLimit,
+        ] {
+            assert!(
+                matches!(
+                    map_send_result(Err(err.clone())),
+                    Err(SendError::RouteRejected(_))
+                ),
+                "{err:?} must classify as a route rejection, not Transport"
             );
         }
 

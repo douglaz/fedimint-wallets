@@ -31,7 +31,7 @@ use crate::journal::{
     WatchState,
 };
 use crate::move_protocol::{MovePhase, MoveRecord};
-use crate::multi_client::{JoinDeadlineOutcome, MultiClient, ReceiveState};
+use crate::multi_client::{parse_invoice, JoinDeadlineOutcome, MultiClient, ReceiveState};
 use crate::probe::{assemble_facts, assemble_status, FedimintProbeRunner, ProbeResult};
 use crate::tick::{
     build_snapshot, decisions_to_apply, pinned_input_problems, ScoredFed, StatusReport, TickPolicy,
@@ -39,11 +39,14 @@ use crate::tick::{
 };
 use crate::types::{GatewayUrl, Invoice};
 use async_trait::async_trait;
+use bitcoin::hashes::{sha256, Hash as _};
 use fedimint_core::config::ClientConfig;
 use fedimint_core::encoding::{Decodable, DynRawFallback};
+use fedimint_core::invite_code::InviteCode;
 use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fedimint_core::runtime;
 use fedimint_core::NumPeers;
+use std::str::FromStr as _;
 use std::time::Duration;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -54,9 +57,9 @@ use wallet_core::{
     probe_verdict, probe_wake_due_ms, score, Action, ActiveProbeVerdict, Actor,
     AdaptiveSleepDeadlines, AllocatorDecision, AllocatorSnapshot, DiscoveryPolicy, ExecError,
     ExecutionSummary, Executor, FederationFacts, FederationId, IdempotencyKey, Intent,
-    IntentStatus, Journal, Module, Msat, Occurrence, OperationKind, OperationRecord,
+    IntentStatus, Journal, Module, Msat, Occurrence, OperationId, OperationKind, OperationRecord,
     OperationStatus, PerformOutcome, ProbeAttempt, ProbeBudgetUsage, ProbePolicy, ReasonCode,
-    ScorerPolicy, WatchPolicy,
+    Reservations, ScorerPolicy, WatchPolicy,
 };
 
 /// Wall-clock in unix millis for the ledger's `created_at_ms` (§8/§9.4). `seq` is the
@@ -106,6 +109,28 @@ pub struct MoveOutcome {
     pub key: IdempotencyKey,
     pub status: Option<IntentStatus>,
     pub outcome: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RawPayOutcome {
+    pub key: IdempotencyKey,
+    pub operation_id: OperationId,
+    pub status: IntentStatus,
+    pub already_in_flight: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct RawReceiveOutcome {
+    pub key: IdempotencyKey,
+    pub operation_id: OperationId,
+    pub invoice: Invoice,
+    pub status: IntentStatus,
+}
+
+#[derive(Clone, Debug)]
+pub struct JoinIntentOutcome {
+    pub key: IdempotencyKey,
+    pub status: IntentStatus,
 }
 
 /// The terminal result of [`Runtime::await_move`]: the inflow settled (`Done`) or did not
@@ -334,12 +359,14 @@ struct TerminalReplay {
     status: IntentStatus,
 }
 
-/// Wraps an [`Executor`] so each `perform` is bounded by a wall-clock deadline (§15.9). A tick
-/// blocks on `await_send`/`await_receive` (the SDK long-polls up to 60 min/request), so one
-/// stalled gateway would otherwise freeze probing and every other decision. On timeout the perform
-/// future is DROPPED — the move engine is crash-safe (a later reconcile rebuilds the record from
-/// the op-log and reattaches, never re-minting/re-paying) — and the intent is left `Pending` via
-/// the `Retryable` path, so the tick moves on and the summary counts it.
+/// Wraps an [`Executor`] so money-operation `perform` calls are bounded by a wall-clock deadline
+/// (§15.9). A tick blocks on `await_send`/`await_receive` (the SDK long-polls up to 60 min/request),
+/// so one stalled gateway would otherwise freeze probing and every other decision. On timeout the
+/// perform future is DROPPED — the move engine is crash-safe (a later reconcile rebuilds the
+/// record from the op-log and reattaches, never re-minting/re-paying) — and the intent is left
+/// `Pending` via the `Retryable` path, so the tick moves on and the summary counts it. Joins retain
+/// their pre-intent unbounded behavior because dropping the SDK join future can interrupt its
+/// best-effort partition cleanup; discovery's separate join deadline remains cancellation-aware.
 struct TimeoutExecutor<E> {
     inner: E,
     timeout: Option<Duration>,
@@ -354,6 +381,9 @@ impl<E> TimeoutExecutor<E> {
 #[async_trait]
 impl<E: Executor> Executor for TimeoutExecutor<E> {
     async fn perform(&self, intent: &Intent) -> Result<PerformOutcome, ExecError> {
+        if matches!(intent.action, Action::Join { .. }) {
+            return self.inner.perform(intent).await;
+        }
         match self.timeout {
             Some(deadline) => match runtime::timeout(deadline, self.inner.perform(intent)).await {
                 Ok(result) => result,
@@ -419,6 +449,72 @@ impl Runtime {
         TimeoutExecutor::new(self.executor(), self.perform_timeout)
     }
 
+    async fn projected_reservations(&self) -> Result<Reservations, ExecError> {
+        let intents = self.journal.reservation_intents().await?;
+        let mut records = BTreeMap::new();
+        for intent in &intents {
+            if let Some(record) = self.journal.get_move(&intent.idempotency_key).await? {
+                records.insert(intent.idempotency_key.clone(), record);
+            }
+        }
+        Ok(wallet_core::project_reservations(&intents, |key| {
+            records.get(key).cloned()
+        }))
+    }
+
+    async fn decide_and_drive(
+        &self,
+        decision: &AllocatorDecision,
+        actor: Actor,
+        balances: Option<&BTreeMap<FederationId, Msat>>,
+        per_fed_cap: Option<Msat>,
+    ) -> Result<(ExecutionSummary, Option<PerformOutcome>, Option<ExecError>), ExecError> {
+        let mut summary = ExecutionSummary::default();
+        let mut performed_outcome = None;
+        let mut drive_error = None;
+        match wallet_core::decide_and_journal(
+            self.journal.as_ref(),
+            decision,
+            actor,
+            now_ms(),
+            balances,
+            per_fed_cap,
+        )
+        .await?
+        {
+            wallet_core::DecideAndJournal::Drive(intent) => {
+                let executor = self.driving_executor();
+                match wallet_core::drive_intent_step(
+                    self.journal.as_ref(),
+                    &executor,
+                    &intent,
+                    &mut summary,
+                )
+                .await
+                {
+                    Ok(outcome) => performed_outcome = outcome,
+                    Err(error) => drive_error = Some(error),
+                }
+            }
+            wallet_core::DecideAndJournal::Skip => summary.skipped += 1,
+            wallet_core::DecideAndJournal::TerminalFailed => {
+                summary.skipped += 1;
+                summary.terminal_failed_skipped += 1;
+            }
+        }
+        Ok((summary, performed_outcome, drive_error))
+    }
+
+    async fn terminal_intent_error(&self, key: &IdempotencyKey) -> Result<ExecError, ExecError> {
+        let reason = self
+            .journal
+            .operation(&OperationRef::Key(key.clone()))
+            .await?
+            .and_then(|row| row.error)
+            .unwrap_or_else(|| format!("intent {} previously failed", key.0));
+        Ok(ExecError::Permanent(reason))
+    }
+
     /// The BOLT11 surfaced for an intent (spec §7's `invoice_for`): read the persisted
     /// `MoveRecord.invoice`. `None` before the invoice is minted (or for a non-move intent).
     pub async fn invoice_for(&self, key: &IdempotencyKey) -> Result<Option<Invoice>, ExecError> {
@@ -443,7 +539,8 @@ impl Runtime {
         occurrence: Occurrence,
     ) -> anyhow::Result<DirectInflowOutcome> {
         let key = direct_inflow_key(&to, amount, fee_cap, occurrence);
-        if self.journal.get(&key).await.map_err(exec_err)?.is_none() {
+        let attached = self.journal.get(&key).await.map_err(exec_err)?.is_some();
+        if !attached {
             // The preflight exists to catch DETERMINISTIC rejections (lnv2 dust) before an
             // intent is journaled. A RETRYABLE failure here (e.g. the never-over quote loop
             // not settling this instant) must NOT hard-fail the command pre-journal — there
@@ -475,15 +572,21 @@ impl Runtime {
             occurrence,
             idempotency_key: key.clone(),
         };
-        let executor = self.driving_executor();
-        let _summary = wallet_core::apply(
-            self.journal.as_ref(),
-            &executor,
-            std::slice::from_ref(&decision),
-            Actor::User,
-            now_ms(),
-        )
-        .await;
+        let balances = if attached || self.hard_cap.is_none() || !self.mc.has_client(&to) {
+            None
+        } else {
+            Some(BTreeMap::from([(
+                to,
+                self.mc
+                    .balance(&to)
+                    .await
+                    .map_err(|error| exec_err(ExecError::Retryable(error.to_string())))?,
+            )]))
+        };
+        let _summary = self
+            .decide_and_drive(&decision, Actor::User, balances.as_ref(), self.hard_cap)
+            .await
+            .map_err(exec_err)?;
 
         // Read the intent + its derived record together so we can complete a transition that a
         // crash in `await_move` interrupted (spec §9.5): if `settle_move` wrote a terminal record
@@ -544,6 +647,7 @@ impl Runtime {
         actor: Actor,
     ) -> anyhow::Result<MoveOutcome> {
         let key = move_key(&from, &to, amount, fee_cap, occurrence);
+        let attached = self.journal.get(&key).await.map_err(exec_err)?.is_some();
         let decision = AllocatorDecision {
             action: Action::Move {
                 from,
@@ -555,15 +659,30 @@ impl Runtime {
             occurrence,
             idempotency_key: key.clone(),
         };
-        let executor = self.driving_executor();
-        let _summary = wallet_core::apply(
-            self.journal.as_ref(),
-            &executor,
-            std::slice::from_ref(&decision),
-            actor,
-            now_ms(),
-        )
-        .await;
+        let balances = if attached || !self.mc.has_client(&from) || !self.mc.has_client(&to) {
+            None
+        } else {
+            Some(BTreeMap::from([
+                (
+                    from,
+                    self.mc
+                        .balance(&from)
+                        .await
+                        .map_err(|error| exec_err(ExecError::Retryable(error.to_string())))?,
+                ),
+                (
+                    to,
+                    self.mc
+                        .balance(&to)
+                        .await
+                        .map_err(|error| exec_err(ExecError::Retryable(error.to_string())))?,
+                ),
+            ]))
+        };
+        let _summary = self
+            .decide_and_drive(&decision, actor, balances.as_ref(), self.hard_cap)
+            .await
+            .map_err(exec_err)?;
 
         let status = self
             .journal
@@ -582,6 +701,213 @@ impl Runtime {
             status,
             outcome,
         })
+    }
+
+    pub async fn pay(
+        &self,
+        from: FederationId,
+        invoice: Invoice,
+        amount: Msat,
+        fee_cap: Msat,
+        payment_hash: [u8; 32],
+        gateway: Option<GatewayUrl>,
+    ) -> anyhow::Result<RawPayOutcome> {
+        let details = parse_invoice(&invoice)?;
+        anyhow::ensure!(
+            details.payment_hash == payment_hash,
+            "payment hash does not match the invoice"
+        );
+        let invoice_amount = details.amount.ok_or_else(|| {
+            anyhow::anyhow!(
+                "amountless BOLT11 invoices are not supported by the pinned lnv2 client"
+            )
+        })?;
+        anyhow::ensure!(
+            invoice_amount == amount,
+            "stated amount does not match the invoice amount"
+        );
+        let key = raw_pay_key(payment_hash);
+        let attached = self.journal.get(&key).await.map_err(exec_err)?.is_some();
+        let decision = AllocatorDecision {
+            action: Action::Pay {
+                from,
+                invoice,
+                amount,
+                fee_cap,
+                payment_hash,
+                gateway,
+            },
+            reason: ReasonCode::UserInitiated,
+            occurrence: Occurrence(0),
+            idempotency_key: key.clone(),
+        };
+        let balances = if attached {
+            None
+        } else {
+            Some(BTreeMap::from([(
+                from,
+                self.mc
+                    .balance(&from)
+                    .await
+                    .map_err(|error| exec_err(ExecError::Retryable(error.to_string())))?,
+            )]))
+        };
+        let (summary, performed_outcome, drive_error) = self
+            .decide_and_drive(&decision, Actor::User, balances.as_ref(), None)
+            .await
+            .map_err(exec_err)?;
+        if let Some(error) = drive_error {
+            return Err(exec_err(error));
+        }
+        if summary.terminal_failed_skipped > 0 {
+            return Err(exec_err(
+                self.terminal_intent_error(&key).await.map_err(exec_err)?,
+            ));
+        }
+        let intent = self
+            .journal
+            .get(&key)
+            .await
+            .map_err(exec_err)?
+            .ok_or_else(|| anyhow::anyhow!("raw pay intent {} was not journaled", key.0))?;
+        Ok(RawPayOutcome {
+            key,
+            operation_id: intent.operation_id.ok_or_else(|| {
+                anyhow::anyhow!("raw pay intent has no durable send operation artifact")
+            })?,
+            status: intent.status,
+            already_in_flight: matches!(
+                performed_outcome,
+                Some(PerformOutcome::AwaitingAlreadyInFlight)
+            ) || (performed_outcome.is_none()
+                && attached
+                && intent.status == IntentStatus::Awaiting),
+        })
+    }
+
+    pub async fn receive(
+        &self,
+        to: FederationId,
+        amount: Msat,
+        fee_cap: Msat,
+        nonce: String,
+        gateway: Option<GatewayUrl>,
+    ) -> anyhow::Result<RawReceiveOutcome> {
+        let key = raw_receive_key(to, amount, &nonce);
+        let attached = self.journal.get(&key).await.map_err(exec_err)?.is_some();
+        let decision = AllocatorDecision {
+            action: Action::Receive {
+                to,
+                amount,
+                fee_cap,
+                nonce,
+                gateway,
+            },
+            reason: ReasonCode::UserInitiated,
+            occurrence: Occurrence(0),
+            idempotency_key: key.clone(),
+        };
+        let balances = if attached {
+            None
+        } else {
+            Some(BTreeMap::from([(
+                to,
+                self.mc
+                    .balance(&to)
+                    .await
+                    .map_err(|error| exec_err(ExecError::Retryable(error.to_string())))?,
+            )]))
+        };
+        let (summary, _, drive_error) = self
+            .decide_and_drive(&decision, Actor::User, balances.as_ref(), self.hard_cap)
+            .await
+            .map_err(exec_err)?;
+        if let Some(error) = drive_error {
+            return Err(exec_err(error));
+        }
+        if summary.terminal_failed_skipped > 0 {
+            return Err(exec_err(
+                self.terminal_intent_error(&key).await.map_err(exec_err)?,
+            ));
+        }
+        let intent = self
+            .journal
+            .get(&key)
+            .await
+            .map_err(exec_err)?
+            .ok_or_else(|| anyhow::anyhow!("raw receive intent {} was not journaled", key.0))?;
+        Ok(RawReceiveOutcome {
+            key,
+            operation_id: intent.operation_id.ok_or_else(|| {
+                anyhow::anyhow!("raw receive intent has no durable operation artifact")
+            })?,
+            invoice: intent
+                .invoice
+                .ok_or_else(|| anyhow::anyhow!("raw receive intent has no durable invoice"))?,
+            status: intent.status,
+        })
+    }
+
+    pub async fn join(
+        &self,
+        federation: FederationId,
+        invite: String,
+    ) -> anyhow::Result<JoinIntentOutcome> {
+        let parsed = InviteCode::from_str(&invite)?;
+        let invite_federation = crate::multi_client::bridge_federation_id(parsed.federation_id());
+        anyhow::ensure!(
+            invite_federation == federation,
+            "join federation does not match the invite"
+        );
+        let invite = parsed.to_string();
+        let key = join_intent_key(federation, &invite);
+        let membership_preexisting = match self.journal.get(&key).await.map_err(exec_err)? {
+            Some(Intent {
+                action:
+                    Action::Join {
+                        membership_preexisting,
+                        ..
+                    },
+                ..
+            }) => membership_preexisting,
+            Some(_) => false,
+            None => self
+                .journal
+                .get_federation(&federation)
+                .await
+                .map_err(exec_err)?
+                .is_some(),
+        };
+        let decision = AllocatorDecision {
+            action: Action::Join {
+                federation,
+                invite,
+                membership_preexisting,
+            },
+            reason: ReasonCode::UserInitiated,
+            occurrence: Occurrence(0),
+            idempotency_key: key.clone(),
+        };
+        let (summary, _, drive_error) = self
+            .decide_and_drive(&decision, Actor::User, None, None)
+            .await
+            .map_err(exec_err)?;
+        if let Some(error) = drive_error {
+            return Err(exec_err(error));
+        }
+        if summary.terminal_failed_skipped > 0 {
+            return Err(exec_err(
+                self.terminal_intent_error(&key).await.map_err(exec_err)?,
+            ));
+        }
+        let status = self
+            .journal
+            .get(&key)
+            .await
+            .map_err(exec_err)?
+            .ok_or_else(|| anyhow::anyhow!("join intent {} was not journaled", key.0))?
+            .status;
+        Ok(JoinIntentOutcome { key, status })
     }
 
     /// Run one discovery pass (§5.1.2): union source announcements, authenticate configs without
@@ -1870,7 +2196,7 @@ impl Runtime {
         let executor = self.executor();
 
         // §9.2: rebuild the derived records for every intent we might re-drive or finalize.
-        let mut backfill_set = self.journal.pending().await;
+        let mut backfill_set = self.journal.pending().await.map_err(exec_err)?;
         backfill_set.extend(self.journal.awaiting().await.map_err(exec_err)?);
         for intent in &backfill_set {
             if let Err(e) = executor.backfill_move_record(intent).await {
@@ -1978,7 +2304,13 @@ impl Runtime {
             return Err(e);
         }
         let executor = self.driving_executor();
-        let summary = wallet_core::apply(
+        let balances = plan
+            .snapshot
+            .federations
+            .iter()
+            .map(|fed| (fed.id, fed.balance.spendable))
+            .collect::<BTreeMap<_, _>>();
+        let summary = wallet_core::apply_with_admission(
             self.journal.as_ref(),
             &executor,
             &decisions_to_apply(&plan.decisions),
@@ -1986,6 +2318,8 @@ impl Runtime {
                 occurrence: policy.occurrence,
             },
             now_ms(),
+            Some(&balances),
+            Some(policy.per_fed_cap),
         )
         .await;
 
@@ -2147,21 +2481,24 @@ impl Runtime {
     ) -> anyhow::Result<TickPlan> {
         let mut probes = raw_probes.clone();
         let auto_joined = self.auto_joined_candidates().await?;
+        let reservations = self.projected_reservations().await.map_err(exec_err)?;
         let mut route_revisions = 0usize;
         let mut evacuation_fallback: Option<EvacuationFallback> = None;
         loop {
-            let preliminary = build_snapshot(
+            let mut preliminary = build_snapshot(
                 &probes,
                 policy,
                 scorer_policy,
                 &auto_joined,
                 &BTreeMap::new(),
             );
+            preliminary.reservations = reservations.clone();
             let active_probes = self
                 .active_probe_verdicts(&probes, preliminary.spending_fed, &policy.probe_gate_policy)
                 .await;
-            let snapshot =
+            let mut snapshot =
                 build_snapshot(&probes, policy, scorer_policy, &auto_joined, &active_probes);
+            snapshot.reservations = reservations.clone();
             let decisions = wallet_core::decide(&snapshot, policy.occurrence);
             if let Some(fallback) = &evacuation_fallback {
                 let still_trying_evacuation = decisions.iter().any(|d| {
@@ -2973,6 +3310,32 @@ fn move_key(
     ))
 }
 
+fn raw_pay_key(payment_hash: [u8; 32]) -> IdempotencyKey {
+    IdempotencyKey(format!("pay:{}", bytes_hex(&payment_hash)))
+}
+
+pub fn raw_receive_key(to: FederationId, amount: Msat, nonce: &str) -> IdempotencyKey {
+    IdempotencyKey(format!("recv:{}:{}:{nonce}", to.to_hex(), amount.0))
+}
+
+fn join_intent_key(federation: FederationId, invite: &str) -> IdempotencyKey {
+    let invite_hash = sha256::Hash::hash(invite.as_bytes()).to_byte_array();
+    IdempotencyKey(format!(
+        "join:{}:{}",
+        federation.to_hex(),
+        bytes_hex(&invite_hash)
+    ))
+}
+
+fn bytes_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// The §5.0.5 probe report: the verdicts around one terminal invocation plus the leg keys.
 /// `cost_msat` mirrors the terminal umbrella row's budget-counted cost, when money moved.
 #[derive(Clone, Debug)]
@@ -3483,6 +3846,139 @@ mod tests {
         (Runtime::new(mc, journal.clone(), None, None, None), journal)
     }
 
+    #[tokio::test]
+    async fn join_rejects_a_federation_that_disagrees_with_the_invite() {
+        use fedimint_core::config::FederationId as SdkFederationId;
+        use fedimint_core::util::SafeUrl;
+        use fedimint_core::PeerId;
+
+        let (runtime, journal) = runtime_fixture().await;
+        let sdk_id = SdkFederationId::from_str(&FED_A.to_hex()).expect("valid federation id");
+        let invite = InviteCode::new(
+            SafeUrl::parse("https://join-mismatch.example").expect("valid URL"),
+            PeerId::from(0),
+            sdk_id,
+            None,
+        );
+        let invite = invite.to_string();
+        let error = runtime
+            .join(FED_B, invite.clone())
+            .await
+            .expect_err("mismatched join identity must be refused");
+        assert!(error.to_string().contains("does not match"), "{error}");
+        assert_eq!(
+            journal
+                .get(&join_intent_key(FED_B, &invite))
+                .await
+                .expect("read intent"),
+            None
+        );
+    }
+
+    #[test]
+    fn join_operation_keys_are_invite_derived() {
+        let invite_a = "invite-a";
+        let invite_b = "invite-b";
+
+        assert_eq!(
+            join_intent_key(FED_A, invite_a),
+            join_intent_key(FED_A, invite_a)
+        );
+        assert_ne!(
+            join_intent_key(FED_A, invite_a),
+            join_intent_key(FED_A, invite_b)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_attach_returns_the_original_driver_error() {
+        let (runtime, journal) = runtime_fixture().await;
+        let decision = AllocatorDecision {
+            action: Action::Receive {
+                to: FED_A,
+                amount: Msat(50_000),
+                fee_cap: Msat(1_000),
+                nonce: "terminal-retry".into(),
+                gateway: None,
+            },
+            reason: ReasonCode::UserInitiated,
+            occurrence: Occurrence(0),
+            idempotency_key: raw_receive_key(FED_A, Msat(50_000), "terminal-retry"),
+        };
+        journal
+            .upsert(&Intent::from_decision(&decision, Actor::User, 0))
+            .await
+            .expect("journal intent");
+        journal
+            .set_status(
+                &decision.idempotency_key,
+                IntentStatus::Failed,
+                Some("original terminal reason"),
+            )
+            .await
+            .expect("terminalize intent");
+
+        let error = runtime
+            .receive(
+                FED_A,
+                Msat(50_000),
+                Msat(1_000),
+                "terminal-retry".into(),
+                None,
+            )
+            .await
+            .expect_err("terminal attach returns its failure");
+        assert!(
+            error.to_string().contains("original terminal reason"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_terminal_attach_returns_the_original_driver_error() {
+        use fedimint_core::config::FederationId as SdkFederationId;
+        use fedimint_core::util::SafeUrl;
+        use fedimint_core::PeerId;
+
+        let (runtime, journal) = runtime_fixture().await;
+        let sdk_id = SdkFederationId::from_str(&FED_A.to_hex()).expect("valid federation id");
+        let invite = InviteCode::new(
+            SafeUrl::parse("https://join-terminal.example").expect("valid URL"),
+            PeerId::from(0),
+            sdk_id,
+            None,
+        )
+        .to_string();
+        let key = join_intent_key(FED_A, &invite);
+        let decision = AllocatorDecision {
+            action: Action::Join {
+                federation: FED_A,
+                invite: invite.clone(),
+                membership_preexisting: false,
+            },
+            reason: ReasonCode::UserInitiated,
+            occurrence: Occurrence(0),
+            idempotency_key: key.clone(),
+        };
+        journal
+            .upsert(&Intent::from_decision(&decision, Actor::User, 0))
+            .await
+            .expect("journal intent");
+        journal
+            .set_status(&key, IntentStatus::Failed, Some("original join failure"))
+            .await
+            .expect("terminalize intent");
+
+        let error = runtime
+            .join(FED_A, invite)
+            .await
+            .expect_err("terminal join attach returns its failure");
+        assert!(
+            error.to_string().contains("original join failure"),
+            "{error}"
+        );
+    }
+
     fn direct_inflow_intent(key: IdempotencyKey, to: FederationId, status: IntentStatus) -> Intent {
         Intent {
             idempotency_key: key,
@@ -3496,6 +3992,8 @@ mod tests {
             reason: ReasonCode::UserInitiated,
             actor: Actor::User,
             created_at_ms: 0,
+            operation_id: None,
+            invoice: None,
         }
     }
 
@@ -3714,6 +4212,8 @@ mod tests {
                     occurrence: Occurrence(1),
                 },
                 created_at_ms: now_ms(),
+                operation_id: None,
+                invoice: None,
             })
             .await
             .expect("seed leg-in intent");
@@ -4963,6 +5463,33 @@ mod tests {
                 .map(|i| i.status),
             Some(IntentStatus::Pending)
         );
+    }
+
+    #[tokio::test]
+    async fn perform_timeout_does_not_cancel_join_partition_cleanup() {
+        struct SlowJoin;
+        #[async_trait]
+        impl Executor for SlowJoin {
+            async fn perform(&self, _intent: &Intent) -> Result<PerformOutcome, ExecError> {
+                fedimint_core::runtime::sleep(Duration::from_millis(25)).await;
+                Ok(PerformOutcome::Done)
+            }
+        }
+
+        let decision = AllocatorDecision {
+            action: Action::Join {
+                federation: FED_A,
+                invite: "test-invite".into(),
+                membership_preexisting: false,
+            },
+            reason: ReasonCode::UserInitiated,
+            occurrence: Occurrence(0),
+            idempotency_key: IdempotencyKey("join:test".into()),
+        };
+        let intent = Intent::from_decision(&decision, Actor::User, 0);
+        let executor = TimeoutExecutor::new(SlowJoin, Some(Duration::from_millis(1)));
+
+        assert_eq!(executor.perform(&intent).await, Ok(PerformOutcome::Done));
     }
 
     #[tokio::test]

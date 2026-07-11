@@ -18,7 +18,7 @@ use wallet_core::{
 };
 use wallet_fedimint::{
     FederationInfo, FedimintJournal, GatewayUrl, Invoice, LedgerRepairOracle, MovePhase,
-    MoveRecord, OperationId, OperationRef, RawOpObservation, RawTerminal,
+    MoveRecord, OperationId, OperationRef, RawOpObservation, RawOperationRole, RawTerminal,
 };
 
 const BASE: u64 = 1_700_000_000_000; // a base ms timestamp (divisible by 1000: joins the sec/ms math)
@@ -94,6 +94,8 @@ fn move_intent(k: &str, status: IntentStatus) -> Intent {
         reason: ReasonCode::UserInitiated,
         actor: Actor::User,
         created_at_ms: BASE,
+        operation_id: None,
+        invoice: None,
     }
 }
 
@@ -210,6 +212,62 @@ fn in_flight_send_obs() -> RawOpObservation {
         invoice_amount: Some(Msat(50_000)),
         payment_hash: Some([0xab; 32]),
     }
+}
+
+#[tokio::test]
+async fn raw_finalizer_completes_intent_and_ledger_from_one_observation() {
+    let journal = mem_ledger();
+    let key = key("pay:finalize");
+    let operation_id = op(7);
+    let intent = Intent {
+        idempotency_key: key.clone(),
+        action: Action::Pay {
+            from: fed(1),
+            invoice: Invoice("lnbc1fixture".into()),
+            amount: Msat(50_000),
+            fee_cap: Msat(1_000),
+            payment_hash: [0xab; 32],
+            gateway: None,
+        },
+        max_fee: Some(Msat(1_000)),
+        status: IntentStatus::Awaiting,
+        reason: ReasonCode::UserInitiated,
+        actor: Actor::User,
+        created_at_ms: BASE,
+        operation_id: Some(operation_id),
+        invoice: None,
+    };
+    journal.upsert(&intent).await.expect("seed raw pay intent");
+    let mut oracle = MockOracle::default();
+    oracle
+        .observations
+        .insert((fed(1), operation_id.0), terminal_send_obs(true, 42));
+
+    assert!(journal
+        .finalize_raw_operation(
+            &oracle,
+            fed(1),
+            operation_id,
+            &key,
+            RawOperationRole::Send,
+            OperationStatus::Succeeded,
+            None,
+        )
+        .await
+        .expect("finalize")
+        .is_empty());
+    assert_eq!(
+        journal
+            .get(&key)
+            .await
+            .expect("read intent")
+            .expect("intent exists")
+            .status,
+        IntentStatus::Done
+    );
+    let row = op_of(&journal, &key).await;
+    assert_eq!(row.status, OperationStatus::Succeeded);
+    assert_eq!(row.fees.send_fee_quoted, Some(Msat(42)));
 }
 
 fn terminal_recv_obs(recv_fee: u64) -> RawOpObservation {
@@ -709,6 +767,47 @@ async fn repair_soft_fails_a_raw_row_with_no_op_after_1h() {
 }
 
 #[tokio::test]
+async fn raw_negative_repair_keeps_the_intent_retriable_and_the_ledger_defeasible() {
+    let j = FedimintJournal::with_clock(MemDatabase::new().into_database(), clock_base_plus_2h);
+    let k = key("pay:0101:soft-intent");
+    j.upsert(&Intent {
+        idempotency_key: k.clone(),
+        action: Action::Pay {
+            from: fed(1),
+            invoice: Invoice("lnbc1repairfixture".into()),
+            amount: Msat(10_000),
+            fee_cap: Msat(100),
+            payment_hash: [0xab; 32],
+            gateway: None,
+        },
+        max_fee: Some(Msat(100)),
+        status: IntentStatus::Pending,
+        reason: ReasonCode::UserInitiated,
+        actor: Actor::User,
+        created_at_ms: BASE,
+        operation_id: None,
+        invoice: None,
+    })
+    .await
+    .expect("seed raw intent and ledger row");
+
+    j.repair_ledger(&empty_oracle()).await.expect("repair");
+
+    let row = op_of(&j, &k).await;
+    assert_eq!(row.status, OperationStatus::Failed);
+    assert!(row.repaired, "negative evidence must remain defeasible");
+    assert_eq!(
+        j.get(&k)
+            .await
+            .expect("read intent")
+            .expect("intent exists")
+            .status,
+        IntentStatus::Pending,
+        "soft repair must leave the operation eligible for authoritative retry"
+    );
+}
+
+#[tokio::test]
 async fn record_update_op_id_supersedes_soft_failed_raw_row_to_awaiting() {
     let j = FedimintJournal::with_clock(MemDatabase::new().into_database(), clock_base_plus_2h);
     let k = key("pay:0101:n");
@@ -987,6 +1086,25 @@ async fn repair_awaiting_with_op_id_terminalizes_from_the_op_log() {
     )
     .await
     .expect("op-id update"); // -> Awaiting
+    j.upsert(&Intent {
+        idempotency_key: k.clone(),
+        action: Action::Receive {
+            to: fed(1),
+            amount: Msat(1_000),
+            fee_cap: Msat(100),
+            nonce: "repair-terminal".into(),
+            gateway: None,
+        },
+        max_fee: Some(Msat(100)),
+        status: IntentStatus::Awaiting,
+        reason: ReasonCode::UserInitiated,
+        actor: Actor::User,
+        created_at_ms: BASE,
+        operation_id: Some(op(7)),
+        invoice: Some(Invoice("lnbc1repairfixture".into())),
+    })
+    .await
+    .expect("seed matching raw receive intent");
     assert_eq!(status_of(&j, &k).await, OperationStatus::Awaiting);
 
     let mut oracle = MockOracle::default();
@@ -1002,6 +1120,15 @@ async fn repair_awaiting_with_op_id_terminalizes_from_the_op_log() {
         "reading a real op-log outcome is authoritative"
     );
     assert_eq!(rec.fees.receive_fee, Some(Msat(150)));
+    assert_eq!(
+        j.get(&k)
+            .await
+            .expect("read intent")
+            .expect("intent exists")
+            .status,
+        IntentStatus::Done,
+        "repair must release the raw receive reservation with the ledger terminal"
+    );
 }
 
 #[tokio::test]
@@ -1433,9 +1560,10 @@ async fn an_authoritative_write_supersedes_a_soft_repair() {
 }
 
 #[tokio::test]
-async fn repair_never_touches_intent_keyed_rows() {
-    // An intent-keyed row (owned by the §9.2 journal integration) is NEVER repaired here, even
-    // when non-terminal and old.
+async fn repair_never_touches_move_intent_rows() {
+    // A move-shaped intent row is owned by the §9.2 move journal integration and is never
+    // repaired here, even when non-terminal and old. Raw pay/receive intents have their own
+    // op-log-backed repair path.
     let j = FedimintJournal::with_clock(MemDatabase::new().into_database(), clock_base_plus_2h);
     let intent = move_intent("move:0102:0", IntentStatus::Pending);
     j.upsert(&intent).await.expect("upsert");

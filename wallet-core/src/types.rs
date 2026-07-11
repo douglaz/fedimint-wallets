@@ -90,6 +90,9 @@ pub struct AllocatorSnapshot {
     pub target_spending_balance: Msat,
     pub standby_target: Msat,
     pub max_fee: Msat,
+    /// Durable cross-operation reservations projected from the journal. The allocator's
+    /// local `credited`/`debited` maps remain the intra-batch layer.
+    pub reservations: Reservations,
     pub now: u64,
 }
 
@@ -124,6 +127,35 @@ pub enum Action {
         amount: Msat,
         fee_cap: Msat,
     },
+    /// Pay a user-supplied BOLT11 directly from one federation. The payment hash is the
+    /// natural user-API idempotency anchor; all sizing fields remain in the intent so an
+    /// attach can verify the original reservation bounds.
+    Pay {
+        from: FederationId,
+        invoice: Invoice,
+        amount: Msat,
+        fee_cap: Msat,
+        payment_hash: [u8; 32],
+        gateway: Option<GatewayUrl>,
+    },
+    /// Mint a raw receive invoice on one federation. `nonce` distinguishes deliberate
+    /// repeated receives because the request has no natural external anchor.
+    Receive {
+        to: FederationId,
+        amount: Msat,
+        fee_cap: Msat,
+        nonce: String,
+        gateway: Option<GatewayUrl>,
+    },
+    /// Join a federation under the invite-derived operation identity.
+    Join {
+        federation: FederationId,
+        invite: String,
+        /// Whether membership already existed when this intent was admitted. Recovery uses
+        /// this durable fact to distinguish a no-op reopen from a crash after this intent
+        /// persisted the federation registry but before it terminalized its ledger row.
+        membership_preexisting: bool,
+    },
     /// Advisory: do not route the next inflow to `fed` / do not cap allocation here.
     /// Never becomes an executor `Intent` (see `Action::is_executable`); the ledger's
     /// `Refusal` kind records the concept.
@@ -139,20 +171,28 @@ impl Action {
     pub fn is_executable(&self) -> bool {
         matches!(
             self,
-            Action::DirectInflow { .. } | Action::Move { .. } | Action::Evacuate { .. }
+            Action::DirectInflow { .. }
+                | Action::Move { .. }
+                | Action::Evacuate { .. }
+                | Action::Pay { .. }
+                | Action::Receive { .. }
+                | Action::Join { .. }
         )
     }
 
     /// The fee budget authoritative for this action, if it has one.
     /// `Move`/`Evacuate` carry a `fee_cap` bounding the total move cost;
-    /// `DirectInflow` carries one bounding its receive-side gross-up (spec §6).
-    /// Advisory actions are never executed, so they have none.
+    /// `DirectInflow` carries one bounding its receive-side gross-up (spec §6), and
+    /// raw pay/receive intents retain their user-supplied sizing bound. `Join` and
+    /// advisory actions have no fee budget.
     pub fn fee_cap(&self) -> Option<Msat> {
         match self {
             Action::Move { fee_cap, .. }
             | Action::Evacuate { fee_cap, .. }
-            | Action::DirectInflow { fee_cap, .. } => Some(*fee_cap),
-            Action::RefuseInflow { .. } => None,
+            | Action::DirectInflow { fee_cap, .. }
+            | Action::Pay { fee_cap, .. }
+            | Action::Receive { fee_cap, .. } => Some(*fee_cap),
+            Action::Join { .. } | Action::RefuseInflow { .. } => None,
         }
     }
 }
@@ -225,3 +265,54 @@ pub struct GatewayUrl(pub String);
     Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub struct Invoice(pub String);
+
+/// Where a durable move currently sits in its lifecycle. The type lives in core because
+/// reservation projection is pure and must not depend on the fedimint adapter crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MovePhase {
+    Created,
+    Invoiced,
+    Sending,
+    Settled,
+    Refunded,
+    Failed,
+    Stranded,
+}
+
+/// Durable derived artifacts for a move-shaped intent. Network code owns the writes; core
+/// consumes only the phase and sizing fields when projecting reservations.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MoveRecord {
+    pub key: IdempotencyKey,
+    pub from: Option<FederationId>,
+    pub to: FederationId,
+    pub amount: Msat,
+    pub fee_cap: Msat,
+    pub gateway: GatewayUrl,
+    pub send_required: bool,
+    pub invoice: Option<Invoice>,
+    pub recv_op: Option<OperationId>,
+    pub send_op: Option<OperationId>,
+    pub phase: MovePhase,
+    pub outcome: Option<String>,
+    pub preimage: Option<Preimage>,
+    pub receive_fee_quoted: Option<Msat>,
+    pub send_fee_quoted: Option<Msat>,
+}
+
+/// Cross-operation reservations that have not yet been absorbed by live balances.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reservations {
+    pub per_fed_outbound: std::collections::BTreeMap<FederationId, Msat>,
+    pub per_fed_inbound: std::collections::BTreeMap<FederationId, Msat>,
+}
+
+impl Reservations {
+    pub fn outbound(&self, fed: FederationId) -> Msat {
+        self.per_fed_outbound.get(&fed).copied().unwrap_or(Msat(0))
+    }
+
+    pub fn inbound(&self, fed: FederationId) -> Msat {
+        self.per_fed_inbound.get(&fed).copied().unwrap_or(Msat(0))
+    }
+}

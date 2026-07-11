@@ -6,8 +6,10 @@
 //! pure functions here: [`next_step`] (what side effect a move needs next) and
 //! [`assemble_move_record`] (rebuild the derived record from its durable sources).
 
-use crate::types::{GatewayUrl, Invoice, OperationId, Preimage};
+use crate::types::{GatewayUrl, Invoice, OperationId};
 use wallet_core::{Action, FederationId, IdempotencyKey, Msat};
+
+pub use wallet_core::{MovePhase, MoveRecord};
 
 /// Where a move currently sits in its lifecycle (spec §3.3).
 ///
@@ -22,17 +24,6 @@ use wallet_core::{Action, FederationId, IdempotencyKey, Msat};
 /// re-driving — but DISTINCT so the ledger/UI can say "debited, not credited — payment proof
 /// saved" rather than a silent loss; the preimage on the [`MoveRecord`] is the durable
 /// recovery artifact.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum MovePhase {
-    Created,
-    Invoiced,
-    Sending,
-    Settled,
-    Refunded,
-    Failed,
-    Stranded,
-}
-
 /// The next side effect a move needs, computed purely from a [`MoveRecord`] (spec §3.3).
 /// RESUME, not restart: once a step's artifact is recorded, that step is never re-issued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,40 +39,6 @@ pub enum MoveStep {
 /// fedimint op-log, §5). The PARAMS (from/to/amount/fee_cap/gateway/send_required) come
 /// from the durable Intent; the op-ids + invoice come from the op-log artifacts. It is
 /// rebuilt by [`assemble_move_record`] and consumed by [`next_step`].
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MoveRecord {
-    /// `== Intent key == ` the `move_id` embedded in each op's `custom_meta`.
-    pub key: IdempotencyKey,
-    /// Source federation. `None` for a `DirectInflow` (receive-only).
-    pub from: Option<FederationId>,
-    pub to: FederationId,
-    pub amount: Msat,
-    pub fee_cap: Msat,
-    pub gateway: GatewayUrl,
-    /// `Move` = true; `DirectInflow` = false (receive-only, `from = None`).
-    pub send_required: bool,
-    pub invoice: Option<Invoice>,
-    pub recv_op: Option<OperationId>,
-    pub send_op: Option<OperationId>,
-    pub phase: MovePhase,
-    pub outcome: Option<String>,
-    /// The send leg's settlement preimage — proof A's payment settled (spec §3). Persisted the
-    /// instant `await_send` returns `Success`, BEFORE the receive is awaited, so a crash can
-    /// never lose the recovery artifact for a [`MovePhase::Stranded`] move. `None` until the
-    /// send settles (and for a receive-only `DirectInflow`, which has no send leg).
-    pub preimage: Option<Preimage>,
-    /// The receive-side fee quote (gateway + federation), set at `CreateInvoice` when the
-    /// invoice is sized (spec §2.3). Named QUOTED: it is the actual paid cost only when the
-    /// receive CLAIMS (the invoice is fixed); on a never-paid / refunded / stranded / cap-refused
-    /// row it is what the move WOULD have cost. `None` until the invoice is sized.
-    pub receive_fee_quoted: Option<Msat>,
-    /// The send-side fee quote (gateway + federation), set at `Pay` BEFORE the cap check (spec
-    /// §2.3), so a "fee over cap" refusal — which returns before any send commits — is still
-    /// explained in history. `None` for a receive-only `DirectInflow` and until the send is
-    /// quoted.
-    pub send_fee_quoted: Option<Msat>,
-}
-
 /// Which leg of a move an op-log artifact belongs to (spec §4). A cross-fed move spans
 /// two operations: a `Receive` on the destination (B) and a `Send` on the source (A).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,7 +109,8 @@ impl MovePlan {
     ///   replay + gross-up path. LN-only: v1 validates that the destination-selected gateway
     ///   also serves the source, giving the same internal-swap route as `Move`. No peg-out.
     /// - `DirectInflow` → `Some` with `from = None`, `send_required = false` (receive-only).
-    /// - `RefuseInflow` → `None` (advisory policy signal, never executed).
+    /// - Raw pay/receive/join and `RefuseInflow` → `None`; their lifecycles do not use a
+    ///   two-leg [`MovePlan`].
     pub fn from_action(a: &Action) -> Option<MovePlan> {
         match a {
             // A `Move` and an `Evacuate` are the same executable send-required move (drain
@@ -187,8 +145,12 @@ impl MovePlan {
                 fee_cap: *fee_cap,
                 send_required: false,
             }),
-            // Advisory policy signals are never executed — absent from the money path.
-            Action::RefuseInflow { .. } => None,
+            // These actions do not use the two-leg move protocol. Raw operations have their
+            // own driver steps; advisory policy signals never execute.
+            Action::Pay { .. }
+            | Action::Receive { .. }
+            | Action::Join { .. }
+            | Action::RefuseInflow { .. } => None,
         }
     }
 }

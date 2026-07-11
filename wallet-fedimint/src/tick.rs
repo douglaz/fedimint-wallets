@@ -193,6 +193,7 @@ pub fn build_snapshot(
         target_spending_balance: policy.target_spending_balance,
         standby_target: policy.standby_target,
         max_fee: policy.max_fee,
+        reservations: wallet_core::Reservations::default(),
         now: policy.now,
     }
 }

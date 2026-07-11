@@ -22,12 +22,12 @@ use wallet_core::{
     WatchPolicy,
 };
 use wallet_fedimint::{
-    parse_invoice, AutoJoinReport, CandidateSource, CandidateState, DiscoverReport,
-    DiscoverSourceReport, FedimintJournal, FinalizeOutcome, GatewayUrl, Invoice,
-    LedgerRepairOracle, ManualSource, MoveOutcome, MultiClient, ObserverSource, OperationId,
-    OperationRef, ProbeOutcome, ReceiveState, Runtime, ScoredFed, SendOutcome, SendState,
-    TickPolicy, WatchCycleReport, WatchDiscoverOutcome, WatchProbeOutcome, WatchReconcileOutcome,
-    WatchTickOutcome, JOIN_NOOP_REOPEN_NOTE,
+    parse_invoice, raw_receive_key, AutoJoinReport, CandidateSource, CandidateState,
+    DiscoverReport, DiscoverSourceReport, FedimintJournal, FinalizeOutcome, GatewayUrl, Invoice,
+    ManualSource, MoveOutcome, MultiClient, ObserverSource, OperationId, OperationRef,
+    ProbeOutcome, RawOperationRole, ReceiveState, Runtime, ScoredFed, SendState, TickPolicy,
+    WatchCycleReport, WatchDiscoverOutcome, WatchProbeOutcome, WatchReconcileOutcome,
+    WatchTickOutcome,
 };
 
 #[derive(Parser)]
@@ -106,6 +106,13 @@ enum Command {
         /// Amount to receive, in millisatoshis.
         #[arg(long)]
         amount: u64,
+        /// Maximum receive-side cost; defaults to the shipped per-operation bound.
+        #[arg(long, default_value_t = 200_000)]
+        fee_cap: u64,
+        /// Stable client nonce used to attach a retry to the same receive intent. A fresh nonce
+        /// is generated when omitted and printed with the operation key on failure.
+        #[arg(long)]
+        nonce: Option<String>,
         /// Federation to receive into (hex id). Defaults to the sole joined federation.
         #[arg(long)]
         to: Option<String>,
@@ -120,6 +127,13 @@ enum Command {
     Pay {
         /// The BOLT11 invoice to pay.
         invoice: String,
+        /// Optional consistency check for the invoice amount. The pinned lnv2 client does not
+        /// support amountless BOLT11 invoices.
+        #[arg(long)]
+        amount: Option<u64>,
+        /// Maximum send cost reserved alongside the payment amount.
+        #[arg(long)]
+        fee_cap: Option<u64>,
         /// Federation to pay from (hex id). Defaults to the sole joined federation.
         #[arg(long)]
         fed: Option<String>,
@@ -533,79 +547,35 @@ async fn main() -> anyhow::Result<()> {
 
     match command {
         Command::Join { invite } => {
-            let invite = InviteCode::from_str(&invite)?;
+            let parsed_invite = InviteCode::from_str(&invite)?;
             let fed_id = {
                 use fedimint_core::BitcoinHash as _;
-                FederationId(invite.federation_id().0.to_byte_array())
+                FederationId(parsed_invite.federation_id().0.to_byte_array())
             };
-            // §10.2: check the membership registry FIRST — an already-joined fed is (re)opened
-            // only, with NO ledger row (the idempotent fast path; nothing happened).
-            let already = journal
-                .get_federation(&fed_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("reading federation registry: {e:?}"))?
-                .is_some();
-            if already {
-                let outcome = multi_client.join(invite.clone()).await?;
-                note_candidate(
-                    mark_candidate_user_approved(
-                        journal.as_ref(),
-                        outcome.id,
-                        &invite,
-                        cli_now_ms(),
-                    )
-                    .await,
-                );
-                println!("{}", outcome.id.to_hex());
-            } else {
-                // A fresh join: write the `Started` attempt row BEFORE the join, then terminalize
-                // truthfully — `newly_joined` distinguishes a real membership from the
-                // concurrent-registration window (the pre-written row cannot be un-written).
-                let key = IdempotencyKey(format!("join:{}:{}", fed_id.to_hex(), cli_nonce()));
-                journal
-                    .record_started(
-                        &key,
-                        OperationKind::Join { fed: fed_id },
-                        Actor::User,
-                        ReasonCode::UserInitiated,
-                        cli_now_ms(),
-                        None,
-                    )
-                    .await
-                    .map_err(ledger_err)?;
-                let outcome = match multi_client.join(invite.clone()).await {
-                    Ok(outcome) => outcome,
-                    Err(e) => {
-                        let _ = journal
-                            .record_terminal(
-                                &key,
-                                OperationStatus::Failed,
-                                cli_now_ms(),
-                                Some(&e.to_string()),
-                                None,
-                            )
-                            .await;
-                        return Err(e);
-                    }
-                };
-                let note = (!outcome.newly_joined).then_some(JOIN_NOOP_REOPEN_NOTE);
-                note_ledger(
-                    journal
-                        .record_terminal(&key, OperationStatus::Succeeded, cli_now_ms(), note, None)
-                        .await,
-                );
-                note_candidate(
-                    mark_candidate_user_approved(
-                        journal.as_ref(),
-                        outcome.id,
-                        &invite,
-                        cli_now_ms(),
-                    )
-                    .await,
-                );
-                println!("{}", outcome.id.to_hex());
-                eprintln!("key: {}", key.0);
-            }
+            let runtime = Runtime::new(
+                multi_client.clone(),
+                journal.clone(),
+                None,
+                None,
+                perform_timeout,
+            );
+            let outcome = runtime.join(fed_id, invite).await?;
+            anyhow::ensure!(
+                outcome.status == IntentStatus::Done,
+                "join {} did not complete",
+                outcome.key.0
+            );
+            note_candidate(
+                mark_candidate_user_approved(
+                    journal.as_ref(),
+                    fed_id,
+                    &parsed_invite,
+                    cli_now_ms(),
+                )
+                .await,
+            );
+            println!("{}", fed_id.to_hex());
+            eprintln!("key: {}", outcome.key.0);
         }
         Command::Discover {
             source,
@@ -687,140 +657,143 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Receive {
             amount,
+            fee_cap,
+            nonce,
             to,
             gateway,
         } => {
             let id = select_fed(&joined_ids, &open_ids, to.as_deref())?;
             let amount = Msat(amount);
-            // §10.1: open the recorded window BEFORE gateway resolution — a nonce-only per-attempt
-            // key, so the row exists even if the (below) resolution/SDK call fails synchronously.
-            let key = IdempotencyKey(format!("recv:{}:{}", id.to_hex(), cli_nonce()));
-            journal
-                .record_started(
-                    &key,
-                    OperationKind::Receive {
-                        fed: id,
-                        amount_invoiced: amount,
-                        op_id: None,
-                        gateway: None,
-                    },
-                    Actor::User,
-                    ReasonCode::UserInitiated,
-                    cli_now_ms(),
-                    None,
+            let sdk_gateway = gateway.map(GatewayUrl);
+            let runtime = Runtime::new(
+                multi_client.clone(),
+                journal.clone(),
+                None,
+                operator_hard_cap(false),
+                perform_timeout,
+            );
+            let nonce = nonce.unwrap_or_else(cli_nonce);
+            let retry_key = raw_receive_key(id, amount, &nonce);
+            let outcome = match runtime
+                .receive(
+                    id,
+                    amount,
+                    Msat(fee_cap),
+                    nonce.clone(),
+                    sdk_gateway.clone(),
                 )
                 .await
-                .map_err(ledger_err)?;
-            // `pick_receive_gateway` bails on no-registered-gateway — inside the window, so it
-            // lands a `Failed` row (§10.1).
-            let sdk_gateway = match pick_receive_gateway(&multi_client, &id, gateway).await {
-                Ok(g) => g,
-                Err(e) => return fail_raw_row(&journal, &key, e).await,
-            };
-            // Two-stage fee capture (§9.3): a pre-call best-effort ESTIMATE against a concrete
-            // gateway (the `gateway` field stays None — the auto-selected choice is unknown).
-            if let Some(fee) =
-                estimate_receive_fee(&multi_client, &id, amount, sdk_gateway.clone()).await
             {
-                note_ledger(journal.record_update(&key, receive_fee_upd(fee)).await);
-            }
-            let meta = serde_json::json!({ "role": "receive", "correlation_key": key.0 });
-            let (invoice, op) = match multi_client.receive(&id, amount, sdk_gateway, meta).await {
-                Ok(result) => result,
-                Err(e) => return fail_raw_row(&journal, &key, e).await,
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    eprintln!("key: {}", retry_key.0);
+                    eprintln!("nonce: {nonce}");
+                    return Err(error);
+                }
             };
-            // The op id advances the row `Started → Awaiting` (the federation accepted the op).
-            note_ledger(journal.record_update(&key, op_id_upd(op)).await);
+            if let Some(fee) = estimate_receive_fee(&multi_client, &id, amount, sdk_gateway).await {
+                note_ledger(
+                    journal
+                        .record_update(&outcome.key, receive_fee_upd(fee))
+                        .await,
+                );
+            }
+            if !raw_receive_surfaces_invoice(outcome.status) {
+                eprintln!("operation_id: {}", to_hex(&outcome.operation_id.0));
+                eprintln!("key: {}", outcome.key.0);
+                eprintln!("nonce: {nonce}");
+                anyhow::bail!(
+                    "receive intent {} is already {}; its invoice is no longer payable — use a \
+                     new --nonce to create another receive",
+                    outcome.key.0,
+                    status_label(Some(outcome.status))
+                );
+            }
             // Invoice -> stdout (the payable result); op id + key -> stderr (diagnostic handles).
-            println!("{}", invoice.0);
-            eprintln!("operation_id: {}", to_hex(&op.0));
-            eprintln!("key: {}", key.0);
+            println!("{}", outcome.invoice.0);
+            eprintln!("operation_id: {}", to_hex(&outcome.operation_id.0));
+            eprintln!("key: {}", outcome.key.0);
+            eprintln!("nonce: {nonce}");
         }
         Command::Pay {
             invoice,
+            amount,
+            fee_cap,
             fed,
             gateway,
         } => {
             let id = select_fed(&joined_ids, &open_ids, fed.as_deref())?;
-            // §10.1: the window opens BEFORE parsing — a malformed BOLT11 has no payment hash,
-            // yet its failed attempt must still be a durable row.
-            let key = IdempotencyKey(format!("pay:{}:{}", id.to_hex(), cli_nonce()));
-            journal
-                .record_started(
-                    &key,
-                    OperationKind::Pay {
-                        fed: id,
-                        invoice_amount: None,
-                        payment_hash: None,
-                        op_id: None,
-                        gateway: None,
-                    },
-                    Actor::User,
-                    ReasonCode::UserInitiated,
-                    cli_now_ms(),
-                    None,
-                )
-                .await
-                .map_err(ledger_err)?;
             let invoice = Invoice(invoice);
-            // Parse (amount + payment hash) — a parse failure is the synchronous-error path.
             let details = match parse_invoice(&invoice) {
                 Ok(details) => details,
-                Err(e) => return fail_raw_row(&journal, &key, e).await,
+                Err(error) => {
+                    return fail_pay_preflight(&journal, id, None, None, error).await;
+                }
             };
-            // Post-parse `record_update` (amount + hash, durable BEFORE the SDK call) plus a
-            // best-effort send-fee estimate (§9.3 / §10.1).
-            let send_fee = estimate_send_fee(
-                &multi_client,
-                &id,
-                &invoice,
-                gateway.clone().map(GatewayUrl),
-            )
-            .await;
-            journal
-                .record_update(
-                    &key,
-                    pay_parse_upd(details.amount, details.payment_hash, send_fee),
+            let amount = match (details.amount, amount) {
+                (Some(invoice_amount), Some(stated)) => {
+                    if invoice_amount != Msat(stated) {
+                        return fail_pay_preflight(
+                            &journal,
+                            id,
+                            details.amount,
+                            Some(details.payment_hash),
+                            anyhow::anyhow!("--amount does not match the invoice amount"),
+                        )
+                        .await;
+                    }
+                    invoice_amount
+                }
+                (Some(invoice_amount), None) => invoice_amount,
+                (None, _) => {
+                    return fail_pay_preflight(
+                        &journal,
+                        id,
+                        None,
+                        Some(details.payment_hash),
+                        anyhow::anyhow!(
+                            "amountless BOLT11 invoices are not supported by the pinned lnv2 client"
+                        ),
+                    )
+                    .await;
+                }
+            };
+            let fee_cap = Msat(fee_cap.unwrap_or_else(|| default_move_fee_cap(amount.0)));
+            let gateway = gateway.map(GatewayUrl);
+            let runtime = Runtime::new(
+                multi_client.clone(),
+                journal.clone(),
+                None,
+                None,
+                perform_timeout,
+            );
+            let outcome = runtime
+                .pay(
+                    id,
+                    invoice.clone(),
+                    amount,
+                    fee_cap,
+                    details.payment_hash,
+                    gateway.clone(),
                 )
-                .await
-                .map_err(ledger_err)?;
-            let meta = serde_json::json!({ "role": "send", "correlation_key": key.0 });
-            let outcome = match multi_client
-                .pay(&id, invoice, gateway.map(GatewayUrl), meta)
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(e) => return fail_raw_row(&journal, &key, e.into()).await,
-            };
-            match outcome {
-                SendOutcome::Started(op) => {
-                    note_ledger(journal.record_update(&key, op_id_upd(op)).await);
-                    println!("started {}", to_hex(&op.0));
-                }
-                SendOutcome::AlreadyInFlight(op) => {
-                    note_ledger(journal.record_update(&key, op_id_upd(op)).await);
-                    println!("already-in-flight {}", to_hex(&op.0));
-                }
-                SendOutcome::AlreadyPaid(op) => {
-                    // Terminal at creation. Read the ORIGINAL op-log meta for definitive fees
-                    // FIRST, THEN terminalize — freezing the row before the lookup would keep
-                    // blank/estimated fees (§10.1).
-                    let upd = settlement_upd(&multi_client, &id, op).await;
-                    note_ledger(
-                        journal
-                            .record_terminal(
-                                &key,
-                                OperationStatus::Succeeded,
-                                cli_now_ms(),
-                                None,
-                                Some(upd),
-                            )
-                            .await,
-                    );
-                    println!("already-paid {}", to_hex(&op.0));
-                }
+                .await?;
+            let send_fee = estimate_send_fee(&multi_client, &id, &invoice, gateway).await;
+            note_ledger(
+                journal
+                    .record_update(
+                        &outcome.key,
+                        pay_parse_upd(Some(amount), details.payment_hash, send_fee),
+                    )
+                    .await,
+            );
+            if outcome.status == IntentStatus::Done {
+                println!("already-paid {}", to_hex(&outcome.operation_id.0));
+            } else if outcome.already_in_flight {
+                println!("already-in-flight {}", to_hex(&outcome.operation_id.0));
+            } else {
+                println!("started {}", to_hex(&outcome.operation_id.0));
             }
-            eprintln!("key: {}", key.0);
+            eprintln!("key: {}", outcome.key.0);
         }
         Command::AwaitReceive { op, fed, key } => {
             let id = select_fed(&joined_ids, &open_ids, Some(&fed))?;
@@ -843,7 +816,7 @@ async fn main() -> anyhow::Result<()> {
                     AwaitRole::Receive,
                     (status, error),
                 )
-                .await;
+                .await?;
             }
             match state {
                 ReceiveState::Claimed => println!("claimed"),
@@ -872,7 +845,7 @@ async fn main() -> anyhow::Result<()> {
                     AwaitRole::Send,
                     (status, error),
                 )
-                .await;
+                .await?;
             }
             match state {
                 SendState::Success(preimage) => println!("success {}", to_hex(&preimage.0)),
@@ -1999,6 +1972,13 @@ fn describe_decision(decision: &AllocatorDecision) -> String {
         Action::RefuseInflow { fed, reason } => {
             format!("refuse-inflow {} (reason {reason:?})", fed.to_hex())
         }
+        Action::Pay { from, amount, .. } => {
+            format!("pay {} msat from {}", amount.0, from.to_hex())
+        }
+        Action::Receive { to, amount, .. } => {
+            format!("receive {} msat into {}", amount.0, to.to_hex())
+        }
+        Action::Join { federation, .. } => format!("join {}", federation.to_hex()),
     }
 }
 
@@ -2208,11 +2188,13 @@ fn default_direct_inflow_fee_cap(amount_msat: u64) -> u64 {
     amount_msat.saturating_add(1_000_000)
 }
 
-/// A deliberately loose default fee cap for a CLI `move`: the net amount plus 1000 sat of
-/// headroom, covering BOTH legs' federation + gateway fees on the happy path. This is a
-/// no-surprises guard, not meaningful fee protection; pass `--fee-cap` to bound the move cost.
-fn default_move_fee_cap(amount_msat: u64) -> u64 {
-    amount_msat.saturating_add(1_000_000)
+/// `wallet_api::Policy::default().max_fee` (200 sats) — the per-operation fee bound that
+/// becomes the runtime default once step 4 wires the DB Policy into TickPolicy (whose own
+/// legacy 50-sat default remains until then). Admission reserves the payment amount
+/// separately, so including the amount in this value would double-count it and reject the
+/// validated default pay/move paths.
+fn default_move_fee_cap(_amount_msat: u64) -> u64 {
+    200_000
 }
 
 /// A human-readable reason a `move` did not settle. A `Permanent` failure (fee over cap,
@@ -2239,6 +2221,13 @@ fn move_failure_reason(outcome: &MoveOutcome) -> String {
 /// or absent one has nothing to pay.
 fn direct_inflow_surfaces_invoice(status: Option<IntentStatus>) -> bool {
     matches!(status, Some(IntentStatus::Awaiting | IntentStatus::Done))
+}
+
+/// A raw receive invoice is payable only while its intent awaits settlement. Unlike a
+/// direct-inflow replay, a completed raw receive is an operational retry handle rather than a
+/// proof-oriented move result, so stdout must not hand the already-claimed invoice to a script.
+fn raw_receive_surfaces_invoice(status: IntentStatus) -> bool {
+    status == IntentStatus::Awaiting
 }
 
 /// A stable, lowercase label for an intent status (never the `Debug`-rendered `Some(..)` wrapper).
@@ -2613,11 +2602,35 @@ async fn fail_raw_row(
     Err(error)
 }
 
-fn op_id_upd(op: OperationId) -> RawOpUpdate {
-    RawOpUpdate {
-        op_id: Some(op),
-        ..Default::default()
-    }
+/// Record a pay attempt rejected after invoice parsing under a per-attempt fallback key. The
+/// payment-hash key remains available for a corrected request's Intent, while `history` still
+/// contains the rejected attempt and every detail parsing established before the refusal.
+async fn fail_pay_preflight(
+    journal: &FedimintJournal,
+    fed: FederationId,
+    invoice_amount: Option<Msat>,
+    payment_hash: Option<[u8; 32]>,
+    error: anyhow::Error,
+) -> anyhow::Result<()> {
+    let key = IdempotencyKey(format!("pay:{}:{}", fed.to_hex(), cli_nonce()));
+    journal
+        .record_started(
+            &key,
+            OperationKind::Pay {
+                fed,
+                invoice_amount,
+                payment_hash,
+                op_id: None,
+                gateway: None,
+            },
+            Actor::User,
+            ReasonCode::UserInitiated,
+            cli_now_ms(),
+            None,
+        )
+        .await
+        .map_err(ledger_err)?;
+    fail_raw_row(journal, &key, error).await
 }
 
 fn receive_fee_upd(fee: Msat) -> RawOpUpdate {
@@ -2699,31 +2712,6 @@ async fn estimate_gateway(
     }
 }
 
-/// The definitive settlement enrichment for a raw op (§9.3 backfill), read from its op-log meta
-/// via the repair oracle. On failure the fees degrade to `None` (the op id is still recorded).
-async fn settlement_upd(mc: &MultiClient, id: &FederationId, op: OperationId) -> RawOpUpdate {
-    match mc.observe_op(*id, op).await {
-        Ok(obs) => RawOpUpdate {
-            op_id: Some(op),
-            gateway: obs.gateway,
-            invoice_amount: obs.invoice_amount,
-            payment_hash: obs.payment_hash,
-            fees: Some(obs.fees),
-            // Definitive iff the op is TERMINAL: settlement fees then replace any pre-call
-            // estimate outright (even with `None`) so a terminal row never freezes an
-            // estimate as an observed cost.
-            fees_definitive: obs.terminal.is_some(),
-        },
-        Err(e) => {
-            eprintln!(
-                "note: could not read settlement fees for {}: {e:?}",
-                to_hex(&op.0)
-            );
-            op_id_upd(op)
-        }
-    }
-}
-
 /// Whether an `await-*` `--key` names a `send` (`pay:`) or a `receive` (`recv:`) row.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AwaitRole {
@@ -2738,31 +2726,28 @@ enum AwaitRole {
 /// crash-before-`record_update` window): the caller must then prove via the op-log's
 /// `correlation_key` meta that the awaited op really is this row's before terminalizing —
 /// a blank row of the same kind/federation could belong to a DIFFERENT attempt.
+#[cfg(test)]
 fn awaited_row_matches(
     row: &OperationRecord,
     role: AwaitRole,
     id: &FederationId,
     op: OperationId,
 ) -> Result<bool, String> {
-    let (row_fed, row_op) = match (&row.kind, role) {
-        (OperationKind::Pay { fed, op_id, .. }, AwaitRole::Send) => (fed, op_id),
-        (OperationKind::Receive { fed, op_id, .. }, AwaitRole::Receive) => (fed, op_id),
-        _ => return Err("its kind is not the awaited pay/receive operation".to_owned()),
-    };
-    if row_fed != id {
-        return Err("it belongs to a different federation".to_owned());
-    }
-    match row_op {
-        Some(existing) if *existing != op => {
-            Err("it already tracks a different operation".to_owned())
-        }
-        Some(_) => Ok(false),
-        None => Ok(true),
-    }
+    wallet_fedimint::raw_operation_row_matches(
+        row,
+        match role {
+            AwaitRole::Send => RawOperationRole::Send,
+            AwaitRole::Receive => RawOperationRole::Receive,
+        },
+        *id,
+        op,
+    )
 }
 
 /// Advance the `--key` ledger row to its terminal state after an `await-*` (§10.1), carrying
-/// the definitive settlement enrichment. Auxiliary — a recording fault is logged, not fatal.
+/// the definitive settlement enrichment. Legacy ledger-only recording remains best-effort;
+/// an intent-backed raw operation must also durably reach its terminal lifecycle state before
+/// the CLI reports completion.
 async fn terminalize_awaited(
     journal: &FedimintJournal,
     mc: &MultiClient,
@@ -2771,68 +2756,21 @@ async fn terminalize_awaited(
     key: &str,
     role: AwaitRole,
     outcome: (OperationStatus, Option<String>),
-) {
+) -> anyhow::Result<()> {
     let (status, error) = outcome;
     let key = IdempotencyKey(key.to_owned());
-    // Guard against a mistyped/mismatched `--key`: a terminal row cannot be un-written, so verify
-    // the row is this op's before touching it (§10.1). A missing row is a no-op anyway.
-    match journal.operation(&OperationRef::Key(key.clone())).await {
-        Ok(Some(row)) => {
-            match awaited_row_matches(&row, role, id, op) {
-                Err(why) => {
-                    eprintln!(
-                        "note: --key {} does not match this operation ({why}); not recording",
-                        key.0
-                    );
-                    return;
-                }
-                // A BLANK row (op id never recorded) is only accepted when the op-log proves
-                // the awaited op was created under THIS correlation key — the pre-call meta
-                // embeds it, so a genuine crash-before-`record_update` attempt matches. A
-                // deduped retry (the op carries another attempt's key) or a wrong blank row
-                // is refused and left to reconcile's hash-dedup repair, which records the
-                // attribution ambiguity honestly instead of silently mis-attaching history.
-                Ok(true) => match mc.find_op_by_correlation_key(*id, &key).await {
-                    Ok(Some(found)) if found == op => {}
-                    Ok(_) => {
-                        eprintln!(
-                            "note: --key {} has no recorded op id and the op-log does not tie \
-                             this operation to it; not recording (reconcile repairs it)",
-                            key.0
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "note: could not verify --key {} against the op-log: {e:?}; \
-                             not recording",
-                            key.0
-                        );
-                        return;
-                    }
-                },
-                Ok(false) => {}
-            }
-        }
-        Ok(None) => {
-            eprintln!("note: no ledger row for --key {}; not recording", key.0);
-            return;
-        }
-        Err(e) => {
-            eprintln!(
-                "note: could not read the ledger row for --key {}: {e:?}",
-                key.0
-            );
-            return;
-        }
-    }
-    let upd = settlement_upd(mc, id, op).await;
-    if let Err(e) = journal
-        .record_terminal(&key, status, cli_now_ms(), error.as_deref(), Some(upd))
+    let role = match role {
+        AwaitRole::Send => RawOperationRole::Send,
+        AwaitRole::Receive => RawOperationRole::Receive,
+    };
+    for note in journal
+        .finalize_raw_operation(mc, *id, op, &key, role, status, error.as_deref())
         .await
+        .map_err(ledger_err)?
     {
-        eprintln!("note: recording the terminal ledger row failed: {e:?}");
+        eprintln!("note: {note}");
     }
+    Ok(())
 }
 
 impl ActorFilter {
@@ -3203,6 +3141,11 @@ mod tests {
     use wallet_fedimint::DiscoverPassProgress;
 
     #[test]
+    fn default_money_fee_cap_matches_the_shipped_policy_bound() {
+        assert_eq!(default_move_fee_cap(100_000), 200_000);
+    }
+
+    #[test]
     fn gate_policy_override_maps_window_flags_or_none() {
         // No gate flag -> None (TickPolicy keeps the conservative default).
         assert!(gate_policy_override(&PolicyFlags::default()).is_none());
@@ -3228,6 +3171,75 @@ mod tests {
 
     fn fed(byte: u8) -> FederationId {
         FederationId([byte; 32])
+    }
+
+    #[tokio::test]
+    async fn parsed_pay_preflight_failures_are_durable_without_consuming_the_intent_key() {
+        use fedimint_core::db::mem_impl::MemDatabase;
+        use fedimint_core::db::IRawDatabaseExt as _;
+
+        let journal = FedimintJournal::new(MemDatabase::new().into_database());
+        for (invoice_amount, message) in [
+            (
+                Some(Msat(50_000)),
+                "--amount does not match the invoice amount",
+            ),
+            (
+                None,
+                "amountless BOLT11 invoices are not supported by the pinned lnv2 client",
+            ),
+        ] {
+            let error = fail_pay_preflight(
+                &journal,
+                fed(1),
+                invoice_amount,
+                Some([7; 32]),
+                anyhow::anyhow!(message),
+            )
+            .await
+            .expect_err("preflight refusal must be surfaced");
+            assert_eq!(error.to_string(), message);
+        }
+
+        let rows = journal.history(10, None).await.expect("history");
+        assert_eq!(
+            rows.len(),
+            2,
+            "each rejected attempt gets its own audit row"
+        );
+        for row in rows {
+            assert_eq!(row.status, OperationStatus::Failed);
+            assert!(
+                row.correlation_key.0.starts_with("pay:"),
+                "validation failures use per-attempt fallback keys"
+            );
+            assert!(
+                journal
+                    .get(&row.correlation_key)
+                    .await
+                    .expect("intent lookup")
+                    .is_none(),
+                "a rejected preflight must not consume the payment-hash intent key"
+            );
+            match row.kind {
+                OperationKind::Pay {
+                    fed, payment_hash, ..
+                } => {
+                    assert_eq!(fed, FederationId([1; 32]));
+                    assert_eq!(payment_hash, Some([7; 32]));
+                }
+                other => panic!("unexpected ledger kind: {other:?}"),
+            }
+        }
+        let natural_key = IdempotencyKey(format!("pay:{}", to_hex(&[7; 32])));
+        assert!(
+            journal
+                .get(&natural_key)
+                .await
+                .expect("natural-key lookup")
+                .is_none(),
+            "a corrected retry must still be able to create the payment-hash intent"
+        );
     }
 
     fn exec_err(e: wallet_core::ExecError) -> anyhow::Error {
@@ -3889,6 +3901,15 @@ mod tests {
         assert_eq!(status_label(Some(IntentStatus::Done)), "done");
         assert_eq!(status_label(Some(IntentStatus::Failed)), "failed");
         assert_eq!(status_label(None), "unknown");
+    }
+
+    #[test]
+    fn only_awaiting_raw_receive_surfaces_the_invoice() {
+        assert!(raw_receive_surfaces_invoice(IntentStatus::Awaiting));
+        assert!(!raw_receive_surfaces_invoice(IntentStatus::Done));
+        assert!(!raw_receive_surfaces_invoice(IntentStatus::Failed));
+        assert!(!raw_receive_surfaces_invoice(IntentStatus::Pending));
+        assert!(!raw_receive_surfaces_invoice(IntentStatus::Executing));
     }
 
     // --- §11 history/show formatting ---

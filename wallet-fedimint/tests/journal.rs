@@ -13,18 +13,23 @@ use std::sync::{Arc, Mutex};
 use std::{collections::BTreeSet, str::FromStr};
 use tokio::sync::Barrier;
 use wallet_core::{
-    reconcile, Action, Actor, DiscoverySource, ExecError, Executor, FederationId, IdempotencyKey,
-    Intent, IntentStatus, Journal, MockExecutor, Msat, Occurrence, OperationKind, OperationStatus,
-    PerformOutcome, ReasonCode,
+    apply, decide_and_journal, drive_to_terminal, project_reservations, reconcile, Action, Actor,
+    AllocatorDecision, DecideAndJournal, DiscoverySource, ExecError, ExecutionSummary, Executor,
+    FederationId, IdempotencyKey, Intent, IntentStatus, Journal, MockExecutor, Msat, Occurrence,
+    OperationKind, OperationStatus, PerformOutcome, ReasonCode,
 };
 use wallet_fedimint::{
     CandidateRecord, CandidateState, FederationInfo, FedimintJournal, GatewayUrl, Invoice,
-    MovePhase, MoveRecord, OperationId, Preimage, StructuralOutcome, WatchState,
+    MovePhase, MoveRecord, OperationId, OperationRef, Preimage, StructuralOutcome, WatchState,
     JOIN_NOOP_REOPEN_NOTE,
 };
 
 fn mem_journal() -> FedimintJournal {
     FedimintJournal::new(MemDatabase::new().into_database())
+}
+
+fn fixed_clock() -> u64 {
+    1_700_000_000_000
 }
 
 fn fed(n: u8) -> FederationId {
@@ -45,6 +50,8 @@ fn intent(key: &str, status: IntentStatus) -> Intent {
         reason: ReasonCode::UserInitiated,
         actor: Actor::User,
         created_at_ms: 0,
+        operation_id: None,
+        invoice: None,
     }
 }
 
@@ -138,7 +145,7 @@ async fn set_status_moves_between_indexes() {
     let i = intent("k2", IntentStatus::Pending);
     journal.upsert(&i).await.expect("upsert");
 
-    assert!(has_key(&journal.pending().await, "k2"));
+    assert!(has_key(&journal.pending().await.expect("pending"), "k2"));
     assert!(!has_key(&journal.failed().await, "k2"));
 
     journal
@@ -147,7 +154,7 @@ async fn set_status_moves_between_indexes() {
         .expect("set_status");
 
     assert!(has_key(&journal.failed().await, "k2"));
-    assert!(!has_key(&journal.pending().await, "k2"));
+    assert!(!has_key(&journal.pending().await.expect("pending"), "k2"));
     // The intent itself reflects the new status.
     assert_eq!(
         journal
@@ -185,7 +192,7 @@ async fn set_status_if_cas() {
             .map(|i| i.status),
         Some(IntentStatus::Executing)
     );
-    assert!(has_key(&journal.pending().await, "cas"));
+    assert!(has_key(&journal.pending().await.expect("pending"), "cas"));
 
     // A second claim against the now-stale `expected` (Pending) must not win: no change to
     // the intent row or either index.
@@ -216,7 +223,7 @@ async fn set_status_if_cas() {
         )
         .await
         .expect("set_status_if"));
-    assert!(!has_key(&journal.pending().await, "cas"));
+    assert!(!has_key(&journal.pending().await.expect("pending"), "cas"));
     assert!(has_key(&journal.failed().await, "cas"));
 
     // An absent key never matches any `expected`.
@@ -440,7 +447,7 @@ async fn pending_excludes_done_and_failed() {
         .await
         .expect("upsert failed");
 
-    let pending = journal.pending().await;
+    let pending = journal.pending().await.expect("pending");
     assert!(has_key(&pending, "p"));
     assert!(has_key(&pending, "x"));
     assert!(!has_key(&pending, "d"));
@@ -461,6 +468,175 @@ async fn move_record_roundtrip() {
         journal.get_move(&rec.key).await.expect("get_move"),
         Some(rec)
     );
+}
+
+#[tokio::test]
+async fn raw_pay_artifact_durably_ends_the_source_reservation() {
+    let journal = mem_journal();
+    let mut pay = intent("raw-pay", IntentStatus::Pending);
+    pay.action = Action::Pay {
+        from: fed(1),
+        invoice: Invoice("lnbc1fixture".into()),
+        amount: Msat(100_000),
+        fee_cap: Msat(2_000),
+        payment_hash: [7; 32],
+        gateway: None,
+    };
+    pay.max_fee = Some(Msat(2_000));
+    journal.upsert(&pay).await.expect("upsert raw pay");
+
+    let pending = journal.pending().await.expect("pending");
+    assert_eq!(
+        project_reservations(&pending, |_| None).outbound(fed(1)),
+        Msat(102_000)
+    );
+
+    let operation_id = OperationId([9; 32]);
+    journal
+        .set_operation_artifact(&pay.idempotency_key, operation_id, None)
+        .await
+        .expect("persist raw send artifact");
+    let reopened = journal
+        .get(&pay.idempotency_key)
+        .await
+        .expect("read raw pay")
+        .expect("raw pay exists");
+    assert_eq!(reopened.operation_id, Some(operation_id));
+    let ledger = journal
+        .operation(&OperationRef::Key(pay.idempotency_key.clone()))
+        .await
+        .expect("read raw pay ledger")
+        .expect("raw pay ledger exists");
+    assert!(matches!(
+        ledger.kind,
+        OperationKind::Pay {
+            op_id: Some(id),
+            ..
+        } if id == operation_id
+    ));
+    assert_eq!(
+        project_reservations(std::slice::from_ref(&reopened), |_| None).outbound(fed(1)),
+        Msat(0)
+    );
+}
+
+#[tokio::test]
+async fn join_outcome_preserves_the_noop_audit_note_through_intent_completion() {
+    let journal = mem_journal();
+    let mut join = intent("join-outcome", IntentStatus::Executing);
+    join.action = Action::Join {
+        federation: fed(3),
+        invite: "invite".into(),
+        membership_preexisting: false,
+    };
+    join.max_fee = None;
+    journal.upsert(&join).await.expect("upsert join intent");
+    journal
+        .record_join_outcome(&join.idempotency_key, false)
+        .await
+        .expect("record join outcome");
+    journal
+        .set_status(&join.idempotency_key, IntentStatus::Done, None)
+        .await
+        .expect("complete join intent");
+
+    let row = journal
+        .operation(&OperationRef::Key(join.idempotency_key))
+        .await
+        .expect("read join ledger")
+        .expect("join ledger exists");
+    assert_eq!(row.status, OperationStatus::Succeeded);
+    assert_eq!(row.error.as_deref(), Some(JOIN_NOOP_REOPEN_NOTE));
+}
+
+#[tokio::test]
+async fn recomposed_sync_path_writes_identical_intent_and_ledger_bytes() {
+    for (key, action, awaiting) in [
+        (
+            "equivalent-move",
+            Action::Move {
+                from: fed(1),
+                to: fed(2),
+                amount: Msat(100_000),
+                fee_cap: Msat(2_000),
+            },
+            false,
+        ),
+        (
+            "equivalent-inflow",
+            Action::DirectInflow {
+                to: fed(2),
+                amount: Msat(100_000),
+                fee_cap: Msat(2_000),
+            },
+            true,
+        ),
+    ] {
+        let decision = AllocatorDecision {
+            action,
+            reason: ReasonCode::UserInitiated,
+            occurrence: Occurrence(1),
+            idempotency_key: IdempotencyKey(key.into()),
+        };
+        let composed = FedimintJournal::with_clock(MemDatabase::new().into_database(), fixed_clock);
+        let composed_executor = MockExecutor::new();
+        if awaiting {
+            composed_executor.set_awaiting(key);
+        }
+        apply(
+            &composed,
+            &composed_executor,
+            std::slice::from_ref(&decision),
+            Actor::User,
+            fixed_clock(),
+        )
+        .await;
+
+        let split = FedimintJournal::with_clock(MemDatabase::new().into_database(), fixed_clock);
+        let split_executor = MockExecutor::new();
+        if awaiting {
+            split_executor.set_awaiting(key);
+        }
+        let DecideAndJournal::Drive(intent) =
+            decide_and_journal(&split, &decision, Actor::User, fixed_clock(), None, None)
+                .await
+                .expect("decide")
+        else {
+            panic!("fresh intent must drive")
+        };
+        drive_to_terminal(
+            &split,
+            &split_executor,
+            &intent,
+            &mut ExecutionSummary::default(),
+        )
+        .await;
+
+        let composed_intent = composed
+            .get(&decision.idempotency_key)
+            .await
+            .expect("composed intent")
+            .expect("composed intent exists");
+        let split_intent = split
+            .get(&decision.idempotency_key)
+            .await
+            .expect("split intent")
+            .expect("split intent exists");
+        let composed_row = composed
+            .operation(&OperationRef::Key(decision.idempotency_key.clone()))
+            .await
+            .expect("composed ledger")
+            .expect("composed ledger exists");
+        let split_row = split
+            .operation(&OperationRef::Key(decision.idempotency_key.clone()))
+            .await
+            .expect("split ledger")
+            .expect("split ledger exists");
+        assert_eq!(
+            serde_json::to_vec(&(composed_intent, composed_row)).expect("serialize composed"),
+            serde_json::to_vec(&(split_intent, split_row)).expect("serialize split"),
+        );
+    }
 }
 
 /// Test 5: `put_federation` then `list_federations`/`get_federation` round-trip the registry.
@@ -1151,7 +1327,10 @@ async fn shared_database_handle_persists() {
     // A fresh journal over the same Database sees everything the writer committed.
     let reader = FedimintJournal::new(db);
     assert_eq!(reader.get(&i.idempotency_key).await.expect("get"), Some(i));
-    assert!(has_key(&reader.pending().await, "persist"));
+    assert!(has_key(
+        &reader.pending().await.expect("pending"),
+        "persist"
+    ));
     assert_eq!(
         reader.get_move(&rec.key).await.expect("get_move"),
         Some(rec)
@@ -1220,7 +1399,7 @@ impl Journal for BarrierJournal {
         self.inner.set_status_if(key, expected, new).await
     }
 
-    async fn pending(&self) -> Vec<Intent> {
+    async fn pending(&self) -> Result<Vec<Intent>, ExecError> {
         self.inner.pending().await
     }
 
@@ -1376,7 +1555,10 @@ async fn atomic_intent_and_index() {
     // IntentKey row present.
     assert_eq!(journal.get(&i.idempotency_key).await.expect("get"), Some(i));
     // PendingIndexKey row present (the scan finds it).
-    assert!(has_key(&journal.pending().await, "atomic"));
+    assert!(has_key(
+        &journal.pending().await.expect("pending"),
+        "atomic"
+    ));
 }
 
 #[tokio::test]
@@ -1470,9 +1652,14 @@ async fn index_scans_skip_poison_rows() {
         .expect("insert corrupt failed index");
     dbtx.commit_tx_result().await.expect("commit poison rows");
 
-    let pending = journal.pending().await;
+    let pending = journal.pending().await.expect("pending");
     assert_eq!(pending.len(), 1);
     assert!(has_key(&pending, "good-pending"));
+
+    assert!(matches!(
+        journal.reservation_intents().await,
+        Err(ExecError::Permanent(_))
+    ));
 
     let failed = journal.failed().await;
     assert_eq!(failed.len(), 1);
@@ -1501,12 +1688,16 @@ async fn index_scans_skip_intent_key_mismatch() {
         .expect("insert pending index");
     dbtx.commit_tx_result().await.expect("commit poison rows");
 
-    let pending = journal.pending().await;
+    let pending = journal.pending().await.expect("pending");
     assert!(
         !has_key(&pending, "embedded-b"),
         "the poisoned row must not drive the embedded key"
     );
     assert!(!has_key(&pending, "indexed-a"));
+    assert!(matches!(
+        journal.reservation_intents().await,
+        Err(ExecError::Permanent(_))
+    ));
     assert_eq!(
         journal
             .get(&IdempotencyKey("embedded-b".to_string()))
@@ -1633,7 +1824,10 @@ async fn awaiting_intents_are_scannable_for_resume() {
         .upsert(&intent("inflow", IntentStatus::Executing))
         .await
         .expect("upsert executing");
-    assert!(has_key(&journal.pending().await, "inflow"));
+    assert!(has_key(
+        &journal.pending().await.expect("pending"),
+        "inflow"
+    ));
     assert!(!has_key(
         &journal.awaiting().await.expect("awaiting"),
         "inflow"
@@ -1649,7 +1843,10 @@ async fn awaiting_intents_are_scannable_for_resume() {
         &journal.awaiting().await.expect("awaiting"),
         "inflow"
     ));
-    assert!(!has_key(&journal.pending().await, "inflow"));
+    assert!(!has_key(
+        &journal.pending().await.expect("pending"),
+        "inflow"
+    ));
     assert!(!has_key(&journal.failed().await, "inflow"));
 
     // The recv_op subscription finally settles it (→ Done): it leaves every index.
@@ -1661,7 +1858,10 @@ async fn awaiting_intents_are_scannable_for_resume() {
         &journal.awaiting().await.expect("awaiting"),
         "inflow"
     ));
-    assert!(!has_key(&journal.pending().await, "inflow"));
+    assert!(!has_key(
+        &journal.pending().await.expect("pending"),
+        "inflow"
+    ));
     assert_eq!(
         journal.get(&key).await.expect("get").map(|i| i.status),
         Some(IntentStatus::Done)
@@ -1707,6 +1907,10 @@ async fn awaiting_skips_poison_rows() {
         .expect("awaiting skips poison rows instead of erroring");
     assert_eq!(awaiting.len(), 1);
     assert!(has_key(&awaiting, "good-awaiting"));
+    assert!(matches!(
+        journal.reservation_intents().await,
+        Err(ExecError::Permanent(_))
+    ));
 }
 
 /// `list_federations` gates re-opening EVERY client on resume (§9.1), so it is

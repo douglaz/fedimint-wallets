@@ -258,6 +258,31 @@ pub fn kind_from_action(action: &Action) -> OperationKind {
             recv_op: None,
             gateway: None,
         },
+        Action::Pay {
+            from,
+            amount,
+            payment_hash,
+            gateway,
+            ..
+        } => OperationKind::Pay {
+            fed: *from,
+            invoice_amount: Some(*amount),
+            payment_hash: Some(*payment_hash),
+            op_id: None,
+            gateway: gateway.clone(),
+        },
+        Action::Receive {
+            to,
+            amount,
+            gateway,
+            ..
+        } => OperationKind::Receive {
+            fed: *to,
+            amount_invoiced: *amount,
+            op_id: None,
+            gateway: gateway.clone(),
+        },
+        Action::Join { federation, .. } => OperationKind::Join { fed: *federation },
         Action::RefuseInflow { fed, .. } => OperationKind::Refusal { fed: *fed },
     }
 }

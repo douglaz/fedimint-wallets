@@ -52,6 +52,7 @@ pub fn decide(snapshot: &AllocatorSnapshot, occurrence: Occurrence) -> Vec<Alloc
                 s.balance
                     .spendable
                     .0
+                    .saturating_sub(snapshot.reservations.outbound(s.id).0)
                     .saturating_sub(reserved(&debited, s.id))
                     .saturating_sub(snapshot.max_fee.0)
             });
@@ -85,6 +86,7 @@ pub fn decide(snapshot: &AllocatorSnapshot, occurrence: Occurrence) -> Vec<Alloc
                     .spendable
                     .0
                     .saturating_sub(snapshot.target_spending_balance.0)
+                    .saturating_sub(snapshot.reservations.outbound(s.id).0)
                     .saturating_sub(reserved(&debited, s.id))
                     .saturating_sub(snapshot.max_fee.0)
             });
@@ -264,6 +266,7 @@ fn cap_room_with(
         .per_fed_cap
         .0
         .saturating_sub(fed.balance.spendable.0)
+        .saturating_sub(snapshot.reservations.inbound(fed.id).0)
         .saturating_sub(reserved(credited, fed.id))
 }
 
@@ -377,6 +380,7 @@ fn evacuate_decision(
                 .balance
                 .spendable
                 .0
+                .saturating_sub(snapshot.reservations.outbound(from.id).0)
                 .saturating_sub(reserved(debited, from.id));
             let amount = Msat(src_available.min(cap_room_with(snapshot, to, credited)));
             if amount.0 == 0 {

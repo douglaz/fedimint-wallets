@@ -366,6 +366,15 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
   allocator.rs:308): folding amount/fee-cap into agent keys would let changed sizing under
   the same occurrence mint a fresh key and bypass the stale-occurrence replay guard. The
   two derivations coexist deliberately; the validated replay behavior is the frozen thing.
+  **User-op failure + retry semantics (step-2 review ruling):** PRE-FUND user-op driver
+  failures (fee quote over cap, no gateway quote, deterministic route/invoice rejections)
+  TERMINALIZE — a user pay is one-shot; leaving it Pending would let a background
+  reconcile settle it hours after the user gave up ("thought it failed, later
+  succeeded"). Ambiguous mid-send transport errors stay Retryable as a RESUME (the
+  deterministic op id + lnv2 dedup reattach, never re-pay). The attach-conflict rule
+  applies to LIVE intents only; a user re-request whose key matches a TERMINAL-FAILED
+  intent is the phase-1-sanctioned **manual retry** — it refreshes that intent to Pending
+  with the new sizing fields (journaled); a key matching Done still dedups.
   **Universal attach rule (passes 11-12):** for EVERY verb, the §6a.2 same-key attach
   verifies ALL sizing fields of the request (fed, amount, fee cap) against the existing
   intent — the key identifies the operation, the sizing check guards its bounds; any

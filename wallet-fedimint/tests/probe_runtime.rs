@@ -130,6 +130,8 @@ fn leg_intent_with_fee_cap(
         reason: ReasonCode::ActiveProbe,
         actor: Actor::User,
         created_at_ms: 0,
+        operation_id: None,
+        invoice: None,
     }
 }
 

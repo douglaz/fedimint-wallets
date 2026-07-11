@@ -335,19 +335,15 @@ impl FedimintJournal {
     /// intent twice nor drop one (the atomic write keeps each intent's index entry in
     /// lockstep with its status, and one snapshot reads exactly one committed point).
     ///
-    /// The ONE scan helper behind [`Journal::pending`], [`Journal::failed`], AND
-    /// [`FedimintJournal::awaiting`] — so all three handle a poison row IDENTICALLY (the
-    /// asymmetry of an earlier strict `awaiting` variant is gone). Scans are the always-on
-    /// reconcile/resume path, NOT a targeted read: a malformed/dangling index entry, a
-    /// missing intent, a corrupt row, or an index/intent status skew is SKIPPED (warn-logged)
-    /// so one poison row cannot strand the healthy entries (or crash-loop the executor); the
-    /// referenced Intent's real status is still re-checked before it is returned. Only a
-    /// transient STORAGE error (the prefix scan or a row read failing at the db layer) is
-    /// surfaced, as [`ExecError::Retryable`], so the caller can retry the whole pass — the
-    /// `Vec`-returning trait methods swallow even that (see [`Journal::pending`]).
+    /// The ONE scan helper behind the operational scans and the stricter decide-time
+    /// reservation scan. Operational reconcile/resume scans skip poison rows so one corrupt
+    /// entry cannot strand healthy recovery work. Admission passes `fail_on_corruption = true`:
+    /// a malformed/dangling index entry, missing intent, corrupt row, key mismatch, or status
+    /// skew makes the reservation view incomplete, so deciding from it must fail closed.
     async fn intents_indexed_as(
         &self,
         statuses: &[IntentStatus],
+        fail_on_corruption: bool,
     ) -> Result<Vec<Intent>, ExecError> {
         let mut dbtx = self.db.begin_transaction_nc().await;
 
@@ -364,6 +360,11 @@ impl FedimintJournal {
                     Some(Ok(key)) => {
                         keys.insert(IdempotencyKey(key.to_owned()));
                     }
+                    _ if fail_on_corruption => {
+                        return Err(ExecError::Permanent(format!(
+                            "journal: malformed intent index key {raw_key:?}"
+                        )));
+                    }
                     _ => tracing::warn!(?raw_key, "journal: skipping malformed index key"),
                 }
             }
@@ -377,21 +378,42 @@ impl FedimintJournal {
             let raw_key = intent_key(&key);
             match dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? {
                 Some(bytes) => match decode_row_result::<Intent>("intent", &raw_key, &bytes) {
-                    Ok(intent) if intent.idempotency_key != key => tracing::warn!(
-                        index_key = %key.0,
-                        embedded_key = %intent.idempotency_key.0,
-                        "journal: index/intent key mismatch, skipping",
-                    ),
+                    Ok(intent) if intent.idempotency_key != key && fail_on_corruption => {
+                        return Err(ExecError::Permanent(format!(
+                            "journal: intent index key {} disagrees with embedded key {}",
+                            key.0, intent.idempotency_key.0
+                        )));
+                    }
+                    Ok(intent) if intent.idempotency_key != key => {
+                        tracing::warn!(
+                            index_key = %key.0,
+                            embedded_key = %intent.idempotency_key.0,
+                            "journal: index/intent key mismatch, skipping",
+                        );
+                    }
                     Ok(intent) if statuses.contains(&intent.status) => out.push(intent),
+                    Ok(intent) if fail_on_corruption => {
+                        return Err(ExecError::Permanent(format!(
+                            "journal: intent index for {} has unexpected status {:?}",
+                            key.0, intent.status
+                        )));
+                    }
                     Ok(intent) => tracing::warn!(
                         key = %key.0,
                         status = ?intent.status,
                         "journal: index/intent status skew, skipping",
                     ),
+                    Err(error) if fail_on_corruption => return Err(error),
                     Err(e) => {
                         tracing::warn!(key = %key.0, error = ?e, "journal: skipping corrupt intent row");
                     }
                 },
+                None if fail_on_corruption => {
+                    return Err(ExecError::Permanent(format!(
+                        "journal: intent index references missing intent {}",
+                        key.0
+                    )));
+                }
                 None => {
                     tracing::warn!(key = %key.0, "journal: index references missing intent, skipping");
                 }
@@ -404,7 +426,7 @@ impl FedimintJournal {
     /// payer has not settled. This is the resume loop's subscription-rehydration set: on
     /// restart it re-`subscribe`s each one's `recv_op` so the claim is still observed.
     ///
-    /// NOT a [`Journal`] trait method, and DELIBERATELY separate from [`Journal::pending`]:
+    /// DELIBERATELY separate from [`Journal::pending`]:
     /// an `Awaiting` intent must be re-FOUND after a restart but must NEVER be re-DRIVEN
     /// through `perform` (that would mint a second invoice). `pending()` therefore still
     /// returns `Pending|Executing` only; `awaiting()` is the parallel, re-drive-free scan.
@@ -415,7 +437,8 @@ impl FedimintJournal {
     /// rehydration of every OTHER healthy inflow. It still returns a `Result` so a transient
     /// storage error surfaces as [`ExecError::Retryable`] for the resume loop to retry.
     pub async fn awaiting(&self) -> Result<Vec<Intent>, ExecError> {
-        self.intents_indexed_as(&[IntentStatus::Awaiting]).await
+        self.intents_indexed_as(&[IntentStatus::Awaiting], false)
+            .await
     }
 
     // --- app-specific async methods (NOT part of the wallet-core Journal trait) ---
@@ -679,6 +702,139 @@ impl FedimintJournal {
         .await?;
         dbtx.commit_tx_result().await.map_err(db_err)?;
         Ok(())
+    }
+
+    /// Persist a terminal raw-op observation before the intent transition makes its ledger row
+    /// immutable. This reuses the same authoritative enrichment path as reconcile repair.
+    pub async fn record_raw_observation(
+        &self,
+        key: &IdempotencyKey,
+        op: OperationId,
+        observation: &RawOpObservation,
+    ) -> Result<(), ExecError> {
+        self.apply_observation(
+            key,
+            op,
+            observation,
+            self.now_ms(),
+            WriteKind::Authoritative,
+            None,
+        )
+        .await
+    }
+
+    /// Record whether a join created membership or merely reopened an existing federation.
+    /// The ledger transition precedes the intent's terminal status so a crash cannot erase the
+    /// `newly_joined` distinction.
+    pub async fn record_join_outcome(
+        &self,
+        key: &IdempotencyKey,
+        newly_joined: bool,
+    ) -> Result<(), ExecError> {
+        self.record_terminal(
+            key,
+            OperationStatus::Succeeded,
+            self.now_ms(),
+            (!newly_joined).then_some(JOIN_NOOP_REOPEN_NOTE),
+            None,
+        )
+        .await
+    }
+
+    /// Complete an externally-awaited raw pay/receive through the same durable journal used by
+    /// the issue driver. `Ok(notes)` preserves the CLI's best-effort audit diagnostics; an
+    /// intent status-write failure remains fatal so a caller cannot report completion while the
+    /// reservation stays live.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finalize_raw_operation(
+        &self,
+        oracle: &dyn LedgerRepairOracle,
+        fed: FederationId,
+        op: OperationId,
+        key: &IdempotencyKey,
+        role: RawOperationRole,
+        status: OperationStatus,
+        error: Option<&str>,
+    ) -> Result<Vec<String>, ExecError> {
+        let Some(row) = self.operation(&OperationRef::Key(key.clone())).await? else {
+            return Ok(vec![format!(
+                "no ledger row for --key {}; not recording",
+                key.0
+            )]);
+        };
+        let needs_correlation_proof = match raw_operation_row_matches(&row, role, fed, op) {
+            Ok(needs_proof) => needs_proof,
+            Err(reason) => {
+                return Ok(vec![format!(
+                    "--key {} does not match this operation ({reason}); not recording",
+                    key.0
+                )]);
+            }
+        };
+        if needs_correlation_proof {
+            match oracle.find_op_by_correlation_key(fed, key).await {
+                Ok(Some(found)) if found == op => {}
+                Ok(_) => {
+                    return Ok(vec![format!(
+                        "--key {} has no recorded op id and the op-log does not tie this \
+                         operation to it; not recording (reconcile repairs it)",
+                        key.0
+                    )]);
+                }
+                Err(error) => {
+                    return Ok(vec![format!(
+                        "could not verify --key {} against the op-log: {error:?}; not recording",
+                        key.0
+                    )]);
+                }
+            }
+        }
+
+        let mut notes = Vec::new();
+        let update = match oracle.observe_op(fed, op).await {
+            Ok(observation) => RawOpUpdate {
+                op_id: Some(op),
+                gateway: observation.gateway,
+                invoice_amount: observation.invoice_amount,
+                payment_hash: observation.payment_hash,
+                fees: Some(observation.fees),
+                fees_definitive: observation.terminal.is_some(),
+            },
+            Err(observe_error) => {
+                notes.push(format!(
+                    "could not read settlement fees for {op:?}: {observe_error:?}"
+                ));
+                RawOpUpdate {
+                    op_id: Some(op),
+                    ..RawOpUpdate::default()
+                }
+            }
+        };
+        if let Err(record_error) = self
+            .record_terminal(key, status, self.now_ms(), error, Some(update))
+            .await
+        {
+            notes.push(format!(
+                "recording the terminal ledger row failed: {record_error:?}"
+            ));
+        }
+
+        let intent_status = match status {
+            OperationStatus::Succeeded => IntentStatus::Done,
+            OperationStatus::Failed => IntentStatus::Failed,
+            OperationStatus::Started | OperationStatus::Awaiting => return Ok(notes),
+        };
+        if let Some(intent) = self.get(key).await? {
+            let role_matches = matches!(
+                (&intent.action, role),
+                (Action::Pay { .. }, RawOperationRole::Send)
+                    | (Action::Receive { .. }, RawOperationRole::Receive)
+            );
+            if role_matches {
+                self.set_status(key, intent_status, error).await?;
+            }
+        }
+        Ok(notes)
     }
 
     /// Open a `Tick` ledger row `Started` before the agent decides (§9.3). Idempotent per
@@ -1382,7 +1538,8 @@ impl FedimintJournal {
     /// apply immediately as ordinary terminal writes; NEGATIVE inferences (marking `Failed` on
     /// ABSENCE of evidence) are deferred one hour AND written SOFT (`repaired: true`), so a
     /// clock-skewed false `Failed` is superseded by the real writer instead of blocking it.
-    /// Intent-keyed rows are NEVER repaired here — the journal integration (§9.2) owns them.
+    /// Move-shaped intent rows are never repaired here — their journal integration (§9.2) owns
+    /// them. Raw pay/receive intent rows are repaired from their lnv2 op-log witness below.
     pub async fn repair_ledger(
         &self,
         oracle: &dyn LedgerRepairOracle,
@@ -1447,7 +1604,7 @@ impl FedimintJournal {
                         summary.repaired += 1;
                     }
                 }
-                // Join handled above; intent-keyed / other rows are never repaired here.
+                // Join is handled above; move-shaped intent rows and other rows are untouched.
                 KeyClass::Join | KeyClass::Other => {}
             }
         }
@@ -1580,6 +1737,7 @@ impl FedimintJournal {
                     };
                     self.apply_observation(key, op, &obs, now, write, note)
                         .await?;
+                    self.sync_raw_intent_from_observation(key, &obs).await?;
                     return Ok(1);
                 }
                 // Still in flight → leave Awaiting (truthful) for a later pass.
@@ -1591,6 +1749,7 @@ impl FedimintJournal {
                     let obs = oracle.observe_op(fed, op).await?;
                     self.apply_observation(key, op, &obs, now, WriteKind::Authoritative, None)
                         .await?;
+                    self.sync_raw_intent_from_observation(key, &obs).await?;
                     return Ok(1);
                 }
                 // 2. A deduped retry reuses the ORIGINAL op, so its key is in no op's meta; the
@@ -1609,6 +1768,7 @@ impl FedimintJournal {
                             Some(HASH_DEDUP_NOTE),
                         )
                         .await?;
+                        self.sync_raw_intent_from_observation(key, &obs).await?;
                         return Ok(1);
                     }
                 }
@@ -1624,11 +1784,49 @@ impl FedimintJournal {
                         WriteKind::Repair,
                     )
                     .await?;
+                    // Absence of evidence is deliberately SOFT. Keep the intent re-drivable:
+                    // the next authoritative Pending→Executing claim will supersede this repaired
+                    // ledger conclusion if a late operation appears or a retry reaches the SDK.
                     return Ok(1);
                 }
                 Ok(0)
             }
         }
+    }
+
+    async fn sync_raw_intent_from_observation(
+        &self,
+        key: &IdempotencyKey,
+        observation: &RawOpObservation,
+    ) -> Result<(), ExecError> {
+        let Some(terminal) = &observation.terminal else {
+            return Ok(());
+        };
+        self.sync_raw_intent_terminal(
+            key,
+            if terminal.succeeded {
+                IntentStatus::Done
+            } else {
+                IntentStatus::Failed
+            },
+            terminal.error.as_deref(),
+        )
+        .await
+    }
+
+    async fn sync_raw_intent_terminal(
+        &self,
+        key: &IdempotencyKey,
+        status: IntentStatus,
+        error: Option<&str>,
+    ) -> Result<(), ExecError> {
+        let Some(intent) = self.get(key).await? else {
+            return Ok(());
+        };
+        if matches!(intent.action, Action::Pay { .. } | Action::Receive { .. }) {
+            self.set_status(key, status, error).await?;
+        }
+        Ok(())
     }
 
     /// Apply an op observation to a raw row: terminal → `Succeeded`/`Failed` carrying the
@@ -1883,6 +2081,38 @@ pub enum OperationRef {
     Seq(u64),
 }
 
+/// Which raw lnv2 leg an external await is finalizing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawOperationRole {
+    Send,
+    Receive,
+}
+
+/// Verify that an externally supplied raw operation handle belongs to a ledger row before an
+/// immutable terminal write. `Ok(true)` means the row has no op id and needs correlation proof.
+pub fn raw_operation_row_matches(
+    row: &OperationRecord,
+    role: RawOperationRole,
+    fed: FederationId,
+    op: OperationId,
+) -> Result<bool, String> {
+    let (row_fed, row_op) = match (&row.kind, role) {
+        (OperationKind::Pay { fed, op_id, .. }, RawOperationRole::Send) => (fed, op_id),
+        (OperationKind::Receive { fed, op_id, .. }, RawOperationRole::Receive) => (fed, op_id),
+        _ => return Err("its kind is not the awaited pay/receive operation".to_owned()),
+    };
+    if *row_fed != fed {
+        return Err("it belongs to a different federation".to_owned());
+    }
+    match row_op {
+        Some(existing) if *existing != op => {
+            Err("it already tracks a different operation".to_owned())
+        }
+        Some(_) => Ok(false),
+        None => Ok(true),
+    }
+}
+
 /// A count of the rows a [`FedimintJournal::repair_ledger`] pass terminalized/advanced.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RepairSummary {
@@ -2053,24 +2283,63 @@ impl Journal for FedimintJournal {
             })
     }
 
-    async fn pending(&self) -> Vec<Intent> {
-        // The trait returns `Vec`, so a transient storage error can't be surfaced: warn and
-        // return empty for this pass (the index is durable; the next reconcile retries).
-        self.intents_indexed_as(&[IntentStatus::Pending, IntentStatus::Executing])
+    async fn pending(&self) -> Result<Vec<Intent>, ExecError> {
+        self.intents_indexed_as(&[IntentStatus::Pending, IntentStatus::Executing], false)
             .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = ?e, "journal: pending scan failed this pass, returning empty");
-                Vec::new()
-            })
+    }
+
+    async fn awaiting(&self) -> Result<Vec<Intent>, ExecError> {
+        self.intents_indexed_as(&[IntentStatus::Awaiting], false)
+            .await
+    }
+
+    async fn reservation_intents(&self) -> Result<Vec<Intent>, ExecError> {
+        self.intents_indexed_as(
+            &[
+                IntentStatus::Pending,
+                IntentStatus::Executing,
+                IntentStatus::Awaiting,
+            ],
+            true,
+        )
+        .await
     }
 
     async fn failed(&self) -> Vec<Intent> {
-        self.intents_indexed_as(&[IntentStatus::Failed])
+        self.intents_indexed_as(&[IntentStatus::Failed], false)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(error = ?e, "journal: failed scan failed this pass, returning empty");
                 Vec::new()
             })
+    }
+
+    async fn move_record(&self, key: &IdempotencyKey) -> Result<Option<MoveRecord>, ExecError> {
+        self.get_move(key).await
+    }
+
+    async fn set_operation_artifact(
+        &self,
+        key: &IdempotencyKey,
+        operation_id: OperationId,
+        invoice: Option<&wallet_core::Invoice>,
+    ) -> Result<(), ExecError> {
+        let ikey = intent_key(key);
+        let mut dbtx = self.db.begin_transaction().await;
+        let Some(bytes) = dbtx.raw_get_bytes(&ikey).await.map_err(db_err)? else {
+            return Err(ExecError::Permanent("journal: intent not found".into()));
+        };
+        let mut intent = decode_row_result::<Intent>("intent", &ikey, &bytes)?;
+        intent.operation_id = Some(operation_id);
+        if let Some(invoice) = invoice {
+            intent.invoice = Some(invoice.clone());
+        }
+        dbtx.raw_insert_bytes(&ikey, &encode_row(&intent)?)
+            .await
+            .map_err(db_err)?;
+        write_intent_ledger_row(&mut dbtx, &intent, self.now_ms(), None).await?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(())
     }
 
     fn store_id(&self) -> usize {
@@ -2237,9 +2506,21 @@ async fn write_intent_ledger_row(
         if let Some(mv) = &move_rec {
             refresh_from_move(&mut next, mv);
         }
+        refresh_from_intent_artifact(&mut next, intent);
         Some(next)
     })
     .await
+}
+
+fn refresh_from_intent_artifact(record: &mut OperationRecord, intent: &Intent) {
+    let Some(operation_id) = intent.operation_id else {
+        return;
+    };
+    match &mut record.kind {
+        wallet_core::OperationKind::Pay { op_id, .. }
+        | wallet_core::OperationKind::Receive { op_id, .. } => *op_id = Some(operation_id),
+        _ => {}
+    }
 }
 
 /// A fresh ledger row for an intent's first observation (§9.2). Op-ids/gateway/receive/send

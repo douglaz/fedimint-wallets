@@ -82,9 +82,724 @@ fn counts_with_terminal_failed_skipped(
     }
 }
 
+fn intent_for(action: Action, status: IntentStatus) -> Intent {
+    let decision = decision("reservation", action, ReasonCode::UserInitiated);
+    let mut intent = Intent::from_decision(&decision, Actor::User, 0);
+    intent.status = status;
+    intent
+}
+
+fn move_record(intent: &Intent, phase: MovePhase) -> MoveRecord {
+    let (from, to, amount, fee_cap, send_required) = match intent.action {
+        Action::Move {
+            from,
+            to,
+            amount,
+            fee_cap,
+        }
+        | Action::Evacuate {
+            from,
+            to,
+            amount,
+            fee_cap,
+        } => (Some(from), to, amount, fee_cap, true),
+        Action::DirectInflow {
+            to,
+            amount,
+            fee_cap,
+        } => (None, to, amount, fee_cap, false),
+        _ => panic!("test record requires a move-shaped action"),
+    };
+    MoveRecord {
+        key: intent.idempotency_key.clone(),
+        from,
+        to,
+        amount,
+        fee_cap,
+        gateway: GatewayUrl("https://gateway.invalid".into()),
+        send_required,
+        invoice: None,
+        recv_op: None,
+        send_op: None,
+        phase,
+        outcome: None,
+        preimage: None,
+        receive_fee_quoted: None,
+        send_fee_quoted: None,
+    }
+}
+
+#[test]
+fn reservation_projection_covers_every_phase6a_table_row() {
+    let from = FederationId([1; 32]);
+    let to = FederationId([2; 32]);
+    let move_action = Action::Move {
+        from,
+        to,
+        amount: Msat(100),
+        fee_cap: Msat(7),
+    };
+
+    for status in [IntentStatus::Pending, IntentStatus::Executing] {
+        for phase in [None, Some(MovePhase::Created), Some(MovePhase::Invoiced)] {
+            let intent = intent_for(move_action.clone(), status);
+            let record = phase.map(|phase| move_record(&intent, phase));
+            let reservations =
+                project_reservations(std::slice::from_ref(&intent), |_| record.clone());
+            assert_eq!(reservations.outbound(from), Msat(107));
+            assert_eq!(reservations.inbound(to), Msat(100));
+        }
+    }
+
+    let sending = intent_for(move_action.clone(), IntentStatus::Executing);
+    let sending_record = move_record(&sending, MovePhase::Sending);
+    let reservations = project_reservations(std::slice::from_ref(&sending), |_| {
+        Some(sending_record.clone())
+    });
+    assert_eq!(reservations.outbound(from), Msat(0));
+    assert_eq!(reservations.inbound(to), Msat(100));
+
+    for phase in [
+        MovePhase::Settled,
+        MovePhase::Refunded,
+        MovePhase::Failed,
+        MovePhase::Stranded,
+    ] {
+        let intent = intent_for(move_action.clone(), IntentStatus::Executing);
+        let record = move_record(&intent, phase);
+        let reservations =
+            project_reservations(std::slice::from_ref(&intent), |_| Some(record.clone()));
+        assert_eq!(reservations, Reservations::default());
+    }
+
+    for status in [IntentStatus::Done, IntentStatus::Failed] {
+        let intent = intent_for(move_action.clone(), status);
+        let reservations = project_reservations(std::slice::from_ref(&intent), |_| None);
+        assert_eq!(reservations, Reservations::default());
+    }
+
+    let inflow = intent_for(
+        Action::DirectInflow {
+            to,
+            amount: Msat(55),
+            fee_cap: Msat(3),
+        },
+        IntentStatus::Awaiting,
+    );
+    let reservations = project_reservations(std::slice::from_ref(&inflow), |_| None);
+    assert_eq!(reservations.outbound(from), Msat(0));
+    assert_eq!(reservations.inbound(to), Msat(55));
+
+    let evacuate = intent_for(
+        Action::Evacuate {
+            from,
+            to,
+            amount: Msat(40),
+            fee_cap: Msat(9),
+        },
+        IntentStatus::Pending,
+    );
+    let reservations = project_reservations(std::slice::from_ref(&evacuate), |_| None);
+    assert_eq!(reservations.outbound(from), Msat(0));
+    assert_eq!(reservations.inbound(to), Msat(40));
+
+    let mut downsized_evacuation = move_record(&evacuate, MovePhase::Created);
+    downsized_evacuation.amount = Msat(25);
+    let reservations = project_reservations(std::slice::from_ref(&evacuate), |_| {
+        Some(downsized_evacuation.clone())
+    });
+    assert_eq!(reservations.outbound(from), Msat(0));
+    assert_eq!(
+        reservations.inbound(to),
+        Msat(25),
+        "the durable executable amount replaces the intent's original evacuation ask"
+    );
+
+    let receive = intent_for(
+        Action::Receive {
+            to,
+            amount: Msat(70),
+            fee_cap: Msat(4),
+            nonce: "receive-nonce".into(),
+            gateway: None,
+        },
+        IntentStatus::Awaiting,
+    );
+    let reservations = project_reservations(std::slice::from_ref(&receive), |_| None);
+    assert_eq!(reservations.outbound(from), Msat(0));
+    assert_eq!(reservations.inbound(to), Msat(70));
+
+    let join = intent_for(
+        Action::Join {
+            federation: to,
+            invite: "invite".into(),
+            membership_preexisting: false,
+        },
+        IntentStatus::Executing,
+    );
+    assert_eq!(
+        project_reservations(std::slice::from_ref(&join), |_| None),
+        Reservations::default()
+    );
+}
+
+#[test]
+fn raw_pay_reservation_ends_at_the_durable_send_artifact() {
+    let from = FederationId([1; 32]);
+    let action = Action::Pay {
+        from,
+        invoice: Invoice("lnbc1fixture".into()),
+        amount: Msat(100),
+        fee_cap: Msat(7),
+        payment_hash: [9; 32],
+        gateway: None,
+    };
+    let pre_fund = intent_for(action.clone(), IntentStatus::Pending);
+    assert_eq!(
+        project_reservations(std::slice::from_ref(&pre_fund), |_| None).outbound(from),
+        Msat(107)
+    );
+
+    let mut post_fund = pre_fund;
+    post_fund.operation_id = Some(OperationId([3; 32]));
+    assert_eq!(
+        project_reservations(std::slice::from_ref(&post_fund), |_| None).outbound(from),
+        Msat(0)
+    );
+}
+
 #[derive(Default)]
 struct GetFailsJournal {
     upserts: Mutex<usize>,
+}
+
+#[derive(Clone, Copy)]
+enum ScanFailure {
+    Pending,
+    Awaiting,
+    MoveRecord,
+}
+
+struct ScanFailsJournal {
+    inner: MemJournal,
+    failure: ScanFailure,
+}
+
+#[async_trait]
+impl Journal for ScanFailsJournal {
+    async fn upsert(&self, intent: &Intent) -> Result<(), ExecError> {
+        self.inner.upsert(intent).await
+    }
+
+    async fn get(&self, key: &IdempotencyKey) -> Result<Option<Intent>, ExecError> {
+        self.inner.get(key).await
+    }
+
+    async fn set_status(
+        &self,
+        key: &IdempotencyKey,
+        status: IntentStatus,
+        error: Option<&str>,
+    ) -> Result<(), ExecError> {
+        self.inner.set_status(key, status, error).await
+    }
+
+    async fn set_status_if(
+        &self,
+        key: &IdempotencyKey,
+        expected: IntentStatus,
+        new: IntentStatus,
+    ) -> Result<bool, ExecError> {
+        self.inner.set_status_if(key, expected, new).await
+    }
+
+    async fn pending(&self) -> Result<Vec<Intent>, ExecError> {
+        if matches!(self.failure, ScanFailure::Pending) {
+            return Err(ExecError::Retryable("pending scan unavailable".into()));
+        }
+        self.inner.pending().await
+    }
+
+    async fn awaiting(&self) -> Result<Vec<Intent>, ExecError> {
+        if matches!(self.failure, ScanFailure::Awaiting) {
+            return Err(ExecError::Retryable("awaiting scan unavailable".into()));
+        }
+        self.inner.awaiting().await
+    }
+
+    async fn failed(&self) -> Vec<Intent> {
+        self.inner.failed().await
+    }
+
+    async fn move_record(&self, key: &IdempotencyKey) -> Result<Option<MoveRecord>, ExecError> {
+        if matches!(self.failure, ScanFailure::MoveRecord) {
+            return Err(ExecError::Retryable("move record unavailable".into()));
+        }
+        self.inner.move_record(key).await
+    }
+}
+
+fn pay_decision(key: &str, from: FederationId, amount: u64, fee_cap: u64) -> AllocatorDecision {
+    decision(
+        key,
+        Action::Pay {
+            from,
+            invoice: Invoice(format!("lnbc1{key}")),
+            amount: Msat(amount),
+            fee_cap: Msat(fee_cap),
+            payment_hash: [key.len() as u8; 32],
+            gateway: None,
+        },
+        ReasonCode::UserInitiated,
+    )
+}
+
+#[tokio::test]
+async fn admission_fails_closed_when_any_reservation_scan_read_errors() {
+    for (failure, expected) in [
+        (ScanFailure::Pending, "pending scan unavailable"),
+        (ScanFailure::Awaiting, "awaiting scan unavailable"),
+        (ScanFailure::MoveRecord, "move record unavailable"),
+    ] {
+        let journal = ScanFailsJournal {
+            inner: MemJournal::new(),
+            failure,
+        };
+        if matches!(failure, ScanFailure::MoveRecord) {
+            let existing = move_decision("existing-move", 10);
+            journal
+                .inner
+                .upsert(&Intent::from_decision(&existing, Actor::User, 0))
+                .await
+                .expect("seed pending move");
+        }
+        let decision = pay_decision("pay-a", FederationId([1; 32]), 10, 1);
+        let balances = std::collections::BTreeMap::from([(FederationId([1; 32]), Msat(100))]);
+        let error = decide_and_journal(&journal, &decision, Actor::User, 0, Some(&balances), None)
+            .await
+            .expect_err("scan failure must refuse admission");
+        assert_eq!(error, ExecError::Retryable(expected.into()));
+        assert_eq!(journal.inner.get(&ikey("pay-a")).await.expect("get"), None);
+    }
+}
+
+#[tokio::test]
+async fn cross_operation_reservations_gate_source_and_destination_admission() {
+    let from = FederationId([1; 32]);
+    let to = FederationId([2; 32]);
+    let balances = std::collections::BTreeMap::from([(from, Msat(150)), (to, Msat(30))]);
+
+    let journal = MemJournal::new();
+    let first = pay_decision("pay-a", from, 100, 10);
+    decide_and_journal(&journal, &first, Actor::User, 0, Some(&balances), None)
+        .await
+        .expect("first pay admitted");
+    let second = pay_decision("pay-bb", from, 50, 1);
+    assert!(matches!(
+        decide_and_journal(&journal, &second, Actor::User, 0, Some(&balances), None).await,
+        Err(ExecError::Permanent(reason)) if reason.contains("insufficient balance after reservations")
+    ));
+
+    journal
+        .set_operation_artifact(&first.idempotency_key, OperationId([8; 32]), None)
+        .await
+        .expect("funding artifact");
+    decide_and_journal(&journal, &second, Actor::User, 0, Some(&balances), None)
+        .await
+        .expect("post-fund pay no longer double counts the live balance debit");
+
+    let inflow = decision(
+        "inflow-a",
+        Action::DirectInflow {
+            to,
+            amount: Msat(60),
+            fee_cap: Msat(1),
+        },
+        ReasonCode::UserInitiated,
+    );
+    let mut inflow_intent = Intent::from_decision(&inflow, Actor::User, 0);
+    inflow_intent.status = IntentStatus::Awaiting;
+    journal.upsert(&inflow_intent).await.expect("seed inflow");
+    let incoming_move = decision(
+        "move-in",
+        Action::Move {
+            from,
+            to,
+            amount: Msat(20),
+            fee_cap: Msat(1),
+        },
+        ReasonCode::UserInitiated,
+    );
+    assert!(matches!(
+        decide_and_journal(
+            &journal,
+            &incoming_move,
+            Actor::User,
+            0,
+            Some(&balances),
+            Some(Msat(100)),
+        )
+        .await,
+        Err(ExecError::Permanent(reason)) if reason.contains("per-fed cap after reservations")
+    ));
+
+    let evacuation_journal = MemJournal::new();
+    let evacuation = decision(
+        "evacuation",
+        Action::Evacuate {
+            from,
+            to,
+            amount: Msat(40),
+            fee_cap: Msat(50),
+        },
+        ReasonCode::ShutdownNotice,
+    );
+    let tiny_source = std::collections::BTreeMap::from([(from, Msat(10)), (to, Msat(0))]);
+    decide_and_journal(
+        &evacuation_journal,
+        &evacuation,
+        Actor::User,
+        0,
+        Some(&tiny_source),
+        Some(Msat(100)),
+    )
+    .await
+    .expect("evacuation admission must not pre-reserve amount plus fee on its source");
+}
+
+#[tokio::test]
+async fn new_intent_kinds_attach_only_when_all_sizing_fields_match() {
+    let from = FederationId([1; 32]);
+    let balances = std::collections::BTreeMap::from([(from, Msat(1_000))]);
+    let journal = MemJournal::new();
+    let original = pay_decision("same-hash", from, 100, 7);
+    decide_and_journal(&journal, &original, Actor::User, 0, Some(&balances), None)
+        .await
+        .expect("fresh pay");
+    assert!(matches!(
+        decide_and_journal(&journal, &original, Actor::User, 1, Some(&balances), None).await,
+        Ok(DecideAndJournal::Drive(_))
+    ));
+
+    let conflicting_action = |from, amount, fee_cap| {
+        let Action::Pay {
+            invoice,
+            payment_hash,
+            gateway,
+            ..
+        } = &original.action
+        else {
+            unreachable!("fixture is a pay")
+        };
+        Action::Pay {
+            from,
+            invoice: invoice.clone(),
+            amount: Msat(amount),
+            fee_cap: Msat(fee_cap),
+            payment_hash: *payment_hash,
+            gateway: gateway.clone(),
+        }
+    };
+    for action in [
+        conflicting_action(FederationId([9; 32]), 100, 7),
+        conflicting_action(from, 101, 7),
+        conflicting_action(from, 100, 8),
+    ] {
+        let conflict = AllocatorDecision {
+            action,
+            ..original.clone()
+        };
+        assert!(matches!(
+            decide_and_journal(&journal, &conflict, Actor::User, 2, Some(&balances), None).await,
+            Err(ExecError::Permanent(reason)) if reason.contains("conflicts")
+        ));
+    }
+
+    let receive_journal = MemJournal::new();
+    let receive = decision(
+        "receive-key",
+        Action::Receive {
+            to: from,
+            amount: Msat(50),
+            fee_cap: Msat(3),
+            nonce: "nonce".into(),
+            gateway: None,
+        },
+        ReasonCode::UserInitiated,
+    );
+    decide_and_journal(&receive_journal, &receive, Actor::User, 0, None, None)
+        .await
+        .expect("fresh receive");
+    assert!(
+        decide_and_journal(&receive_journal, &receive, Actor::User, 1, None, None)
+            .await
+            .is_ok()
+    );
+    for conflicting_action in [
+        Action::Receive {
+            to: FederationId([9; 32]),
+            amount: Msat(50),
+            fee_cap: Msat(3),
+            nonce: "nonce".into(),
+            gateway: None,
+        },
+        Action::Receive {
+            to: from,
+            amount: Msat(51),
+            fee_cap: Msat(3),
+            nonce: "nonce".into(),
+            gateway: None,
+        },
+        Action::Receive {
+            to: from,
+            amount: Msat(50),
+            fee_cap: Msat(4),
+            nonce: "nonce".into(),
+            gateway: None,
+        },
+    ] {
+        let conflict = AllocatorDecision {
+            action: conflicting_action,
+            ..receive.clone()
+        };
+        assert!(matches!(
+            decide_and_journal(&receive_journal, &conflict, Actor::User, 1, None, None).await,
+            Err(ExecError::Permanent(reason)) if reason.contains("conflicts")
+        ));
+    }
+
+    let join_journal = MemJournal::new();
+    let join = decision(
+        "join-key",
+        Action::Join {
+            federation: from,
+            invite: "invite-a".into(),
+            membership_preexisting: false,
+        },
+        ReasonCode::UserInitiated,
+    );
+    decide_and_journal(&join_journal, &join, Actor::User, 0, None, None)
+        .await
+        .expect("fresh join");
+    assert!(
+        decide_and_journal(&join_journal, &join, Actor::User, 1, None, None)
+            .await
+            .is_ok()
+    );
+    for conflicting_action in [
+        Action::Join {
+            federation: FederationId([9; 32]),
+            invite: "invite-a".into(),
+            membership_preexisting: false,
+        },
+        Action::Join {
+            federation: from,
+            invite: "invite-b".into(),
+            membership_preexisting: false,
+        },
+    ] {
+        let conflict = AllocatorDecision {
+            action: conflicting_action,
+            ..join.clone()
+        };
+        assert!(matches!(
+            decide_and_journal(&join_journal, &conflict, Actor::User, 1, None, None).await,
+            Err(ExecError::Permanent(reason)) if reason.contains("conflicts")
+        ));
+    }
+}
+
+#[tokio::test]
+async fn unfunded_raw_pay_attach_can_replace_its_gateway() {
+    let from = FederationId([1; 32]);
+    let balances = std::collections::BTreeMap::from([(from, Msat(1_000))]);
+    let journal = MemJournal::new();
+    let mut original = pay_decision("same-hash", from, 100, 7);
+    let Action::Pay { gateway, .. } = &mut original.action else {
+        unreachable!("fixture is a pay")
+    };
+    *gateway = Some(wallet_core::GatewayUrl("https://bad.example".into()));
+    decide_and_journal(&journal, &original, Actor::User, 0, Some(&balances), None)
+        .await
+        .expect("fresh pay");
+
+    let mut retry = original.clone();
+    let Action::Pay { gateway, .. } = &mut retry.action else {
+        unreachable!("fixture is a pay")
+    };
+    *gateway = Some(wallet_core::GatewayUrl("https://good.example".into()));
+
+    let attached = decide_and_journal(&journal, &retry, Actor::User, 1, Some(&balances), None)
+        .await
+        .expect("same-sizing pre-fund retry can replace its route");
+    let DecideAndJournal::Drive(attached) = attached else {
+        panic!("pending raw pay should be re-driven")
+    };
+    assert!(matches!(
+        &attached.action,
+        Action::Pay { gateway: Some(gateway), .. } if gateway.0 == "https://good.example"
+    ));
+    assert_eq!(
+        journal
+            .get(&original.idempotency_key)
+            .await
+            .expect("get")
+            .expect("intent")
+            .action,
+        attached.action,
+        "the replacement route must be durable before the driver uses it"
+    );
+}
+
+#[tokio::test]
+async fn unfunded_raw_receive_attach_can_replace_its_gateway() {
+    let to = FederationId([1; 32]);
+    let journal = MemJournal::new();
+    let original = decision(
+        "receive-key",
+        Action::Receive {
+            to,
+            amount: Msat(50),
+            fee_cap: Msat(3),
+            nonce: "nonce".into(),
+            gateway: Some(wallet_core::GatewayUrl("https://bad.example".into())),
+        },
+        ReasonCode::UserInitiated,
+    );
+    decide_and_journal(&journal, &original, Actor::User, 0, None, None)
+        .await
+        .expect("fresh receive");
+
+    let mut retry = original.clone();
+    let Action::Receive { gateway, .. } = &mut retry.action else {
+        unreachable!("fixture is a receive")
+    };
+    *gateway = Some(wallet_core::GatewayUrl("https://good.example".into()));
+
+    let attached = decide_and_journal(&journal, &retry, Actor::User, 1, None, None)
+        .await
+        .expect("same-sizing pre-fund retry can replace its route");
+    let DecideAndJournal::Drive(attached) = attached else {
+        panic!("pending raw receive should be re-driven")
+    };
+    assert!(matches!(
+        &attached.action,
+        Action::Receive { gateway: Some(gateway), .. } if gateway.0 == "https://good.example"
+    ));
+    assert_eq!(
+        journal
+            .get(&original.idempotency_key)
+            .await
+            .expect("get")
+            .expect("intent")
+            .action,
+        attached.action,
+        "the replacement route must be durable before the driver uses it"
+    );
+}
+
+#[tokio::test]
+async fn recomposed_apply_matches_explicit_decide_then_drive() {
+    for (action, awaiting) in [
+        (
+            Action::Move {
+                from: FederationId([1; 32]),
+                to: FederationId([2; 32]),
+                amount: Msat(42),
+                fee_cap: Msat(7),
+            },
+            false,
+        ),
+        (
+            Action::DirectInflow {
+                to: FederationId([2; 32]),
+                amount: Msat(42),
+                fee_cap: Msat(7),
+            },
+            true,
+        ),
+    ] {
+        let decision = decision("equivalence", action, ReasonCode::UserInitiated);
+        let composed_journal = MemJournal::new();
+        let composed_executor = MockExecutor::new();
+        if awaiting {
+            composed_executor.set_awaiting("equivalence");
+        }
+        apply(
+            &composed_journal,
+            &composed_executor,
+            std::slice::from_ref(&decision),
+            Actor::User,
+            99,
+        )
+        .await;
+
+        let split_journal = MemJournal::new();
+        let split_executor = MockExecutor::new();
+        if awaiting {
+            split_executor.set_awaiting("equivalence");
+        }
+        let DecideAndJournal::Drive(intent) =
+            decide_and_journal(&split_journal, &decision, Actor::User, 99, None, None)
+                .await
+                .expect("decide")
+        else {
+            panic!("fresh intent must drive");
+        };
+        let mut summary = ExecutionSummary::default();
+        drive_to_terminal(&split_journal, &split_executor, &intent, &mut summary).await;
+
+        assert_eq!(
+            composed_journal
+                .get(&decision.idempotency_key)
+                .await
+                .expect("composed row"),
+            split_journal
+                .get(&decision.idempotency_key)
+                .await
+                .expect("split row")
+        );
+    }
+}
+
+struct AlreadyInFlightExecutor;
+
+#[async_trait]
+impl Executor for AlreadyInFlightExecutor {
+    async fn perform(&self, _intent: &Intent) -> Result<PerformOutcome, ExecError> {
+        Ok(PerformOutcome::AwaitingAlreadyInFlight)
+    }
+}
+
+#[tokio::test]
+async fn drive_surfaces_already_in_flight_while_persisting_awaiting() {
+    let journal = MemJournal::new();
+    let decision = pay_decision("sdk-dedup", FederationId([1; 32]), 100, 7);
+    let DecideAndJournal::Drive(intent) =
+        decide_and_journal(&journal, &decision, Actor::User, 0, None, None)
+            .await
+            .expect("decide")
+    else {
+        panic!("fresh intent must drive");
+    };
+    let outcome = drive_intent_step(
+        &journal,
+        &AlreadyInFlightExecutor,
+        &intent,
+        &mut ExecutionSummary::default(),
+    )
+    .await
+    .expect("drive succeeds");
+    assert_eq!(outcome, Some(PerformOutcome::AwaitingAlreadyInFlight));
+    assert_eq!(
+        journal
+            .get(&decision.idempotency_key)
+            .await
+            .expect("get")
+            .expect("intent")
+            .status,
+        IntentStatus::Awaiting
+    );
 }
 
 #[async_trait]
@@ -116,8 +831,8 @@ impl Journal for GetFailsJournal {
         unreachable!("apply must not drive when get fails")
     }
 
-    async fn pending(&self) -> Vec<Intent> {
-        Vec::new()
+    async fn pending(&self) -> Result<Vec<Intent>, ExecError> {
+        Ok(Vec::new())
     }
 
     async fn failed(&self) -> Vec<Intent> {
@@ -164,7 +879,7 @@ impl Journal for BarrierJournal {
         self.inner.set_status_if(key, expected, new).await
     }
 
-    async fn pending(&self) -> Vec<Intent> {
+    async fn pending(&self) -> Result<Vec<Intent>, ExecError> {
         self.inner.pending().await
     }
 
@@ -210,11 +925,11 @@ impl Journal for DelayedPendingJournal {
         self.inner.set_status_if(key, expected, new).await
     }
 
-    async fn pending(&self) -> Vec<Intent> {
-        let snapshot = self.inner.pending().await;
+    async fn pending(&self) -> Result<Vec<Intent>, ExecError> {
+        let snapshot = self.inner.pending().await?;
         self.snapshot_taken.wait().await;
         self.release_snapshot.wait().await;
-        snapshot
+        Ok(snapshot)
     }
 
     async fn failed(&self) -> Vec<Intent> {
@@ -500,6 +1215,17 @@ async fn retryable_failure_stays_pending_and_reconcile_retries() {
         IntentStatus::Pending
     );
     assert!(executor.performed_keys().is_empty());
+
+    let pending = journal.get(&ikey(key)).await.expect("get").expect("intent");
+    let error = drive_intent_step(
+        &journal,
+        &executor,
+        &pending,
+        &mut ExecutionSummary::default(),
+    )
+    .await
+    .expect_err("the decomposed driver must surface the retry reason");
+    assert_eq!(error, ExecError::Retryable("injected".into()));
 
     executor.succeed(key);
     assert_eq!(reconcile(&journal, &executor).await, counts(1, 0, 0));
@@ -914,7 +1640,7 @@ impl Journal for RecordingJournal {
         self.inner.set_status_if(key, expected, new).await
     }
 
-    async fn pending(&self) -> Vec<Intent> {
+    async fn pending(&self) -> Result<Vec<Intent>, ExecError> {
         self.inner.pending().await
     }
 
@@ -929,6 +1655,89 @@ struct UnsupportedExecutor;
 impl Executor for UnsupportedExecutor {
     async fn perform(&self, _intent: &Intent) -> Result<PerformOutcome, ExecError> {
         Err(ExecError::Unsupported)
+    }
+}
+
+struct TerminalWriteFailsJournal {
+    inner: MemJournal,
+}
+
+#[async_trait]
+impl Journal for TerminalWriteFailsJournal {
+    async fn upsert(&self, intent: &Intent) -> Result<(), ExecError> {
+        self.inner.upsert(intent).await
+    }
+
+    async fn get(&self, key: &IdempotencyKey) -> Result<Option<Intent>, ExecError> {
+        self.inner.get(key).await
+    }
+
+    async fn set_status(
+        &self,
+        _key: &IdempotencyKey,
+        _status: IntentStatus,
+        _error: Option<&str>,
+    ) -> Result<(), ExecError> {
+        Err(ExecError::Permanent("terminal status write failed".into()))
+    }
+
+    async fn set_status_if(
+        &self,
+        key: &IdempotencyKey,
+        expected: IntentStatus,
+        new: IntentStatus,
+    ) -> Result<bool, ExecError> {
+        self.inner.set_status_if(key, expected, new).await
+    }
+
+    async fn pending(&self) -> Result<Vec<Intent>, ExecError> {
+        self.inner.pending().await
+    }
+
+    async fn failed(&self) -> Vec<Intent> {
+        self.inner.failed().await
+    }
+}
+
+#[tokio::test]
+async fn drive_propagates_terminal_status_write_failures() {
+    for unsupported in [false, true] {
+        let key = "move:terminal-write-failure";
+        let journal = TerminalWriteFailsJournal {
+            inner: MemJournal::new(),
+        };
+        let intent = Intent::from_decision(&move_decision(key, 42), Actor::User, 0);
+        journal.inner.upsert(&intent).await.expect("seed intent");
+        let mut summary = ExecutionSummary::default();
+
+        let error = if unsupported {
+            drive_intent_step(&journal, &UnsupportedExecutor, &intent, &mut summary)
+                .await
+                .expect_err("unsupported terminal write must fail")
+        } else {
+            let executor = MockExecutor::new();
+            executor.fail_permanent(key);
+            drive_intent_step(&journal, &executor, &intent, &mut summary)
+                .await
+                .expect_err("permanent terminal write must fail")
+        };
+
+        assert_eq!(
+            error,
+            ExecError::Permanent("terminal status write failed".into())
+        );
+        assert_eq!(summary.failed, 1);
+        assert_eq!(
+            journal
+                .inner
+                .get(&ikey(key))
+                .await
+                .expect("read intent")
+                .expect("intent exists")
+                .status,
+            IntentStatus::Executing,
+            "a failed terminal write must not be reported as durable"
+        );
     }
 }
 
