@@ -1427,9 +1427,84 @@ impl FedimintJournal {
     /// Upsert the `0x09` candidate row for its fed (§5.1.1). One row per fed, its own dbtx —
     /// the same write discipline as the probe/federation registries.
     pub async fn put_candidate(&self, rec: &CandidateRecord) -> Result<(), ExecError> {
-        let value = encode_row(rec)?;
+        let raw_key = candidate_key(&rec.id);
+        let mut next = rec.clone();
         let mut dbtx = self.db.begin_transaction().await;
-        dbtx.raw_insert_bytes(&candidate_key(&rec.id), &value)
+        // `UserApproved` is durable user ownership; NO discovery refresh may demote it. A pass
+        // reads a candidate (Discovered/AutoJoined), runs a slow network preview, then writes back
+        // its now-stale copy — `Rejected` on a failed structural, `Discovered`/`AutoJoined`
+        // otherwise (discovery.rs's preview and auto-join loops). Meanwhile `/v1/join` or
+        // `/v1/approve` may have committed `UserApproved`. This in-transaction read is the freshest
+        // view, so preserve the approval against EVERY stale non-`UserApproved` refresh, not just
+        // the `AutoJoined` one. Other state transitions retain their existing semantics.
+        if let Some(bytes) = dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? {
+            if let Ok(current) = decode_candidate_row(rec.id, &raw_key, &bytes) {
+                if current.state == CandidateState::UserApproved
+                    && rec.state != CandidateState::UserApproved
+                {
+                    next.state = CandidateState::UserApproved;
+                    next.updated_at_ms = next.updated_at_ms.max(current.updated_at_ms);
+                }
+            }
+        }
+        let value = encode_row(&next)?;
+        dbtx.raw_insert_bytes(&raw_key, &value)
+            .await
+            .map_err(db_err)?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Record ownership after a successful explicit user join. A user join promotes an absent,
+    /// Discovered, Rejected, or unreadable candidate to `UserApproved`; an `AutoJoined` row stays
+    /// agent-owned so only the audited `approve` verb can release its probe gate/concurrent slot.
+    pub async fn mark_candidate_user_approved(
+        &self,
+        id: FederationId,
+        invite: &InviteCode,
+    ) -> Result<(), ExecError> {
+        let now_ms = self.now_ms();
+        let raw_key = candidate_key(&id);
+        let fresh = CandidateRecord {
+            id,
+            invite: invite.clone(),
+            source: DiscoverySource::Manual,
+            discovered_at_ms: now_ms,
+            structural: StructuralOutcome::Passed,
+            structural_checked_at_ms: now_ms,
+            state: CandidateState::UserApproved,
+            updated_at_ms: now_ms,
+        };
+        let mut dbtx = self.db.begin_transaction().await;
+        let next = match dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? {
+            Some(bytes) => match decode_candidate_row(id, &raw_key, &bytes) {
+                Ok(current)
+                    if matches!(
+                        current.state,
+                        CandidateState::AutoJoined | CandidateState::UserApproved
+                    ) =>
+                {
+                    return Ok(())
+                }
+                Ok(mut current) => {
+                    current.state = CandidateState::UserApproved;
+                    current.updated_at_ms = now_ms;
+                    current
+                }
+                // A successful explicit join carries enough authenticated id/invite evidence to
+                // replace a poisoned candidate row instead of leaving the member probe-gated.
+                Err(error) => {
+                    tracing::warn!(
+                        federation = %id.to_hex(),
+                        ?error,
+                        "journal: replacing unreadable candidate after successful user join"
+                    );
+                    fresh
+                }
+            },
+            None => fresh,
+        };
+        dbtx.raw_insert_bytes(&raw_key, &encode_row(&next)?)
             .await
             .map_err(db_err)?;
         dbtx.commit_tx_result().await.map_err(db_err)?;

@@ -722,6 +722,130 @@ async fn candidate_registry_round_trips_every_state_and_upserts() {
 }
 
 #[tokio::test]
+async fn stale_candidate_refresh_does_not_overwrite_user_approval() {
+    let journal = mem_journal();
+    let id = fed(0x14);
+    let stale_refresh = candidate(id, CandidateState::AutoJoined);
+    journal
+        .put_candidate(&stale_refresh)
+        .await
+        .expect("seed auto-joined candidate");
+    journal
+        .approve_auto_joined_candidate(
+            id,
+            &IdempotencyKey("approve:concurrent-refresh".to_owned()),
+            1_700_000_000_300,
+        )
+        .await
+        .expect("approve candidate");
+
+    // Discovery fetched this AutoJoined value before approval, then completed a network
+    // preview afterward. Its stale refresh must not demote the durable user ownership.
+    journal
+        .put_candidate(&stale_refresh)
+        .await
+        .expect("write stale discovery refresh");
+
+    let preserved = journal
+        .get_candidate(&id)
+        .await
+        .expect("read candidate")
+        .expect("candidate exists");
+    assert_eq!(preserved.state, CandidateState::UserApproved);
+    assert_eq!(preserved.updated_at_ms, 1_700_000_000_300);
+}
+
+#[tokio::test]
+async fn stale_discovered_or_rejected_refresh_does_not_overwrite_user_approval() {
+    // Discovery also writes `Discovered` (preview passed, not auto-joined) or `Rejected` (failed
+    // structural) refreshes whose in-memory snapshot can predate a concurrent `/v1/join` or
+    // `/v1/approve`. Neither may demote the durable user ownership — the guard preserves
+    // `UserApproved` against EVERY non-`UserApproved` refresh, not only the `AutoJoined` one.
+    for stale in [CandidateState::Discovered, CandidateState::Rejected] {
+        let journal = mem_journal();
+        let id = fed(0x1a);
+        journal
+            .mark_candidate_user_approved(id, &invite())
+            .await
+            .expect("record user ownership");
+
+        let mut refresh = candidate(id, stale);
+        if stale == CandidateState::Rejected {
+            refresh.structural = StructuralOutcome::Rejected("failed preview".to_owned());
+        }
+        journal
+            .put_candidate(&refresh)
+            .await
+            .expect("write stale discovery refresh");
+
+        let preserved = journal
+            .get_candidate(&id)
+            .await
+            .expect("read candidate")
+            .expect("candidate exists");
+        assert_eq!(
+            preserved.state,
+            CandidateState::UserApproved,
+            "a stale {stale:?} refresh must not demote user ownership"
+        );
+    }
+}
+
+#[tokio::test]
+async fn successful_user_join_marks_ownership_without_claiming_auto_joined_membership() {
+    let journal = mem_journal();
+    let absent = fed(0x15);
+    journal
+        .mark_candidate_user_approved(absent, &invite())
+        .await
+        .expect("record absent user-joined candidate");
+    assert_eq!(
+        journal
+            .get_candidate(&absent)
+            .await
+            .expect("read inserted candidate")
+            .expect("candidate inserted")
+            .state,
+        CandidateState::UserApproved
+    );
+
+    for (byte, initial, expected) in [
+        (
+            0x16,
+            CandidateState::Discovered,
+            CandidateState::UserApproved,
+        ),
+        (0x17, CandidateState::Rejected, CandidateState::UserApproved),
+        (0x18, CandidateState::AutoJoined, CandidateState::AutoJoined),
+        (
+            0x19,
+            CandidateState::UserApproved,
+            CandidateState::UserApproved,
+        ),
+    ] {
+        let id = fed(byte);
+        journal
+            .put_candidate(&candidate(id, initial))
+            .await
+            .expect("seed candidate");
+        journal
+            .mark_candidate_user_approved(id, &invite())
+            .await
+            .expect("record user join ownership");
+        assert_eq!(
+            journal
+                .get_candidate(&id)
+                .await
+                .expect("read candidate")
+                .expect("candidate remains")
+                .state,
+            expected,
+            "initial state {initial:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn list_candidates_skips_poison_rows() {
     let db = MemDatabase::new().into_database();
     let journal = FedimintJournal::new(db.clone());

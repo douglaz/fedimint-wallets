@@ -3710,7 +3710,7 @@ fn direct_inflow_key(
 /// request so `apply` dedups it (no re-mint/re-pay); bumping `occurrence` produces a fresh key
 /// for a genuinely new move. All params participate, so a same-`from`/`to`/`occurrence` request
 /// with a DIFFERENT amount/cap is a distinct move rather than silently dedup'd to the old one.
-pub(crate) fn move_key(
+pub fn move_key(
     from: &FederationId,
     to: &FederationId,
     amount: Msat,
@@ -3727,7 +3727,7 @@ pub(crate) fn move_key(
     ))
 }
 
-fn raw_pay_key(payment_hash: [u8; 32]) -> IdempotencyKey {
+pub fn raw_pay_key(payment_hash: [u8; 32]) -> IdempotencyKey {
     IdempotencyKey(format!("pay:{}", bytes_hex(&payment_hash)))
 }
 
@@ -3735,7 +3735,16 @@ pub fn raw_receive_key(to: FederationId, amount: Msat, nonce: &str) -> Idempoten
     IdempotencyKey(format!("recv:{}:{}:{nonce}", to.to_hex(), amount.0))
 }
 
-fn join_intent_key(federation: FederationId, invite: &str) -> IdempotencyKey {
+/// The nonce-anchored idempotency key for a `walletd` API `direct-inflow` (spec §6a.6): a
+/// timed-out client retry with the SAME `(to, amount, nonce)` collides on this key and
+/// dedups, while a deliberate repeat carries a fresh nonce. Distinct from the standalone
+/// verb's occurrence-anchored [`direct_inflow_key`] — the two entry points key differently by
+/// design (§6a.6), but both derive here so the daemon never forks its own scheme.
+pub fn direct_inflow_nonce_key(to: FederationId, amount: Msat, nonce: &str) -> IdempotencyKey {
+    IdempotencyKey(format!("dinflow:{}:{}:{nonce}", to.to_hex(), amount.0))
+}
+
+pub fn join_intent_key(federation: FederationId, invite: &str) -> IdempotencyKey {
     let invite_hash = sha256::Hash::hash(invite.as_bytes()).to_byte_array();
     IdempotencyKey(format!(
         "join:{}:{}",

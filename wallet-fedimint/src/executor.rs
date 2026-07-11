@@ -45,7 +45,8 @@ use std::collections::BTreeMap;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use wallet_core::{
-    Action, ExecError, Executor, FederationId, Intent, Journal, Msat, OperationId, PerformOutcome,
+    Action, Actor, ExecError, Executor, FederationId, Intent, Journal, Msat, OperationId,
+    PerformOutcome,
 };
 
 /// Pinned lnv2 requires the gateway-reduced incoming contract to be at least 5 sats
@@ -1073,6 +1074,14 @@ impl FedimintExecutor {
                     &invite.to_string(),
                     registered_invite.as_deref(),
                 );
+                if intent.actor == Actor::User {
+                    // The network join succeeded. Persist explicit user ownership before the
+                    // terminal transition; a retry is idempotent, while AutoJoined remains owned
+                    // by the agent until the separately-audited approve verb runs.
+                    self.journal
+                        .mark_candidate_user_approved(*federation, &invite)
+                        .await?;
+                }
                 self.journal
                     .record_join_outcome(&intent.idempotency_key, newly_joined)
                     .await?;

@@ -1565,6 +1565,8 @@ async fn shutdown_drain_deregisters_finished_drivers_without_spawning_handoffs()
         registry: _,
         scheduler_abort: _,
         scheduler_task: _,
+        scheduler_alive: _,
+        critical_exit: _,
         policy_wake: _,
     } = service;
     let (shutdown_reply, shutdown_result) = oneshot::channel();
@@ -2250,6 +2252,25 @@ async fn shutdown_drains_the_actor_even_when_the_scheduler_panics() {
         client.get_policy().await,
         Err(ServiceError::ShuttingDown)
     ));
+}
+
+#[tokio::test]
+async fn critical_task_guard_reports_panics_and_clears_scheduler_liveness() {
+    let (exit_tx, mut exit_rx) = mpsc::unbounded_channel();
+    let alive = Arc::new(AtomicBool::new(true));
+    let task_alive = alive.clone();
+    let task = tokio::spawn(async move {
+        let _guard = CriticalTaskGuard {
+            name: "test scheduler",
+            exit: exit_tx,
+            liveness: Some(task_alive),
+        };
+        panic!("injected scheduler panic");
+    });
+
+    assert!(task.await.is_err(), "fixture task must panic");
+    assert_eq!(exit_rx.recv().await, Some("test scheduler"));
+    assert!(!alive.load(Ordering::Acquire));
 }
 
 #[tokio::test]
@@ -3065,6 +3086,8 @@ async fn closing_every_sender_exits_actor_cleanly() {
         registry: _,
         scheduler_abort: _,
         scheduler_task: _,
+        scheduler_alive: _,
+        critical_exit: _,
         policy_wake: _,
     } = service;
     drop(client);

@@ -269,6 +269,9 @@ pub struct OperationView {
     pub actor: String,
     pub reason: String,
     pub operation_key: String,
+    /// The ledger row's failure diagnostic (audit-honest: cleared on success). Without it a
+    /// caller directed to `/v1/operations/{key}` after a failure learns only THAT it failed.
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -587,6 +590,7 @@ mod tests {
             actor: "user".to_owned(),
             reason: "user_initiated".to_owned(),
             operation_key: "move:example".to_owned(),
+            error: Some("gateway route rejected".to_owned()),
         };
         assert_json_roundtrip(OperationAccepted {
             operation_key: "pay:example".to_owned(),

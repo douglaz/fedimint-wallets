@@ -273,6 +273,46 @@ async fn run_cycle(
             "watch scheduler: ledger repair failed; continuing cycle"
         );
     }
+    // §15.8 (ported from the standalone watch): a tick must NOT drive money decisions from a
+    // partial world-view — an unopened joined federation would silently vanish from balances,
+    // probes, and every allocation the cycle plans. The 5.2 watch process refused to start and
+    // relied on the supervisor restart to retry `open_all`; the daemon keeps serving user ops
+    // but retries the MISSING opens itself each cycle (re-opening an already-open fed would
+    // replace its live client under in-flight drivers, so only the missing set is retried) and
+    // skips the whole automated cycle — tick, scheduled probes, discovery — until whole.
+    // Crash-recovery (the reconcile + repair above) still runs: re-driving already-admitted
+    // intents is not a fresh money decision over the world-view.
+    let multi_client = runtime.service_multi_client();
+    let joined = runtime
+        .service_journal()
+        .list_federations()
+        .await
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let open: BTreeSet<_> = multi_client.federations().into_iter().collect();
+    let missing: Vec<_> = joined
+        .iter()
+        .filter(|(id, _)| !open.contains(id))
+        .map(|(_, info)| info.clone())
+        .collect();
+    if !missing.is_empty() {
+        let _ = multi_client.open_all(&missing).await;
+        let open: BTreeSet<_> = multi_client.federations().into_iter().collect();
+        let unopened: Vec<_> = joined
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| !open.contains(id))
+            .collect();
+        if !unopened.is_empty() {
+            tracing::warn!(
+                unopened = ?unopened.iter().map(|id| id.to_hex()).collect::<Vec<_>>(),
+                "watch scheduler: partial federation view; skipping the automated cycle (§15.8)"
+            );
+            return Ok(CycleResult {
+                deadlines: wallet_core::AdaptiveSleepDeadlines::default(),
+                noop: false,
+            });
+        }
+    }
     let policy = client.get_policy().await.map_err(anyhow::Error::new)?;
     let watch_state = runtime
         .service_journal()

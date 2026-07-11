@@ -467,6 +467,14 @@ impl WalletClient {
         .await
     }
 
+    /// Approximate actor-mailbox occupancy for `/v1/health`: submitted commands not yet
+    /// received. A snapshot of a moving value, never held as an invariant.
+    pub fn queue_depth(&self) -> usize {
+        self.sender
+            .max_capacity()
+            .saturating_sub(self.sender.capacity())
+    }
+
     pub async fn get_policy(&self) -> ServiceResult<Policy> {
         self.request(|reply| Command::GetPolicy { reply }).await
     }
@@ -491,6 +499,11 @@ pub struct WalletService {
     registry: driver::Registry,
     scheduler_abort: Option<oneshot::Sender<()>>,
     scheduler_task: Option<JoinHandle<()>>,
+    /// Cleared when the scheduler task returns (graceful abort OR panic), so `/v1/health`
+    /// reports scheduler liveness without owning the join handle. Seeded `false` when no
+    /// runtime is present (a detached fixture service has no scheduler).
+    scheduler_alive: Arc<AtomicBool>,
+    critical_exit: mpsc::UnboundedReceiver<&'static str>,
     #[cfg(test)]
     policy_wake: tokio::sync::watch::Receiver<u64>,
 }
@@ -499,6 +512,36 @@ impl WalletService {
     /// Live in-flight driver count — the `/v1/health` observability surface.
     pub fn inflight_drivers(&self) -> usize {
         driver::len(&self.registry)
+    }
+
+    /// A cloneable handle to the scheduler-liveness flag for `/v1/health`: `true` while the
+    /// scheduler task runs, flipped `false` when it returns or panics.
+    pub fn scheduler_liveness(&self) -> Arc<AtomicBool> {
+        self.scheduler_alive.clone()
+    }
+
+    /// Wait for the actor or scheduler to stop unexpectedly. The daemon races this against
+    /// SIGTERM/SIGINT and the HTTP server so systemd can restart a degraded process instead of
+    /// leaving it alive with a dead critical task.
+    pub async fn critical_task_exit(&mut self) -> Option<&'static str> {
+        self.critical_exit.recv().await
+    }
+}
+
+/// Reports task exit even when unwinding from a panic. The liveness flag is scheduler-only;
+/// actor guards leave it absent.
+struct CriticalTaskGuard {
+    name: &'static str,
+    exit: mpsc::UnboundedSender<&'static str>,
+    liveness: Option<Arc<AtomicBool>>,
+}
+
+impl Drop for CriticalTaskGuard {
+    fn drop(&mut self) {
+        if let Some(liveness) = &self.liveness {
+            liveness.store(false, Ordering::Release);
+        }
+        let _ = self.exit.send(self.name);
     }
 }
 
@@ -511,6 +554,18 @@ impl WalletService {
             Arc::new(runtime.service_executor(Some(policy.per_fed_cap)));
         let perform_timeout = runtime.service_perform_timeout();
         Self::start_parts(Some(runtime), journal, executor, policy, perform_timeout).await
+    }
+
+    /// Fixture/test constructor: a detached service (no runtime → no scheduler, no network)
+    /// over a caller-supplied journal + [`Executor`], seeding the policy insert-if-absent.
+    /// Production uses [`Self::start`]; the daemon's axum tests use this to exercise the HTTP
+    /// surface against an in-process actor without live guardians.
+    pub async fn start_detached(
+        journal: Arc<FedimintJournal>,
+        executor: Arc<dyn Executor>,
+        seed_policy: Policy,
+    ) -> ServiceResult<Self> {
+        Self::start_parts(None, journal, executor, seed_policy, None).await
     }
 
     async fn start_parts(
@@ -543,29 +598,52 @@ impl WalletService {
         #[cfg(test)]
         let test_policy_wake = policy_wake_rx.clone();
         let scheduler_runtime = runtime.clone();
-        let task = tokio::spawn(actor::run(
-            receiver,
-            client.sender.downgrade(),
-            accepting,
-            runtime,
-            journal,
-            executor,
-            policy,
-            perform_timeout,
-            registry.clone(),
-            policy_wake,
-        ));
+        let (critical_exit_tx, critical_exit) = mpsc::unbounded_channel();
+        let actor_exit = critical_exit_tx.clone();
+        let actor_sender = client.sender.downgrade();
+        let actor_registry = registry.clone();
+        let task = tokio::spawn(async move {
+            let _guard = CriticalTaskGuard {
+                name: "wallet actor",
+                exit: actor_exit,
+                liveness: None,
+            };
+            actor::run(
+                receiver,
+                actor_sender,
+                accepting,
+                runtime,
+                journal,
+                executor,
+                policy,
+                perform_timeout,
+                actor_registry,
+                policy_wake,
+            )
+            .await;
+        });
+        let scheduler_alive = Arc::new(AtomicBool::new(scheduler_runtime.is_some()));
         let (scheduler_abort, scheduler_task) = match scheduler_runtime {
             Some(runtime) => {
                 let (abort, abort_rx) = oneshot::channel();
                 let scheduler_client = client.clone();
-                let task = tokio::spawn(scheduler::run(
-                    runtime,
-                    scheduler_client,
-                    scheduler::default_sources(),
-                    policy_wake_rx,
-                    abort_rx,
-                ));
+                let liveness = scheduler_alive.clone();
+                let scheduler_exit = critical_exit_tx.clone();
+                let task = tokio::spawn(async move {
+                    let _guard = CriticalTaskGuard {
+                        name: "wallet scheduler",
+                        exit: scheduler_exit,
+                        liveness: Some(liveness),
+                    };
+                    scheduler::run(
+                        runtime,
+                        scheduler_client,
+                        scheduler::default_sources(),
+                        policy_wake_rx,
+                        abort_rx,
+                    )
+                    .await;
+                });
                 (Some(abort), Some(task))
             }
             None => (None, None),
@@ -576,6 +654,8 @@ impl WalletService {
             registry,
             scheduler_abort,
             scheduler_task,
+            scheduler_alive,
+            critical_exit,
             #[cfg(test)]
             policy_wake: test_policy_wake,
         })
