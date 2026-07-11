@@ -119,6 +119,7 @@ fn leg_intent_with_fee_cap(
 ) -> Intent {
     Intent {
         idempotency_key: key,
+        attempt: 0,
         action: Action::Move {
             from,
             to,

@@ -201,6 +201,7 @@ impl FedimintExecutor {
         plan: &MovePlan,
     ) -> Result<MoveRecord, ExecError> {
         let cached = self.journal.get_move(&intent.idempotency_key).await?;
+        let operation_key = intent.operation_correlation_key();
 
         // Backfill both sides: the receive leg lives on `to`, the send leg on `from`. For a
         // single-fed self-move (`from == to`, Phase 1) one client holds both legs, so skip
@@ -220,7 +221,7 @@ impl FedimintExecutor {
         let gateway = match gateway_from_cache_or_recovered(
             cached.as_ref(),
             plan,
-            &intent.idempotency_key,
+            &operation_key,
             &artifacts,
         ) {
             Some(gateway) => gateway,
@@ -231,6 +232,7 @@ impl FedimintExecutor {
 
         let params = MoveParams {
             key: intent.idempotency_key.clone(),
+            operation_key,
             from: plan.from,
             to: plan.to,
             amount: plan.amount,
@@ -875,7 +877,7 @@ impl FedimintExecutor {
                 };
                 let meta = serde_json::json!({
                     "role": "send",
-                    "correlation_key": intent.idempotency_key.0,
+                    "correlation_key": intent.operation_correlation_key().0,
                 });
                 let outcome = self
                     .mc
@@ -935,7 +937,10 @@ impl FedimintExecutor {
                 }
                 if let Some((invoice, operation_id)) = self
                     .mc
-                    .find_receive_artifact_by_correlation_key(to, &intent.idempotency_key)
+                    .find_receive_artifact_by_correlation_key(
+                        to,
+                        &intent.operation_correlation_key(),
+                    )
                     .await?
                 {
                     self.verify_raw_receive_fee_cap(
@@ -1024,7 +1029,7 @@ impl FedimintExecutor {
                 };
                 let meta = serde_json::json!({
                     "role": "receive",
-                    "correlation_key": intent.idempotency_key.0,
+                    "correlation_key": intent.operation_correlation_key().0,
                 });
                 let (invoice, operation_id) = self
                     .mc
@@ -1158,7 +1163,7 @@ impl FedimintExecutor {
                     // history with the receive quote blanked.
                     self.journal.put_move(&rec).await?;
                     let meta = MoveMeta {
-                        move_id: rec.key.clone(),
+                        move_id: intent.operation_correlation_key(),
                         role: MoveRole::Receive,
                         amount: net_amount,
                         from: rec.from,
@@ -1289,7 +1294,7 @@ impl FedimintExecutor {
                     pay_step_cap_verdict(receive_quote, send_quote, rec.fee_cap)?;
 
                     let meta = MoveMeta {
-                        move_id: rec.key.clone(),
+                        move_id: intent.operation_correlation_key(),
                         role: MoveRole::Send,
                         amount: rec.amount,
                         from: rec.from,
@@ -1973,6 +1978,7 @@ mod tests {
         let max_fee = action.fee_cap();
         Intent {
             idempotency_key: IdempotencyKey("gate-test".into()),
+            attempt: 0,
             action,
             max_fee,
             status: IntentStatus::Pending,

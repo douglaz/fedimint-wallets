@@ -21,6 +21,9 @@ pub enum IntentStatus {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Intent {
     pub idempotency_key: IdempotencyKey,
+    /// Zero for the first durable attempt; incremented only when a user deliberately
+    /// retries a terminal failure under the same public idempotency key.
+    pub attempt: u32,
     pub action: Action,
     /// Derived from `action.fee_cap()`: `Some` for money actions carrying an explicit
     /// bound; `None` for the fee-free `Join` and advisory actions.
@@ -46,6 +49,7 @@ impl Intent {
     pub fn from_decision(decision: &AllocatorDecision, actor: Actor, now_ms: u64) -> Self {
         Self {
             idempotency_key: decision.idempotency_key.clone(),
+            attempt: 0,
             action: decision.action.clone(),
             max_fee: decision.action.fee_cap(),
             status: IntentStatus::Pending,
@@ -55,6 +59,24 @@ impl Intent {
             operation_id: None,
             invoice: None,
         }
+    }
+
+    /// Correlation key written into SDK operation metadata for this durable attempt.
+    ///
+    /// The public idempotency key remains stable across a manual retry, while the SDK
+    /// correlation must change so recovery cannot attach the new attempt to an operation
+    /// that made the preceding attempt terminally fail. First attempts retain the historic
+    /// key shape; retries use an unambiguous length-prefixed derivative.
+    pub fn operation_correlation_key(&self) -> IdempotencyKey {
+        if self.attempt == 0 {
+            return self.idempotency_key.clone();
+        }
+        IdempotencyKey(format!(
+            "retry:{}:{}:{}",
+            self.idempotency_key.0.len(),
+            self.idempotency_key.0,
+            self.attempt
+        ))
     }
 }
 
@@ -597,6 +619,14 @@ pub async fn decide_and_journal<J: Journal>(
     balances: Option<&BTreeMap<FederationId, Msat>>,
     per_fed_cap: Option<Msat>,
 ) -> Result<DecideAndJournal, ExecError> {
+    // Advisory actions (`RefuseInflow`) are policy signals, not work: never journal an
+    // Intent for them. `apply` filters them before calling; this hard error makes the
+    // invariant self-enforcing for every OTHER caller (step-3 review, round 8).
+    if matches!(decision.action, Action::RefuseInflow { .. }) {
+        return Err(ExecError::Permanent(
+            "advisory actions are never journaled as intents".into(),
+        ));
+    }
     let existing = journal.get(&decision.idempotency_key).await?;
     match existing {
         Some(intent) if intent.status == IntentStatus::Failed => {
@@ -810,7 +840,7 @@ pub async fn drive_to_terminal<J: Journal, E: Executor>(
 
 /// Claim and drive one journaled intent through the existing executor lifecycle, recording
 /// the terminal transition exactly once. Network work begins only inside this function.
-pub async fn drive_intent_step<J: Journal, E: Executor>(
+pub async fn drive_intent_step<J: Journal, E: Executor + ?Sized>(
     journal: &J,
     executor: &E,
     intent: &Intent,

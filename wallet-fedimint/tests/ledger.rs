@@ -83,6 +83,7 @@ fn fees_send(quote: u64) -> FeeBreakdown {
 fn move_intent(k: &str, status: IntentStatus) -> Intent {
     Intent {
         idempotency_key: key(k),
+        attempt: 0,
         action: Action::Move {
             from: fed(1),
             to: fed(2),
@@ -221,6 +222,7 @@ async fn raw_finalizer_completes_intent_and_ledger_from_one_observation() {
     let operation_id = op(7);
     let intent = Intent {
         idempotency_key: key.clone(),
+        attempt: 0,
         action: Action::Pay {
             from: fed(1),
             invoice: Invoice("lnbc1fixture".into()),
@@ -772,6 +774,7 @@ async fn raw_negative_repair_keeps_the_intent_retriable_and_the_ledger_defeasibl
     let k = key("pay:0101:soft-intent");
     j.upsert(&Intent {
         idempotency_key: k.clone(),
+        attempt: 0,
         action: Action::Pay {
             from: fed(1),
             invoice: Invoice("lnbc1repairfixture".into()),
@@ -1088,6 +1091,7 @@ async fn repair_awaiting_with_op_id_terminalizes_from_the_op_log() {
     .expect("op-id update"); // -> Awaiting
     j.upsert(&Intent {
         idempotency_key: k.clone(),
+        attempt: 0,
         action: Action::Receive {
             to: fed(1),
             amount: Msat(1_000),

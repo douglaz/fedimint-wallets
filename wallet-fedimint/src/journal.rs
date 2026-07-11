@@ -307,6 +307,78 @@ impl FedimintJournal {
         (self.clock)()
     }
 
+    /// Atomically begin a deliberate retry of a terminal-failed intent while preserving the
+    /// failed attempt's immutable ledger row. The intent key remains the public idempotency
+    /// anchor; the ledger index advances to a fresh row for the new attempt, so history retains
+    /// both truthful outcomes and `operation(key)` resolves the currently active attempt.
+    pub async fn retry_failed_intent(&self, refreshed: &Intent) -> Result<(), ExecError> {
+        if refreshed.status != IntentStatus::Pending {
+            return Err(ExecError::Permanent(
+                "journal: a manual retry must restart as Pending".to_owned(),
+            ));
+        }
+        let key = &refreshed.idempotency_key;
+        let ikey = intent_key(key);
+        let mut dbtx = self.db.begin_transaction().await;
+        let old_bytes = dbtx
+            .raw_get_bytes(&ikey)
+            .await
+            .map_err(db_err)?
+            .ok_or_else(|| ExecError::Permanent("journal: retry intent not found".to_owned()))?;
+        let old: Intent = decode_row_result("intent", &ikey, &old_bytes)?;
+        if old.status != IntentStatus::Failed {
+            return Err(ExecError::Permanent(format!(
+                "journal: intent {} is not Failed and cannot be manually retried",
+                key.0
+            )));
+        }
+        let expected_attempt = old.attempt.checked_add(1).ok_or_else(|| {
+            ExecError::Permanent("journal: manual retry attempt counter overflow".to_owned())
+        })?;
+        if refreshed.attempt != expected_attempt {
+            return Err(ExecError::Permanent(format!(
+                "journal: manual retry attempt must advance from {} to {}",
+                old.attempt, expected_attempt
+            )));
+        }
+
+        dbtx.raw_remove_entry(&pending_index_key(IntentStatus::Failed, key))
+            .await
+            .map_err(db_err)?;
+        dbtx.raw_insert_bytes(&ikey, &encode_row(refreshed)?)
+            .await
+            .map_err(db_err)?;
+        dbtx.raw_insert_bytes(&pending_index_key(IntentStatus::Pending, key), &[])
+            .await
+            .map_err(db_err)?;
+        // The 0x02 row is the derived state of the attempt that just failed. In
+        // particular, a cached terminal MovePhase would make the refreshed Pending
+        // intent fail again before doing any work. The old attempt's immutable ledger
+        // row remains its audit record; this cache is safe and necessary to reset.
+        dbtx.raw_remove_entry(&move_key(key))
+            .await
+            .map_err(db_err)?;
+
+        let counter_key = ledger_counter_key();
+        let next_seq = match dbtx.raw_get_bytes(&counter_key).await.map_err(db_err)? {
+            Some(bytes) => read_be64(&bytes)
+                .ok_or_else(|| ExecError::Permanent("journal: corrupt ledger counter".into()))?,
+            None => 0,
+        };
+        let now = self.now_ms();
+        let row = fresh_intent_record(next_seq, refreshed, OperationStatus::Started, now, None);
+        dbtx.raw_insert_bytes(&counter_key, &(next_seq + 1).to_be_bytes())
+            .await
+            .map_err(db_err)?;
+        dbtx.raw_insert_bytes(&ledger_row_key(next_seq), &encode_row(&row)?)
+            .await
+            .map_err(db_err)?;
+        dbtx.raw_insert_bytes(&ledger_key_index(key), &next_seq.to_be_bytes())
+            .await
+            .map_err(db_err)?;
+        dbtx.commit_tx_result().await.map_err(db_err)
+    }
+
     // --- inherent read helpers (shared by the trait methods) ---
 
     /// Load and decode the [`Intent`] stored under `key`, or `None` if absent.
@@ -1035,12 +1107,44 @@ impl FedimintJournal {
             .collect())
     }
 
-    /// Newest-first time-windowed ledger rows needed by the watch probe scheduler.
+    /// Newest-first time-windowed ledger rows needed by the watch probe scheduler. An unresolved
+    /// probe remains visible regardless of age because its durable session can still resume and
+    /// spend; only terminal probe history expires with the requested horizon.
     pub async fn probe_schedule_ledger_rows(
         &self,
         now_ms: u64,
         horizon_ms: u64,
     ) -> Result<Vec<OperationRecord>, ExecError> {
+        Ok(self
+            .probe_schedule_ledger_rows_report(now_ms, horizon_ms)
+            .await?
+            .rows)
+    }
+
+    /// Probe-budget reconstruction must fail closed: a skipped row could be an in-window
+    /// automated probe attempt or spend that is required to enforce the hard weekly limits.
+    pub(crate) async fn probe_budget_ledger_rows(
+        &self,
+        now_ms: u64,
+        horizon_ms: u64,
+    ) -> Result<Vec<OperationRecord>, ExecError> {
+        let report = self
+            .probe_schedule_ledger_rows_report(now_ms, horizon_ms)
+            .await?;
+        if report.skipped_rows != 0 {
+            return Err(ExecError::Permanent(format!(
+                "journal: cannot reconstruct probe budget: {} ledger row(s) were corrupt",
+                report.skipped_rows
+            )));
+        }
+        Ok(report.rows)
+    }
+
+    async fn probe_schedule_ledger_rows_report(
+        &self,
+        now_ms: u64,
+        horizon_ms: u64,
+    ) -> Result<LedgerRowsReport, ExecError> {
         let cutoff_ms = now_ms.saturating_sub(horizon_ms);
         let mut dbtx = self.db.begin_transaction_nc().await;
         let mut stream = dbtx
@@ -1048,20 +1152,32 @@ impl FedimintJournal {
             .await
             .map_err(db_err)?;
         let mut rows = Vec::new();
+        let mut skipped_rows = 0;
         while let Some((raw_key, value)) = stream.next().await {
             match decode_row_result::<OperationRecord>("ledger row", &raw_key, &value) {
                 Ok(rec) => {
-                    if rec.created_at_ms < cutoff_ms && rec.updated_at_ms < cutoff_ms {
+                    let unresolved_probe = matches!(
+                        &rec.kind,
+                        OperationKind::Probe {
+                            cost_msat: None,
+                            ..
+                        }
+                    ) && !rec.status.is_terminal();
+                    if rec.created_at_ms < cutoff_ms
+                        && rec.updated_at_ms < cutoff_ms
+                        && !unresolved_probe
+                    {
                         continue;
                     }
                     rows.push(rec);
                 }
                 Err(e) => {
+                    skipped_rows += 1;
                     tracing::warn!(?raw_key, error = ?e, "journal: skipping undecodable ledger row")
                 }
             }
         }
-        Ok(rows)
+        Ok(LedgerRowsReport { rows, skipped_rows })
     }
 
     /// Resolve a single ledger row by correlation key OR seq (§9.3, for `show`).

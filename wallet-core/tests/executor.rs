@@ -1001,6 +1001,31 @@ fn direct_inflow_is_executable() {
     assert_eq!(action.fee_cap(), Some(Msat(500)));
 }
 
+#[tokio::test]
+async fn decide_and_journal_rejects_advisory_actions() {
+    // The "advisories are never journaled" guard used to live only in `apply`'s loop;
+    // decide_and_journal now enforces it for every caller (step-3 review, round 8).
+    let journal = MemJournal::new();
+    let decision = AllocatorDecision {
+        action: Action::RefuseInflow {
+            fed: FederationId([9; 32]),
+            reason: ReasonCode::OverCap,
+        },
+        reason: ReasonCode::OverCap,
+        occurrence: Occurrence(0),
+        idempotency_key: IdempotencyKey("advisory:never".into()),
+    };
+    assert!(matches!(
+        decide_and_journal(&journal, &decision, Actor::User, 0, None, None).await,
+        Err(ExecError::Permanent(reason)) if reason.contains("advisory")
+    ));
+    assert!(journal
+        .get(&decision.idempotency_key)
+        .await
+        .expect("journal read")
+        .is_none());
+}
+
 #[test]
 fn advisory_actions_are_not_executable() {
     let refuse = Action::RefuseInflow {

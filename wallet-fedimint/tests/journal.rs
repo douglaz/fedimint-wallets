@@ -39,6 +39,7 @@ fn fed(n: u8) -> FederationId {
 fn intent(key: &str, status: IntentStatus) -> Intent {
     Intent {
         idempotency_key: IdempotencyKey(key.to_string()),
+        attempt: 0,
         action: Action::Move {
             from: fed(1),
             to: fed(2),

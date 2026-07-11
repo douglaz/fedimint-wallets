@@ -70,7 +70,10 @@ pub struct OpArtifact {
 /// `Action` enum). AUTHORITATIVE for from/to/amount/fee_cap/gateway/send_required.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MoveParams {
+    /// Public journal/ledger identity, stable across a deliberate manual retry.
     pub key: IdempotencyKey,
+    /// Per-attempt SDK metadata identity used to select crash-recovery artifacts.
+    pub operation_key: IdempotencyKey,
     pub from: Option<FederationId>,
     pub to: FederationId,
     pub amount: Msat,
@@ -177,7 +180,8 @@ pub enum MoveRole {
 /// allocator stamps it into the idempotency key), and backfill keys purely on `move_id`.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MoveMeta {
-    /// `== MoveRecord.key == Intent key` — the join key across both legs (embeds occurrence).
+    /// Per-attempt join key across both legs. It equals the public intent key on the
+    /// first attempt and changes for a deliberate retry of a terminal failure.
     pub move_id: IdempotencyKey,
     pub role: MoveRole,
     /// The net amount the destination should receive. For a fresh evacuation this may be lower
@@ -360,7 +364,10 @@ pub fn assemble_move_record(
     let cached_send_fee_quoted = cached.as_ref().and_then(|c| c.send_fee_quoted);
     let mut artifact_amount = None;
 
-    for artifact in artifacts.iter().filter(|a| a.move_id == params.key) {
+    for artifact in artifacts
+        .iter()
+        .filter(|a| a.move_id == params.operation_key)
+    {
         if artifact_amount.is_none() {
             artifact_amount = Some(artifact.amount);
         }

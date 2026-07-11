@@ -43,6 +43,7 @@ pub mod move_protocol;
 pub mod multi_client;
 pub mod probe;
 pub mod runtime;
+pub mod service;
 pub mod tick;
 pub mod types;
 
@@ -71,6 +72,11 @@ pub use runtime::{
     raw_receive_key, DirectInflowOutcome, FinalizeOutcome, MoveOutcome, ProbeOutcome, ProbeReport,
     ReconcileSummary, Runtime, WatchCycleReport, WatchDiscoverOutcome, WatchProbeOutcome,
     WatchProbeReport, WatchReconcileOutcome, WatchTickOutcome,
+};
+pub use service::{
+    AwaitOutcome, Command, DecidedOp, JournalTransition, OpRequest, ProbeCandidate, ProbeDecision,
+    ReconcileReport as ServiceReconcileReport, ServiceError, Snapshot, SnapshotScope,
+    TransitionResult, WalletClient, WalletService,
 };
 pub use tick::{build_snapshot, ScoredFed, StatusReport, TickPolicy, TickReport};
 pub use types::{GatewayUrl, Invoice, OperationId, Preimage};

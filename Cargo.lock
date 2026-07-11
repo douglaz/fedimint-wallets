@@ -7529,6 +7529,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "wallet-api",
  "wallet-core",
 ]
 

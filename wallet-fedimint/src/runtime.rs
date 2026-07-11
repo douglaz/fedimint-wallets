@@ -28,10 +28,12 @@ use crate::discovery::{
 use crate::executor::FedimintExecutor;
 use crate::journal::{
     CandidateListReport, CandidateState, FedimintJournal, OperationRef, ProbeRecord, ProbeSession,
-    WatchState,
+    RawOperationRole, WatchState,
 };
 use crate::move_protocol::{MovePhase, MoveRecord};
-use crate::multi_client::{parse_invoice, JoinDeadlineOutcome, MultiClient, ReceiveState};
+use crate::multi_client::{
+    parse_invoice, JoinDeadlineOutcome, MultiClient, ReceiveState, SendState,
+};
 use crate::probe::{assemble_facts, assemble_status, FedimintProbeRunner, ProbeResult};
 use crate::tick::{
     build_snapshot, decisions_to_apply, pinned_input_problems, ScoredFed, StatusReport, TickPolicy,
@@ -65,20 +67,20 @@ use wallet_core::{
 /// Wall-clock in unix millis for the ledger's `created_at_ms` (§8/§9.4). `seq` is the
 /// ordering authority; this is display material, so a pre-epoch clock degrades to `0`
 /// rather than failing a money op. The durable §9.4 injected clock is a later run's concern.
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
-const PROBE_BUDGET_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+pub(crate) const PROBE_BUDGET_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// A fresh 128-bit nonce as 32 lowercase-hex chars for a per-attempt ledger key (§10.1 — a
 /// 32-bit nonce risks birthday collisions over a wallet lifetime, aliasing two attempts onto
 /// one `0x06` entry). The runtime owns randomness (the journal stays deterministic, §9.3);
 /// this draws from fedimint's CSPRNG.
-fn ledger_nonce() -> String {
+pub(crate) fn ledger_nonce() -> String {
     use std::fmt::Write as _;
     let bytes = fedimint_core::core::OperationId::new_random().0;
     let mut out = String::with_capacity(32);
@@ -427,6 +429,86 @@ impl Runtime {
             hard_cap,
             perform_timeout,
         }
+    }
+
+    /// Service-layer journal handle used for actor decisions and lifecycle transitions.
+    pub(crate) fn service_journal(&self) -> Arc<FedimintJournal> {
+        self.journal.clone()
+    }
+
+    /// Fresh step-2 executor for a detached service driver.
+    pub(crate) fn service_executor(&self, hard_cap: Option<Msat>) -> FedimintExecutor {
+        FedimintExecutor::new(
+            self.mc.clone(),
+            self.journal.clone(),
+            self.pinned_gateway.clone(),
+            hard_cap,
+        )
+    }
+
+    pub(crate) fn service_perform_timeout(&self) -> Option<Duration> {
+        self.perform_timeout
+    }
+
+    /// Reattach the subscription-owned side of a service intent. The issued operation
+    /// artifact is authoritative; this path never mints or pays again.
+    pub(crate) async fn service_await_intent(&self, intent: &Intent) -> anyhow::Result<()> {
+        let key = &intent.idempotency_key;
+        match &intent.action {
+            Action::DirectInflow { .. } => {
+                let _ = self.await_move(key, None).await?;
+            }
+            Action::Pay { from, .. } => {
+                let operation_id = intent.operation_id.ok_or_else(|| {
+                    anyhow::anyhow!("awaiting raw pay {} has no send operation id", key.0)
+                })?;
+                let (status, error) = match self.mc.await_send(from, operation_id).await? {
+                    SendState::Success(_) => (OperationStatus::Succeeded, None),
+                    SendState::Refunded => {
+                        (OperationStatus::Failed, Some("send refunded".to_owned()))
+                    }
+                    SendState::Failed(error) => (OperationStatus::Failed, Some(error)),
+                };
+                self.journal
+                    .finalize_raw_operation(
+                        self.mc.as_ref(),
+                        *from,
+                        operation_id,
+                        key,
+                        RawOperationRole::Send,
+                        status,
+                        error.as_deref(),
+                    )
+                    .await
+                    .map_err(exec_err)?;
+            }
+            Action::Receive { to, .. } => {
+                let operation_id = intent.operation_id.ok_or_else(|| {
+                    anyhow::anyhow!("awaiting raw receive {} has no receive operation id", key.0)
+                })?;
+                let (status, error) = match self.mc.await_receive(to, operation_id).await? {
+                    ReceiveState::Claimed => (OperationStatus::Succeeded, None),
+                    ReceiveState::Expired => {
+                        (OperationStatus::Failed, Some("receive expired".to_owned()))
+                    }
+                    ReceiveState::Failed(error) => (OperationStatus::Failed, Some(error)),
+                };
+                self.journal
+                    .finalize_raw_operation(
+                        self.mc.as_ref(),
+                        *to,
+                        operation_id,
+                        key,
+                        RawOperationRole::Receive,
+                        status,
+                        error.as_deref(),
+                    )
+                    .await
+                    .map_err(exec_err)?;
+            }
+            _ => anyhow::bail!("intent {} has no subscription-owned await path", key.0),
+        }
+        Ok(())
     }
 
     /// A fresh executor sharing this runtime's clients + journal + pinned gateway + hard cap.
@@ -1505,6 +1587,41 @@ impl Runtime {
         policy: &ProbePolicy,
         actor: Actor,
     ) -> anyhow::Result<ProbeReport> {
+        self.active_probe_inner(candidate, from, policy, actor, self.hard_cap, None)
+            .await
+    }
+
+    /// Service probe orchestration. Probe session/verdict mechanics stay here, while
+    /// each money leg enters through the service actor's shared admission guard.
+    pub(crate) async fn service_active_probe(
+        &self,
+        candidate: FederationId,
+        from: FederationId,
+        policy: &ProbePolicy,
+        actor: Actor,
+        per_fed_cap: Msat,
+        client: crate::service::WalletClient,
+    ) -> anyhow::Result<ProbeReport> {
+        self.active_probe_inner(
+            candidate,
+            from,
+            policy,
+            actor,
+            Some(per_fed_cap),
+            Some(client),
+        )
+        .await
+    }
+
+    async fn active_probe_inner(
+        &self,
+        candidate: FederationId,
+        from: FederationId,
+        policy: &ProbePolicy,
+        actor: Actor,
+        hard_cap: Option<Msat>,
+        service_client: Option<crate::service::WalletClient>,
+    ) -> anyhow::Result<ProbeReport> {
         let record = self
             .journal
             .probe_record(&candidate)
@@ -1617,7 +1734,7 @@ impl Runtime {
                     "probe: resuming a pre-leg-IN session; re-running the preflight"
                 );
             }
-            if let Err(diagnostic) = self.probe_preflight(&session, candidate).await {
+            if let Err(diagnostic) = self.probe_preflight(&session, candidate, hard_cap).await {
                 return self.finish_probe_no_attempt(&run, &diagnostic, None).await;
             }
         }
@@ -1645,14 +1762,15 @@ impl Runtime {
 
         // §5.0.5 step 3 — leg IN (journals the intent; a resume reattaches idempotently).
         let in_outcome = self
-            .do_move(
+            .drive_probe_leg(
                 run.source,
                 candidate,
                 run.amount,
                 run.leg_fee_cap,
                 occurrence,
-                ReasonCode::ActiveProbe,
                 actor,
+                &session.nonce,
+                service_client.as_ref(),
             )
             .await?;
         match in_outcome.status {
@@ -1778,7 +1896,7 @@ impl Runtime {
             // legs, `do_move(candidate -> from)` would deterministically fail ADR-0018 after
             // leg IN already spent — the same guaranteed inconclusive spend the fresh
             // preflight prevents. Abort umbrella-only BEFORE the doomed return move.
-            if let Some(cap) = self.hard_cap {
+            if let Some(cap) = hard_cap {
                 let src_spendable = self.mc.balance(&run.source).await.map_err(|e| {
                     anyhow::anyhow!(
                         "probe: reading the source balance for the resume cap check failed                          transiently ({e}); re-run `probe` to resume (session retained)"
@@ -1796,14 +1914,15 @@ impl Runtime {
 
         // Leg OUT — sized exactly, same nonce-derived occurrence.
         let out_outcome = self
-            .do_move(
+            .drive_probe_leg(
                 candidate,
                 run.source,
                 out_net,
                 out_fee_cap,
                 occurrence,
-                ReasonCode::ActiveProbe,
                 actor,
+                &session.nonce,
+                service_client.as_ref(),
             )
             .await?;
         match out_outcome.status {
@@ -1881,6 +2000,104 @@ impl Runtime {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_probe_leg(
+        &self,
+        from: FederationId,
+        to: FederationId,
+        amount: Msat,
+        fee_cap: Msat,
+        occurrence: Occurrence,
+        actor: Actor,
+        session_nonce: &str,
+        service_client: Option<&crate::service::WalletClient>,
+    ) -> anyhow::Result<MoveOutcome> {
+        let Some(client) = service_client else {
+            return self
+                .do_move(
+                    from,
+                    to,
+                    amount,
+                    fee_cap,
+                    occurrence,
+                    ReasonCode::ActiveProbe,
+                    actor,
+                )
+                .await;
+        };
+
+        let key = move_key(&from, &to, amount, fee_cap, occurrence);
+        let attached = self.journal.get(&key).await.map_err(exec_err)?.is_some();
+        let balances = if attached || !self.mc.has_client(&from) || !self.mc.has_client(&to) {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([
+                (
+                    from,
+                    self.mc
+                        .balance(&from)
+                        .await
+                        .map_err(|error| exec_err(ExecError::Retryable(error.to_string())))?,
+                ),
+                (
+                    to,
+                    self.mc
+                        .balance(&to)
+                        .await
+                        .map_err(|error| exec_err(ExecError::Retryable(error.to_string())))?,
+                ),
+            ])
+        };
+        let decision = AllocatorDecision {
+            action: Action::Move {
+                from,
+                to,
+                amount,
+                fee_cap,
+            },
+            reason: ReasonCode::ActiveProbe,
+            occurrence,
+            idempotency_key: key.clone(),
+        };
+        let decided = client
+            .decide_op(crate::service::OpRequest {
+                decision,
+                actor,
+                now_ms: now_ms(),
+                balances,
+                probe_session_nonce: Some(session_nonce.to_owned()),
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("probe leg admission failed: {error}"))?;
+        if !matches!(decided.status, IntentStatus::Done | IntentStatus::Failed) {
+            let deadline = tokio::time::Instant::now()
+                + self
+                    .perform_timeout
+                    .unwrap_or_else(|| Duration::from_secs(24 * 60 * 60));
+            client
+                .resolve_await(key.clone(), wallet_api::AwaitTarget::Terminal, deadline)
+                .await
+                .map_err(|error| anyhow::anyhow!("probe leg wait failed: {error}"))?;
+        }
+        let status = self
+            .journal
+            .get(&key)
+            .await
+            .map_err(exec_err)?
+            .map(|intent| intent.status);
+        let outcome = self
+            .journal
+            .get_move(&key)
+            .await
+            .map_err(exec_err)?
+            .and_then(|record| record.outcome);
+        Ok(MoveOutcome {
+            key,
+            status,
+            outcome,
+        })
+    }
+
     /// The §5.0.5 step-1 preflight for a fresh (or pre-leg-IN resumed) probe. `Err`
     /// carries the LOCAL / no-shared-route diagnostic that terminalizes the umbrella row
     /// with NO attempt (neither demotes — §5.0.3's scoping rule).
@@ -1888,6 +2105,7 @@ impl Runtime {
         &self,
         session: &ProbeSession,
         candidate: FederationId,
+        hard_cap: Option<Msat>,
     ) -> Result<(), String> {
         let open = self.mc.federations();
         if !open.contains(&candidate) {
@@ -1919,7 +2137,7 @@ impl Runtime {
             candidate_spendable,
             Msat(session.amount_msat),
             Msat(session.leg_fee_cap_msat),
-            self.hard_cap,
+            hard_cap,
         )?;
         // The existing move-route preflight in BOTH directions (§15.6): leg IN proves
         // S -> C and leg OUT must be known routable before money lands on C. The
@@ -3293,7 +3511,7 @@ fn direct_inflow_key(
 /// request so `apply` dedups it (no re-mint/re-pay); bumping `occurrence` produces a fresh key
 /// for a genuinely new move. All params participate, so a same-`from`/`to`/`occurrence` request
 /// with a DIFFERENT amount/cap is a distinct move rather than silently dedup'd to the old one.
-fn move_key(
+pub(crate) fn move_key(
     from: &FederationId,
     to: &FederationId,
     amount: Msat,
@@ -3505,7 +3723,10 @@ fn is_known_non_candidate_error(error: &str) -> bool {
 /// when no money left the source (leg IN never settled its send, or refunded whole). On
 /// a clean pass this is fees + the small residue; on a hostile candidate whose leg OUT
 /// never redeems it is fees + the WHOLE delivered amount — the honest exposure number.
-fn probe_cost(in_rec: Option<&MoveRecord>, out_rec: Option<&MoveRecord>) -> Option<Msat> {
+pub(crate) fn probe_cost(
+    in_rec: Option<&MoveRecord>,
+    out_rec: Option<&MoveRecord>,
+) -> Option<Msat> {
     let debit = in_rec.and_then(|r| match r.phase {
         MovePhase::Settled | MovePhase::Stranded => Some(
             r.amount
@@ -3564,7 +3785,7 @@ fn probe_gated_members(
 /// extra candidate residue (accepted, §5.0.9 decision 6), always far below the leg fee cap.
 const PROBE_FEE_MARGIN_MSAT: u64 = 1_000;
 
-fn probe_out_fee_cap(delivered_in: Msat, out_net: Msat, leg_fee_cap: Msat) -> Msat {
+pub(crate) fn probe_out_fee_cap(delivered_in: Msat, out_net: Msat, leg_fee_cap: Msat) -> Msat {
     Msat(leg_fee_cap.0.min(delivered_in.0.saturating_sub(out_net.0)))
 }
 
@@ -3580,14 +3801,14 @@ fn probe_kind(run: &ProbeRun, cost_msat: Option<Msat>) -> OperationKind {
 }
 
 /// The umbrella ledger key `probe:<fed-hex>:<nonce>` (§5.0.5).
-fn probe_umbrella_key(fed: &FederationId, nonce: &str) -> IdempotencyKey {
+pub(crate) fn probe_umbrella_key(fed: &FederationId, nonce: &str) -> IdempotencyKey {
     IdempotencyKey(format!("probe:{}:{nonce}", fed.to_hex()))
 }
 
 /// The nonce-derived occurrence embedded in both probe legs' `move:` keys (§5.0.5): the
 /// keys stay reconstructible from the session alone, and a 64-bit random head never
 /// collides with user moves' small occurrence integers.
-fn occurrence_from_nonce(nonce: &str) -> anyhow::Result<Occurrence> {
+pub(crate) fn occurrence_from_nonce(nonce: &str) -> anyhow::Result<Occurrence> {
     let head = nonce
         .get(..16)
         .ok_or_else(|| anyhow::anyhow!("probe session nonce {nonce:?} is too short"))?;
@@ -3982,6 +4203,7 @@ mod tests {
     fn direct_inflow_intent(key: IdempotencyKey, to: FederationId, status: IntentStatus) -> Intent {
         Intent {
             idempotency_key: key,
+            attempt: 0,
             action: Action::DirectInflow {
                 to,
                 amount: Msat(100_000),
@@ -4199,6 +4421,7 @@ mod tests {
         journal
             .upsert(&Intent {
                 idempotency_key: in_key.clone(),
+                attempt: 0,
                 action: Action::Move {
                     from: source,
                     to: candidate,
