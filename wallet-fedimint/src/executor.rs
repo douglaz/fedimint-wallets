@@ -843,8 +843,13 @@ impl FedimintExecutor {
                 }
                 validate_raw_pay_invoice(invoice)?;
                 self.enforce_pre_fund_admission(intent).await?;
-                let candidates = match gateway {
-                    Some(gateway) => vec![gateway.clone()],
+                // Same precedence as `resolve_gateway`: the intent's own gateway, else the
+                // constructor pin (walletd.toml / standalone --gateway — devimint's LDK gateway
+                // is never in the registered list), else the fed's registered scan. The pin is
+                // deliberately NOT journaled into the intent, so a pin change applies to
+                // re-drives after a restart.
+                let candidates = match gateway.clone().or_else(|| self.pinned_gateway.clone()) {
+                    Some(gateway) => vec![gateway],
                     None => self.mc.gateways(from).await.map_err(retryable)?,
                 };
                 let mut selected_gateway = None;
@@ -963,8 +968,9 @@ impl FedimintExecutor {
                     return Ok(PerformOutcome::AwaitingAlreadyInFlight);
                 }
                 self.enforce_pre_fund_admission(intent).await?;
-                let candidates = match gateway {
-                    Some(gateway) => vec![gateway.clone()],
+                // Pin fallback as in the raw pay arm above (and `resolve_gateway`).
+                let candidates = match gateway.clone().or_else(|| self.pinned_gateway.clone()) {
+                    Some(gateway) => vec![gateway],
                     None => self.mc.gateways(to).await.map_err(retryable)?,
                 };
                 let mut selected_gateway = None;
