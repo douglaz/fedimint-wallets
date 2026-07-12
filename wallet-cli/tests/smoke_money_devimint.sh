@@ -35,18 +35,19 @@
 #
 # IMPORTANT: the lnv2 gateway is NOT auto-registered into the federation's vetted list
 # (runbook §4), so EVERY lnv2 call — on both `wallet-cli` and `fedimint-cli` — passes
-# `--gateway "$GW"` explicitly.
+# `--gateway "$GW"` explicitly. wallet-cli pins it once via the global standalone-only
+# `--gateway` flag (in `wcli()` below) — the engine resolves routes from it.
 #
 # Flow:
 #   RECEIVE (devimint default-0 -> our wallet):
-#     wallet-cli receive --amount N --gateway $GW   -> invoice INV_A (+ op id OP_A on stderr)
+#     wallet-cli receive --amount N                 -> invoice INV_A (+ operation key on stderr)
 #     fedimint-cli module lnv2 send INV_A --gateway $GW    (default-0 pays; gateway swaps in)
-#     wallet-cli await-receive OP_A --fed FED       -> claimed
+#     wallet-cli await-receive KEY_A                -> claimed
 #     wallet-cli balance                            -> ~N
 #   PAY (our wallet -> devimint default-0):
 #     fedimint-cli module lnv2 receive M --gateway $GW     -> [INV_B, OP_B_DEV]
-#     wallet-cli pay INV_B --fed FED --gateway $GW  -> started OP_B
-#     wallet-cli await-send OP_B --fed FED          -> success <preimage>
+#     wallet-cli pay INV_B --fed FED                -> started KEY_B
+#     wallet-cli await-send KEY_B                   -> success
 #     fedimint-cli module lnv2 await-receive OP_B_DEV      -> "Claimed" (money landed)
 set -euo pipefail
 
@@ -70,28 +71,36 @@ DATA_DIR="$(mktemp -d)"
 RECV_ERR="$(mktemp)"
 trap 'rm -rf "$DATA_DIR" "$RECV_ERR"' EXIT
 
-wcli() { "$WALLET_CLI" --data-dir "$DATA_DIR" "$@"; }
+wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" --gateway "$GW" "$@"; }
+join_fed() {
+  local started key state
+  started=$(wcli join "$1") || return
+  key=${started#* }
+  state=$(wcli await-move "$key") || return
+  [[ "$state" == "done" ]] || { echo "join $key did not settle: $state" >&2; return 1; }
+  cut -d: -f2 <<<"$key"
+}
 balance_msat_for_fed() {
   local fed_id="$1"
   wcli balance | awk -v id="$fed_id" '$1 == id ":" && $3 == "msat" { print $2; exit }'
 }
 
 echo "== join =="
-FED_ID=$(wcli join "$FM_INVITE_CODE")
+FED_ID=$(join_fed "$FM_INVITE_CODE")
 echo "joined federation: $FED_ID"
 
 # ---------------------------------------------------------------------------------------
 echo "== RECEIVE: our wallet mints an invoice, devimint's funded client pays it =="
-# Invoice -> stdout; "operation_id: <hex>" -> stderr (captured to $RECV_ERR).
-INV_A=$(wcli receive --amount "$RECEIVE_MSAT" --gateway "$GW" 2>"$RECV_ERR")
-OP_A=$(grep -oiE 'operation_id: [0-9a-f]{64}' "$RECV_ERR" | grep -oiE '[0-9a-f]{64}' | head -n1)
-if [[ -z "$INV_A" || -z "$OP_A" ]]; then
-  echo "FAIL: receive did not yield an invoice (stdout) and an op id (stderr):" >&2
+# Invoice -> stdout; "key: <operation key>" -> stderr (captured to $RECV_ERR).
+INV_A=$(wcli receive --amount "$RECEIVE_MSAT" 2>"$RECV_ERR")
+KEY_A=$(sed -n 's/^key: //p' "$RECV_ERR")
+if [[ -z "$INV_A" || -z "$KEY_A" ]]; then
+  echo "FAIL: receive did not yield an invoice (stdout) and operation key (stderr):" >&2
   echo "  invoice=$INV_A" >&2; echo "  --- receive stderr ---" >&2; cat "$RECV_ERR" >&2
   exit 1
 fi
 echo "invoice: $INV_A"
-echo "receive op: $OP_A"
+echo "receive operation: $KEY_A"
 
 # devimint's funded client pays the invoice; the LDK gateway direct-swaps it into our wallet.
 # IMPORTANT (devimint investigation): await the payer's SEND to Success FIRST. lnv2's internal
@@ -104,7 +113,7 @@ SEND_A=$(fedimint-cli module lnv2 send "$INV_A" --gateway "$GW" 2>/dev/null | tr
 fedimint-cli module lnv2 await-send "$SEND_A" >/dev/null 2>&1 || true
 
 echo "-- await our receive claim --"
-RECV_STATE=$(wcli await-receive "$OP_A" --fed "$FED_ID")
+RECV_STATE=$(wcli await-receive "$KEY_A")
 echo "await-receive: $RECV_STATE"
 if [[ "$RECV_STATE" != "claimed" ]]; then
   echo "FAIL: expected receive to be 'claimed', got '$RECV_STATE'" >&2
@@ -144,7 +153,7 @@ fi
 echo "invoice to pay: $INV_B"
 
 echo "-- our wallet pays --"
-PAY_OUT=$(wcli pay "$INV_B" --fed "$FED_ID" --gateway "$GW")
+PAY_OUT=$(wcli pay "$INV_B" --fed "$FED_ID")
 echo "pay: $PAY_OUT"
 OP_B=$(awk '{print $2}' <<<"$PAY_OUT")
 case "$PAY_OUT" in
@@ -153,11 +162,11 @@ case "$PAY_OUT" in
 esac
 
 echo "-- await our send settlement --"
-SEND_STATE=$(wcli await-send "$OP_B" --fed "$FED_ID")
+SEND_STATE=$(wcli await-send "$OP_B")
 echo "await-send: $SEND_STATE"
 case "$SEND_STATE" in
-  success\ *) : ;;  # carries the preimage
-  *) echo "FAIL: expected 'success <preimage>', got '$SEND_STATE'" >&2; exit 1 ;;
+  success) : ;;
+  *) echo "FAIL: expected 'success', got '$SEND_STATE'" >&2; exit 1 ;;
 esac
 
 # Confirm the money actually landed on the devimint side too.
@@ -171,7 +180,7 @@ fi
 # Dedup check (spec §4): re-paying the SAME invoice must NOT be a fresh payment and must NOT
 # move money again — the lnv2 client recognizes it (already-paid / already-in-flight).
 echo "-- re-pay the same invoice: expect dedup, not a second debit --"
-REPAY_OUT=$(wcli pay "$INV_B" --fed "$FED_ID" --gateway "$GW")
+REPAY_OUT=$(wcli pay "$INV_B" --fed "$FED_ID")
 echo "re-pay: $REPAY_OUT"
 case "$REPAY_OUT" in
   already-paid\ *|already-in-flight\ *) : ;;

@@ -11,6 +11,7 @@ license = "AGPL-3.0-or-later"
 # build/test with: nix develop /home/master/p/fedimint -c cargo <cmd>
 [dependencies]
 wallet-core = { path = "../wallet-core" }
+wallet-api = { path = "../wallet-api" }
 wallet-fedimint = { path = "../wallet-fedimint" }
 # Same git source + rev as wallet-fedimint (see its Cargo.toml note); do not change the pin.
 fedimint-core = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
@@ -19,8 +20,24 @@ fedimint-bip39 = { git = "https://github.com/douglaz/fedimint.git", rev = "b108e
 fedimint-rocksdb = { git = "https://github.com/douglaz/fedimint.git", rev = "b108ec66ab21b70e1eea35d8663d9941a665ad58" }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+# The SAME advisory-lock crate fedimint-db-locked uses (workspace-resolved 0.1.10), so a
+# non-blocking pre-check on `<data_dir>/client.db.lock` sees a lock walletd (or another
+# standalone) holds — fedimint's own open BLOCKS on a held lock, which would hang instead of
+# giving the deliberate `--standalone` lock-held error.
+fs-lock = "0.1.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 anyhow = "1"
 rand = "0.8"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Same pin/features as wallet-fedimint's reqwest — the client mode talks to the local daemon.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+toml = "0.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# The client-mode tests stand up a real axum mock on an ephemeral port and drive the CLI binary
+# (as a subprocess) against it (spec §6a.9 "CLI: verbs against a mock server"). `process` is a
+# test-only tokio feature; cargo unifies it with the main tokio features when building tests.
+axum = "0.8"
+tokio = { version = "1", features = ["process"] }

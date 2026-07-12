@@ -554,6 +554,48 @@ async fn history_and_watch_status_read_detached() {
     service.shutdown().await.expect("shutdown");
 }
 
+/// A signed, parseable, AMOUNTLESS BOLT11 (with a payment secret — modern parsing requires one;
+/// the classic spec donation vector predates that and fails semantic checks).
+fn amountless_invoice() -> String {
+    use bitcoin::hashes::{sha256, Hash as _};
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let key = bitcoin::secp256k1::SecretKey::from_slice(&[41; 32]).expect("static test key");
+    lightning_invoice::InvoiceBuilder::new(lightning_invoice::Currency::Bitcoin)
+        .description("amountless fixture".to_owned())
+        .payment_hash(sha256::Hash::hash(&[7; 32]))
+        .payment_secret(lightning_invoice::PaymentSecret([42; 32]))
+        .current_timestamp()
+        .min_final_cltv_expiry_delta(144)
+        .build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &key))
+        .expect("build amountless invoice")
+        .to_string()
+}
+
+#[tokio::test]
+async fn pay_refuses_an_amountless_invoice_even_with_a_stated_amount() {
+    // The pinned lnv2 send API cannot supply an amount, so admitting an amountless invoice
+    // would 202 an operation whose driver can only fail (step-6 review P1).
+    let (state, service, _) = fixture().await;
+    let invoice = amountless_invoice();
+    for body in [
+        json!({ "invoice": invoice, "amount": 1_000, "fee_cap": null, "fed": null }),
+        json!({ "invoice": invoice, "amount": null, "fee_cap": null, "fed": null }),
+    ] {
+        let (status, response) =
+            send(&state, request("POST", "/v1/pay", Some(TOKEN), Some(body))).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response["refuse_reason"], "amount_required");
+        assert!(
+            response["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not payable"),
+            "body: {response}"
+        );
+    }
+    service.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn show_surfaces_the_failure_diagnostic_of_a_failed_operation() {
     let (state, service, journal) = fixture().await;

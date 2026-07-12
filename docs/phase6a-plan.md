@@ -388,16 +388,19 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
   intent — the key identifies the operation, the sizing check guards its bounds; any
   mismatch (e.g. same receive nonce/to/amount with a changed fee cap) is refused as a
   conflict, never silently attached.
-  **Pay sizing inputs (passes 8-9):** the `/v1/pay` request carries an `amount` — REQUIRED
-  for an amountless BOLT11, and if present on an amount-carrying invoice it must match — a
+  **Pay sizing inputs (passes 8-9):** the `/v1/pay` request carries an `amount` — if present
+  on an amount-carrying invoice it must match — a
   fee cap (defaulted from the DB `Policy`'s per-move cap), and the **source `fed`**
   (defaulted to the designated spending fed), so the §6a.4 pre-fund reservation
   (`amount + fee_cap` against that fed) and the TL-1 held-fed refusal are both enforceable
   BEFORE the `202`. The intent records ALL its sizing fields, and the same-key attach
   (§6a.2) verifies EVERY one of them — fed, amount, fee cap — against the existing intent
   (pass 11: a fed-only conflict check would let an attach drive money under different
-  bounds than the original reserved); any mismatch is refused as a conflict. An amountless invoice
-  with no stated amount is refused at decide time, never admitted un-reserved.
+  bounds than the original reserved); any mismatch is refused as a conflict. **Amountless
+  invoices are refused outright** (step-6 review deviation from the earlier "REQUIRED amount"
+  wording: the pinned lnv2 send API — `LightningClientModule::send(bolt11, gateway, meta)` —
+  takes no amount parameter, so a stated amount cannot actually be paid; admitting one would
+  202 an operation whose driver can only fail. Revisit if the SDK gains an amount override.)
 - The `202` key = the ledger's correlation key — the async API and the audit trail share one
   keyspace.
 

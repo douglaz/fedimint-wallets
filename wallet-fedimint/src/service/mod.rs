@@ -546,14 +546,40 @@ impl Drop for CriticalTaskGuard {
 }
 
 impl WalletService {
+    /// Production daemon constructor: actor + drivers + the watch scheduler.
     pub async fn start(runtime: Runtime) -> ServiceResult<Self> {
+        Self::start_from_runtime(runtime, true).await
+    }
+
+    /// Standalone constructor (spec §6a.7): the CLI's one-shot `--standalone` mode spins up the
+    /// SAME actor + drivers the daemon uses, MINUS the watch scheduler. A one-shot command must
+    /// not fire the background rebalancer — running the scheduler with no HTTP surface is exactly
+    /// the "daemon-without-an-API in standalone mode" the deleted `watch` verb was; the scheduler's
+    /// only home is now the daemon. The actor still owns admission/holds/driving, so the money
+    /// verbs run the one true `WalletClient` command path.
+    pub async fn start_without_scheduler(runtime: Runtime) -> ServiceResult<Self> {
+        Self::start_from_runtime(runtime, false).await
+    }
+
+    /// Shared bring-up from a live [`Runtime`]. `run_scheduler` gates the background watch task:
+    /// the daemon runs it; the one-shot standalone CLI does not.
+    async fn start_from_runtime(runtime: Runtime, run_scheduler: bool) -> ServiceResult<Self> {
         let policy = Policy::default();
         let runtime = Arc::new(runtime);
         let journal = runtime.service_journal();
         let executor: Arc<dyn Executor> =
             Arc::new(runtime.service_executor(Some(policy.per_fed_cap)));
         let perform_timeout = runtime.service_perform_timeout();
-        Self::start_parts(Some(runtime), journal, executor, policy, perform_timeout).await
+        let scheduler_runtime = run_scheduler.then(|| runtime.clone());
+        Self::start_parts_inner(
+            Some(runtime),
+            scheduler_runtime,
+            journal,
+            executor,
+            policy,
+            perform_timeout,
+        )
+        .await
     }
 
     /// Fixture/test constructor: a detached service (no runtime → no scheduler, no network)
@@ -568,8 +594,31 @@ impl WalletService {
         Self::start_parts(None, journal, executor, seed_policy, None).await
     }
 
+    /// Constructor where the scheduler is coupled to the runtime's presence (the `start_detached`
+    /// fixtures and the in-crate tests): the scheduler runs iff a runtime is present.
+    /// [`Self::start_parts_inner`] decouples the two so standalone can run the actor without it.
     async fn start_parts(
         runtime: Option<Arc<Runtime>>,
+        journal: Arc<FedimintJournal>,
+        executor: Arc<dyn Executor>,
+        seed_policy: Policy,
+        perform_timeout: Option<std::time::Duration>,
+    ) -> ServiceResult<Self> {
+        let scheduler_runtime = runtime.clone();
+        Self::start_parts_inner(
+            runtime,
+            scheduler_runtime,
+            journal,
+            executor,
+            seed_policy,
+            perform_timeout,
+        )
+        .await
+    }
+
+    async fn start_parts_inner(
+        runtime: Option<Arc<Runtime>>,
+        scheduler_runtime: Option<Arc<Runtime>>,
         journal: Arc<FedimintJournal>,
         executor: Arc<dyn Executor>,
         seed_policy: Policy,
@@ -597,7 +646,6 @@ impl WalletService {
         let (policy_wake, policy_wake_rx) = tokio::sync::watch::channel(0);
         #[cfg(test)]
         let test_policy_wake = policy_wake_rx.clone();
-        let scheduler_runtime = runtime.clone();
         let (critical_exit_tx, critical_exit) = mpsc::unbounded_channel();
         let actor_exit = critical_exit_tx.clone();
         let actor_sender = client.sender.downgrade();

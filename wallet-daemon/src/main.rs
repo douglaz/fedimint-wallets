@@ -122,8 +122,16 @@ async fn run_serve(config_path: &std::path::Path) -> Result<()> {
     let listener = server::bind(&config.bind()).await?;
 
     // hard_cap is None ON PURPOSE — the actor reads per_fed_cap from the stored Policy per
-    // decide (step 4); no constructor cap.
-    let service_runtime = Runtime::new(multi_client.clone(), journal.clone(), None, None, None);
+    // decide (step 4); no constructor cap. The gateway pin is host config (walletd.toml):
+    // required against devimint, whose LDK gateway is never registered into the lnv2 set.
+    let pinned_gateway = config.gateway.clone().map(wallet_fedimint::GatewayUrl);
+    let service_runtime = Runtime::new(
+        multi_client.clone(),
+        journal.clone(),
+        pinned_gateway.clone(),
+        None,
+        None,
+    );
     let service = WalletService::start(service_runtime)
         .await
         .map_err(|error| anyhow::anyhow!("starting the wallet service: {error}"))?;
@@ -133,7 +141,7 @@ async fn run_serve(config_path: &std::path::Path) -> Result<()> {
     let read_runtime = Arc::new(Runtime::new(
         multi_client.clone(),
         journal.clone(),
-        None,
+        pinned_gateway,
         None,
         None,
     ));

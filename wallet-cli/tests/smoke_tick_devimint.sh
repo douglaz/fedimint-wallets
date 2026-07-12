@@ -107,7 +107,15 @@ TICK_OUT="$(mktemp)"
 TICK_ERR="$(mktemp)"
 trap 'rm -rf "$DATA_DIR" "$DI_ERR" "$TICK_OUT" "$TICK_ERR"' EXIT
 
-wcli() { "$WALLET_CLI" --data-dir "$DATA_DIR" "$@"; }
+wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" --gateway "$GW" "$@"; }
+join_fed() {
+  local started key state
+  started=$(wcli join "$1") || return
+  key=${started#* }
+  state=$(wcli await-move "$key") || return
+  [[ "$state" == "done" ]] || { echo "join $key did not settle: $state" >&2; return 1; }
+  cut -d: -f2 <<<"$key"
+}
 balance_msat_for_fed() {
   local fed_id="$1"
   # NOTE: no `exit` in awk — it must consume ALL of `wcli balance`'s output, else awk closes the
@@ -117,8 +125,8 @@ balance_msat_for_fed() {
 performed_count() { sed -n 's/.*performed=\([0-9]*\).*/\1/p' "$1"; }
 
 echo "== join BOTH federations =="
-FED_A=$(wcli join "$FM_INVITE_CODE")
-FED_B=$(wcli join "$FED_B_INVITE")
+FED_A=$(join_fed "$FM_INVITE_CODE")
+FED_B=$(join_fed "$FED_B_INVITE")
 echo "fed A (spending): $FED_A"
 echo "fed B (standby):  $FED_B"
 if [[ "$FED_A" == "$FED_B" ]]; then
@@ -139,10 +147,10 @@ fi
 
 # ---------------------------------------------------------------------------------------
 echo "== FUND fed A (spending): direct-inflow ${FUND_MSAT} msat (funded client pays; gateway swaps in) =="
-INV_A=$(wcli direct-inflow --to "$FED_A" --amount "$FUND_MSAT" --gateway "$GW" 2>"$DI_ERR")
-KEY_FUND=$(sed -n 's/^intent_key: //p' "$DI_ERR")
+INV_A=$(wcli direct-inflow --to "$FED_A" --amount "$FUND_MSAT" 2>"$DI_ERR")
+KEY_FUND=$(sed -n 's/^key: //p' "$DI_ERR")
 if [[ -z "$INV_A" || -z "$KEY_FUND" ]]; then
-  echo "FAIL: funding direct-inflow did not yield an invoice + intent key:" >&2
+  echo "FAIL: funding direct-inflow did not yield an invoice + operation key:" >&2
   echo "  invoice=$INV_A" >&2; echo "  --- direct-inflow stderr ---" >&2; cat "$DI_ERR" >&2
   exit 1
 fi

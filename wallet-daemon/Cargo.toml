@@ -38,3 +38,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = { version = "0.5", features = ["util"] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+# Same versions wallet-fedimint pins — used only to BUILD a signed amountless BOLT11 fixture
+# (the classic spec vector lacks a payment secret, which modern parsing rejects).
+lightning-invoice = "0.33"
+bitcoin = "0.32"

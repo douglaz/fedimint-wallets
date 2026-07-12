@@ -285,11 +285,15 @@ pub async fn pay(
             ))
         }
         (Some(invoice_amount), _) => invoice_amount,
-        (None, Some(stated)) => stated,
-        (None, None) => {
+        // The pinned lnv2 send API takes no amount parameter (`MultiClient::pay` →
+        // `LightningClientModule::send(bolt11, gateway, meta)`), so an amountless invoice is
+        // UNPAYABLE by the engine — refuse at admission rather than 202 an operation whose
+        // driver can only fail.
+        (None, _) => {
             return Err(HttpError::refused(
                 RefuseReason::AmountRequired,
-                "an amountless BOLT11 invoice requires an explicit amount",
+                "amountless BOLT11 invoices are not payable (the lnv2 send API cannot supply \
+                 an amount); request an amount-carrying invoice",
             ))
         }
     };
