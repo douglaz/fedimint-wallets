@@ -61,6 +61,18 @@ pub struct MultiClient {
     /// Serializes db-prefix allocation and initial client creation so two concurrent joins
     /// cannot initialize different federations into the same per-fed partition.
     join_lock: Mutex<()>,
+    /// Pooled HTTP client for DIRECT gateway reads (`routing_info`). The SDK's
+    /// `GatewayApi` route is deliberately bypassed for these: its per-URL
+    /// `ConnectionPool` treats every http(s) connection as disconnected
+    /// (`HttpConnection::is_connected()` is hard-coded `false` at the pin), so every
+    /// request after the first re-enters the RECONNECT path and sleeps a Fibonacci
+    /// backoff starting at 500 ms — measured live by the §6a.9 responsiveness gate as
+    /// 550-730 ms added to every pre-fund fee quote, with concurrent quotes coalescing
+    /// behind one leader. A quote is a pure HTTP read with no state-machine
+    /// involvement, so a plain pooled client is strictly better; the SDK's own
+    /// settlement calls (send_payment, invoice fetch inside the lnv2 state machines)
+    /// keep their path — that latency is async settlement, not responsiveness.
+    gateway_http: reqwest::Client,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +123,15 @@ impl MultiClient {
             root_secret,
             clients: RwLock::new(BTreeMap::new()),
             join_lock: Mutex::new(()),
+            // Bounded: a quote is pre-fund and advisory (no money has moved), so timing out
+            // against an unresponsive gateway is safe — the driver surfaces Retryable and the
+            // intent stays Pending. The SDK path had NO deadline here, which left a driver
+            // hanging on a black-holed quote until abandonment.
+            gateway_http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("static reqwest client configuration cannot fail"),
         }
     }
 
@@ -724,18 +745,40 @@ impl MultiClient {
             })
     }
 
+    /// Direct `POST {gateway}/routing_info` on [`Self::gateway_http`] (see that field for why
+    /// the SDK's `GatewayApi` route is bypassed here). Wire-identical to
+    /// `RealGatewayConnection::routing_info` at the pin: the request body is the federation id,
+    /// the 200 body is `Option<RoutingInfo>`.
     async fn maybe_routing_info_for(
         &self,
         id: &FederationId,
         gateway: &GatewayUrl,
     ) -> anyhow::Result<Option<RoutingInfo>> {
         let client = self.client(id)?;
-        let lnv2 = client.get_first_module::<LightningClientModule>()?;
+        let federation_id = client.federation_id();
         let url = SafeUrl::parse(&gateway.0)
-            .map_err(|e| anyhow::anyhow!("invalid gateway url {:?}: {e}", gateway.0))?;
-        lnv2.routing_info(&url)
+            .map_err(|e| anyhow::anyhow!("invalid gateway url {:?}: {e}", gateway.0))?
+            .join("routing_info")
+            .map_err(|e| anyhow::anyhow!("joining routing_info onto {:?}: {e}", gateway.0))?;
+        let response = self
+            .gateway_http
+            .post(url.to_unsafe())
+            .json(&federation_id)
+            .send()
             .await
-            .map_err(|e| anyhow::anyhow!("fetching routing info from gateway {}: {e}", gateway.0))
+            .map_err(|e| {
+                anyhow::anyhow!("fetching routing info from gateway {}: {e}", gateway.0)
+            })?;
+        let status = response.status();
+        anyhow::ensure!(
+            status == reqwest::StatusCode::OK,
+            "gateway {} routing_info returned status {status}",
+            gateway.0
+        );
+        response
+            .json::<Option<RoutingInfo>>()
+            .await
+            .map_err(|e| anyhow::anyhow!("decoding routing info from gateway {}: {e}", gateway.0))
     }
 
     /// Clone out the open client for `id`, or error if the federation isn't joined/opened.
