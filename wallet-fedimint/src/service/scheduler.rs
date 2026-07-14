@@ -10,6 +10,112 @@ use wallet_core::{adaptive_sleep_ms, Actor, IdempotencyKey, Msat, Occurrence, Op
 
 const DEFAULT_OBSERVER_URL: &str = "https://observer.fedimint.org/api";
 
+/// How many receives must be stuck Awaiting past the stall deadline before we conclude the
+/// fedimint client's shared receive task has died (rather than a single slow/unpaid invoice).
+const SETTLEMENT_STALL_THRESHOLD: usize = 3;
+
+/// The settlement-stall deadline (host-operational, env-overridable for the devimint gates).
+fn settlement_stall_deadline() -> Duration {
+    std::env::var("WALLETD_SETTLEMENT_STALL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(300))
+}
+
+/// Settlement-stall watchdog (root-caused 2026-07 by the 24h soak). fedimint's lnv2 client
+/// spawns a shared `receive_lnurl_task` that holds a DB transaction open across a long-poll and
+/// commits with a NON-retrying `commit_tx()`; under the sustained concurrent load only a 24/7
+/// daemon produces, a `WriteConflict` panics that task and kills it — after which NO receive
+/// ever claims and the awaiter drivers pin the registry at its cap. We cannot fix that in the
+/// pinned fedimint fork, so the daemon detects the degradation and self-heals by restarting:
+/// a fresh process rebuilds the client (fresh receive task) and reconcile re-drives the Awaiting
+/// operations to their TRUE terminal — claiming a funded contract, expiring an unpaid one — so
+/// no payment is ever marked failed while its contract is still claimable.
+///
+/// The signal is deliberately SELF-CLEARING to avoid a restart loop on legitimately-unpaid
+/// invoices: it fires only when several receives are stuck past the deadline AND zero receives
+/// have CLAIMED within that same window. A live client keeps claiming other receives (nonzero
+/// recent successes ⇒ the stuck ones are merely unpaid, no restart); a dead task claims nothing
+/// (zero successes ⇒ restart), and after the restart the fresh task's successes clear it.
+/// Returning `Some` makes [`run`] exit; its `CriticalTaskGuard` fires, walletd exits non-zero,
+/// and the supervisor (systemd `Restart=on-failure`, shipped) brings it back.
+async fn detect_settlement_stall(journal: &crate::journal::FedimintJournal) -> Option<String> {
+    let deadline_ms = settlement_stall_deadline().as_millis() as u64;
+    let now = now_ms();
+
+    // Cheap every-cycle scan: how many receives are stuck Awaiting past the deadline?
+    let awaiting = journal.awaiting().await.ok()?;
+    let stalled = awaiting
+        .iter()
+        .filter(|intent| {
+            matches!(
+                intent.action,
+                wallet_core::Action::Receive { .. } | wallet_core::Action::DirectInflow { .. }
+            ) && now.saturating_sub(intent.created_at_ms) > deadline_ms
+        })
+        .count();
+    if stalled < SETTLEMENT_STALL_THRESHOLD {
+        return None;
+    }
+
+    // Gate (only reached when already stalled): a receive claimed within the window means the
+    // receive path is ALIVE — those stalled ones are just unpaid, so do NOT restart.
+    let recent = journal.history(4096, None).await.ok()?;
+    let claimed_recently = recent.iter().any(|row| {
+        matches!(row.kind, wallet_core::OperationKind::Receive { .. })
+            && row.status == OperationStatus::Succeeded
+            && now.saturating_sub(row.updated_at_ms) <= deadline_ms
+    });
+
+    settlement_stall_verdict(stalled, claimed_recently, deadline_ms / 1000)
+}
+
+/// The pure decision behind [`detect_settlement_stall`], split out so the self-clearing logic is
+/// unit-tested without a journal fixture: restart only when the stuck count reaches the threshold
+/// AND no receive claimed recently (a live client always claims *some* receive; a dead task claims
+/// none). `stalled` is already filtered to receives past the deadline by the caller.
+fn settlement_stall_verdict(
+    stalled: usize,
+    claimed_recently: bool,
+    deadline_secs: u64,
+) -> Option<String> {
+    if stalled < SETTLEMENT_STALL_THRESHOLD || claimed_recently {
+        return None;
+    }
+    Some(format!(
+        "settlement stall: {stalled} receive operation(s) stuck Awaiting past {deadline_secs}s \
+         with zero receives claimed in that window — the fedimint client's receive task has \
+         likely died; exiting for a supervised restart (reconcile re-drives on a fresh client)"
+    ))
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::{settlement_stall_verdict, SETTLEMENT_STALL_THRESHOLD};
+
+    #[test]
+    fn below_threshold_never_restarts() {
+        assert!(settlement_stall_verdict(SETTLEMENT_STALL_THRESHOLD - 1, false, 300).is_none());
+        assert!(settlement_stall_verdict(0, false, 300).is_none());
+    }
+
+    #[test]
+    fn a_recent_claim_exonerates_even_at_threshold() {
+        // Many receives stuck, but the client claimed one within the window ⇒ merely unpaid, not
+        // a dead task. Must NOT restart (this is what prevents a loop on legit-unpaid invoices).
+        assert!(settlement_stall_verdict(SETTLEMENT_STALL_THRESHOLD + 5, true, 300).is_none());
+    }
+
+    #[test]
+    fn threshold_stuck_and_no_recent_claim_restarts() {
+        let verdict = settlement_stall_verdict(SETTLEMENT_STALL_THRESHOLD, false, 300)
+            .expect("a stalled receive path with no claims must trigger a restart");
+        assert!(verdict.contains("settlement stall"));
+        assert!(verdict.contains("300s"));
+    }
+}
+
 pub(super) fn default_sources() -> Vec<Box<dyn CandidateSource>> {
     vec![Box::new(ObserverSource::new(DEFAULT_OBSERVER_URL))]
 }
@@ -137,6 +243,13 @@ pub(super) async fn run(
                 }
             }
         };
+        // Settlement-stall watchdog: exit for a supervised restart if the client's receive path
+        // has died (see `detect_settlement_stall`). Runs off-actor each cycle; the history scan
+        // is gated behind the cheap awaiting scan so it only fires when receives are stuck.
+        if let Some(reason) = detect_settlement_stall(&runtime.service_journal()).await {
+            tracing::error!("{reason}");
+            return;
+        }
         expiry_wake_tasks.extend(
             multi_client.spawn_expiry_wake_tasks(&mut expiry_wake_feds, expiry_wake_tx.clone()),
         );
