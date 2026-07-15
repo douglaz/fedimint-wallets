@@ -111,13 +111,13 @@ impl MultiClient {
     /// must never pre-derive it, per the builder's own contract). `db` holds ONLY the
     /// fedimint clients (+ the client secret); `journal_db` is a SEPARATE store for the
     /// app journal. They MUST be different RocksDBs (the 24h soak, 2026-07): fedimint
-    /// tunes RocksDB to a 2MB write buffer with NO extra memtable history, and its lnv2
-    /// `receive_lnurl_task` holds a transaction open across a minutes-long long-poll —
-    /// any co-located writer (our journal's tick/ledger churn) flushing ~2MB during that
-    /// window destroys the snapshot's memtable history, so the commit fails `TryAgain`
-    /// (mapped to `WriteConflict` REGARDLESS of key disjointness), panics, and kills the
-    /// shared receive task. Separate DBs = separate memtables; our churn can no longer
-    /// starve fedimint's long-held transactions.
+    /// tunes RocksDB to a 2MB write buffer with NO extra memtable history, so any
+    /// fedimint transaction held open while a co-located writer (our journal's
+    /// tick/ledger churn) flushes ~2MB loses its snapshot's memtable history and the
+    /// commit fails `TryAgain` (mapped to `WriteConflict` REGARDLESS of key
+    /// disjointness). The known instance — lnv2's `receive_lnurl_task` panicking across
+    /// its long-poll — is fixed at our pinned rev (upstream PR #8816), but the isolation
+    /// stands: our churn must never share a memtable with fedimint's transactions.
     pub async fn new(db: Database, journal_db: Database, mnemonic: Mnemonic) -> Self {
         let root_secret = RootSecret::StandardDoubleDerive(
             Bip39RootSecretStrategy::<12>::to_root_secret(&mnemonic),
@@ -498,8 +498,8 @@ impl MultiClient {
     }
 
     /// Pay a BOLT11 invoice from `id` via lnv2. The lnv2 client is the dedup AUTHORITY
-    /// (deterministic op-id): re-paying an in-flight or already-settled invoice returns
-    /// [`SendOutcome::AlreadyInFlight`]/[`SendOutcome::AlreadyPaid`] carrying the ORIGINAL
+    /// (deterministic op-id, ONE attempt per invoice): re-paying an in-flight or settled
+    /// invoice returns [`SendOutcome::AlreadyInFlight`] carrying the ORIGINAL
     /// op-id — never a double-pay (spec §4). `custom_meta` is committed into the operation
     /// meta. A failure is a typed [`SendError`] so the caller can tell a DETERMINISTIC
     /// rejection (expired/wrong-currency — re-paying the SAME invoice can never succeed) from a
@@ -878,18 +878,18 @@ fn op_artifact_from_meta(
     }))
 }
 
-/// The outcome of an lnv2 `send` (see [`MultiClient::pay`]). The dedup variants are
-/// OUTCOMES, not errors: the client recognised an existing operation for this invoice and
+/// The outcome of an lnv2 `send` (see [`MultiClient::pay`]). The dedup variant is an
+/// OUTCOME, not an error: the client recognised an existing operation for this invoice and
 /// hands back its op-id so the caller re-attaches instead of paying twice (spec §4 — the
-/// client is the dedup authority).
+/// client is the dedup authority). lnv2 allows ONE attempt per invoice, so the existing op
+/// may be in flight OR settled — the awaiter resolves which from the op's own final state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SendOutcome {
     /// A fresh payment was submitted; carries its new op-id.
     Started(OperationId),
-    /// A payment for this invoice is already in progress; carries its existing op-id.
+    /// An operation for this invoice already exists (in flight or settled); carries its
+    /// existing op-id — attach and await its true terminal.
     AlreadyInFlight(OperationId),
-    /// This invoice was already paid; carries the settled op-id.
-    AlreadyPaid(OperationId),
 }
 
 /// The outcome of [`MultiClient::join`] (spec §10.2): the federation id, plus whether THIS
@@ -1027,11 +1027,8 @@ fn map_send_result(
 ) -> Result<SendOutcome, SendError> {
     match result {
         Ok(op) => Ok(SendOutcome::Started(bridge_op_id(op))),
-        Err(SendPaymentError::PaymentInProgress(op)) => {
+        Err(SendPaymentError::DuplicatePaymentAttempt(op)) => {
             Ok(SendOutcome::AlreadyInFlight(bridge_op_id(op)))
-        }
-        Err(SendPaymentError::InvoiceAlreadyPaid(op)) => {
-            Ok(SendOutcome::AlreadyPaid(bridge_op_id(op)))
         }
         Err(e) if is_invoice_send_rejection(&e) => Err(SendError::InvoiceRejected(format!(
             "lnv2 send deterministically rejected the invoice: {e}"
@@ -1570,17 +1567,13 @@ mod tests {
             map_send_result(Ok(op)).expect("Ok maps to an outcome"),
             SendOutcome::Started(OperationId(op.0))
         );
-        // The two dedup errors are OUTCOMES (not failures), each carrying the EXISTING
-        // op-id so the caller re-attaches rather than double-paying.
+        // The dedup error is an OUTCOME (not a failure), carrying the EXISTING op-id so
+        // the caller re-attaches rather than double-paying (in flight or settled — the
+        // awaiter resolves which from the op's own final state).
         assert_eq!(
-            map_send_result(Err(SendPaymentError::PaymentInProgress(op)))
-                .expect("PaymentInProgress maps to an outcome"),
+            map_send_result(Err(SendPaymentError::DuplicatePaymentAttempt(op)))
+                .expect("DuplicatePaymentAttempt maps to an outcome"),
             SendOutcome::AlreadyInFlight(OperationId(op.0))
-        );
-        assert_eq!(
-            map_send_result(Err(SendPaymentError::InvoiceAlreadyPaid(op)))
-                .expect("InvoiceAlreadyPaid maps to an outcome"),
-            SendOutcome::AlreadyPaid(OperationId(op.0))
         );
         // Any other send error stays a real failure (never a silent success).
         assert!(map_send_result(Err(SendPaymentError::InvoiceExpired)).is_err());

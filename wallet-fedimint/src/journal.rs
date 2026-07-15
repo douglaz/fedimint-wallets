@@ -2412,7 +2412,7 @@ pub trait LedgerRepairOracle: Send + Sync {
         key: &IdempotencyKey,
     ) -> Result<Option<OperationId>, ExecError>;
     /// A SEND op on `fed` whose invoice payment-hash matches `hash` (§10.3 dedup recovery: an
-    /// `AlreadyInFlight`/`AlreadyPaid` retry reuses the ORIGINAL op — its key is in no op's
+    /// `AlreadyInFlight` retry reuses the ORIGINAL op — its key is in no op's
     /// meta, so the durably-written hash is the link).
     async fn find_send_op_by_payment_hash(
         &self,

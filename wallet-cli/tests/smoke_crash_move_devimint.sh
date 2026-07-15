@@ -28,7 +28,7 @@
 #   after-send-commit    — send op committed in the CLIENT db, but our MoveRecord does NOT yet
 #                          carry `send_op`. Resume must NOT double-pay: backfill recovers the
 #                          send op by `move_id`; if that misses, a re-drive re-`pay`s and the
-#                          client dedups to `AlreadyInFlight`/`AlreadyPaid` (§5).
+#                          client dedups to `AlreadyInFlight` (§5).
 #
 # NOTE on `before-move-record` (§5 bounded hazard): this killpoint fires just AFTER `mc.receive`
 # RETURNS, so the receive op is already committed and backfill recovers it — no orphan for THIS

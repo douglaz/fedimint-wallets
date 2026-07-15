@@ -24,11 +24,12 @@ fn settlement_stall_deadline() -> Duration {
 }
 
 /// Settlement-stall watchdog (root-caused 2026-07 by the 24h soak). fedimint's lnv2 client
-/// spawns a shared `receive_lnurl_task` that holds a DB transaction open across a long-poll and
-/// commits with a NON-retrying `commit_tx()`; under the sustained concurrent load only a 24/7
-/// daemon produces, a `WriteConflict` panics that task and kills it — after which NO receive
-/// ever claims and the awaiter drivers pin the registry at its cap. We cannot fix that in the
-/// pinned fedimint fork, so the daemon detects the degradation and self-heals by restarting:
+/// spawned a shared `receive_lnurl_task` that held a DB transaction open across a long-poll and
+/// committed with a NON-retrying `commit_tx()`; under the sustained concurrent load only a 24/7
+/// daemon produces, a `WriteConflict` panicked that task and killed it — after which NO receive
+/// ever claimed and the awaiter drivers pinned the registry at its cap. That bug is fixed at our
+/// pinned fedimint rev (upstream PR #8816), but the watchdog stays as cause-agnostic insurance:
+/// ANY future failure mode that silently kills settlement gets the same self-heal by restarting:
 /// a fresh process rebuilds the client (fresh receive task) and reconcile re-drives the Awaiting
 /// operations to their TRUE terminal — claiming a funded contract, expiring an unpaid one — so
 /// no payment is ever marked failed while its contract is still claimable.

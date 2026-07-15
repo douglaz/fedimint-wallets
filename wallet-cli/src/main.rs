@@ -720,7 +720,8 @@ async fn run_standalone(cli: Cli) -> Result<(), CliExit> {
     // The journal's OWN RocksDB, matching walletd's split (client.db FIRST — the exclusivity
     // anchor above — then journal.db, always in that order so two processes can never deadlock).
     // A co-located journal's write churn flushes fedimint's tiny no-history memtable out from
-    // under its long-held lnv2 transactions and panics their commits (the 24h-soak wedge).
+    // under any transaction fedimint holds open and fails its commit (the 24h-soak wedge;
+    // fixed at our pinned rev, upstream PR #8816, but the isolation stands).
     let journal_open = fedimint_rocksdb::RocksDb::build(data_dir.join("journal.db")).open();
     let journal_db: Database = tokio::time::timeout(Duration::from_secs(10), journal_open)
         .await

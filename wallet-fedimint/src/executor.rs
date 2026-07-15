@@ -12,7 +12,7 @@
 //! two-leg send path — receive on `to`, re-quote + cap-check + `pay` from `from`, await both,
 //! settle → `Done` — synchronously (`perform` returns `Done`, never `Awaiting`, for a Move). It
 //! is resume-safe: `assemble_record` reattaches a replayed move to its existing invoice/recv_op/
-//! send_op (the send op-id is deterministic; a re-`pay` returns `AlreadyInFlight`/`AlreadyPaid`),
+//! send_op (the send op-id is deterministic; a re-`pay` returns `AlreadyInFlight`),
 //! so a crash never re-mints or re-pays. `Evacuate` (Phase 3.A) maps to the SAME send-required
 //! plan as `Move` (`MovePlan::from_action`), so it drives the identical validated two-leg path —
 //! the money engine can now flee a dying federation, not just top up a standby. Do not read
@@ -890,28 +890,16 @@ impl FedimintExecutor {
                     .pay(from, invoice.clone(), Some(gateway), meta)
                     .await
                     .map_err(map_raw_pay_send_error)?;
-                let (operation_id, completed, already_in_flight) = match outcome {
-                    SendOutcome::Started(operation_id) => (operation_id, false, false),
-                    SendOutcome::AlreadyInFlight(operation_id) => (operation_id, false, true),
-                    SendOutcome::AlreadyPaid(operation_id) => (operation_id, true, false),
+                let (operation_id, already_in_flight) = match outcome {
+                    SendOutcome::Started(operation_id) => (operation_id, false),
+                    // In flight OR settled — the awaiter attaches and terminalizes from the
+                    // op's own final state (a settled op's await resolves immediately).
+                    SendOutcome::AlreadyInFlight(operation_id) => (operation_id, true),
                 };
                 self.journal
                     .set_operation_artifact(&intent.idempotency_key, operation_id, None)
                     .await?;
-                if completed {
-                    if let Ok(observation) = self.mc.observe_op(*from, operation_id).await {
-                        self.journal
-                            .record_raw_observation(
-                                &intent.idempotency_key,
-                                operation_id,
-                                &observation,
-                            )
-                            .await?;
-                    }
-                }
-                return Ok(if completed {
-                    PerformOutcome::Done
-                } else if already_in_flight {
+                return Ok(if already_in_flight {
                     PerformOutcome::AwaitingAlreadyInFlight
                 } else {
                     PerformOutcome::Awaiting
@@ -1324,16 +1312,14 @@ impl FedimintExecutor {
                         .await
                         .map_err(map_send_error)?
                     {
-                        // All three are the SAME committed send (the client dedups on the
+                        // Both are the SAME committed send (the client dedups on the
                         // deterministic op-id): reattach, never double-pay (spec §4).
-                        SendOutcome::Started(op)
-                        | SendOutcome::AlreadyInFlight(op)
-                        | SendOutcome::AlreadyPaid(op) => op,
+                        SendOutcome::Started(op) | SendOutcome::AlreadyInFlight(op) => op,
                     };
                     // KILLPOINT (§5 backfill window): the send op is committed in the CLIENT db,
                     // but our MoveRecord does NOT yet carry `send_op`. A crash here must NOT
                     // double-pay: backfill recovers the send op by `move_id`; if that misses, a
-                    // re-`pay` dedups to `AlreadyInFlight`/`AlreadyPaid`.
+                    // re-`pay` dedups to `AlreadyInFlight`.
                     maybe_crash("after-send-commit");
                     rec.send_op = Some(send_op);
                     rec.phase = MovePhase::Sending;

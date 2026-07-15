@@ -108,10 +108,10 @@ async fn run_serve(config_path: &std::path::Path) -> Result<()> {
     // TWO RocksDBs, opened in a FIXED order (client.db first — the exclusivity anchor every
     // other process contends on, then journal.db; a consistent order can never deadlock).
     // The journal MUST NOT share the fedimint clients' store: fedimint tunes RocksDB to a
-    // 2MB write buffer with no extra memtable history, and its lnv2 receive task holds a
-    // transaction open across a minutes-long long-poll — a co-located journal's tick/ledger
-    // churn flushes that history away and the commit dies `TryAgain`→`WriteConflict`→panic
-    // (the 24h-soak wedge). Separate DBs = separate memtables.
+    // 2MB write buffer with no extra memtable history, so a co-located journal's tick/ledger
+    // churn flushes the history out from under any transaction fedimint holds open and its
+    // commit dies `TryAgain`→`WriteConflict` (the 24h-soak wedge; that instance is fixed at
+    // our pinned rev, upstream PR #8816). Separate DBs = separate memtables.
     let db = open_db(&config).await?;
     let journal_db = open_journal_db(&config).await?;
     let journal = Arc::new(FedimintJournal::new(journal_db.clone()));

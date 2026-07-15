@@ -694,7 +694,7 @@ async fn synchronous_failure_leaves_a_durable_failed_row() {
 }
 
 #[tokio::test]
-async fn already_paid_terminal_carries_definitive_fees() {
+async fn settled_dedup_terminal_carries_definitive_fees() {
     let j = mem_ledger();
     let k = key("pay:0101:n");
     j.record_started(
@@ -707,7 +707,8 @@ async fn already_paid_terminal_carries_definitive_fees() {
     )
     .await
     .expect("start");
-    // AlreadyPaid: terminalize Succeeded carrying the definitive fees read from the op meta.
+    // A dedup'd re-pay whose op already settled: the awaiter terminalizes Succeeded carrying
+    // the definitive fees read from the op meta.
     j.record_terminal(
         &k,
         OperationStatus::Succeeded,
