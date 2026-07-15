@@ -4272,9 +4272,10 @@ mod tests {
 
     async fn runtime_fixture() -> (Runtime, Arc<FedimintJournal>) {
         let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
         let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
-        let mc = Arc::new(MultiClient::new(db.clone(), mnemonic).await);
-        let journal = Arc::new(FedimintJournal::new(db));
+        let mc = Arc::new(MultiClient::new(db, journal_db.clone(), mnemonic).await);
+        let journal = Arc::new(FedimintJournal::new(journal_db));
         (Runtime::new(mc, journal.clone(), None, None, None), journal)
     }
 

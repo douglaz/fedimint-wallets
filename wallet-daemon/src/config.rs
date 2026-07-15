@@ -64,6 +64,14 @@ impl WalletdConfig {
         self.data_dir.join("client.db")
     }
 
+    /// The app journal's own store, SEPARATE from the fedimint clients' `client.db` — a
+    /// co-located journal's write churn flushes fedimint's tiny (2MB, no-history) memtable
+    /// out from under its long-held lnv2 transactions, panicking their commits (the 24h-soak
+    /// wedge). Never merge these back into one RocksDB.
+    pub fn journal_db_path(&self) -> PathBuf {
+        self.data_dir.join("journal.db")
+    }
+
     pub fn bind(&self) -> String {
         format!("{}:{}", authority_host(&self.address), self.port)
     }

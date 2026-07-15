@@ -74,9 +74,11 @@ async fn run_init(config_path: &std::path::Path) -> Result<()> {
     config::ensure_private_data_dir(&config.data_dir)?;
     // Acquire the exclusive store lock before rotating credentials. If another walletd owns
     // the DB, init must leave the token and client pointer untouched so clients remain able to
-    // authenticate to that running process.
-    let db = open_db(&config).await?;
-    let journal = FedimintJournal::new(db);
+    // authenticate to that running process. Same fixed order as serve: client.db (the
+    // exclusivity anchor), then journal.db (where the policy row lives after the split).
+    let _db = open_db(&config).await?;
+    let journal_db = open_journal_db(&config).await?;
+    let journal = FedimintJournal::new(journal_db);
     // Insert-if-absent: a re-init for token rotation NEVER resets an existing policy.
     journal
         .seed_policy(&Policy::default())
@@ -103,11 +105,19 @@ async fn run_serve(config_path: &std::path::Path) -> Result<()> {
     init_tracing(&config.log_level);
     config::ensure_private_data_dir(&config.data_dir)?;
     let token = config::read_token(&config)?;
+    // TWO RocksDBs, opened in a FIXED order (client.db first — the exclusivity anchor every
+    // other process contends on, then journal.db; a consistent order can never deadlock).
+    // The journal MUST NOT share the fedimint clients' store: fedimint tunes RocksDB to a
+    // 2MB write buffer with no extra memtable history, and its lnv2 receive task holds a
+    // transaction open across a minutes-long long-poll — a co-located journal's tick/ledger
+    // churn flushes that history away and the commit dies `TryAgain`→`WriteConflict`→panic
+    // (the 24h-soak wedge). Separate DBs = separate memtables.
     let db = open_db(&config).await?;
-    let journal = Arc::new(FedimintJournal::new(db.clone()));
+    let journal_db = open_journal_db(&config).await?;
+    let journal = Arc::new(FedimintJournal::new(journal_db.clone()));
 
     let mnemonic = load_or_generate_mnemonic(&db).await?;
-    let multi_client = Arc::new(MultiClient::new(db, mnemonic).await);
+    let multi_client = Arc::new(MultiClient::new(db, journal_db, mnemonic).await);
     let joined = journal
         .list_federations()
         .await
@@ -168,6 +178,22 @@ async fn open_db(config: &config::WalletdConfig) -> Result<Database> {
             format!(
                 "opening the wallet store {} (is another walletd running?)",
                 config.db_path().display()
+            )
+        })?
+        .into();
+    Ok(db)
+}
+
+/// The app journal's OWN RocksDB (`journal.db`), separate from the fedimint clients' store —
+/// see `run_serve` for why co-locating them wedges fedimint's long-held lnv2 transactions.
+async fn open_journal_db(config: &config::WalletdConfig) -> Result<Database> {
+    let db: Database = fedimint_rocksdb::RocksDb::build(config.journal_db_path())
+        .open()
+        .await
+        .with_context(|| {
+            format!(
+                "opening the journal store {} (is another walletd running?)",
+                config.journal_db_path().display()
             )
         })?
         .into();

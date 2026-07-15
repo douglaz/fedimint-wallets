@@ -717,7 +717,23 @@ async fn run_standalone(cli: Cli) -> Result<(), CliExit> {
         .map_err(|e| CliExit::Usage(anyhow::anyhow!("opening the wallet store: {e:#}")))?
         .into();
 
-    let journal = Arc::new(FedimintJournal::new(db.clone()));
+    // The journal's OWN RocksDB, matching walletd's split (client.db FIRST — the exclusivity
+    // anchor above — then journal.db, always in that order so two processes can never deadlock).
+    // A co-located journal's write churn flushes fedimint's tiny no-history memtable out from
+    // under its long-held lnv2 transactions and panics their commits (the 24h-soak wedge).
+    let journal_open = fedimint_rocksdb::RocksDb::build(data_dir.join("journal.db")).open();
+    let journal_db: Database = tokio::time::timeout(Duration::from_secs(10), journal_open)
+        .await
+        .map_err(|_| {
+            CliExit::Usage(anyhow::anyhow!(
+                "opening the journal store timed out waiting for its lock (walletd restarting?); \
+                 stop it, or use client mode (drop --standalone)"
+            ))
+        })?
+        .map_err(|e| CliExit::Usage(anyhow::anyhow!("opening the journal store: {e:#}")))?
+        .into();
+
+    let journal = Arc::new(FedimintJournal::new(journal_db.clone()));
 
     // §11: `history`/`show`/`candidates`/`approve` are OFFLINE journal reads and MUST work with only
     // the journal open — dispatch them BEFORE any client/network setup (see the phase-4/5 rationale).
@@ -750,7 +766,7 @@ async fn run_standalone(cli: Cli) -> Result<(), CliExit> {
     let mnemonic = load_or_generate_mnemonic(&db)
         .await
         .map_err(CliExit::from)?;
-    let multi_client = Arc::new(MultiClient::new(db, mnemonic).await);
+    let multi_client = Arc::new(MultiClient::new(db, journal_db, mnemonic).await);
 
     let joined = journal
         .list_federations()

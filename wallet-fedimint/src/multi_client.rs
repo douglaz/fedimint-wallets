@@ -45,9 +45,11 @@ use wallet_core::{ExecError, FederationId, FeeBreakdown, IdempotencyKey, Msat};
 /// load-bearing: a variable-length prefix could alias (`[0x01,0x00]` vs `[0x01],[0x00,..]`).
 const CLIENT_PREFIX_TAG: u8 = 0x01;
 
-/// One fedimint client per joined federation, sharing ONE async `Database`: app state
-/// (the journal) lives at `[0x00]`, each client `i` at `[0x01] ++ u32_le(db_prefix)`.
-/// Concrete type, no trait (ADR-0021) — `MultiClient` is the one production impl.
+/// One fedimint client per joined federation. `db` is the CLIENT store — each client `i`
+/// at `[0x01] ++ u32_le(db_prefix)`, plus fedimint's own client secret — while the app
+/// journal lives in its OWN separate `Database` (see [`Self::new`] for why co-locating
+/// them wedges fedimint's long-held lnv2 transactions). Concrete type, no trait
+/// (ADR-0021) — `MultiClient` is the one production impl.
 pub struct MultiClient {
     db: Database,
     journal: FedimintJournal,
@@ -106,9 +108,17 @@ struct JoinDeadlineElapsed;
 impl MultiClient {
     /// Derive the root secret once from `mnemonic` (`StandardDoubleDerive` — the
     /// per-federation mix-in happens INSIDE the fedimint builder on join/open; callers
-    /// must never pre-derive it, per the builder's own contract) and share `db` for the
-    /// journal + every per-federation client.
-    pub async fn new(db: Database, mnemonic: Mnemonic) -> Self {
+    /// must never pre-derive it, per the builder's own contract). `db` holds ONLY the
+    /// fedimint clients (+ the client secret); `journal_db` is a SEPARATE store for the
+    /// app journal. They MUST be different RocksDBs (the 24h soak, 2026-07): fedimint
+    /// tunes RocksDB to a 2MB write buffer with NO extra memtable history, and its lnv2
+    /// `receive_lnurl_task` holds a transaction open across a minutes-long long-poll —
+    /// any co-located writer (our journal's tick/ledger churn) flushing ~2MB during that
+    /// window destroys the snapshot's memtable history, so the commit fails `TryAgain`
+    /// (mapped to `WriteConflict` REGARDLESS of key disjointness), panics, and kills the
+    /// shared receive task. Separate DBs = separate memtables; our churn can no longer
+    /// starve fedimint's long-held transactions.
+    pub async fn new(db: Database, journal_db: Database, mnemonic: Mnemonic) -> Self {
         let root_secret = RootSecret::StandardDoubleDerive(
             Bip39RootSecretStrategy::<12>::to_root_secret(&mnemonic),
         );
@@ -117,7 +127,7 @@ impl MultiClient {
             .await
             .expect("binding the default client connectors performs no I/O and cannot fail");
         Self {
-            journal: FedimintJournal::new(db.clone()),
+            journal: FedimintJournal::new(journal_db),
             db,
             connectors,
             root_secret,
@@ -1748,8 +1758,9 @@ mod tests {
     #[tokio::test]
     async fn next_db_prefix_accounts_for_orphaned_client_partitions() {
         let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
         let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
-        let multi_client = MultiClient::new(db.clone(), mnemonic).await;
+        let multi_client = MultiClient::new(db.clone(), journal_db, mnemonic).await;
 
         let mut orphaned_client_key = client_prefix_bytes(41);
         orphaned_client_key.push(0x2f);
@@ -1766,8 +1777,9 @@ mod tests {
     #[tokio::test]
     async fn remove_client_partition_deletes_only_the_unfinished_prefix() {
         let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
         let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
-        let multi_client = MultiClient::new(db.clone(), mnemonic).await;
+        let multi_client = MultiClient::new(db.clone(), journal_db, mnemonic).await;
 
         let mut target_key = client_prefix_bytes(7);
         target_key.push(0x2f);
@@ -1817,8 +1829,9 @@ mod tests {
     #[tokio::test]
     async fn join_before_deadline_bounds_join_lock_wait() -> anyhow::Result<()> {
         let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
         let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
-        let multi_client = MultiClient::new(db, mnemonic).await;
+        let multi_client = MultiClient::new(db, journal_db, mnemonic).await;
         let _guard = multi_client.join_lock.lock().await;
         let invite = InviteCode::new(
             SafeUrl::parse("https://lock-held.example").expect("valid url"),

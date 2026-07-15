@@ -23,6 +23,14 @@ Type=simple
 ExecStart=%h/.cargo/bin/walletd
 Restart=on-failure
 RestartSec=2
+# fedimint tunes RocksDB to a 2MB write buffer with NO extra memtable history, and its
+# optimistic-commit validation needs history covering back to a transaction's snapshot. Its
+# lnv2 receive task holds a transaction open across minutes-long long-polls, so ~2MB of
+# client-side write churn in that window makes the commit die TryAgain -> WriteConflict ->
+# panic, killing the shared receive task (the 24h-soak wedge; the settlement-stall watchdog
+# restarts us when it happens). 32MB extends the survivable idle window 16x for a few tens
+# of MB of daemon memory — the right trade for a 24/7 process.
+Environment=FM_ROCKSDB_WRITE_BUFFER_SIZE=33554432
 # The ordered shutdown is bounded (parked long-polls drain within their request deadline);
 # give it generous headroom before systemd escalates to SIGKILL.
 TimeoutStopSec=90

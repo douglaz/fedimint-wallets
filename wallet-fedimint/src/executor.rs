@@ -1983,9 +1983,10 @@ mod tests {
     /// which decides `Move`/`Evacuate` BEFORE any federation I/O (no join needed).
     async fn test_executor() -> FedimintExecutor {
         let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
         let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
-        let mc = Arc::new(MultiClient::new(db.clone(), mnemonic).await);
-        let journal = Arc::new(FedimintJournal::new(db));
+        let mc = Arc::new(MultiClient::new(db, journal_db.clone(), mnemonic).await);
+        let journal = Arc::new(FedimintJournal::new(journal_db));
         FedimintExecutor::new(mc, journal, None, None)
     }
 
@@ -2343,12 +2344,14 @@ mod tests {
     #[tokio::test]
     async fn poison_reservation_row_does_not_terminalize_a_healthy_move() {
         let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
         let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
-        let mc = Arc::new(MultiClient::new(db.clone(), mnemonic).await);
-        let journal = Arc::new(FedimintJournal::new(db.clone()));
+        let mc = Arc::new(MultiClient::new(db, journal_db.clone(), mnemonic).await);
+        let journal = Arc::new(FedimintJournal::new(journal_db.clone()));
         let executor = FedimintExecutor::new(mc, journal, None, None);
 
-        let app_db = db.with_prefix(vec![0x00]);
+        // The poison row targets the JOURNAL's partition — on its own db after the split.
+        let app_db = journal_db.with_prefix(vec![0x00]);
         let mut dbtx = app_db.begin_transaction().await;
         let mut poison_index_key = vec![0x04, 0x00];
         poison_index_key.extend_from_slice(b"missing-intent");

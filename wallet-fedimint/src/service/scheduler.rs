@@ -725,9 +725,10 @@ mod tests {
     #[tokio::test]
     async fn tick_planning_failure_still_reaches_due_discovery() {
         let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
         let mnemonic = Mnemonic::from_entropy(&[0_u8; 16]).expect("valid test mnemonic");
-        let multi_client = Arc::new(MultiClient::new(db.clone(), mnemonic).await);
-        let journal = Arc::new(FedimintJournal::new(db));
+        let multi_client = Arc::new(MultiClient::new(db, journal_db.clone(), mnemonic).await);
+        let journal = Arc::new(FedimintJournal::new(journal_db));
         let runtime = Runtime::new(multi_client, journal.clone(), None, None, None);
         let service = super::super::WalletService::start_parts(
             None,
