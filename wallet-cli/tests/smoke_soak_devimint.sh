@@ -119,15 +119,17 @@ BASE="http://127.0.0.1:$PORT"
 AUTH=(-H "Authorization: Bearer $TOKEN")
 # The PRODUCTION ENSEMBLE, exactly as deployed: walletd under a supervisor (the systemd
 # Restart=on-failure stand-in) so the settlement-stall watchdog's exit-and-restart self-heal
-# actually heals, with the deploy unit's 32MB RocksDB write buffer (16x the fedimint default's
-# memtable history — see wallet-daemon/deploy/walletd.service for the whole story).
+# actually heals. Stock RocksDB tuning, deliberately: the lnv2 long-held-transaction wedge is
+# fixed at our pinned fedimint rev (upstream PR #8816), and this soak is the burn-in proving
+# that fix under the exact idle-cadence scenario that used to wedge — a widened write buffer
+# would mask any regression.
 RESTARTS_FILE="$SANDBOX/restarts"; : > "$RESTARTS_FILE"
 SUP_PID=""
 supervise() {
   local n=0
   while true; do
     n=$((n + 1)); echo "$n" > "$RESTARTS_FILE"
-    FM_ROCKSDB_WRITE_BUFFER_SIZE=33554432 "$WALLETD" >> "$WALLETD_LOG" 2>&1
+    "$WALLETD" >> "$WALLETD_LOG" 2>&1
     echo "$(date -u +%FT%TZ) walletd exited (run $n); supervisor restarting" >> "$WALLETD_LOG"
     sleep 2
   done
