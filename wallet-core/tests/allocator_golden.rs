@@ -16,7 +16,7 @@ macro_rules! fed {
     ($id:expr, $balance:expr, $probed:expr, $reputation:expr, $shutdown:expr, $healthy:expr, $elig:expr) => { FederationStatus { id: id!($id), balance: balance!($balance), probed_ok: $probed, reputation: $reputation, shutdown_notice: $shutdown, healthy: $healthy, eligible_to_fund: $elig } };
 }
 macro_rules! snap {
-    ([$($fed:expr),*], $spending:expr, $standby:expr, $cap:expr, $target:expr, $standby_target:expr, $now:expr) => { AllocatorSnapshot { federations: vec![$($fed),*], spending_fed: $spending, standby_fed: $standby, per_fed_cap: msat!($cap), target_spending_balance: msat!($target), standby_target: msat!($standby_target), max_fee: msat!(500), reservations: Reservations::default(), now: $now } };
+    ([$($fed:expr),*], $spending:expr, $standby:expr, $cap:expr, $target:expr, $standby_target:expr, $now:expr) => { AllocatorSnapshot { federations: vec![$($fed),*], spending_fed: $spending, standby_fed: $standby, per_fed_cap: msat!($cap), target_spending_balance: msat!($target), standby_target: msat!($standby_target), max_fee: msat!(500), min_move: Msat(0), reservations: Reservations::default(), now: $now } };
 }
 macro_rules! decision {
     ($action:expr, $reason:expr, $occurrence:expr, $key:expr) => { vec![AllocatorDecision { action: $action, reason: $reason, occurrence: $occurrence, idempotency_key: $key }] };
@@ -78,6 +78,37 @@ fn move_funds_distinct_warm_standby() {
 fn self_fund_standby_is_silent_noop() {
     let snapshot = snap!([fed!(1, 80_000, true, false, true)], Some(id!(1)), Some(id!(1)), 100_000, 50_000, 100_000, 2500);
     assert!(decide(&snapshot, occ(1)).is_empty());
+}
+
+#[test]
+fn sub_floor_standby_shortfall_is_silent_dust() {
+    // Standby 96_000 vs target 100_000: the 4_000 shortfall is below the 5_000 protocol
+    // move floor (lnv2's minimum incoming contract) — effectively AT target. The 24h soak
+    // logged 91 doomed sub-minimum moves retried every tick before this floor existed.
+    // Silent like the self-fund no-op: no move, no refusal.
+    let mut snapshot = snap!([fed!(1, 200_000, true, false, true), fed!(2, 96_000, true, false, true)], Some(id!(1)), Some(id!(2)), 500_000, 50_000, 100_000, 2600);
+    snapshot.min_move = Msat(5_000);
+    assert!(decide(&snapshot, occ(1)).is_empty());
+}
+
+#[test]
+fn floor_does_not_block_a_real_shortfall() {
+    // Same shape with a 6_000 shortfall (>= the floor): the move is emitted exactly as
+    // without the floor.
+    let mut snapshot = snap!([fed!(1, 200_000, true, false, true), fed!(2, 94_000, true, false, true)], Some(id!(1)), Some(id!(2)), 500_000, 50_000, 100_000, 2700);
+    snapshot.min_move = Msat(5_000);
+    assert_eq!(decide(&snapshot, occ(1)), decision!(move_action!(1, 2, 6_000), ReasonCode::StandbyBelowTarget, occ(1), move_key(1, 2, 1)));
+}
+
+#[test]
+fn sub_floor_available_crumbs_skip_the_move_but_keep_the_refusal() {
+    // A REAL 50_000 shortfall, but the source's spendable surplus after its own target and
+    // the fee reservation is only 3_000 (53_500 - 50_000 - 500) — sub-floor crumbs that
+    // could only fail lnv2's minimum at perform time. No move; the shortfall refusal STILL
+    // records why the standby stays underfunded (unlike the dust case, this is actionable).
+    let mut snapshot = snap!([fed!(1, 53_500, true, false, true), fed!(2, 0, true, false, true)], Some(id!(1)), Some(id!(2)), 500_000, 50_000, 50_000, 2800);
+    snapshot.min_move = Msat(5_000);
+    assert_eq!(decide(&snapshot, occ(1)), decision!(refuse!(2, ReasonCode::StandbyBelowTarget), ReasonCode::StandbyBelowTarget, occ(1), refuse_key(2, ReasonCode::StandbyBelowTarget, 1)));
 }
 
 #[test]

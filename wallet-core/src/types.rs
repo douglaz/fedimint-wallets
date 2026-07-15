@@ -90,6 +90,12 @@ pub struct AllocatorSnapshot {
     pub target_spending_balance: Msat,
     pub standby_target: Msat,
     pub max_fee: Msat,
+    /// The smallest fund/top-up move worth emitting, injected by the I/O layer from the
+    /// protocol floor (lnv2 refuses incoming contracts below its 5-sat minimum). A top-up
+    /// whose whole SHORTFALL is below this is dust — the destination is effectively at
+    /// target, and the move could only fail at perform time, every tick, forever (the 24h
+    /// soak logged 91 such doomed sub-minimum moves). Zero disables the floor.
+    pub min_move: Msat,
     /// Durable cross-operation reservations projected from the journal. The allocator's
     /// local `credited`/`debited` maps remain the intra-batch layer.
     pub reservations: Reservations,

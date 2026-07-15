@@ -153,11 +153,27 @@ fn fund_into(
         return;
     }
 
+    // A shortfall below the protocol move floor is DUST: the destination is effectively at
+    // target, and a sub-floor move could only fail lnv2's minimum-incoming-contract check at
+    // perform time — every tick, forever (the 24h soak logged 91 such doomed moves). Silent
+    // like the self-fund no-op: a refusal row every cycle for a sub-5-sat gap would itself
+    // be the noise this floor removes.
+    if want < snapshot.min_move.0 {
+        return;
+    }
+
     // Reservation-aware cap room: any inbound already committed to `dest` this pass is
     // subtracted, so a same-tick evacuation into it and this top-up cannot jointly
     // exceed the cap.
     let cap_room = cap_room_with(snapshot, dest, credited);
     let amount = want.min(cap_room).min(available);
+    // Cap/available CRUMBS below the floor are equally unperformable: emit no move — the
+    // shortfall refusals below still record WHY the destination stays underfunded.
+    let amount = if amount < snapshot.min_move.0 {
+        0
+    } else {
+        amount
+    };
     if let Some(src) = source.filter(|_| amount > 0) {
         push_and_reserve(
             out,
