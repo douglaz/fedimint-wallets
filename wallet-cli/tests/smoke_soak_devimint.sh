@@ -229,7 +229,11 @@ HIST=$("$WALLET_CLI" history --limit 100000)
 MISSING=0; DUPED=0
 while IFS= read -r key; do
   [[ -z "$key" ]] && continue
-  n=$(grep -cF "$key" <<<"$HIST" || true); n=${n:-0}
+  # Exact-key match, NOT substring: move keys end in the occurrence number, so key
+  # ...:10000:6 is a string prefix of ...:10000:66 and a bare grep -cF double-counts
+  # (the 24h v3 run "found" 4 dups this way: 6/66, 12/120, 18/186, 24/240). Keys are
+  # hex/digits/colons only, so they're ERE-safe; require a non-digit or EOL after.
+  n=$(grep -cE "${key}([^0-9]|\$)" <<<"$HIST" || true); n=${n:-0}
   if (( n == 0 )); then MISSING=$((MISSING + 1)); echo "MISSING from ledger: $key" >&2; fi
   if (( n > 1 )); then DUPED=$((DUPED + 1)); echo "DUPLICATED in ledger ($n rows): $key" >&2; fi
 done < "$KEYS_FILE"
@@ -237,7 +241,11 @@ SUBMITTED=$(wc -l < "$KEYS_FILE")
 echo "audit: $SUBMITTED keys submitted, $MISSING missing, $DUPED duplicated"
 
 echo "== audit: daemon log hygiene (no lock conflicts, no panics) =="
-LOCK_HITS=$(grep -ciE "database.*lock|lock.*conflict|would block" "$WALLETD_LOG" || true); LOCK_HITS=${LOCK_HITS:-0}
+# Cross-process DB LOCK contention only (RocksDB's "While lock file ...: Resource
+# temporarily unavailable"). The old fuzzy pattern (database.*lock) substring-matched the
+# word "block" in fedimint's BENIGN "commit failed in an autocommit block - retrying" WARN —
+# a retried optimistic conflict is designed behavior, not a lock conflict.
+LOCK_HITS=$(grep -ciE "lock file|resource temporarily unavailable|would block" "$WALLETD_LOG" || true); LOCK_HITS=${LOCK_HITS:-0}
 PANIC_HITS=$(grep -ciE "panicked at" "$WALLETD_LOG" || true); PANIC_HITS=${PANIC_HITS:-0}
 echo "audit: lock-ish lines $LOCK_HITS, panics $PANIC_HITS"
 
