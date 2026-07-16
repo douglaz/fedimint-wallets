@@ -230,13 +230,15 @@ if (( A2 != A1 || B2 != B1 )); then
   exit 1
 fi
 
-# reconcile must be a no-op: the move intent is Done (not pending/awaiting).
+# reconcile must be a no-op: the move intent is Done (not pending/awaiting). The summary
+# format changed in phase 6a step 3 (redriven=..., was awaiting=...) — assert the field
+# that carries this check's intent: a Done move re-drives nothing.
 echo "-- reconcile: a Done move must not be re-driven --"
 RECONCILE_OUT=$(wcli reconcile)
 echo "reconcile: $RECONCILE_OUT"
 case "$RECONCILE_OUT" in
-  *"awaiting=0"*) : ;;
-  *) echo "FAIL: expected reconcile to report 'awaiting=0', got '$RECONCILE_OUT'" >&2; exit 1 ;;
+  *"redriven=0"*) : ;;
+  *) echo "FAIL: expected reconcile to report 'redriven=0', got '$RECONCILE_OUT'" >&2; exit 1 ;;
 esac
 A3=$(balance_msat_for_fed "$FED_A")
 B3=$(balance_msat_for_fed "$FED_B")

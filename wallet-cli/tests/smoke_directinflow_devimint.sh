@@ -50,7 +50,7 @@
 #   wallet-cli await-move KEY                         -> done  (recv_op subscription finalizes)
 #   wallet-cli balance                                -> EXACTLY N
 #   direct-inflow (same args) -> SAME invoice, balance still N  (idempotent: no second mint)
-#   reconcile -> awaiting=0, balance still N
+#   reconcile -> redriven=0, balance still N
 set -euo pipefail
 
 : "${FM_INVITE_CODE:?FM_INVITE_CODE not set — run this inside \`devimint dev-fed --exec\`}"
@@ -168,8 +168,8 @@ echo "-- reconcile: a Done inflow must not be re-driven or re-minted --"
 RECONCILE_OUT=$(wcli reconcile)
 echo "reconcile: $RECONCILE_OUT"
 case "$RECONCILE_OUT" in
-  *"awaiting=0"*) : ;;
-  *) echo "FAIL: expected reconcile to report 'awaiting=0', got '$RECONCILE_OUT'" >&2; exit 1 ;;
+  *"redriven=0"*) : ;;  # summary format changed in phase 6a step 3 (redriven=, was awaiting=)
+  *) echo "FAIL: expected reconcile to report 'redriven=0', got '$RECONCILE_OUT'" >&2; exit 1 ;;
 esac
 BAL_RECONCILE=$(balance_msat_for_fed "$FED_ID")
 if (( BAL_RECONCILE != BAL_AFTER )); then
