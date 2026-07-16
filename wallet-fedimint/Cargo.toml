@@ -17,19 +17,19 @@ license = "AGPL-3.0-or-later"
 wallet-core = { path = "../wallet-core" }
 wallet-api = { path = "../wallet-api" }
 # All fedimint crates share ONE git source + rev (douglaz/fedimint @ b108ec6, see note above).
-fedimint-core = { git = "https://github.com/douglaz/fedimint.git", rev = "d0a552c3c412aefce59876016987aefcd69f04db" }
-fedimint-api-client = { git = "https://github.com/douglaz/fedimint.git", rev = "d0a552c3c412aefce59876016987aefcd69f04db" }
-fedimint-client = { git = "https://github.com/douglaz/fedimint.git", rev = "d0a552c3c412aefce59876016987aefcd69f04db" }
-fedimint-bip39 = { git = "https://github.com/douglaz/fedimint.git", rev = "d0a552c3c412aefce59876016987aefcd69f04db" }
-fedimint-rocksdb = { git = "https://github.com/douglaz/fedimint.git", rev = "d0a552c3c412aefce59876016987aefcd69f04db" }
+fedimint-core = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
+fedimint-api-client = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
+fedimint-client = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
+fedimint-bip39 = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
+fedimint-rocksdb = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
 # `ConnectorRegistry` (join/open need it) is already resolved transitively via
 # fedimint-client, so pinning it directly adds no new version to the lockfile.
-fedimint-connectors = { git = "https://github.com/douglaz/fedimint.git", rev = "d0a552c3c412aefce59876016987aefcd69f04db" }
-fedimint-mint-client = { git = "https://github.com/douglaz/fedimint.git", rev = "d0a552c3c412aefce59876016987aefcd69f04db" }
-fedimint-wallet-client = { git = "https://github.com/douglaz/fedimint.git", rev = "d0a552c3c412aefce59876016987aefcd69f04db" }
-fedimint-ln-client = { git = "https://github.com/douglaz/fedimint.git", rev = "d0a552c3c412aefce59876016987aefcd69f04db" }
-fedimint-lnv2-client = { git = "https://github.com/douglaz/fedimint.git", rev = "d0a552c3c412aefce59876016987aefcd69f04db" }
-fedimint-lnv2-common = { git = "https://github.com/douglaz/fedimint.git", rev = "d0a552c3c412aefce59876016987aefcd69f04db" }
+fedimint-connectors = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
+fedimint-mint-client = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
+fedimint-wallet-client = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
+fedimint-ln-client = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
+fedimint-lnv2-client = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
+fedimint-lnv2-common = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
 # `Bolt11Invoice` (the type lnv2 `send`/`receive` speak) — pinned to the SAME version
 # fedimint's workspace uses (0.33), so it resolves to the one copy already in the lockfile;
 # depending on it directly adds no new version and guarantees the exact same type.

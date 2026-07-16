@@ -19,10 +19,10 @@ wallet-api = { path = "../wallet-api" }
 wallet-fedimint = { path = "../wallet-fedimint" }
 # Same git source + rev as wallet-fedimint (do not change the pin) — the daemon builds the DB,
 # mnemonic, and MultiClient exactly like wallet-cli does at bring-up.
-fedimint-core = { git = "https://github.com/douglaz/fedimint.git", rev = "d0a552c3c412aefce59876016987aefcd69f04db" }
-fedimint-client = { git = "https://github.com/douglaz/fedimint.git", rev = "d0a552c3c412aefce59876016987aefcd69f04db" }
-fedimint-bip39 = { git = "https://github.com/douglaz/fedimint.git", rev = "d0a552c3c412aefce59876016987aefcd69f04db" }
-fedimint-rocksdb = { git = "https://github.com/douglaz/fedimint.git", rev = "d0a552c3c412aefce59876016987aefcd69f04db" }
+fedimint-core = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
+fedimint-client = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
+fedimint-bip39 = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
+fedimint-rocksdb = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
