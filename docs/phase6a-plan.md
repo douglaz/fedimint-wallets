@@ -383,6 +383,12 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
   applies to LIVE intents only; a user re-request whose key matches a TERMINAL-FAILED
   intent is the phase-1-sanctioned **manual retry** — it refreshes that intent to Pending
   with the new sizing fields (journaled); a key matching Done still dedups.
+  **One-attempt-per-invoice carve-out (post fedimint 703a37e8f3f):** lnv2 permits a
+  single payment attempt per invoice, so manual retry of a Failed PAY is sanctioned only
+  while no send op was committed (pre-fund failures: fee over cap, no gateway route —
+  `operation_id` absent). Once the prior attempt committed its op (`operation_id` set),
+  a re-`pay` can only dedup-reattach to the dead op and can never succeed; the actor
+  refuses it with an explicit "request a fresh invoice" message instead of refreshing.
   **Universal attach rule (passes 11-12):** for EVERY verb, the §6a.2 same-key attach
   verifies ALL sizing fields of the request (fed, amount, fee cap) against the existing
   intent — the key identifies the operation, the sizing check guards its bounds; any

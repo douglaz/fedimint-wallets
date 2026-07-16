@@ -842,6 +842,21 @@ impl ActorState {
         let key = existing.idempotency_key.clone();
         if existing.status == IntentStatus::Failed && req.actor == Actor::User {
             validate_manual_retry_anchor(&existing.action, &req.decision.action)?;
+            // lnv2 allows ONE payment attempt per invoice: once the prior attempt
+            // committed its send op (`operation_id` is the pre/post-fund reservation
+            // boundary), a re-`pay` can only dedup-reattach to that dead op — it can
+            // never succeed. Refuse loudly instead of refreshing an unwinnable intent.
+            // Failed pays WITHOUT an op (fee over cap, no gateway route) never reached
+            // the federation, so those stay manually retryable below.
+            if matches!(existing.action, Action::Pay { .. }) && existing.operation_id.is_some() {
+                return Err(refused(
+                    RefuseReason::Conflict,
+                    "this invoice already consumed its single payment attempt (the prior \
+                     attempt was refunded or failed after submission); request a fresh \
+                     invoice from the payee"
+                        .to_owned(),
+                ));
+            }
             let external_admission = counts_against_external_cap(&req.decision, req.actor);
             if external_admission && driver::external_len(&self.registry) >= EXTERNAL_DRIVER_CAP {
                 return Err(refused(

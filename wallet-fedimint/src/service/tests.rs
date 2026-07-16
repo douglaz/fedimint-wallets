@@ -1660,6 +1660,46 @@ async fn same_key_live_attach_ensures_orphan_is_driven_and_done_dedups() {
 }
 
 #[tokio::test]
+async fn failed_pay_with_committed_op_refuses_manual_retry() {
+    // lnv2 allows one payment attempt per invoice: a Failed pay whose prior attempt
+    // COMMITTED its send op (operation_id set) can never succeed on retry — the SDK
+    // dedups any re-`pay` back to the dead op. The actor must refuse loudly with an
+    // actionable message instead of refreshing an unwinnable intent.
+    let executor = Arc::new(SlowExecutor::default());
+    let (service, journal) = fixture(executor).await;
+    let client = service.client();
+    let old = pay("pay:spent", fed(1), 10, 1, 21);
+    let mut failed = Intent::from_decision(&old.decision, Actor::User, 1);
+    failed.status = IntentStatus::Failed;
+    failed.operation_id = Some(OperationId([7; 32]));
+    journal.upsert(&failed).await.expect("seed failed with op");
+    let err = client
+        .decide_op(pay("pay:spent", fed(1), 20, 2, 21))
+        .await
+        .expect_err("committed-op retry must refuse");
+    assert!(matches!(
+        err,
+        ServiceError::Refused {
+            reason: RefuseReason::Conflict,
+            ..
+        }
+    ));
+    assert!(
+        err.to_string().contains("single payment attempt"),
+        "refusal must tell the user the invoice is spent: {err}"
+    );
+    // The failed intent is untouched: same attempt counter, still Failed.
+    let untouched = journal
+        .get(&IdempotencyKey("pay:spent".to_owned()))
+        .await
+        .expect("read back")
+        .unwrap();
+    assert_eq!(untouched.status, IntentStatus::Failed);
+    assert_eq!(untouched.attempt, 0);
+    service.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn failed_manual_retry_refreshes_sizing_but_live_mismatch_conflicts() {
     let executor = Arc::new(SlowExecutor::default());
     let (service, journal) = fixture(executor).await;
