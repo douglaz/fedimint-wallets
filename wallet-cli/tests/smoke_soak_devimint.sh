@@ -71,6 +71,9 @@ cleanup() {
   mkdir -p "$DEBUG_DIR"
   cp -f "$WALLETD_LOG" "$DEBUG_DIR/walletd.log" 2>/dev/null || true
   cp -f "$KEYS_FILE" "$DEBUG_DIR/submitted-keys.txt" 2>/dev/null || true
+  # Preserve the exact history dump the exactly-once audit grepped: the v3 dup-FAIL
+  # post-mortem needed a structural argument because this wasn't kept.
+  if [[ -n "${HIST:-}" ]]; then printf '%s\n' "$HIST" > "$DEBUG_DIR/history-dump.txt" 2>/dev/null || true; fi
   if [[ "$STATUS" != "0" ]]; then
     echo "diagnostics preserved at $DEBUG_DIR" >&2
     tail -30 "$WALLETD_LOG" >&2 2>/dev/null || true
@@ -247,7 +250,11 @@ echo "== audit: daemon log hygiene (no lock conflicts, no panics) =="
 # a retried optimistic conflict is designed behavior, not a lock conflict.
 LOCK_HITS=$(grep -ciE "lock file|resource temporarily unavailable|would block" "$WALLETD_LOG" || true); LOCK_HITS=${LOCK_HITS:-0}
 PANIC_HITS=$(grep -ciE "panicked at" "$WALLETD_LOG" || true); PANIC_HITS=${PANIC_HITS:-0}
-echo "audit: lock-ish lines $LOCK_HITS, panics $PANIC_HITS"
+# Retried autocommit conflicts are DESIGNED behavior (v3 saw exactly 1 in 24h), but a
+# regression that made them constant would sail through the narrowed lock audit — keep
+# them as a rate canary, not a zero-tolerance check.
+RETRY_HITS=$(grep -c "commit failed in an autocommit block" "$WALLETD_LOG" 2>/dev/null || true); RETRY_HITS=${RETRY_HITS:-0}
+echo "audit: lock-ish lines $LOCK_HITS, panics $PANIC_HITS, autocommit retries $RETRY_HITS"
 
 echo "== self-heal accounting (supervisor restarts + watchdog firings) =="
 RESTARTS=$(cat "$RESTARTS_FILE" 2>/dev/null || echo 1); RESTARTS=${RESTARTS:-1}
@@ -275,6 +282,10 @@ FAIL_BUDGET=$(( SELF_HEALS * 6 + SUBMITTED / 20 ))   # ~6 ops around each heal +
 (( DUPED == 0 ))    || FAIL_REASONS+=("$DUPED duplicated key(s)")
 (( LOCK_HITS == 0 )) || FAIL_REASONS+=("$LOCK_HITS lock-conflict line(s)")
 (( PANIC_HITS <= SELF_HEALS )) || FAIL_REASONS+=("$PANIC_HITS panic(s) but only $SELF_HEALS restart(s) — an unhealed panic")
+(( SCHED_DEAD == 0 )) || FAIL_REASONS+=("scheduler_alive=false observed $SCHED_DEAD time(s) — a silently dead scheduler is not a PASS")
+# Canary threshold: ~1 retried conflict per soak-day is the observed healthy rate; an
+# order of magnitude more means something started churning fedimint's memtable again.
+(( RETRY_HITS <= 10 )) || FAIL_REASONS+=("$RETRY_HITS autocommit-retry line(s) — conflict rate regressed (healthy ≈1/24h)")
 
 if (( ${#FAIL_REASONS[@]} > 0 )); then
   printf 'FAIL: %s\n' "${FAIL_REASONS[@]}" >&2
