@@ -45,6 +45,12 @@ enum Command {
     /// the default Policy row (insert-if-absent). Idempotent: re-running rotates the token and
     /// rewrites host config while preserving the DB + policy.
     Init,
+    /// Print the wallet's 12-word recovery mnemonic to stdout so the operator can write it
+    /// down (the seed otherwise lives ONLY inside client.db — losing that store without a
+    /// backup loses the funds). Read-only: never generates a seed, and fails loudly if the
+    /// store has none. Blocks on the exclusive store lock, so it only reveals the secret
+    /// while the daemon is stopped — same while-stopped semantics as `init`'s token rotation.
+    Mnemonic,
 }
 
 #[tokio::main]
@@ -56,8 +62,35 @@ async fn main() -> Result<()> {
     };
     match cli.command {
         Some(Command::Init) => run_init(&config_path).await,
+        Some(Command::Mnemonic) => run_mnemonic(&config_path).await,
         None => run_serve(&config_path).await,
     }
+}
+
+/// `walletd mnemonic`: reveal the persisted seed for a written backup. Deliberately NOT a
+/// load-or-generate: revealing must never mint a seed (a mistyped data dir would silently
+/// hand the operator words that control an empty wallet). The words go to stdout alone —
+/// warnings go to stderr — so `walletd mnemonic > seed.txt` captures exactly the secret.
+async fn run_mnemonic(config_path: &std::path::Path) -> Result<()> {
+    let config = config::load(config_path)?;
+    let db = open_db(&config).await?;
+    let entropy = Client::load_decodable_client_secret_opt::<Vec<u8>>(&db)
+        .await
+        .map_err(|error| {
+            error.context("wallet client secret is present in the database but failed to decode")
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no wallet seed in {} — this store has never run a wallet (check --config \
+                 and the data_dir it points at)",
+                config.db_path().display()
+            )
+        })?;
+    let mnemonic = Mnemonic::from_entropy(&entropy)?;
+    eprintln!("write these 12 words down and store them offline; anyone holding them");
+    eprintln!("controls the funds. This is the ONLY copy outside client.db.");
+    println!("{mnemonic}");
+    Ok(())
 }
 
 /// `walletd init`: filesystem scaffolding + a durable default-policy seed. Deliberately does
