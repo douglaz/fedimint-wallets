@@ -14,10 +14,10 @@ wallet-core = { path = "../wallet-core" }
 wallet-api = { path = "../wallet-api" }
 wallet-fedimint = { path = "../wallet-fedimint" }
 # Same git source + rev as wallet-fedimint (see its Cargo.toml note); do not change the pin.
-fedimint-core = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
-fedimint-client = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
-fedimint-bip39 = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
-fedimint-rocksdb = { git = "https://github.com/fedimint/fedimint.git", rev = "d3c1537a11c793badccefb64a258a64196b29cd7" }
+fedimint-core = { git = "https://github.com/douglaz/fedimint.git", rev = "63ab515d1fc33d0d2e061f43eb41302b5f775c97" }
+fedimint-client = { git = "https://github.com/douglaz/fedimint.git", rev = "63ab515d1fc33d0d2e061f43eb41302b5f775c97" }
+fedimint-bip39 = { git = "https://github.com/douglaz/fedimint.git", rev = "63ab515d1fc33d0d2e061f43eb41302b5f775c97" }
+fedimint-rocksdb = { git = "https://github.com/douglaz/fedimint.git", rev = "63ab515d1fc33d0d2e061f43eb41302b5f775c97" }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 # The SAME advisory-lock crate fedimint-db-locked uses (workspace-resolved 0.1.10), so a
