@@ -22,6 +22,7 @@ use fedimint_client::Client;
 use fedimint_core::db::Database;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use wallet_api::Policy;
 use wallet_fedimint::{FedimintJournal, MultiClient, Runtime, WalletService};
 
@@ -168,12 +169,20 @@ async fn run_serve(config_path: &std::path::Path) -> Result<()> {
     // decide (step 4); no constructor cap. The gateway pin is host config (walletd.toml):
     // required against devimint, whose LDK gateway is never registered into the lnv2 set.
     let pinned_gateway = config.gateway.clone().map(wallet_fedimint::GatewayUrl);
+    // Per-`perform` wall-clock deadline (§15.9). The daemon MUST bound this: an unbounded
+    // `perform` lets a stalled settlement long-poll (e.g. a `Move`'s receive-claim await over
+    // a flaky transport) park its driver forever — the driver never yields, so reconcile can
+    // never re-drive it and the move hangs indefinitely (observed on an iroh-transport fed).
+    // On timeout the intent is left `Pending` (never terminalized), and the next reconcile
+    // re-drives it with a FRESH await, the way `wallet-cli` already bounds every op. Join is
+    // exempt inside the timeout wrapper (DKG config download is legitimately slow).
+    let perform_timeout = perform_timeout_from_env();
     let service_runtime = Runtime::new(
         multi_client.clone(),
         journal.clone(),
         pinned_gateway.clone(),
         None,
-        None,
+        perform_timeout,
     );
     let service = WalletService::start(service_runtime)
         .await
@@ -201,6 +210,29 @@ async fn run_serve(config_path: &std::path::Path) -> Result<()> {
     };
 
     server::run(service, state, listener).await
+}
+
+/// The per-`perform` deadline for the driving runtime, from `WALLETD_PERFORM_TIMEOUT_SECS`
+/// (default 600s, matching `wallet-cli`). `0` disables the deadline — allowed but discouraged,
+/// since an unbounded `perform` can park a driver on a stalled settlement long-poll forever.
+/// A non-numeric value falls back to the default rather than failing daemon startup.
+fn perform_timeout_from_env() -> Option<Duration> {
+    parse_perform_timeout(
+        std::env::var("WALLETD_PERFORM_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parse of the `WALLETD_PERFORM_TIMEOUT_SECS` value (split from the env read so it is
+/// unit-testable without process-global env). `None`/blank/non-numeric → the 600s default; an
+/// explicit `0` → no deadline.
+fn parse_perform_timeout(raw: Option<&str>) -> Option<Duration> {
+    const DEFAULT_SECS: u64 = 600;
+    let secs = raw
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS);
+    (secs > 0).then(|| Duration::from_secs(secs))
 }
 
 async fn open_db(config: &config::WalletdConfig) -> Result<Database> {
@@ -258,4 +290,35 @@ fn init_tracing(level: &str) {
         .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .try_init();
+}
+
+#[cfg(test)]
+mod perform_timeout_tests {
+    use super::{parse_perform_timeout, Duration};
+
+    #[test]
+    fn defaults_to_600s_when_unset_or_garbage() {
+        assert_eq!(parse_perform_timeout(None), Some(Duration::from_secs(600)));
+        assert_eq!(
+            parse_perform_timeout(Some("")),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            parse_perform_timeout(Some("not-a-number")),
+            Some(Duration::from_secs(600))
+        );
+    }
+
+    #[test]
+    fn honors_an_explicit_value_and_disables_on_zero() {
+        assert_eq!(
+            parse_perform_timeout(Some("180")),
+            Some(Duration::from_secs(180))
+        );
+        assert_eq!(
+            parse_perform_timeout(Some("  180  ")),
+            Some(Duration::from_secs(180))
+        );
+        assert_eq!(parse_perform_timeout(Some("0")), None);
+    }
 }

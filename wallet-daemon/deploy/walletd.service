@@ -23,6 +23,11 @@ Type=simple
 ExecStart=%h/.cargo/bin/walletd
 Restart=on-failure
 RestartSec=2
+# Per-`perform` deadline (default 600s). A stalled settlement long-poll (e.g. a cross-fed
+# Move's receive-claim await over a flaky transport) is cancelled at this deadline, left
+# Pending, and re-driven by reconcile with a fresh await instead of parking its driver
+# forever. Lower it (e.g. 180) to recover such stalls faster; 0 disables it (discouraged).
+# Environment=WALLETD_PERFORM_TIMEOUT_SECS=600
 # The ordered shutdown is bounded (parked long-polls drain within their request deadline);
 # give it generous headroom before systemd escalates to SIGKILL.
 TimeoutStopSec=90
