@@ -29,7 +29,8 @@ pub use scorer::{
 };
 pub use types::*;
 pub use watch::{
-    adaptive_sleep_ms, discover_pass_plan, probe_budget_ok, probe_budget_usage, probe_next_due,
-    probe_next_due_at, AdaptiveSleepDeadlines, DiscoverPassPlan, ProbeBudget, ProbeBudgetUsage,
-    WatchPolicy, WATCH_BUSY_SPIN_FLOOR_MS,
+    adaptive_sleep_ms, discover_pass_plan, discover_pass_plan_in_rotation, probe_budget_ok,
+    probe_budget_usage, probe_next_due, probe_next_due_at, probe_wake_due_ms,
+    AdaptiveSleepDeadlines, DiscoverPassPlan, ProbeBudget, ProbeBudgetUsage, WatchPolicy,
+    WATCH_BUSY_SPIN_FLOOR_MS,
 };

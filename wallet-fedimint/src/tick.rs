@@ -193,6 +193,10 @@ pub fn build_snapshot(
         target_spending_balance: policy.target_spending_balance,
         standby_target: policy.standby_target,
         max_fee: policy.max_fee,
+        // lnv2's minimum incoming contract: a fund/top-up sized below this could only fail
+        // at perform time, so the allocator treats a sub-floor shortfall as dust.
+        min_move: Msat(crate::executor::MINIMUM_INCOMING_CONTRACT_MSAT),
+        reservations: wallet_core::Reservations::default(),
         now: policy.now,
     }
 }
@@ -435,6 +439,8 @@ pub struct ScoredFed {
 pub struct TickReport {
     pub decisions: Vec<AllocatorDecision>,
     pub summary: ExecutionSummary,
+    pub spending_fed: Option<FederationId>,
+    pub standby_fed: Option<FederationId>,
 }
 
 /// The result of [`crate::runtime::Runtime::status`]: the per-fed scored view, the
@@ -698,6 +704,7 @@ mod tests {
                 Action::RefuseInflow {
                     fed,
                     reason: ReasonCode::NotProbed,
+                    ..
                 } if *fed == fed_id(2)
             )),
             "unpassed auto-joined standby must be refused, not funded: {gated_decisions:?}"
@@ -738,6 +745,7 @@ mod tests {
                 Action::RefuseInflow {
                     fed,
                     reason: ReasonCode::NotProbed,
+                    ..
                 } if *fed == fed_id(2)
             )),
             "unpassed auto-joined spending pin must be refused, not topped up: {spending_pin_decisions:?}"
@@ -1279,6 +1287,7 @@ mod tests {
                 Action::RefuseInflow {
                     fed,
                     reason: ReasonCode::OverCap,
+                    ..
                 } if *fed == fed_id(1)
             )),
             "expected an over-cap refusal for fed 1; decisions: {decisions:?}"

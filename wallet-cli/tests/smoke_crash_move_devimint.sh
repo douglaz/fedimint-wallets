@@ -28,7 +28,7 @@
 #   after-send-commit    — send op committed in the CLIENT db, but our MoveRecord does NOT yet
 #                          carry `send_op`. Resume must NOT double-pay: backfill recovers the
 #                          send op by `move_id`; if that misses, a re-drive re-`pay`s and the
-#                          client dedups to `AlreadyInFlight`/`AlreadyPaid` (§5).
+#                          client dedups to `AlreadyInFlight` (§5).
 #
 # NOTE on `before-move-record` (§5 bounded hazard): this killpoint fires just AFTER `mc.receive`
 # RETURNS, so the receive op is already committed and backfill recovers it — no orphan for THIS
@@ -123,7 +123,15 @@ DI_ERR="$(mktemp)"
 MOVE_ERR="$(mktemp)"
 trap 'rm -rf "$DATA_DIR" "$DI_ERR" "$MOVE_ERR"' EXIT
 
-wcli() { "$WALLET_CLI" --data-dir "$DATA_DIR" "$@"; }
+wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" --gateway "$GW" "$@"; }
+join_fed() {
+  local started key state
+  started=$(wcli join "$1") || return
+  key=${started#* }
+  state=$(wcli await-move "$key") || return
+  [[ "$state" == "done" ]] || { echo "join $key did not settle: $state" >&2; return 1; }
+  cut -d: -f2 <<<"$key"
+}
 balance_msat_for_fed() {
   local fed_id="$1"
   # NOTE: no `exit` in awk — it must consume ALL of `wcli balance`'s output, else awk closes the
@@ -133,8 +141,8 @@ balance_msat_for_fed() {
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 echo "== join BOTH federations =="
-FED_A=$(wcli join "$FM_INVITE_CODE")
-FED_B=$(wcli join "$FED_B_INVITE")
+FED_A=$(join_fed "$FM_INVITE_CODE")
+FED_B=$(join_fed "$FED_B_INVITE")
 echo "fed A (source): $FED_A"
 echo "fed B (dest):   $FED_B"
 [[ "$FED_A" != "$FED_B" ]] || fail "both invites resolved to the SAME federation id ($FED_A) — need two distinct feds."
@@ -152,10 +160,10 @@ fi
 
 # ---------------------------------------------------------------------------------------
 echo "== FUND fed A: direct-inflow ${FUND_MSAT} msat (funded client pays; gateway swaps in) =="
-INV_A=$(wcli direct-inflow --to "$FED_A" --amount "$FUND_MSAT" --gateway "$GW" 2>"$DI_ERR")
-KEY_FUND=$(sed -n 's/^intent_key: //p' "$DI_ERR")
+INV_A=$(wcli direct-inflow --to "$FED_A" --amount "$FUND_MSAT" 2>"$DI_ERR")
+KEY_FUND=$(sed -n 's/^key: //p' "$DI_ERR")
 if [[ -z "$INV_A" || -z "$KEY_FUND" ]]; then
-  echo "FAIL: funding direct-inflow did not yield an invoice + intent key:" >&2
+  echo "FAIL: funding direct-inflow did not yield an invoice + operation key:" >&2
   echo "  invoice=$INV_A" >&2; echo "  --- direct-inflow stderr ---" >&2; cat "$DI_ERR" >&2
   exit 1
 fi
@@ -185,15 +193,22 @@ for point in "${KILLPOINTS[@]}"; do
   echo "pre-crash balances: A=${A0} msat  B=${B0} msat"
   (( A0 >= MOVE_MSAT + A_FEE_HEADROOM )) || fail "fed A only has ${A0} msat, not enough to move ${MOVE_MSAT} + fees"
 
-  # 1. Crash the move at this killpoint. The hook `std::process::abort()`s (uncatchable), so wcli
-  #    dies on a SIGNAL — rc >= 128 (typically 134 = 128 + SIGABRT) — and NEVER prints 'done'.
-  #    Guard `set -e` so the expected non-zero exit does not abort the script.
+  # 1. Admit the async move, then crash its driver while await-move re-drives it. The phase-1
+  #    invocation exits after printing the operation key (standalone shutdown aborts its driver);
+  #    await-move starts the same service path, reconciles the pending operation, and blocks while
+  #    the hook `std::process::abort()`s. It therefore dies on a SIGNAL — rc >= 128.
+  MOVE_PHASE1=$(wcli move \
+    --from "$FED_A" --to "$FED_B" --amount "$MOVE_MSAT" --occurrence "$occ" 2>"$MOVE_ERR")
+  MOVE_KEY=$(sed -n 's/^key: //p' "$MOVE_ERR")
+  [[ "$MOVE_PHASE1" == "started $MOVE_KEY" && -n "$MOVE_KEY" ]] \
+    || fail "killpoint '${point}': move did not produce the phase-1 operation key (stdout='${MOVE_PHASE1}')"
+
+  # Guard `set -e` so the expected crash does not abort the script before we inspect its status.
   set +e
-  CRASH_OUT=$(WALLET_CLI_CRASH_AT="$point" wcli move \
-    --from "$FED_A" --to "$FED_B" --amount "$MOVE_MSAT" --gateway "$GW" --occurrence "$occ" 2>"$MOVE_ERR")
+  CRASH_OUT=$(WALLET_CLI_CRASH_AT="$point" wcli await-move "$MOVE_KEY" 2>>"$MOVE_ERR")
   rc=$?
   set -e
-  echo "crashed move exited rc=${rc}, stdout='${CRASH_OUT}'"
+  echo "crashed await-move exited rc=${rc}, stdout='${CRASH_OUT}'"
   # REQUIRE a signal death (rc >= 128), not merely a non-zero exit: the injected hook ALWAYS raises
   # SIGABRT, so an ordinary error exit (e.g. rc 1 from `perform` returning Err, or a --release
   # binary with the hook compiled out) is NOT our crash. Failing here keeps a real move error from
@@ -202,21 +217,23 @@ for point in "${KILLPOINTS[@]}"; do
   (( rc >= 128 )) || fail "killpoint '${point}': expected a CRASH via SIGABRT (rc >= 128), got rc=${rc} (stdout='${CRASH_OUT}') — not the injected abort (did you build a DEBUG wallet-cli?)"
   [[ "$CRASH_OUT" != "done" ]] || fail "killpoint '${point}': expected a CRASH, got a clean 'done'"
 
-  # 2. Reconcile RESUMES the crashed move: reconcile re-drives the Pending/Executing intent,
+  # 2. Reconcile RESUMES the crashed move: reconcile re-drives the Pending/Executing operation,
   #    backfilling its MoveRecord from the op-log first (so a lost recv_op/send_op reattaches
-  #    instead of re-minting/re-paying). A Move is driven synchronously to Done; a transient
-  #    fault may leave it Pending, so retry a few passes until B is credited.
+  #    instead of re-minting/re-paying). The one-shot reconcile command returns after admission;
+  #    await-move then reattaches to the same operation and blocks for terminal settlement.
+  #    Retry a few passes because a transient gateway fault may leave it Pending.
   credited=0
   for ((t = 1; t <= RECONCILE_TRIES; t++)); do
     RECON=$(wcli reconcile 2>/dev/null || true)
+    RESUME_STATE=$(wcli await-move "$MOVE_KEY" 2>/dev/null || true)
     Bnow=$(balance_msat_for_fed "$FED_B")
     [[ "$Bnow" =~ ^[0-9]+$ ]] || continue
     if (( Bnow - B0 >= MOVE_MSAT - RECV_SLACK )); then
-      echo "reconcile pass ${t}: ${RECON}  (B credited: +$(( Bnow - B0 )) msat)"
+      echo "reconcile pass ${t}: ${RECON}; await=${RESUME_STATE}  (B credited: +$(( Bnow - B0 )) msat)"
       credited=1
       break
     fi
-    echo "reconcile pass ${t}: ${RECON}  (B not yet credited: +$(( Bnow - B0 )) msat)"
+    echo "reconcile pass ${t}: ${RECON}; await=${RESUME_STATE}  (B not yet credited: +$(( Bnow - B0 )) msat)"
     sleep 1
   done
   (( credited == 1 )) || fail "killpoint '${point}': move never completed after ${RECONCILE_TRIES} reconcile passes"
@@ -245,7 +262,9 @@ for point in "${KILLPOINTS[@]}"; do
   # 4. Idempotency after resume: re-running the SAME move (same key) must NOT move funds again —
   #    apply sees the Done intent and SKIPS the drive (no second invoice, no second pay). Reconcile
   #    again must likewise be a no-op.
-  MOVE_STATE2=$(wcli move --from "$FED_A" --to "$FED_B" --amount "$MOVE_MSAT" --gateway "$GW" --occurrence "$occ" 2>/dev/null)
+  MOVE_PHASE1=$(wcli move --from "$FED_A" --to "$FED_B" --amount "$MOVE_MSAT" --occurrence "$occ" 2>/dev/null)
+  MOVE_KEY=${MOVE_PHASE1#* }
+  MOVE_STATE2=$(wcli await-move "$MOVE_KEY")
   [[ "$MOVE_STATE2" == "done" ]] || fail "killpoint '${point}': idempotent re-run expected 'done', got '$MOVE_STATE2'"
   wcli reconcile >/dev/null 2>&1 || true
   A2=$(balance_msat_for_fed "$FED_A")

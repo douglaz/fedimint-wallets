@@ -36,14 +36,18 @@ const DELIVERED_IN: u64 = 19_500;
 const OUT_NET: u64 = 15_000;
 
 async fn fixture_with_db() -> (Runtime, Arc<FedimintJournal>, Database) {
+    // Split stores, mirroring production: clients in `db`, the journal in its OWN
+    // database (the returned handle is the JOURNAL db — the corruption tests poke
+    // journal keys).
     let db = MemDatabase::new().into_database();
+    let journal_db = MemDatabase::new().into_database();
     let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
-    let mc = Arc::new(MultiClient::new(db.clone(), mnemonic).await);
-    let journal = Arc::new(FedimintJournal::new(db.clone()));
+    let mc = Arc::new(MultiClient::new(db, journal_db.clone(), mnemonic).await);
+    let journal = Arc::new(FedimintJournal::new(journal_db.clone()));
     (
         Runtime::new(mc, journal.clone(), None, None, None),
         journal,
-        db,
+        journal_db,
     )
 }
 
@@ -119,6 +123,7 @@ fn leg_intent_with_fee_cap(
 ) -> Intent {
     Intent {
         idempotency_key: key,
+        attempt: 0,
         action: Action::Move {
             from,
             to,
@@ -130,6 +135,8 @@ fn leg_intent_with_fee_cap(
         reason: ReasonCode::ActiveProbe,
         actor: Actor::User,
         created_at_ms: 0,
+        operation_id: None,
+        invoice: None,
     }
 }
 

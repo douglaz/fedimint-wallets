@@ -24,7 +24,15 @@ fi
 WCLI_DIR=$(mktemp -d)
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
 FED_B_INV="${FED_B_INVITE:-${FM_INVITE_CODE_B:?two-fed harness did not export FED_B_INVITE}}"
-wcli() { "$WALLET_CLI" --data-dir "$WCLI_DIR" "$@"; }
+wcli() { "$WALLET_CLI" --standalone --data-dir "$WCLI_DIR" --gateway "$GW" "$@"; }
+join_fed() {
+  local started key state
+  started=$(wcli join "$1") || return
+  key=${started#* }
+  state=$(wcli await-move "$key") || return
+  [[ "$state" == "done" ]] || { echo "join $key did not settle: $state" >&2; return 1; }
+  cut -d: -f2 <<<"$key"
+}
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # TSV columns (§11): 1 seq, 2 updated_at, 3 kind, 4 status, 5 amount, 6 recv_fee,
@@ -38,49 +46,51 @@ command -v gateway-ldk >/dev/null && gateway-ldk connect-fed "$FED_B_INV" >/dev/
 
 # ---------------------------------------------------------------------------------------
 echo "== JOIN both federations (two join rows) =="
-FED_A=$(wcli join "$FM_INVITE_CODE")
-FED_B=$(wcli join "$FED_B_INV")
+FED_A=$(join_fed "$FM_INVITE_CODE")
+FED_B=$(join_fed "$FED_B_INV")
 echo "A=$FED_A B=$FED_B"
 
 # ---------------------------------------------------------------------------------------
 echo "== FUND fed A: direct-inflow 500000 msat (user actor) =="
 DI_ERR=$(mktemp)
-INV_A=$(wcli direct-inflow --to "$FED_A" --amount 500000 --gateway "$GW" 2>"$DI_ERR")
-KEY_FUND=$(sed -n 's/^intent_key: //p' "$DI_ERR")
+INV_A=$(wcli direct-inflow --to "$FED_A" --amount 500000 2>"$DI_ERR")
+KEY_FUND=$(sed -n 's/^key: //p' "$DI_ERR")
 [[ -n "$INV_A" && -n "$KEY_FUND" ]] || { cat "$DI_ERR" >&2; fail "direct-inflow gave no invoice/key"; }
 SEND1=$(fedimint-cli module lnv2 send "$INV_A" --gateway "$GW" 2>/dev/null | tr -d '"[:space:]')
 fedimint-cli module lnv2 await-send "$SEND1" >/dev/null 2>&1 || true
 [[ "$(wcli await-move "$KEY_FUND")" == "done" ]] || fail "funding direct-inflow did not settle"
 
 # ---------------------------------------------------------------------------------------
-echo "== RAW receive 100000 msat on A (pre-call row, --key terminalization) =="
+echo "== RAW receive 100000 msat on A (operation-key terminalization) =="
 RC_ERR=$(mktemp)
-INV_RAW=$(wcli receive --amount 100000 --to "$FED_A" --gateway "$GW" 2>"$RC_ERR")
-OP_RAW=$(sed -n 's/^operation_id: //p' "$RC_ERR")
+INV_RAW=$(wcli receive --amount 100000 --to "$FED_A" 2>"$RC_ERR")
 KEY_RAW=$(sed -n 's/^key: //p' "$RC_ERR")
-[[ -n "$INV_RAW" && -n "$OP_RAW" && -n "$KEY_RAW" ]] || { cat "$RC_ERR" >&2; fail "receive gave no invoice/op/key"; }
+[[ -n "$INV_RAW" && -n "$KEY_RAW" ]] || { cat "$RC_ERR" >&2; fail "receive gave no invoice/key"; }
 SEND2=$(fedimint-cli module lnv2 send "$INV_RAW" --gateway "$GW" 2>/dev/null | tr -d '"[:space:]')
 fedimint-cli module lnv2 await-send "$SEND2" >/dev/null 2>&1 || true
-STATE_RAW=$(wcli await-receive --fed "$FED_A" --key "$KEY_RAW" "$OP_RAW")
+STATE_RAW=$(wcli await-receive "$KEY_RAW")
 [[ "$STATE_RAW" == "claimed" ]] || fail "raw receive expected 'claimed', got '$STATE_RAW'"
 
 # ---------------------------------------------------------------------------------------
 echo "== MOVE A->B 50000 msat (user actor; both op ids must resolve) =="
 MV_ERR=$(mktemp)
-MOVE_STATE=$(wcli move --from "$FED_A" --to "$FED_B" --amount 50000 --gateway "$GW" 2>"$MV_ERR")
-KEY_MOVE=$(sed -n 's/^move_key: //p' "$MV_ERR")
-[[ "$MOVE_STATE" == "done" && -n "$KEY_MOVE" ]] || { cat "$MV_ERR" >&2; fail "move did not settle (state=$MOVE_STATE)"; }
+MOVE_PHASE1=$(wcli move --from "$FED_A" --to "$FED_B" --amount 50000 2>"$MV_ERR")
+KEY_MOVE=$(sed -n 's/^key: //p' "$MV_ERR")
+[[ "$MOVE_PHASE1" == "started $KEY_MOVE" && -n "$KEY_MOVE" ]] || { cat "$MV_ERR" >&2; fail "move did not start (phase1=$MOVE_PHASE1)"; }
+MOVE_STATE=$(wcli await-move "$KEY_MOVE")
+[[ "$MOVE_STATE" == "done" ]] || fail "move did not settle (state=$MOVE_STATE)"
 
 # ---------------------------------------------------------------------------------------
 echo "== FORCED FAILURE: move with --fee-cap 1 must refuse BEFORE paying =="
-BAL_BEFORE=$(wcli balance | awk '$1 == "total:" {print $2}')
+BAL_BEFORE=$(wcli balance | awk '$1 == "total" {print $(NF-1)}')
 FMV_ERR=$(mktemp)
-if wcli move --from "$FED_A" --to "$FED_B" --amount 50000 --fee-cap 1 --gateway "$GW" --occurrence 1 >/dev/null 2>"$FMV_ERR"; then
-  fail "a 1-msat fee-cap move unexpectedly succeeded"
+FMV_PHASE1=$(wcli move --from "$FED_A" --to "$FED_B" --amount 50000 --fee-cap 1 --occurrence 1 2>"$FMV_ERR")
+KEY_FAILED=$(sed -n 's/^key: //p' "$FMV_ERR")
+[[ -n "$KEY_FAILED" ]] || { cat "$FMV_ERR" >&2; fail "failed move printed no operation key"; }
+if wcli await-move "$KEY_FAILED" >>"$FMV_ERR" 2>&1; then
+  fail "a 1-msat fee-cap move unexpectedly terminalized successfully ($FMV_PHASE1)"
 fi
-KEY_FAILED=$(sed -n 's/^move_key: //p' "$FMV_ERR")
-[[ -n "$KEY_FAILED" ]] || { cat "$FMV_ERR" >&2; fail "failed move printed no move_key"; }
-BAL_AFTER=$(wcli balance | awk '$1 == "total:" {print $2}')
+BAL_AFTER=$(wcli balance | awk '$1 == "total" {print $(NF-1)}')
 [[ "$BAL_BEFORE" == "$BAL_AFTER" ]] || fail "the refused move changed balances ($BAL_BEFORE -> $BAL_AFTER)"
 
 # ---------------------------------------------------------------------------------------

@@ -1,0 +1,36 @@
+# walletd — the 24/7 fedimint wallet daemon (spec §6a.8). Install as a systemd USER unit:
+#   cargo install --path wallet-daemon  # installs `walletd` into ~/.cargo/bin
+#   mkdir -p ~/.config/systemd/user
+#   cp wallet-daemon/deploy/walletd.service ~/.config/systemd/user/
+#   walletd init                       # scaffold config + 0600 token + client pointer
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now walletd
+#
+# Fatal errors exit non-zero and systemd restarts the process; restart reconciles in-flight
+# operations (abandon-and-resume is the model). SIGTERM triggers the ordered shutdown
+# (stop intake → abort drivers → drain the actor).
+[Unit]
+Description=walletd — 24/7 fedimint wallet daemon + local API
+Documentation=file://%h/.config/walletd/walletd.toml
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# `cargo install --path wallet-daemon` lands `walletd` in ~/.cargo/bin, which is NOT on the
+# systemd user-manager's default PATH — a bare `ExecStart=walletd` would fail 203/EXEC. Use an
+# absolute path (%h expands to the user's home); edit this if you installed the binary elsewhere.
+ExecStart=%h/.cargo/bin/walletd
+Restart=on-failure
+RestartSec=2
+# Per-`perform` deadline (default 600s). A stalled settlement long-poll (e.g. a cross-fed
+# Move's receive-claim await over a flaky transport) is cancelled at this deadline, left
+# Pending, and re-driven by reconcile with a fresh await instead of parking its driver
+# forever. Lower it (e.g. 180) to recover such stalls faster; 0 disables it (discouraged).
+# Environment=WALLETD_PERFORM_TIMEOUT_SECS=600
+# The ordered shutdown is bounded (parked long-polls drain within their request deadline);
+# give it generous headroom before systemd escalates to SIGKILL.
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target

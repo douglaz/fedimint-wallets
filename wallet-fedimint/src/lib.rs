@@ -43,6 +43,7 @@ pub mod move_protocol;
 pub mod multi_client;
 pub mod probe;
 pub mod runtime;
+pub mod service;
 pub mod tick;
 pub mod types;
 
@@ -54,10 +55,10 @@ pub use discovery::{
 pub use executor::FedimintExecutor;
 pub use fee::{gross_up, predicted_net, total_within_cap, GatewayFee, GrossUp};
 pub use journal::{
-    prune_probe_attempts, CandidateListReport, CandidateRecord, CandidateState, FederationInfo,
-    FederationListReport, FedimintJournal, LedgerRepairOracle, OperationRef, ProbeRecord,
-    ProbeSession, RawOpObservation, RawTerminal, RepairSummary, StructuralOutcome, WatchState,
-    JOIN_NOOP_REOPEN_NOTE, PROBE_HISTORY_CAP,
+    prune_probe_attempts, raw_operation_row_matches, CandidateListReport, CandidateRecord,
+    CandidateState, FederationInfo, FederationListReport, FedimintJournal, LedgerRepairOracle,
+    OperationRef, ProbeRecord, ProbeSession, RawOpObservation, RawOperationRole, RawTerminal,
+    RepairSummary, StructuralOutcome, WatchState, JOIN_NOOP_REOPEN_NOTE, PROBE_HISTORY_CAP,
 };
 pub use move_protocol::{
     assemble_move_record, next_step, Leg, MoveMeta, MoveParams, MovePhase, MovePlan, MoveRecord,
@@ -68,8 +69,15 @@ pub use multi_client::{
 };
 pub use probe::{assemble_facts, assemble_status, FedimintProbeRunner, ProbeResult};
 pub use runtime::{
+    direct_inflow_nonce_key, join_intent_key, move_key, raw_pay_key, raw_receive_key,
     DirectInflowOutcome, FinalizeOutcome, MoveOutcome, ProbeOutcome, ProbeReport, ReconcileSummary,
-    Runtime,
+    Runtime, WatchCycleReport, WatchDiscoverOutcome, WatchProbeOutcome, WatchProbeReport,
+    WatchReconcileOutcome, WatchTickOutcome,
+};
+pub use service::{
+    AwaitOutcome, Command, DecidedOp, JournalTransition, OpRequest, ProbeCandidate, ProbeDecision,
+    ReconcileReport as ServiceReconcileReport, ServiceError, Snapshot, SnapshotScope,
+    TransitionResult, WalletClient, WalletService,
 };
 pub use tick::{build_snapshot, ScoredFed, StatusReport, TickPolicy, TickReport};
 pub use types::{GatewayUrl, Invoice, OperationId, Preimage};

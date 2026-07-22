@@ -1,0 +1,44 @@
+[package]
+name = "wallet-daemon"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+# Phase 6a step 5: the `walletd` binary — a 24/7 daemon that owns the wallet DB and fronts the
+# in-process `WalletService` (wallet-fedimint) with a local, bearer-authed axum HTTP surface.
+# axum lives ONLY here; wallet-fedimint stays HTTP-free (crate-boundary discipline).
+# NOTE: needs the nix build env for fedimint's native deps, same as wallet-fedimint —
+# build/test with: nix develop /home/master/p/fedimint -c cargo <cmd>
+[[bin]]
+name = "walletd"
+path = "src/main.rs"
+
+[dependencies]
+wallet-core = { path = "../wallet-core" }
+wallet-api = { path = "../wallet-api" }
+wallet-fedimint = { path = "../wallet-fedimint" }
+# Same git source + rev as wallet-fedimint (do not change the pin) — the daemon builds the DB,
+# mnemonic, and MultiClient exactly like wallet-cli does at bring-up.
+fedimint-core = { git = "https://github.com/douglaz/fedimint.git", rev = "63ab515d1fc33d0d2e061f43eb41302b5f775c97" }
+fedimint-client = { git = "https://github.com/douglaz/fedimint.git", rev = "63ab515d1fc33d0d2e061f43eb41302b5f775c97" }
+fedimint-bip39 = { git = "https://github.com/douglaz/fedimint.git", rev = "63ab515d1fc33d0d2e061f43eb41302b5f775c97" }
+fedimint-rocksdb = { git = "https://github.com/douglaz/fedimint.git", rev = "63ab515d1fc33d0d2e061f43eb41302b5f775c97" }
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+# Same versions wallet-fedimint pins — used only to BUILD a signed amountless BOLT11 fixture
+# (the classic spec vector lacks a payment secret, which modern parsing rejects).
+lightning-invoice = "0.33"
+bitcoin = "0.32"

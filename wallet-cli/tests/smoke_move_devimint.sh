@@ -108,7 +108,15 @@ DI_ERR="$(mktemp)"
 MOVE_ERR="$(mktemp)"
 trap 'rm -rf "$DATA_DIR" "$DI_ERR" "$MOVE_ERR"' EXIT
 
-wcli() { "$WALLET_CLI" --data-dir "$DATA_DIR" "$@"; }
+wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" --gateway "$GW" "$@"; }
+join_fed() {
+  local started key state
+  started=$(wcli join "$1") || return
+  key=${started#* }
+  state=$(wcli await-move "$key") || return
+  [[ "$state" == "done" ]] || { echo "join $key did not settle: $state" >&2; return 1; }
+  cut -d: -f2 <<<"$key"
+}
 balance_msat_for_fed() {
   local fed_id="$1"
   # NOTE: no `exit` in awk — it must consume ALL of `wcli balance`'s output, else awk closes the
@@ -117,8 +125,8 @@ balance_msat_for_fed() {
 }
 
 echo "== join BOTH federations =="
-FED_A=$(wcli join "$FM_INVITE_CODE")
-FED_B=$(wcli join "$FED_B_INVITE")
+FED_A=$(join_fed "$FM_INVITE_CODE")
+FED_B=$(join_fed "$FED_B_INVITE")
 echo "fed A (source): $FED_A"
 echo "fed B (dest):   $FED_B"
 if [[ "$FED_A" == "$FED_B" ]]; then
@@ -139,10 +147,10 @@ fi
 
 # ---------------------------------------------------------------------------------------
 echo "== FUND fed A: direct-inflow ${FUND_MSAT} msat (funded client pays; gateway swaps in) =="
-INV_A=$(wcli direct-inflow --to "$FED_A" --amount "$FUND_MSAT" --gateway "$GW" 2>"$DI_ERR")
-KEY_FUND=$(sed -n 's/^intent_key: //p' "$DI_ERR")
+INV_A=$(wcli direct-inflow --to "$FED_A" --amount "$FUND_MSAT" 2>"$DI_ERR")
+KEY_FUND=$(sed -n 's/^key: //p' "$DI_ERR")
 if [[ -z "$INV_A" || -z "$KEY_FUND" ]]; then
-  echo "FAIL: funding direct-inflow did not yield an invoice + intent key:" >&2
+  echo "FAIL: funding direct-inflow did not yield an invoice + operation key:" >&2
   echo "  invoice=$INV_A" >&2; echo "  --- direct-inflow stderr ---" >&2; cat "$DI_ERR" >&2
   exit 1
 fi
@@ -167,8 +175,14 @@ fi
 
 # ---------------------------------------------------------------------------------------
 echo "== MOVE ${MOVE_MSAT} msat  fed A -> fed B  (the cross-federation transfer) =="
-MOVE_STATE=$(wcli move --from "$FED_A" --to "$FED_B" --amount "$MOVE_MSAT" --gateway "$GW" 2>"$MOVE_ERR")
-MOVE_KEY=$(sed -n 's/^move_key: //p' "$MOVE_ERR")
+MOVE_PHASE1=$(wcli move --from "$FED_A" --to "$FED_B" --amount "$MOVE_MSAT" 2>"$MOVE_ERR")
+MOVE_KEY=$(sed -n 's/^key: //p' "$MOVE_ERR")
+if [[ "$MOVE_PHASE1" != "started $MOVE_KEY" ]]; then
+  cat "$MOVE_ERR" >&2
+  echo "FAIL: move did not start: $MOVE_PHASE1" >&2
+  exit 1
+fi
+MOVE_STATE=$(wcli await-move "$MOVE_KEY")
 echo "move: $MOVE_STATE  (key: $MOVE_KEY)"
 if [[ "$MOVE_STATE" != "done" ]]; then
   echo "FAIL: expected move to be 'done', got '$MOVE_STATE'" >&2
@@ -201,10 +215,12 @@ fi
 echo "== IDEMPOTENCY: re-running the SAME move must NOT move funds again =="
 # Same (from, to, amount, default fee_cap, occurrence) -> same key -> apply SKIPS the drive
 # (the intent is Done); no second invoice, no second pay.
-MOVE_STATE2=$(wcli move --from "$FED_A" --to "$FED_B" --amount "$MOVE_MSAT" --gateway "$GW" 2>/dev/null)
-echo "re-run move: $MOVE_STATE2"
-if [[ "$MOVE_STATE2" != "done" ]]; then
-  echo "FAIL: idempotent re-run expected 'done', got '$MOVE_STATE2'" >&2
+MOVE_PHASE2=$(wcli move --from "$FED_A" --to "$FED_B" --amount "$MOVE_MSAT" 2>/dev/null)
+MOVE_KEY2=${MOVE_PHASE2#* }
+MOVE_STATE2=$(wcli await-move "$MOVE_KEY2")
+echo "re-run move: $MOVE_PHASE2 -> $MOVE_STATE2"
+if [[ "$MOVE_STATE2" != "done" || "$MOVE_KEY2" != "$MOVE_KEY" ]]; then
+  echo "FAIL: idempotent re-run expected the same key and 'done', got '$MOVE_PHASE2' -> '$MOVE_STATE2'" >&2
   exit 1
 fi
 A2=$(balance_msat_for_fed "$FED_A")
@@ -214,13 +230,15 @@ if (( A2 != A1 || B2 != B1 )); then
   exit 1
 fi
 
-# reconcile must be a no-op: the move intent is Done (not pending/awaiting).
+# reconcile must be a no-op: the move intent is Done (not pending/awaiting). The summary
+# format changed in phase 6a step 3 (redriven=..., was awaiting=...) — assert the field
+# that carries this check's intent: a Done move re-drives nothing.
 echo "-- reconcile: a Done move must not be re-driven --"
 RECONCILE_OUT=$(wcli reconcile)
 echo "reconcile: $RECONCILE_OUT"
 case "$RECONCILE_OUT" in
-  *"awaiting=0"*) : ;;
-  *) echo "FAIL: expected reconcile to report 'awaiting=0', got '$RECONCILE_OUT'" >&2; exit 1 ;;
+  *"redriven=0"*) : ;;
+  *) echo "FAIL: expected reconcile to report 'redriven=0', got '$RECONCILE_OUT'" >&2; exit 1 ;;
 esac
 A3=$(balance_msat_for_fed "$FED_A")
 B3=$(balance_msat_for_fed "$FED_B")

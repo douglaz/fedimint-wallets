@@ -63,7 +63,15 @@ DI_ERR="$(mktemp)"; DISC_OUT="$(mktemp)"; DISC_ERR="$(mktemp)"
 TICK_OUT="$(mktemp)"; TICK_ERR="$(mktemp)"; P_OUT="$(mktemp)"; P_ERR="$(mktemp)"
 trap 'rm -rf "$DATA_DIR" "$DI_ERR" "$DISC_OUT" "$DISC_ERR" "$TICK_OUT" "$TICK_ERR" "$P_OUT" "$P_ERR"' EXIT
 
-wcli() { "$WALLET_CLI" --data-dir "$DATA_DIR" "$@"; }
+wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" --gateway "$GW" "$@"; }
+join_fed() {
+  local started key state
+  started=$(wcli join "$1") || return
+  key=${started#* }
+  state=$(wcli await-move "$key") || return
+  [[ "$state" == "done" ]] || { echo "join $key did not settle: $state" >&2; return 1; }
+  cut -d: -f2 <<<"$key"
+}
 fail() { echo "FAIL: $*" >&2; exit 1; }
 bal_for() { wcli balance | awk -v id="$1" '$1 == id":" && $3 == "msat" { print $2 }'; }
 performed_count() { sed -n 's/.*performed=\([0-9]*\).*/\1/p' "$1"; }
@@ -72,7 +80,7 @@ cand_field() { wcli candidates "$@"; }
 
 # ---------------------------------------------------------------------------------------
 echo "== JOIN fed A (spending, USER-owned -> UserApproved); DISCOVER fed B (agent-owned) =="
-FED_A=$(wcli join "$FM_INVITE_CODE")
+FED_A=$(join_fed "$FM_INVITE_CODE")
 echo "fed A (spending, user): $FED_A"
 # A user join must land A as UserApproved (ungated) — that is what keeps it fundable as spending.
 wcli candidates --state userapproved | awk -F'\t' -v a="$FED_A" '$1 == a {found=1} END{exit !found}' \
@@ -113,8 +121,8 @@ echo "discovery OK: B is AutoJoined; discover + autojoin + agent-join rows prese
 
 # ---------------------------------------------------------------------------------------
 echo "== FUND fed A: direct-inflow ${FUND_MSAT} msat =="
-INV_A=$(wcli direct-inflow --to "$FED_A" --amount "$FUND_MSAT" --gateway "$GW" 2>"$DI_ERR")
-KEY_FUND=$(sed -n 's/^intent_key: //p' "$DI_ERR")
+INV_A=$(wcli direct-inflow --to "$FED_A" --amount "$FUND_MSAT" 2>"$DI_ERR")
+KEY_FUND=$(sed -n 's/^key: //p' "$DI_ERR")
 [[ -n "$INV_A" && -n "$KEY_FUND" ]] || { cat "$DI_ERR" >&2; fail "funding direct-inflow gave no invoice/key"; }
 SEND_FUND=$(fedimint-cli module lnv2 send "$INV_A" --gateway "$GW" 2>/dev/null | tr -d '"[:space:]')
 fedimint-cli module lnv2 await-send "$SEND_FUND" >/dev/null 2>&1 || true
@@ -149,7 +157,7 @@ echo "gate OK: tick bailed (fundability gate), B still EMPTY"
 # ---------------------------------------------------------------------------------------
 echo "== PROBE B from A three times -> the active-probe verdict flips to 'passed' =="
 run_probe() { # run_probe <label> <outfile>
-  if ! wcli probe "$FED_B" --from "$FED_A" --gateway "$GW" --min-span-secs 1 >"$1" 2>"$P_ERR"; then
+  if ! wcli probe "$FED_B" --from "$FED_A"  --min-span-secs 1 >"$1" 2>"$P_ERR"; then
     echo "  --- $1 out ---" >&2; cat "$1" >&2; echo "  --- err ---" >&2; cat "$P_ERR" >&2
     fail "a probe of B from A failed"
   fi

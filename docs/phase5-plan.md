@@ -1173,6 +1173,28 @@ wallet-cli watch [POLICY FLAGS: --spending --standby --per-fed-cap --spending-ta
 5. Occurrence is monotonic + persisted (`0x0a`) so restarts never reuse a journaled decision key.
 6. A non-fatal step failure is recorded and does not abort the cycle; only lock-loss/corruption
    stops the loop. `--once` is the testable unit; the exit gate drives it repeatedly.
+7. **Reconcile failure fails SAFE, not open.** If `reconcile()` itself errors (e.g. a transient
+   journal read fault), the pending-move state is unknown, so the cycle SKIPS the tick
+   (`SkippedReconcileFailed`) rather than ticking on a stale balance and re-issuing a still-
+   `Pending` prior-occurrence move under this cycle's fresh occurrence (a distinct idempotency
+   key). The next cycle re-drives once reconcile succeeds.
+8. **In-window expiry wake caps at time-until-shutdown.** Once an expiry's evacuation point is
+   reached, the adaptive sleep re-checks at `min_interval` (no 1s busy-spin for the whole window)
+   BUT never sleeps past the actual expiry — so a load-bearing evacuation retry still lands before
+   shutdown even when `evacuation_lead < min_interval` (and a sub-second time-to-shutdown is
+   honored exactly, not rounded up to the 1s floor — that floor is for probe deadlines, which
+   can recur at ~0, not one-shot expiries). A failed discovery pass advances `last_discover_ms`
+   AND clears the backlog flag so a persistent discover fault backs off instead of retrying every
+   cycle (backlog would otherwise short-circuit the backoff; the cursor is preserved and backlog
+   re-derives on the next successful pass, so no deferred work is lost); retained in-flight probe
+   sessions are resumed before fresh probes are started.
+
+**Deferred to Phase 6 (dual-review confirmed non-blocking for 5.2):** the per-cycle `O(ledger)`
+probe/tick scans (fine at personal-wallet ledger sizes; add an index if the ledger grows); and the
+subscription-coalescing "≤1 no-op cycle per window" bound is best-effort — a hostile
+`meta_override_url` can craft a hint that dodges subscription attribution and drives extra no-op
+cycles (bounded by the client's meta-refresh cadence; the tick stays corroborated and probes stay
+budget-bounded, so there is NO money impact).
 
 ### 5.2.9 Build order (for rb-lite)
 

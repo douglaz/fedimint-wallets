@@ -14,6 +14,7 @@ use crate::discovery::{DiscoverySource, SourceStatus};
 use crate::executor::IntentStatus;
 use crate::types::{
     Action, FederationId, GatewayUrl, IdempotencyKey, Msat, Occurrence, OperationId, ReasonCode,
+    RefusalDiagnostics,
 };
 
 /// One row per user-meaningful operation (history spec §2). Append-only: a row is created
@@ -128,6 +129,11 @@ pub enum OperationKind {
     },
     Refusal {
         fed: FederationId,
+        /// The balance/threshold figures the refusal was decided from (§9.3), so the row is
+        /// self-explanatory after a restart. Empty (`default`) for refusals with no
+        /// shortfall arithmetic — an over-cap fed, an evacuation with no destination, or a
+        /// commit-time tick-drop.
+        diagnostics: RefusalDiagnostics,
     },
     /// The active probe's UMBRELLA row (phase 5 §5.0.5), keyed `probe:<fed-hex>:<nonce>`:
     /// one row per probe INVOCATION, terminalized when the attempt records (the two leg
@@ -258,7 +264,37 @@ pub fn kind_from_action(action: &Action) -> OperationKind {
             recv_op: None,
             gateway: None,
         },
-        Action::RefuseInflow { fed, .. } => OperationKind::Refusal { fed: *fed },
+        Action::Pay {
+            from,
+            amount,
+            payment_hash,
+            gateway,
+            ..
+        } => OperationKind::Pay {
+            fed: *from,
+            invoice_amount: Some(*amount),
+            payment_hash: Some(*payment_hash),
+            op_id: None,
+            gateway: gateway.clone(),
+        },
+        Action::Receive {
+            to,
+            amount,
+            gateway,
+            ..
+        } => OperationKind::Receive {
+            fed: *to,
+            amount_invoiced: *amount,
+            op_id: None,
+            gateway: gateway.clone(),
+        },
+        Action::Join { federation, .. } => OperationKind::Join { fed: *federation },
+        Action::RefuseInflow {
+            fed, diagnostics, ..
+        } => OperationKind::Refusal {
+            fed: *fed,
+            diagnostics: *diagnostics,
+        },
     }
 }
 

@@ -463,8 +463,12 @@ fn kind_from_action_mapping() {
         kind_from_action(&Action::RefuseInflow {
             fed: FED,
             reason: ReasonCode::OverCap,
+            diagnostics: Default::default(),
         }),
-        OperationKind::Refusal { fed: FED }
+        OperationKind::Refusal {
+            fed: FED,
+            diagnostics: Default::default()
+        }
     );
 }
 

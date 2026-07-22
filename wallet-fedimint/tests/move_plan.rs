@@ -68,6 +68,7 @@ fn advisory_actions_have_no_plan() {
     let refuse = Action::RefuseInflow {
         fed: FED_A,
         reason: ReasonCode::OverCap,
+        diagnostics: Default::default(),
     };
     assert_eq!(MovePlan::from_action(&refuse), None);
 }

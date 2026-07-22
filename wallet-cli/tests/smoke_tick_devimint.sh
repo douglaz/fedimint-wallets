@@ -94,7 +94,10 @@ GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
 FUND_MSAT=500000       # fund fed A with 500 sat via direct-inflow (must exceed target + move + fees)
 SPENDING_TARGET=100000 # keep >=100 sat on the spending fed; A's SURPLUS above this funds the standby
 STANDBY_TARGET=100000  # fund the empty standby toward 100 sat -> the expected fund-standby move size
-MAX_FEE=1000000        # 1000 sat: a generous per-move fee cap so the cap-check never bites on devimint
+MAX_FEE=100000         # 100 sat: generous vs the ~10-sat devimint move fee, yet WELL under A's surplus
+                       # above target. The allocator reserves the FULL fee cap from that surplus when
+                       # sizing a fund-standby move (available = spendable - target - max_fee), so a
+                       # cap larger than the surplus saturates `available` to 0 and the move is refused.
 RECV_SLACK=1000        # 1 sat — bounds lnv2 receive-fee-quote under-estimate on B (per the other smokes)
 A_FEE_HEADROOM=50000   # 50 sat — generous upper bound on the TOTAL move fee A pays on top of the move
 
@@ -104,7 +107,15 @@ TICK_OUT="$(mktemp)"
 TICK_ERR="$(mktemp)"
 trap 'rm -rf "$DATA_DIR" "$DI_ERR" "$TICK_OUT" "$TICK_ERR"' EXIT
 
-wcli() { "$WALLET_CLI" --data-dir "$DATA_DIR" "$@"; }
+wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" --gateway "$GW" "$@"; }
+join_fed() {
+  local started key state
+  started=$(wcli join "$1") || return
+  key=${started#* }
+  state=$(wcli await-move "$key") || return
+  [[ "$state" == "done" ]] || { echo "join $key did not settle: $state" >&2; return 1; }
+  cut -d: -f2 <<<"$key"
+}
 balance_msat_for_fed() {
   local fed_id="$1"
   # NOTE: no `exit` in awk — it must consume ALL of `wcli balance`'s output, else awk closes the
@@ -114,8 +125,8 @@ balance_msat_for_fed() {
 performed_count() { sed -n 's/.*performed=\([0-9]*\).*/\1/p' "$1"; }
 
 echo "== join BOTH federations =="
-FED_A=$(wcli join "$FM_INVITE_CODE")
-FED_B=$(wcli join "$FED_B_INVITE")
+FED_A=$(join_fed "$FM_INVITE_CODE")
+FED_B=$(join_fed "$FED_B_INVITE")
 echo "fed A (spending): $FED_A"
 echo "fed B (standby):  $FED_B"
 if [[ "$FED_A" == "$FED_B" ]]; then
@@ -136,10 +147,10 @@ fi
 
 # ---------------------------------------------------------------------------------------
 echo "== FUND fed A (spending): direct-inflow ${FUND_MSAT} msat (funded client pays; gateway swaps in) =="
-INV_A=$(wcli direct-inflow --to "$FED_A" --amount "$FUND_MSAT" --gateway "$GW" 2>"$DI_ERR")
-KEY_FUND=$(sed -n 's/^intent_key: //p' "$DI_ERR")
+INV_A=$(wcli direct-inflow --to "$FED_A" --amount "$FUND_MSAT" 2>"$DI_ERR")
+KEY_FUND=$(sed -n 's/^key: //p' "$DI_ERR")
 if [[ -z "$INV_A" || -z "$KEY_FUND" ]]; then
-  echo "FAIL: funding direct-inflow did not yield an invoice + intent key:" >&2
+  echo "FAIL: funding direct-inflow did not yield an invoice + operation key:" >&2
   echo "  invoice=$INV_A" >&2; echo "  --- direct-inflow stderr ---" >&2; cat "$DI_ERR" >&2
   exit 1
 fi

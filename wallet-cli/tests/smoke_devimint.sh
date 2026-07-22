@@ -46,11 +46,14 @@ DATA_DIR="$(mktemp -d)"
 trap 'rm -rf "$DATA_DIR"' EXIT
 
 echo "== join =="
-FED_ID=$("$WALLET_CLI" --data-dir "$DATA_DIR" join "$FM_INVITE_CODE")
+JOIN_OUT=$("$WALLET_CLI" --standalone --data-dir "$DATA_DIR" join "$FM_INVITE_CODE")
+JOIN_KEY=${JOIN_OUT#* }
+FED_ID=$(cut -d: -f2 <<<"$JOIN_KEY")
+[[ "$("$WALLET_CLI" --standalone --data-dir "$DATA_DIR" await-move "$JOIN_KEY")" == "done" ]]
 echo "joined federation: $FED_ID"
 
 echo "== balance =="
-BALANCE_OUT=$("$WALLET_CLI" --data-dir "$DATA_DIR" balance)
+BALANCE_OUT=$("$WALLET_CLI" --standalone --data-dir "$DATA_DIR" balance)
 echo "$BALANCE_OUT"
 
 if ! grep -qF "${FED_ID}: 0 msat" <<<"$BALANCE_OUT"; then
@@ -58,13 +61,13 @@ if ! grep -qF "${FED_ID}: 0 msat" <<<"$BALANCE_OUT"; then
   echo "$BALANCE_OUT" >&2
   exit 1
 fi
-if ! grep -qF "total: 0 msat" <<<"$BALANCE_OUT"; then
+if ! grep -qF "total (1/1 federations): 0 msat" <<<"$BALANCE_OUT"; then
   echo "FAIL: expected total balance to be 0 msat, got:" >&2
   echo "$BALANCE_OUT" >&2
   exit 1
 fi
 
 echo "== list-feds =="
-"$WALLET_CLI" --data-dir "$DATA_DIR" list-feds
+"$WALLET_CLI" --standalone --data-dir "$DATA_DIR" list-feds
 
 echo "OK: wallet-cli join + balance smoke test passed"

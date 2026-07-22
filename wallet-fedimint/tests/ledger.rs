@@ -14,11 +14,11 @@ use std::collections::BTreeMap;
 use wallet_core::{
     Action, Actor, AllocatorDecision, DiscoverySource, ExecError, FederationId, FeeBreakdown,
     IdempotencyKey, Intent, IntentStatus, Journal, Msat, Occurrence, OperationKind,
-    OperationRecord, OperationStatus, RawOpUpdate, ReasonCode, SourceStatus,
+    OperationRecord, OperationStatus, RawOpUpdate, ReasonCode, RefusalDiagnostics, SourceStatus,
 };
 use wallet_fedimint::{
     FederationInfo, FedimintJournal, GatewayUrl, Invoice, LedgerRepairOracle, MovePhase,
-    MoveRecord, OperationId, OperationRef, RawOpObservation, RawTerminal,
+    MoveRecord, OperationId, OperationRef, RawOpObservation, RawOperationRole, RawTerminal,
 };
 
 const BASE: u64 = 1_700_000_000_000; // a base ms timestamp (divisible by 1000: joins the sec/ms math)
@@ -83,6 +83,7 @@ fn fees_send(quote: u64) -> FeeBreakdown {
 fn move_intent(k: &str, status: IntentStatus) -> Intent {
     Intent {
         idempotency_key: key(k),
+        attempt: 0,
         action: Action::Move {
             from: fed(1),
             to: fed(2),
@@ -94,6 +95,8 @@ fn move_intent(k: &str, status: IntentStatus) -> Intent {
         reason: ReasonCode::UserInitiated,
         actor: Actor::User,
         created_at_ms: BASE,
+        operation_id: None,
+        invoice: None,
     }
 }
 
@@ -130,6 +133,7 @@ fn refuse_dec(target: FederationId, reason: ReasonCode, k: &str) -> AllocatorDec
         action: Action::RefuseInflow {
             fed: target,
             reason,
+            diagnostics: Default::default(),
         },
         reason,
         occurrence: Occurrence(0),
@@ -210,6 +214,63 @@ fn in_flight_send_obs() -> RawOpObservation {
         invoice_amount: Some(Msat(50_000)),
         payment_hash: Some([0xab; 32]),
     }
+}
+
+#[tokio::test]
+async fn raw_finalizer_completes_intent_and_ledger_from_one_observation() {
+    let journal = mem_ledger();
+    let key = key("pay:finalize");
+    let operation_id = op(7);
+    let intent = Intent {
+        idempotency_key: key.clone(),
+        attempt: 0,
+        action: Action::Pay {
+            from: fed(1),
+            invoice: Invoice("lnbc1fixture".into()),
+            amount: Msat(50_000),
+            fee_cap: Msat(1_000),
+            payment_hash: [0xab; 32],
+            gateway: None,
+        },
+        max_fee: Some(Msat(1_000)),
+        status: IntentStatus::Awaiting,
+        reason: ReasonCode::UserInitiated,
+        actor: Actor::User,
+        created_at_ms: BASE,
+        operation_id: Some(operation_id),
+        invoice: None,
+    };
+    journal.upsert(&intent).await.expect("seed raw pay intent");
+    let mut oracle = MockOracle::default();
+    oracle
+        .observations
+        .insert((fed(1), operation_id.0), terminal_send_obs(true, 42));
+
+    assert!(journal
+        .finalize_raw_operation(
+            &oracle,
+            fed(1),
+            operation_id,
+            &key,
+            RawOperationRole::Send,
+            OperationStatus::Succeeded,
+            None,
+        )
+        .await
+        .expect("finalize")
+        .is_empty());
+    assert_eq!(
+        journal
+            .get(&key)
+            .await
+            .expect("read intent")
+            .expect("intent exists")
+            .status,
+        IntentStatus::Done
+    );
+    let row = op_of(&journal, &key).await;
+    assert_eq!(row.status, OperationStatus::Succeeded);
+    assert_eq!(row.fees.send_fee_quoted, Some(Msat(42)));
 }
 
 fn terminal_recv_obs(recv_fee: u64) -> RawOpObservation {
@@ -428,6 +489,58 @@ async fn record_refusals_are_deduped_terminal_rows() {
     );
 }
 
+#[tokio::test]
+async fn record_refusals_persist_diagnostics_across_serialization() {
+    // The point of the diagnostics: a refusal's figures reach the journal (serde_json over the
+    // raw byte store — a real serialize/deserialize), so it is reconstructible after a restart
+    // and not only via live tracing. This is the acceptance signal for the feature.
+    let j = mem_ledger();
+    let diagnostics = RefusalDiagnostics {
+        source: Some(fed(2)),
+        want: Some(Msat(50_000)),
+        available: Some(Msat(9_500)),
+        source_spendable: Some(Msat(10_000)),
+        max_fee: Some(Msat(500)),
+        cap_room: Some(Msat(40_000)),
+        amount: Some(Msat(9_500)),
+        min_move: Some(Msat(0)),
+    };
+    let decision = AllocatorDecision {
+        action: Action::RefuseInflow {
+            fed: fed(1),
+            reason: ReasonCode::SpendingBelowTarget,
+            diagnostics,
+        },
+        reason: ReasonCode::SpendingBelowTarget,
+        occurrence: Occurrence(0),
+        idempotency_key: IdempotencyKey("refuse:spending_below_target:0101:0".into()),
+    };
+    j.record_refusals(std::slice::from_ref(&decision), Occurrence(0), BASE)
+        .await
+        .expect("refusals");
+
+    let hist = j.history(10, None).await.expect("history");
+    assert_eq!(hist.len(), 1);
+    match &hist[0].kind {
+        OperationKind::Refusal {
+            fed: f,
+            diagnostics: read_back,
+        } => {
+            assert_eq!(*f, fed(1));
+            // `RefusalDiagnostics` compares equal always, so assert every field explicitly.
+            assert_eq!(read_back.source, Some(fed(2)));
+            assert_eq!(read_back.want, Some(Msat(50_000)));
+            assert_eq!(read_back.available, Some(Msat(9_500)));
+            assert_eq!(read_back.source_spendable, Some(Msat(10_000)));
+            assert_eq!(read_back.max_fee, Some(Msat(500)));
+            assert_eq!(read_back.cap_room, Some(Msat(40_000)));
+            assert_eq!(read_back.amount, Some(Msat(9_500)));
+            assert_eq!(read_back.min_move, Some(Msat(0)));
+        }
+        other => panic!("expected a refusal row, got {other:?}"),
+    }
+}
+
 // --- §9.2 journal-integrated writes (same dbtx as the intent) ---
 
 #[tokio::test]
@@ -634,7 +747,7 @@ async fn synchronous_failure_leaves_a_durable_failed_row() {
 }
 
 #[tokio::test]
-async fn already_paid_terminal_carries_definitive_fees() {
+async fn settled_dedup_terminal_carries_definitive_fees() {
     let j = mem_ledger();
     let k = key("pay:0101:n");
     j.record_started(
@@ -647,7 +760,8 @@ async fn already_paid_terminal_carries_definitive_fees() {
     )
     .await
     .expect("start");
-    // AlreadyPaid: terminalize Succeeded carrying the definitive fees read from the op meta.
+    // A dedup'd re-pay whose op already settled: the awaiter terminalizes Succeeded carrying
+    // the definitive fees read from the op meta.
     j.record_terminal(
         &k,
         OperationStatus::Succeeded,
@@ -706,6 +820,48 @@ async fn repair_soft_fails_a_raw_row_with_no_op_after_1h() {
         "a negative inference is a defeasible (soft) repair"
     );
     assert_eq!(rec.error.as_deref(), Some("never reached the federation"));
+}
+
+#[tokio::test]
+async fn raw_negative_repair_keeps_the_intent_retriable_and_the_ledger_defeasible() {
+    let j = FedimintJournal::with_clock(MemDatabase::new().into_database(), clock_base_plus_2h);
+    let k = key("pay:0101:soft-intent");
+    j.upsert(&Intent {
+        idempotency_key: k.clone(),
+        attempt: 0,
+        action: Action::Pay {
+            from: fed(1),
+            invoice: Invoice("lnbc1repairfixture".into()),
+            amount: Msat(10_000),
+            fee_cap: Msat(100),
+            payment_hash: [0xab; 32],
+            gateway: None,
+        },
+        max_fee: Some(Msat(100)),
+        status: IntentStatus::Pending,
+        reason: ReasonCode::UserInitiated,
+        actor: Actor::User,
+        created_at_ms: BASE,
+        operation_id: None,
+        invoice: None,
+    })
+    .await
+    .expect("seed raw intent and ledger row");
+
+    j.repair_ledger(&empty_oracle()).await.expect("repair");
+
+    let row = op_of(&j, &k).await;
+    assert_eq!(row.status, OperationStatus::Failed);
+    assert!(row.repaired, "negative evidence must remain defeasible");
+    assert_eq!(
+        j.get(&k)
+            .await
+            .expect("read intent")
+            .expect("intent exists")
+            .status,
+        IntentStatus::Pending,
+        "soft repair must leave the operation eligible for authoritative retry"
+    );
 }
 
 #[tokio::test]
@@ -987,6 +1143,26 @@ async fn repair_awaiting_with_op_id_terminalizes_from_the_op_log() {
     )
     .await
     .expect("op-id update"); // -> Awaiting
+    j.upsert(&Intent {
+        idempotency_key: k.clone(),
+        attempt: 0,
+        action: Action::Receive {
+            to: fed(1),
+            amount: Msat(1_000),
+            fee_cap: Msat(100),
+            nonce: "repair-terminal".into(),
+            gateway: None,
+        },
+        max_fee: Some(Msat(100)),
+        status: IntentStatus::Awaiting,
+        reason: ReasonCode::UserInitiated,
+        actor: Actor::User,
+        created_at_ms: BASE,
+        operation_id: Some(op(7)),
+        invoice: Some(Invoice("lnbc1repairfixture".into())),
+    })
+    .await
+    .expect("seed matching raw receive intent");
     assert_eq!(status_of(&j, &k).await, OperationStatus::Awaiting);
 
     let mut oracle = MockOracle::default();
@@ -1002,6 +1178,15 @@ async fn repair_awaiting_with_op_id_terminalizes_from_the_op_log() {
         "reading a real op-log outcome is authoritative"
     );
     assert_eq!(rec.fees.receive_fee, Some(Msat(150)));
+    assert_eq!(
+        j.get(&k)
+            .await
+            .expect("read intent")
+            .expect("intent exists")
+            .status,
+        IntentStatus::Done,
+        "repair must release the raw receive reservation with the ledger terminal"
+    );
 }
 
 #[tokio::test]
@@ -1136,6 +1321,7 @@ async fn repair_soft_fails_stale_discover_and_autojoin_rows_after_1h() {
     let j = FedimintJournal::with_clock(MemDatabase::new().into_database(), clock_base_plus_2h);
     let discover = key("discover:manual:n");
     let autojoin = key("autojoin:n");
+    let probe_skip = key("watch-probe-skip:0202:0101:20000:1700000000000");
     j.record_started(
         &discover,
         OperationKind::Discover {
@@ -1172,10 +1358,27 @@ async fn repair_soft_fails_stale_discover_and_autojoin_rows_after_1h() {
     )
     .await
     .expect("autojoin started");
+    j.record_started(
+        &probe_skip,
+        OperationKind::Probe {
+            fed: fed(2),
+            from: fed(1),
+            amount_msat: Msat(20_000),
+            cost_msat: None,
+        },
+        Actor::Agent {
+            occurrence: Occurrence(7),
+        },
+        ReasonCode::StandingInstruction,
+        BASE,
+        None,
+    )
+    .await
+    .expect("probe skip started");
 
     let summary = j.repair_ledger(&empty_oracle()).await.expect("repair");
-    assert_eq!(summary.repaired, 2);
-    for k in [&discover, &autojoin] {
+    assert_eq!(summary.repaired, 3);
+    for k in [&discover, &autojoin, &probe_skip] {
         let rec = op_of(&j, k).await;
         assert_eq!(rec.status, OperationStatus::Failed);
         assert!(rec.repaired);
@@ -1415,9 +1618,10 @@ async fn an_authoritative_write_supersedes_a_soft_repair() {
 }
 
 #[tokio::test]
-async fn repair_never_touches_intent_keyed_rows() {
-    // An intent-keyed row (owned by the §9.2 journal integration) is NEVER repaired here, even
-    // when non-terminal and old.
+async fn repair_never_touches_move_intent_rows() {
+    // A move-shaped intent row is owned by the §9.2 move journal integration and is never
+    // repaired here, even when non-terminal and old. Raw pay/receive intents have their own
+    // op-log-backed repair path.
     let j = FedimintJournal::with_clock(MemDatabase::new().into_database(), clock_base_plus_2h);
     let intent = move_intent("move:0102:0", IntentStatus::Pending);
     j.upsert(&intent).await.expect("upsert");
