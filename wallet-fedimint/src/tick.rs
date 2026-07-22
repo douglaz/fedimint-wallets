@@ -41,9 +41,14 @@ const DEFAULT_STANDBY_TARGET: Msat = Msat(100_000_000);
 /// Default per-fed balance cap (ADR-0018): 5M sats (0.05 BTC). Well above the two
 /// targets, so it bounds accumulation without fighting the standing targets.
 const DEFAULT_PER_FED_CAP: Msat = Msat(5_000_000_000);
-/// Default per-move fee cap: 50 sats (50_000 msat). A no-surprises bound on a single
-/// rebalance's total (both-legs) cost; tighten it with `--max-fee`.
+/// Default ABSOLUTE per-move fee cap: 50 sats (50_000 msat). Since br-ljj.2 this bounds only
+/// `Evacuate`; funding `Move`s use `DEFAULT_MAX_FEE_BPS_OF_MOVE`. Tighten with `--max-fee`.
 const DEFAULT_MAX_FEE: Msat = Msat(50_000);
+
+/// Default PROPORTIONAL funding-move fee cap: 300 bps (3%) of the amount moved. See
+/// `wallet_api::Policy` default for the derivation (preserves the pilot's ~258 bps effective
+/// cap with headroom over realistic gateway fees). Tighten with `--max-fee-bps-of-move`.
+const DEFAULT_MAX_FEE_BPS_OF_MOVE: u16 = 300;
 
 /// The standing instruction for one orchestrator tick (ADR-0014). Sensible v1 defaults
 /// (see the module constants) are provided by [`Default`]; `wallet-cli` overrides any
@@ -56,8 +61,12 @@ pub struct TickPolicy {
     pub target_spending_balance: Msat,
     /// Target balance for the warm standby; below it, fund from the spending surplus.
     pub standby_target: Msat,
-    /// Per-move fee cap stamped onto every rebalance `Move` this tick emits.
+    /// ABSOLUTE per-move fee cap. Since br-ljj.2 it bounds only `Evacuate`; funding `Move`s
+    /// use `max_fee_bps_of_move`.
     pub max_fee: Msat,
+    /// PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
+    /// (0..=10000). Sizing reserves `amount + amount*bps/10000` from the source budget.
+    pub max_fee_bps_of_move: u16,
     /// The allocation epoch (T10) stamped into each decision's idempotency key.
     pub occurrence: Occurrence,
     /// Operator-pinned spending fed. `None` ⇒ auto-designate from the scored-eligible feds.
@@ -83,6 +92,7 @@ impl Default for TickPolicy {
             target_spending_balance: DEFAULT_TARGET_SPENDING_BALANCE,
             standby_target: DEFAULT_STANDBY_TARGET,
             max_fee: DEFAULT_MAX_FEE,
+            max_fee_bps_of_move: DEFAULT_MAX_FEE_BPS_OF_MOVE,
             occurrence: Occurrence(0),
             spending_fed: None,
             standby_fed: None,
@@ -193,6 +203,7 @@ pub fn build_snapshot(
         target_spending_balance: policy.target_spending_balance,
         standby_target: policy.standby_target,
         max_fee: policy.max_fee,
+        max_fee_bps_of_move: policy.max_fee_bps_of_move,
         // lnv2's minimum incoming contract: a fund/top-up sized below this could only fail
         // at perform time, so the allocator treats a sub-floor shortfall as dust.
         min_move: Msat(crate::executor::MINIMUM_INCOMING_CONTRACT_MSAT),

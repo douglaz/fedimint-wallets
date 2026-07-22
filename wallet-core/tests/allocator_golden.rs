@@ -15,8 +15,11 @@ macro_rules! fed {
     ($id:expr, $balance:expr, $probed:expr, $reputation:expr, $shutdown:expr, $healthy:expr) => { fed!($id, $balance, $probed, $reputation, $shutdown, $healthy, true) };
     ($id:expr, $balance:expr, $probed:expr, $reputation:expr, $shutdown:expr, $healthy:expr, $elig:expr) => { FederationStatus { id: id!($id), balance: balance!($balance), probed_ok: $probed, reputation: $reputation, shutdown_notice: $shutdown, healthy: $healthy, eligible_to_fund: $elig } };
 }
+// Golden fixture bps for the proportional funding-move fee cap (br-ljj.2): 100 bps (1%), so a
+// move's `fee_cap` is `amount / 100` and the source `available` is `budget * 10000/10100`.
+const GOLDEN_MOVE_BPS: u16 = 100;
 macro_rules! snap {
-    ([$($fed:expr),*], $spending:expr, $standby:expr, $cap:expr, $target:expr, $standby_target:expr, $now:expr) => { AllocatorSnapshot { federations: vec![$($fed),*], spending_fed: $spending, standby_fed: $standby, per_fed_cap: msat!($cap), target_spending_balance: msat!($target), standby_target: msat!($standby_target), max_fee: msat!(500), min_move: Msat(0), reservations: Reservations::default(), now: $now } };
+    ([$($fed:expr),*], $spending:expr, $standby:expr, $cap:expr, $target:expr, $standby_target:expr, $now:expr) => { AllocatorSnapshot { federations: vec![$($fed),*], spending_fed: $spending, standby_fed: $standby, per_fed_cap: msat!($cap), target_spending_balance: msat!($target), standby_target: msat!($standby_target), max_fee: msat!(500), max_fee_bps_of_move: GOLDEN_MOVE_BPS, min_move: Msat(0), reservations: Reservations::default(), now: $now } };
 }
 macro_rules! decision {
     ($action:expr, $reason:expr, $occurrence:expr, $key:expr) => { vec![AllocatorDecision { action: $action, reason: $reason, occurrence: $occurrence, idempotency_key: $key }] };
@@ -222,6 +225,76 @@ fn receive_blocked_refusal_records_source_side_figures_only() {
     assert_eq!(diag.max_fee, Some(Msat(500)));
     assert_eq!(diag.cap_room, None);
     assert_eq!(diag.amount, None);
+}
+
+// --- br-ljj.2: proportional funding-move fee cap (core-correctness guards) ---
+
+#[test]
+fn absolute_cap_no_longer_saturates_funding() {
+    // The saturation bug: under the old absolute reservation, a `max_fee` >= the source surplus
+    // zeroed `available` and refused the move. Funding now uses the proportional bps cap, so
+    // even a `max_fee` far exceeding the surplus still emits a move sized off the budget.
+    let mut snapshot = snap!([fed!(1, 10_000, true, false, true), fed!(2, 100_000, true, false, true)], Some(id!(1)), Some(id!(2)), 10_000_000, 1_000_000, 0, 40_001);
+    snapshot.max_fee = Msat(10_000_000); // dwarfs the 100_000 surplus — would fully saturate the old model
+    let amount = decide(&snapshot, occ(1))
+        .iter()
+        .find_map(|d| match &d.action {
+            Action::Move {
+                from, to, amount, ..
+            } if *from == id!(2) && *to == id!(1) => Some(amount.0),
+            _ => None,
+        })
+        .expect("a funding move despite max_fee >> surplus");
+    // available = 100_000 * 10000/(10000+100) = 99_009; cap_room and want both larger.
+    assert_eq!(amount, 99_009);
+}
+
+#[test]
+fn funding_move_fee_cap_fits_the_source_budget() {
+    // Invariant: amount + fee_cap(amount) <= source budget, so the reserved spend never
+    // overdraws the source. Source surplus 500_000, bps 100.
+    let snapshot = snap!([fed!(1, 10_000, true, false, true), fed!(2, 500_000, true, false, true)], Some(id!(1)), Some(id!(2)), 10_000_000, 1_000_000, 0, 40_002);
+    let (amount, fee_cap) = decide(&snapshot, occ(1))
+        .iter()
+        .find_map(|d| match &d.action {
+            Action::Move {
+                from,
+                amount,
+                fee_cap,
+                ..
+            } if *from == id!(2) => Some((amount.0, fee_cap.0)),
+            _ => None,
+        })
+        .expect("a funding move");
+    assert_eq!(amount, 495_049); // 500_000 * 10000/10100
+    assert_eq!(fee_cap, 4_950); // 495_049 * 100/10000
+    assert!(
+        amount + fee_cap <= 500_000,
+        "amount {amount} + fee_cap {fee_cap} overdraws the 500_000 budget"
+    );
+}
+
+#[test]
+fn evacuate_keeps_absolute_cap_and_still_drains_a_small_remnant() {
+    // Evacuate MUST keep the ABSOLUTE `max_fee` (br-ljj.2). A tiny dying-fed remnant far below
+    // that cap is still evacuated — a proportional cap would compute below any base fee (here
+    // 100*100/10000 = 1 msat) and refuse the drain, losing the remnant.
+    let mut snapshot = snap!([fed!(1, 100, true, true, true), fed!(2, 30_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 100_000, 0, 40_003);
+    snapshot.max_fee = Msat(50_000);
+    let (amount, fee_cap) = decide(&snapshot, occ(1))
+        .iter()
+        .find_map(|d| match &d.action {
+            Action::Evacuate {
+                from,
+                amount,
+                fee_cap,
+                ..
+            } if *from == id!(1) => Some((amount.0, fee_cap.0)),
+            _ => None,
+        })
+        .expect("an evacuation of the small remnant");
+    assert_eq!(amount, 100); // the full remnant
+    assert_eq!(fee_cap, 50_000); // ABSOLUTE max_fee, NOT proportional (which would be 1 msat)
 }
 
 #[test]

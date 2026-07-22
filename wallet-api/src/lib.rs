@@ -11,7 +11,13 @@ pub struct Policy {
     pub per_fed_cap: Msat,
     pub spending_target: Msat,
     pub standby_target: Msat,
+    /// ABSOLUTE per-move fee cap. Since br-ljj.2 this bounds only `Evacuate`; funding `Move`s
+    /// use `max_fee_bps_of_move`.
     pub max_fee: Msat,
+    /// PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
+    /// (0..=10000). Replaces the absolute `max_fee` for funding so sizing scales with the move
+    /// and a positive surplus never saturates to a refused (zero-amount) move.
+    pub max_fee_bps_of_move: u16,
     pub spending_fed: Option<FederationId>,
     pub standby_fed: Option<FederationId>,
     pub probe_min_span_secs: u64,
@@ -42,6 +48,12 @@ impl Default for Policy {
             spending_target: Msat(500_000_000),
             standby_target: Msat(150_000_000),
             max_fee: Msat(200_000),
+            // br-ljj.2: 300 bps (3%) of the move. Chosen to preserve the pilot's current
+            // effective tightness — its 50-sat absolute cap on ~1_938-sat top-up moves is
+            // ~258 bps — with ~2.3x headroom over a realistic two-leg gateway fee (~130 bps:
+            // the executor fee model's "realistic" 0.5% ppm/leg plus base + federation fees).
+            // Tune DOWN once br-ljj.3's per-route economics yield precise per-move fee data.
+            max_fee_bps_of_move: 300,
             spending_fed: None,
             standby_fed: None,
             // The verdict knobs and amount match wallet_core::ProbePolicy.
@@ -113,6 +125,11 @@ impl Policy {
         if self.probe_retry_backoff_secs == 0 {
             return Err(PolicyValidationError::ZeroProbeRetryBackoffSecs);
         }
+        if self.max_fee_bps_of_move > 10_000 {
+            // Over 100% of the move: fees would exceed the amount moved (nonsensical), and the
+            // sizing `amount <= budget * 10000/(10000+bps)` assumes a bounded bps.
+            return Err(PolicyValidationError::MaxFeeBpsExceedsCeiling);
+        }
         Ok(())
     }
 }
@@ -130,6 +147,7 @@ pub enum PolicyValidationError {
     ProbeSpanExceedsTtl,
     TargetExceedsPerFedCap,
     ZeroProbeRetryBackoffSecs,
+    MaxFeeBpsExceedsCeiling,
 }
 
 impl PolicyValidationError {
@@ -144,6 +162,7 @@ impl PolicyValidationError {
             Self::ProbeSpanExceedsTtl => "probe_min_span_secs/probe_ttl_secs",
             Self::TargetExceedsPerFedCap => "spending_target/standby_target/per_fed_cap",
             Self::ZeroProbeRetryBackoffSecs => "probe_retry_backoff_secs",
+            Self::MaxFeeBpsExceedsCeiling => "max_fee_bps_of_move",
         }
     }
 }
@@ -175,6 +194,11 @@ impl fmt::Display for PolicyValidationError {
             Self::TargetExceedsPerFedCap => write!(
                 formatter,
                 "{}: targets must not exceed the per-fed cap",
+                self.offending_field()
+            ),
+            Self::MaxFeeBpsExceedsCeiling => write!(
+                formatter,
+                "{}: must not exceed 10000 (100% of the move)",
                 self.offending_field()
             ),
         }

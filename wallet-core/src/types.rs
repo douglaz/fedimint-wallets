@@ -89,7 +89,16 @@ pub struct AllocatorSnapshot {
     pub per_fed_cap: Msat,
     pub target_spending_balance: Msat,
     pub standby_target: Msat,
+    /// The ABSOLUTE per-move fee cap. Since br-ljj.2 this bounds ONLY `Evacuate` (a proportional
+    /// cap on a small dying-fed remnant would compute below any realistic base fee and refuse
+    /// the drain). Funding `Move`s use `max_fee_bps_of_move` instead.
     pub max_fee: Msat,
+    /// The PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
+    /// (0..=10000). Funding-move sizing reserves `amount + amount*bps/10000` from the source
+    /// budget — `amount ≤ budget * 10000/(10000+bps)` — so a positive budget never saturates
+    /// `available` to zero, and the stamped `fee_cap` scales with the move. Does NOT bound
+    /// `Evacuate` (see `max_fee`).
+    pub max_fee_bps_of_move: u16,
     /// The smallest fund/top-up move worth emitting, injected by the I/O layer from the
     /// protocol floor (lnv2 refuses incoming contracts below its 5-sat minimum). A top-up
     /// whose whole SHORTFALL is below this is dust — the destination is effectively at
@@ -202,23 +211,19 @@ pub struct RefusalDiagnostics {
     /// The shortfall the decision was trying to fill (`target − spendable`), when it had one.
     /// `None` for an evacuation, which drains its source rather than filling a target.
     pub want: Option<Msat>,
-    /// The source surplus available to fund the move: `source_spendable` minus the source's
-    /// own reservations, the per-move `max_fee` (funding paths only — an evacuation does not
-    /// reserve it), and — on the standby-funding path — the spending fed's target. `None` when
-    /// there was no usable source at all (as opposed to
-    /// `Some(Msat(0))`, a source with no surplus). It is a residue of several subtractions;
-    /// `source_spendable − max_fee − available` recovers the aggregate of the OTHER deductions
-    /// (reservations, and the target floor on the standby path), which are not split out. The
-    /// operationally decisive split — was `max_fee` the culprit? — IS recoverable, since
-    /// `max_fee` is recorded separately.
+    /// The largest amount fundable from the source: since br-ljj.2, `budget * 10000/(10000+bps)`
+    /// where `budget = source_spendable − reservations − (standby path) the spending target` and
+    /// `bps = max_fee_bps_of_move`. Proportional, so it never saturates to zero for a positive
+    /// budget (the old absolute-cap bug). `None` when there was no usable source at all (as
+    /// opposed to `Some(Msat(0))`, a source with no surplus).
     pub available: Option<Msat>,
-    /// The source federation's raw spendable balance, the top of the `available` subtraction
-    /// chain.
+    /// The source federation's raw spendable balance, the top of the `available` chain.
     pub source_spendable: Option<Msat>,
-    /// The per-move fee cap (`max_fee`) subtracted when computing `available` ON THE FUNDING
-    /// PATHS. Recorded so a cap larger than the surplus — the known foot-gun that zeroes
-    /// `available` and refuses an otherwise-fundable move — is visible in the row rather than
-    /// inferred. `None` on an evacuation refusal, which does not pre-reserve `max_fee`.
+    /// The ABSOLUTE fee cap. `None` on a FUNDING refusal since br-ljj.2 — funding sizing uses
+    /// the proportional `max_fee_bps_of_move` (and `available` already reflects it), so the
+    /// absolute cap is not the funding constraint. Also `None` on an evacuation refusal, which
+    /// does not pre-reserve it. (A follow-up may record `max_fee_bps_of_move` here for full
+    /// funding-refusal reconstructibility.)
     pub max_fee: Option<Msat>,
     /// The destination's remaining per-fed cap room, once it had been computed.
     pub cap_room: Option<Msat>,
