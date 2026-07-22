@@ -112,6 +112,43 @@ systemctl --user show walletd -p NRestarts
   seed. Accept that any operation in flight at the moment of death may need manual
   reconciliation against the federations' view.
 
+## Upgrades — a release that changes the stored-policy schema
+
+This is a greenfield, pre-1.0 wallet: the persisted `Policy` has **no serde migration**. When a
+release adds a required policy field (e.g. `max_fee_bps_of_move`), the policy row written by the
+previous release no longer decodes, and `seed_policy` fails that decode **before the actor
+starts** — so walletd will not come up after the upgrade until the stored policy is replaced.
+There is no in-place `policy set` fix: `policy set` reads the existing policy first and hits the
+same undecodable row.
+
+The recovery leans on the two-store split — **`client.db` holds the ecash + seed; `journal.db`
+holds only the operation ledger, policy, and federation registry** (no money). So you replace the
+journal without touching the wallet:
+
+```bash
+# 0. Confirm nothing is in flight (wiping the journal discards in-flight op state):
+wallet-cli history --limit 200 | grep -iE "started|awaiting" || echo "quiescent — safe"
+# 1. Stop the daemon.
+systemctl --user stop walletd            # or however it is supervised
+# 2. Delete ONLY the journal store. NEVER delete client.db — that IS the wallet (see Never).
+rm -f "$WALLETD_DATA_DIR/journal.db"
+# 3. Restart. A fresh journal re-seeds the DEFAULT policy, so the daemon starts.
+systemctl --user start walletd
+# 4. Re-join every federation from your recorded invites (§2). The seed in the untouched
+#    client.db lets fedimint recover each federation's ecash balance on rejoin.
+wallet-cli join <fed1...>                 # once per fed
+# 5. Re-apply your standing instruction — the whole Cap the exposure block (§4), INCLUDING the
+#    new field, so the policy is not left at defaults.
+wallet-cli policy set --per-fed-cap ... --max-fee-bps-of-move 300 ...
+# 6. Verify.
+wallet-cli policy get                     # the field is present and your values are back
+wallet-cli balance                        # ecash recovered per federation
+```
+
+Wiping the journal loses operation **history** permanently and forces the rejoin above; it does
+not lose money. If a settlement was in flight at step 0, reconcile it against the federations'
+view by hand (same caveat as **Disk dies** under Incidents).
+
 ## Never
 
 - Never run two daemons (or a daemon + `wallet-cli --standalone`) against the same seed
