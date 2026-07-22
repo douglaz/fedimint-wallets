@@ -225,6 +225,53 @@ fn receive_blocked_refusal_records_source_side_figures_only() {
 }
 
 #[test]
+fn diagnose_20260721_refusal_is_a_partial_topup_co_emission() {
+    // DIAGNOSIS of the 2026-07-21 "unexplained" refusal, reconstructed from the recorded
+    // balances (spending 3_936_126, standby 1_987_774, target 50_000_000, max_fee 50_000,
+    // production per_fed_cap 1_500_000_000). It was NEVER anomalous: `fund_into` emits a move
+    // AND a shortfall refusal in the SAME tick. The standby could fund only 1_937_774 of the
+    // spending fed's 46_063_874 shortfall (after the 50_000 fee reserve), so the tick emits
+    // BOTH a partial top-up move (1_937_774 — the one that "later succeeded" when it settled)
+    // AND a SpendingBelowTarget refusal for the ~44M it could not cover. The earlier
+    // investigation looked for a refusal INSTEAD OF a move and couldn't reconcile them; the
+    // new figures (amount>0 → a move WAS emitted; want ≫ amount → the source was exhausted)
+    // make the co-emission self-evident, which is exactly what the diagnostics exist to show.
+    let mut snapshot = snap!([fed!(1, 3_936_126, true, false, true), fed!(2, 1_987_774, true, false, true)], Some(id!(1)), Some(id!(2)), 1_500_000_000, 50_000_000, 0, 20_260_721);
+    snapshot.max_fee = Msat(50_000);
+    snapshot.min_move = Msat(5_000);
+    let decisions = decide(&snapshot, occ(1));
+
+    // A partial top-up move for exactly the standby's fundable surplus (standby − max_fee).
+    let move_amount = decisions
+        .iter()
+        .find_map(|d| match &d.action {
+            Action::Move {
+                from, to, amount, ..
+            } if *from == id!(2) && *to == id!(1) => Some(amount.0),
+            _ => None,
+        })
+        .expect("a partial top-up move 2 -> 1");
+    assert_eq!(move_amount, 1_937_774, "1_987_774 standby − 50_000 max_fee");
+
+    // ...co-emitted with a SpendingBelowTarget refusal whose figures show the source was
+    // exhausted well short of the shortfall.
+    let refusal = decisions
+        .iter()
+        .find(|d| matches!(d.action, Action::RefuseInflow { .. }))
+        .expect("a co-emitted refusal");
+    assert_eq!(refusal.reason, ReasonCode::SpendingBelowTarget);
+    let diag = first_refusal_diagnostics(&decisions);
+    assert_eq!(diag.source, Some(id!(2)));
+    assert_eq!(diag.want, Some(Msat(46_063_874)));
+    assert_eq!(diag.available, Some(Msat(1_937_774)));
+    assert_eq!(diag.source_spendable, Some(Msat(1_987_774)));
+    assert_eq!(diag.max_fee, Some(Msat(50_000)));
+    assert_eq!(diag.amount, Some(Msat(1_937_774)));
+    // amount == available == the move amount: the source, not the cap, was the binding limit.
+    assert_eq!(diag.amount, diag.available);
+}
+
+#[test]
 fn evacuation_drained_source_refusal_records_source_figures_without_max_fee() {
     // fed 1 has a shutdown notice but 0 spendable: `safest_other` guarantees the destination
     // (fed 2) has cap room, so `amount == 0` means the SOURCE is drained. Record the source
