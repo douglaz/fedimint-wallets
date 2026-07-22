@@ -33,7 +33,7 @@ use fedimint_lnv2_client::{
 use futures::lock::Mutex;
 use futures::{FutureExt, StreamExt};
 use lightning_invoice::Bolt11Invoice;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::str::FromStr as _;
 use std::sync::{Arc, RwLock};
@@ -45,9 +45,11 @@ use wallet_core::{ExecError, FederationId, FeeBreakdown, IdempotencyKey, Msat};
 /// load-bearing: a variable-length prefix could alias (`[0x01,0x00]` vs `[0x01],[0x00,..]`).
 const CLIENT_PREFIX_TAG: u8 = 0x01;
 
-/// One fedimint client per joined federation, sharing ONE async `Database`: app state
-/// (the journal) lives at `[0x00]`, each client `i` at `[0x01] ++ u32_le(db_prefix)`.
-/// Concrete type, no trait (ADR-0021) — `MultiClient` is the one production impl.
+/// One fedimint client per joined federation. `db` is the CLIENT store — each client `i`
+/// at `[0x01] ++ u32_le(db_prefix)`, plus fedimint's own client secret — while the app
+/// journal lives in its OWN separate `Database` (see [`Self::new`] for why co-locating
+/// them wedges fedimint's long-held lnv2 transactions). Concrete type, no trait
+/// (ADR-0021) — `MultiClient` is the one production impl.
 pub struct MultiClient {
     db: Database,
     journal: FedimintJournal,
@@ -61,6 +63,18 @@ pub struct MultiClient {
     /// Serializes db-prefix allocation and initial client creation so two concurrent joins
     /// cannot initialize different federations into the same per-fed partition.
     join_lock: Mutex<()>,
+    /// Pooled HTTP client for DIRECT gateway reads (`routing_info`). The SDK's
+    /// `GatewayApi` route is deliberately bypassed for these: its per-URL
+    /// `ConnectionPool` treats every http(s) connection as disconnected
+    /// (`HttpConnection::is_connected()` is hard-coded `false` at the pin), so every
+    /// request after the first re-enters the RECONNECT path and sleeps a Fibonacci
+    /// backoff starting at 500 ms — measured live by the §6a.9 responsiveness gate as
+    /// 550-730 ms added to every pre-fund fee quote, with concurrent quotes coalescing
+    /// behind one leader. A quote is a pure HTTP read with no state-machine
+    /// involvement, so a plain pooled client is strictly better; the SDK's own
+    /// settlement calls (send_payment, invoice fetch inside the lnv2 state machines)
+    /// keep their path — that latency is async settlement, not responsiveness.
+    gateway_http: reqwest::Client,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,9 +108,17 @@ struct JoinDeadlineElapsed;
 impl MultiClient {
     /// Derive the root secret once from `mnemonic` (`StandardDoubleDerive` — the
     /// per-federation mix-in happens INSIDE the fedimint builder on join/open; callers
-    /// must never pre-derive it, per the builder's own contract) and share `db` for the
-    /// journal + every per-federation client.
-    pub async fn new(db: Database, mnemonic: Mnemonic) -> Self {
+    /// must never pre-derive it, per the builder's own contract). `db` holds ONLY the
+    /// fedimint clients (+ the client secret); `journal_db` is a SEPARATE store for the
+    /// app journal. They MUST be different RocksDBs (the 24h soak, 2026-07): fedimint
+    /// tunes RocksDB to a 2MB write buffer with NO extra memtable history, so any
+    /// fedimint transaction held open while a co-located writer (our journal's
+    /// tick/ledger churn) flushes ~2MB loses its snapshot's memtable history and the
+    /// commit fails `TryAgain` (mapped to `WriteConflict` REGARDLESS of key
+    /// disjointness). The known instance — lnv2's `receive_lnurl_task` panicking across
+    /// its long-poll — is fixed at our pinned rev (upstream PR #8816), but the isolation
+    /// stands: our churn must never share a memtable with fedimint's transactions.
+    pub async fn new(db: Database, journal_db: Database, mnemonic: Mnemonic) -> Self {
         let root_secret = RootSecret::StandardDoubleDerive(
             Bip39RootSecretStrategy::<12>::to_root_secret(&mnemonic),
         );
@@ -105,12 +127,21 @@ impl MultiClient {
             .await
             .expect("binding the default client connectors performs no I/O and cannot fail");
         Self {
-            journal: FedimintJournal::new(db.clone()),
+            journal: FedimintJournal::new(journal_db),
             db,
             connectors,
             root_secret,
             clients: RwLock::new(BTreeMap::new()),
             join_lock: Mutex::new(()),
+            // Bounded: a quote is pre-fund and advisory (no money has moved), so timing out
+            // against an unresponsive gateway is safe — the driver surfaces Retryable and the
+            // intent stays Pending. The SDK path had NO deadline here, which left a driver
+            // hanging on a black-holed quote until abandonment.
+            gateway_http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("static reqwest client configuration cannot fail"),
         }
     }
 
@@ -265,6 +296,46 @@ impl MultiClient {
             .collect()
     }
 
+    pub fn spawn_expiry_wake_tasks(
+        &self,
+        subscribed: &mut BTreeSet<FederationId>,
+        wake_tx: tokio::sync::mpsc::Sender<(FederationId, Option<u64>)>,
+    ) -> Vec<runtime::JoinHandle<()>> {
+        let clients = self
+            .clients
+            .read()
+            .expect("client map lock poisoned")
+            .iter()
+            .map(|(id, client)| (*id, client.clone()))
+            .collect::<Vec<_>>();
+        let mut tasks = Vec::new();
+        for (id, client) in clients {
+            if !subscribed.insert(id) {
+                continue;
+            }
+            let wake_tx = wake_tx.clone();
+            tasks.push(runtime::spawn("wallet-watch-expiry-wake", async move {
+                let meta_service = client.meta_service().clone();
+                let mut stream = Box::pin(
+                    meta_service
+                        .subscribe_to_field::<u64>(client.db(), "federation_expiry_timestamp"),
+                );
+                if stream.next().await.is_none() {
+                    return;
+                }
+                while let Some(value) = stream.next().await {
+                    let expiry_ms = value
+                        .and_then(|value| value.value)
+                        .map(|secs| secs.saturating_mul(1000));
+                    if wake_tx.send((id, expiry_ms)).await.is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        tasks
+    }
+
     /// Fetch and authenticate a federation config from an invite without joining or writing a
     /// client partition (§5.1.2 step 2). This is the same preview fetch `join` uses before the
     /// partition write.
@@ -277,7 +348,7 @@ impl MultiClient {
         Ok(preview.config().clone())
     }
 
-    fn has_client(&self, id: &FederationId) -> bool {
+    pub(crate) fn has_client(&self, id: &FederationId) -> bool {
         self.clients
             .read()
             .expect("client map lock poisoned")
@@ -427,12 +498,12 @@ impl MultiClient {
     }
 
     /// Pay a BOLT11 invoice from `id` via lnv2. The lnv2 client is the dedup AUTHORITY
-    /// (deterministic op-id): re-paying an in-flight or already-settled invoice returns
-    /// [`SendOutcome::AlreadyInFlight`]/[`SendOutcome::AlreadyPaid`] carrying the ORIGINAL
+    /// (deterministic op-id, ONE attempt per invoice): re-paying an in-flight or settled
+    /// invoice returns [`SendOutcome::AlreadyInFlight`] carrying the ORIGINAL
     /// op-id — never a double-pay (spec §4). `custom_meta` is committed into the operation
     /// meta. A failure is a typed [`SendError`] so the caller can tell a DETERMINISTIC
-    /// rejection (expired/wrong-currency/unsupported/fee-limit — re-paying the SAME invoice
-    /// can never succeed) from a TRANSPORT fault (retry may succeed) — §15.4.
+    /// rejection (expired/wrong-currency — re-paying the SAME invoice can never succeed) from a
+    /// retryable route/transport fault — §15.4.
     pub async fn pay(
         &self,
         id: &FederationId,
@@ -684,18 +755,40 @@ impl MultiClient {
             })
     }
 
+    /// Direct `POST {gateway}/routing_info` on [`Self::gateway_http`] (see that field for why
+    /// the SDK's `GatewayApi` route is bypassed here). Wire-identical to
+    /// `RealGatewayConnection::routing_info` at the pin: the request body is the federation id,
+    /// the 200 body is `Option<RoutingInfo>`.
     async fn maybe_routing_info_for(
         &self,
         id: &FederationId,
         gateway: &GatewayUrl,
     ) -> anyhow::Result<Option<RoutingInfo>> {
         let client = self.client(id)?;
-        let lnv2 = client.get_first_module::<LightningClientModule>()?;
+        let federation_id = client.federation_id();
         let url = SafeUrl::parse(&gateway.0)
-            .map_err(|e| anyhow::anyhow!("invalid gateway url {:?}: {e}", gateway.0))?;
-        lnv2.routing_info(&url)
+            .map_err(|e| anyhow::anyhow!("invalid gateway url {:?}: {e}", gateway.0))?
+            .join("routing_info")
+            .map_err(|e| anyhow::anyhow!("joining routing_info onto {:?}: {e}", gateway.0))?;
+        let response = self
+            .gateway_http
+            .post(url.to_unsafe())
+            .json(&federation_id)
+            .send()
             .await
-            .map_err(|e| anyhow::anyhow!("fetching routing info from gateway {}: {e}", gateway.0))
+            .map_err(|e| {
+                anyhow::anyhow!("fetching routing info from gateway {}: {e}", gateway.0)
+            })?;
+        let status = response.status();
+        anyhow::ensure!(
+            status == reqwest::StatusCode::OK,
+            "gateway {} routing_info returned status {status}",
+            gateway.0
+        );
+        response
+            .json::<Option<RoutingInfo>>()
+            .await
+            .map_err(|e| anyhow::anyhow!("decoding routing info from gateway {}: {e}", gateway.0))
     }
 
     /// Clone out the open client for `id`, or error if the federation isn't joined/opened.
@@ -785,18 +878,18 @@ fn op_artifact_from_meta(
     }))
 }
 
-/// The outcome of an lnv2 `send` (see [`MultiClient::pay`]). The dedup variants are
-/// OUTCOMES, not errors: the client recognised an existing operation for this invoice and
+/// The outcome of an lnv2 `send` (see [`MultiClient::pay`]). The dedup variant is an
+/// OUTCOME, not an error: the client recognised an existing operation for this invoice and
 /// hands back its op-id so the caller re-attaches instead of paying twice (spec §4 — the
-/// client is the dedup authority).
+/// client is the dedup authority). lnv2 allows ONE attempt per invoice, so the existing op
+/// may be in flight OR settled — the awaiter resolves which from the op's own final state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SendOutcome {
     /// A fresh payment was submitted; carries its new op-id.
     Started(OperationId),
-    /// A payment for this invoice is already in progress; carries its existing op-id.
+    /// An operation for this invoice already exists (in flight or settled); carries its
+    /// existing op-id — attach and await its true terminal.
     AlreadyInFlight(OperationId),
-    /// This invoice was already paid; carries the settled op-id.
-    AlreadyPaid(OperationId),
 }
 
 /// The outcome of [`MultiClient::join`] (spec §10.2): the federation id, plus whether THIS
@@ -868,24 +961,24 @@ pub enum SendState {
 }
 
 /// Why an lnv2 `send` produced no [`SendOutcome`] (spec §15.4). Split so the executor can tell a
-/// DETERMINISTIC rejection — the invoice/gateway/currency is wrong, so re-paying the SAME invoice
-/// can never succeed (the move must fail terminally and a fresh occurrence re-mint) — from a
-/// TRANSPORT fault (the gateway is unreachable this attempt; a retry may succeed). Blanket-mapping
-/// every failure to `Retryable` (the old behavior) let `InvoiceExpired`/`WrongCurrency`/
-/// `FederationNotSupported`/fee-limit breaches livelock forever.
+/// DETERMINISTIC rejection from a transport fault. Route rejections remain distinct from immutable
+/// invoice rejections so raw pay may adopt a new pre-fund route without changing the frozen move
+/// disposition.
 #[derive(Debug)]
 pub enum SendError {
-    /// The federation deterministically rejected this invoice (expired / wrong currency /
-    /// unsupported / fee- or expiry-limit breach). Terminal for this invoice.
-    Rejected(String),
-    /// A transient transport / gateway-reachability fault; retry with the same invoice may succeed.
+    /// The invoice itself cannot become payable (expired / wrong currency / missing amount).
+    InvoiceRejected(String),
+    /// The selected gateway route was rejected. Terminal for a pinned move route, but an
+    /// unfunded raw pay may retry after adopting another gateway.
+    RouteRejected(String),
+    /// A transient funding or transport fault; retry may succeed.
     Transport(anyhow::Error),
 }
 
 impl std::fmt::Display for SendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SendError::Rejected(msg) => write!(f, "{msg}"),
+            SendError::InvoiceRejected(msg) | SendError::RouteRejected(msg) => write!(f, "{msg}"),
             SendError::Transport(e) => write!(f, "{e}"),
         }
     }
@@ -904,38 +997,44 @@ impl From<anyhow::Error> for SendError {
 
 /// Whether a [`SendPaymentError`] is a DETERMINISTIC rejection of the invoice — re-submitting the
 /// SAME BOLT11 can never succeed (verified against `modules/fedimint-lnv2-client/src/lib.rs`'s
-/// variants). Transport/gateway-reachability and funding faults are excluded (they may clear on a
-/// retry). The dedup variants are handled as OUTCOMES before this is consulted.
-fn is_deterministic_send_rejection(e: &SendPaymentError) -> bool {
+/// variants). Route policy, transport/gateway-reachability, and funding faults are excluded (they
+/// may clear on retry, and an unfunded raw-pay attach may replace its route). The dedup variants
+/// are handled as OUTCOMES before this is consulted.
+fn is_invoice_send_rejection(e: &SendPaymentError) -> bool {
     matches!(
         e,
         SendPaymentError::InvoiceMissingAmount
             | SendPaymentError::InvoiceExpired
-            | SendPaymentError::FederationNotSupported
-            | SendPaymentError::GatewayFeeExceedsLimit
-            | SendPaymentError::GatewayExpirationExceedsLimit
             | SendPaymentError::WrongCurrency { .. }
     )
 }
 
-/// Map lnv2 `send`'s result to a [`SendOutcome`] or a classified [`SendError`]: the two dedup
-/// errors become non-failure outcomes carrying the existing op-id; a deterministic rejection
-/// becomes [`SendError::Rejected`] (terminal), and every other failure stays
-/// [`SendError::Transport`] (retryable). Pure, so the classification is unit-tested without a live
-/// federation.
+fn is_route_send_rejection(e: &SendPaymentError) -> bool {
+    matches!(
+        e,
+        SendPaymentError::FederationNotSupported
+            | SendPaymentError::GatewayFeeExceedsLimit
+            | SendPaymentError::GatewayExpirationExceedsLimit
+    )
+}
+
+/// Map lnv2 `send`'s result to a [`SendOutcome`] or a classified [`SendError`]. Dedup errors become
+/// non-failure outcomes; immutable invoice rejections and changeable route rejections stay
+/// distinguishable; every other failure is transport-class. Pure, so this is unit-tested without a
+/// live federation.
 fn map_send_result(
     result: Result<FedimintOperationId, SendPaymentError>,
 ) -> Result<SendOutcome, SendError> {
     match result {
         Ok(op) => Ok(SendOutcome::Started(bridge_op_id(op))),
-        Err(SendPaymentError::PaymentInProgress(op)) => {
+        Err(SendPaymentError::DuplicatePaymentAttempt(op)) => {
             Ok(SendOutcome::AlreadyInFlight(bridge_op_id(op)))
         }
-        Err(SendPaymentError::InvoiceAlreadyPaid(op)) => {
-            Ok(SendOutcome::AlreadyPaid(bridge_op_id(op)))
-        }
-        Err(e) if is_deterministic_send_rejection(&e) => Err(SendError::Rejected(format!(
+        Err(e) if is_invoice_send_rejection(&e) => Err(SendError::InvoiceRejected(format!(
             "lnv2 send deterministically rejected the invoice: {e}"
+        ))),
+        Err(e) if is_route_send_rejection(&e) => Err(SendError::RouteRejected(format!(
+            "lnv2 send rejected the selected gateway route: {e}"
         ))),
         Err(e) => Err(SendError::Transport(anyhow::anyhow!("lnv2 send: {e}"))),
     }
@@ -970,7 +1069,7 @@ impl MultiClient {
         &self,
         fed: &FederationId,
         mut pred: impl FnMut(&LightningOperationMeta) -> bool,
-    ) -> anyhow::Result<Option<OperationId>> {
+    ) -> anyhow::Result<Option<(OperationId, LightningOperationMeta)>> {
         let client = self.client(fed)?;
         let log = client.operation_log();
         let mut last_seen: Option<ChronologicalOperationLogKey> = None;
@@ -987,7 +1086,7 @@ impl MultiClient {
                     continue;
                 };
                 if pred(&meta) {
-                    return Ok(Some(bridge_op_id(key.operation_id)));
+                    return Ok(Some((bridge_op_id(key.operation_id), meta)));
                 }
             }
             if page_len < BACKFILL_PAGE_SIZE {
@@ -995,6 +1094,35 @@ impl MultiClient {
             }
         }
         Ok(None)
+    }
+
+    /// Recover a raw receive's durable artifact from the operation log after a crash between
+    /// lnv2 committing the receive and the journal recording its op id + invoice.
+    pub(crate) async fn find_receive_artifact_by_correlation_key(
+        &self,
+        fed: &FederationId,
+        key: &IdempotencyKey,
+    ) -> Result<Option<(Invoice, OperationId)>, ExecError> {
+        let key = key.0.clone();
+        self.find_op_matching(fed, |meta| {
+            matches!(meta, LightningOperationMeta::Receive(_))
+                && meta_custom(meta)
+                    .and_then(|custom| custom.get("correlation_key"))
+                    .and_then(|value| value.as_str())
+                    == Some(key.as_str())
+        })
+        .await
+        .map_err(oracle_retryable)
+        .and_then(|artifact| match artifact {
+            Some((operation_id, LightningOperationMeta::Receive(receive))) => {
+                let LightningInvoice::Bolt11(invoice) = receive.invoice;
+                Ok(Some((bridge_invoice(&invoice), operation_id)))
+            }
+            Some(_) => Err(ExecError::Permanent(
+                "correlation-key lookup returned a non-receive operation".into(),
+            )),
+            None => Ok(None),
+        })
     }
 
     /// Non-blocking read of `fed_op`'s send-leg terminal state (§10.3): a cached outcome maps to
@@ -1044,6 +1172,7 @@ impl LedgerRepairOracle for MultiClient {
                 == Some(key.as_str())
         })
         .await
+        .map(|found| found.map(|(operation_id, _)| operation_id))
         .map_err(oracle_retryable)
     }
 
@@ -1060,6 +1189,7 @@ impl LedgerRepairOracle for MultiClient {
             _ => false,
         })
         .await
+        .map(|found| found.map(|(operation_id, _)| operation_id))
         .map_err(oracle_retryable)
     }
 
@@ -1437,17 +1567,13 @@ mod tests {
             map_send_result(Ok(op)).expect("Ok maps to an outcome"),
             SendOutcome::Started(OperationId(op.0))
         );
-        // The two dedup errors are OUTCOMES (not failures), each carrying the EXISTING
-        // op-id so the caller re-attaches rather than double-paying.
+        // The dedup error is an OUTCOME (not a failure), carrying the EXISTING op-id so
+        // the caller re-attaches rather than double-paying (in flight or settled — the
+        // awaiter resolves which from the op's own final state).
         assert_eq!(
-            map_send_result(Err(SendPaymentError::PaymentInProgress(op)))
-                .expect("PaymentInProgress maps to an outcome"),
+            map_send_result(Err(SendPaymentError::DuplicatePaymentAttempt(op)))
+                .expect("DuplicatePaymentAttempt maps to an outcome"),
             SendOutcome::AlreadyInFlight(OperationId(op.0))
-        );
-        assert_eq!(
-            map_send_result(Err(SendPaymentError::InvoiceAlreadyPaid(op)))
-                .expect("InvoiceAlreadyPaid maps to an outcome"),
-            SendOutcome::AlreadyPaid(OperationId(op.0))
         );
         // Any other send error stays a real failure (never a silent success).
         assert!(map_send_result(Err(SendPaymentError::InvoiceExpired)).is_err());
@@ -1456,14 +1582,11 @@ mod tests {
 
     #[test]
     fn send_result_classifies_deterministic_rejections_distinctly_from_transport() {
-        // §15.4: the deterministic invoice-level rejections must classify as `Rejected` so the
-        // executor fails the move terminally instead of livelocking a re-drive on a dead invoice.
+        // §15.4: deterministic invoice-level rejections must classify as `Rejected` so the
+        // executor fails terminally instead of re-driving an invoice that can never become valid.
         for err in [
             SendPaymentError::InvoiceMissingAmount,
             SendPaymentError::InvoiceExpired,
-            SendPaymentError::FederationNotSupported,
-            SendPaymentError::GatewayFeeExceedsLimit,
-            SendPaymentError::GatewayExpirationExceedsLimit,
             SendPaymentError::WrongCurrency {
                 invoice_currency: lightning_invoice::Currency::Bitcoin,
                 federation_currency: lightning_invoice::Currency::Regtest,
@@ -1472,9 +1595,25 @@ mod tests {
             assert!(
                 matches!(
                     map_send_result(Err(err.clone())),
-                    Err(SendError::Rejected(_))
+                    Err(SendError::InvoiceRejected(_))
                 ),
                 "{err:?} must classify as a deterministic Rejected, not Transport"
+            );
+        }
+
+        // Gateway policy failures are still deterministic rejections for the selected route, but
+        // remain distinct so raw pay can retry after adopting another route.
+        for err in [
+            SendPaymentError::FederationNotSupported,
+            SendPaymentError::GatewayFeeExceedsLimit,
+            SendPaymentError::GatewayExpirationExceedsLimit,
+        ] {
+            assert!(
+                matches!(
+                    map_send_result(Err(err.clone())),
+                    Err(SendError::RouteRejected(_))
+                ),
+                "{err:?} must classify as a route rejection, not Transport"
             );
         }
 
@@ -1612,8 +1751,9 @@ mod tests {
     #[tokio::test]
     async fn next_db_prefix_accounts_for_orphaned_client_partitions() {
         let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
         let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
-        let multi_client = MultiClient::new(db.clone(), mnemonic).await;
+        let multi_client = MultiClient::new(db.clone(), journal_db, mnemonic).await;
 
         let mut orphaned_client_key = client_prefix_bytes(41);
         orphaned_client_key.push(0x2f);
@@ -1630,8 +1770,9 @@ mod tests {
     #[tokio::test]
     async fn remove_client_partition_deletes_only_the_unfinished_prefix() {
         let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
         let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
-        let multi_client = MultiClient::new(db.clone(), mnemonic).await;
+        let multi_client = MultiClient::new(db.clone(), journal_db, mnemonic).await;
 
         let mut target_key = client_prefix_bytes(7);
         target_key.push(0x2f);
@@ -1681,8 +1822,9 @@ mod tests {
     #[tokio::test]
     async fn join_before_deadline_bounds_join_lock_wait() -> anyhow::Result<()> {
         let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
         let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
-        let multi_client = MultiClient::new(db, mnemonic).await;
+        let multi_client = MultiClient::new(db, journal_db, mnemonic).await;
         let _guard = multi_client.join_lock.lock().await;
         let invite = InviteCode::new(
             SafeUrl::parse("https://lock-held.example").expect("valid url"),

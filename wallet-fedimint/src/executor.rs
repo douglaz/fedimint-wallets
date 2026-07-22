@@ -12,7 +12,7 @@
 //! two-leg send path — receive on `to`, re-quote + cap-check + `pay` from `from`, await both,
 //! settle → `Done` — synchronously (`perform` returns `Done`, never `Awaiting`, for a Move). It
 //! is resume-safe: `assemble_record` reattaches a replayed move to its existing invoice/recv_op/
-//! send_op (the send op-id is deterministic; a re-`pay` returns `AlreadyInFlight`/`AlreadyPaid`),
+//! send_op (the send op-id is deterministic; a re-`pay` returns `AlreadyInFlight`),
 //! so a crash never re-mints or re-pays. `Evacuate` (Phase 3.A) maps to the SAME send-required
 //! plan as `Move` (`MovePlan::from_action`), so it drives the identical validated two-leg path —
 //! the money engine can now flee a dying federation, not just top up a standby. Do not read
@@ -31,7 +31,7 @@
 //! - `Done`/`Failed`: terminal.
 
 use crate::fee;
-use crate::journal::FedimintJournal;
+use crate::journal::{FedimintJournal, LedgerRepairOracle};
 use crate::move_protocol::{
     assemble_move_record, next_step, Leg, MoveMeta, MoveParams, MovePhase, MovePlan, MoveRecord,
     MoveRole, MoveStep, OpArtifact,
@@ -39,10 +39,15 @@ use crate::move_protocol::{
 use crate::multi_client::{MultiClient, ReceiveState, SendError, SendOutcome, SendState};
 use crate::types::{GatewayUrl, Invoice};
 use async_trait::async_trait;
+use fedimint_core::invite_code::InviteCode;
 use lightning_invoice::Bolt11Invoice;
+use std::collections::BTreeMap;
 use std::str::FromStr as _;
 use std::sync::Arc;
-use wallet_core::{Action, ExecError, Executor, FederationId, Intent, Msat, PerformOutcome};
+use wallet_core::{
+    Action, Actor, ExecError, Executor, FederationId, Intent, Journal, Msat, OperationId,
+    PerformOutcome,
+};
 
 /// Pinned lnv2 requires the gateway-reduced incoming contract to be at least 5 sats
 /// (`MINIMUM_INCOMING_CONTRACT_AMOUNT`) before it will mint a receive invoice.
@@ -74,6 +79,54 @@ impl FreshMoveCost {
 
 fn evacuation_cost_fits(cost: FreshMoveCost, fee_cap: Msat, spendable: Msat) -> bool {
     cost.total_fee() <= fee_cap && cost.source_debit() <= spendable
+}
+
+fn raw_pay_fee_fits(gateway_quote: Msat, federation_quote: Msat, fee_cap: Msat) -> bool {
+    gateway_quote.0.saturating_add(federation_quote.0) <= fee_cap.0
+}
+
+fn raw_fee_cap_error(operation: &str, quote: u64, fee_cap: Msat) -> ExecError {
+    ExecError::Permanent(format!(
+        "{operation} fee quote {quote} msat exceeds fee cap {} msat",
+        fee_cap.0
+    ))
+}
+
+fn raw_pay_quote_error(lowest_quote: Option<u64>, fee_cap: Msat, from: FederationId) -> ExecError {
+    // Pre-fund quote failures TERMINALIZE (Permanent): a user pay is one-shot — the
+    // pre-6a CLI returned the error and was done, and leaving the intent Pending would
+    // let a background reconcile settle it hours later, after the user already paid the
+    // bill another way ("thought it failed, later succeeded"). A deliberate retry is a
+    // new operation (docs/phase6a-plan.md §6a.6; ADR-0024). Matches raw receive
+    // (`raw_fee_cap_error`), which already terminalizes its over-cap quote.
+    match lowest_quote {
+        Some(quote) => {
+            let fee_cap = fee_cap.0;
+            ExecError::Permanent(format!(
+                "raw pay fee quote {quote} msat exceeds fee cap {fee_cap} msat"
+            ))
+        }
+        None => {
+            let federation = from.to_hex();
+            ExecError::Permanent(format!(
+                "no lnv2 gateway produced a send fee quote for federation {federation}"
+            ))
+        }
+    }
+}
+
+fn pre_fund_reservation_error(error: ExecError) -> ExecError {
+    let reason = match error {
+        ExecError::Retryable(reason) | ExecError::Permanent(reason) => reason,
+        ExecError::Unsupported => "reservation journal read is unsupported".to_owned(),
+    };
+    ExecError::Retryable(format!(
+        "reservation scan failed before funding; leaving the intent pending: {reason}"
+    ))
+}
+
+fn raw_receive_fee_fits(gateway_quote: Msat, federation_quote: Msat, fee_cap: Msat) -> bool {
+    gateway_quote.0.saturating_add(federation_quote.0) <= fee_cap.0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,6 +202,7 @@ impl FedimintExecutor {
         plan: &MovePlan,
     ) -> Result<MoveRecord, ExecError> {
         let cached = self.journal.get_move(&intent.idempotency_key).await?;
+        let operation_key = intent.operation_correlation_key();
 
         // Backfill both sides: the receive leg lives on `to`, the send leg on `from`. For a
         // single-fed self-move (`from == to`, Phase 1) one client holds both legs, so skip
@@ -168,7 +222,7 @@ impl FedimintExecutor {
         let gateway = match gateway_from_cache_or_recovered(
             cached.as_ref(),
             plan,
-            &intent.idempotency_key,
+            &operation_key,
             &artifacts,
         ) {
             Some(gateway) => gateway,
@@ -179,6 +233,7 @@ impl FedimintExecutor {
 
         let params = MoveParams {
             key: intent.idempotency_key.clone(),
+            operation_key,
             from: plan.from,
             to: plan.to,
             amount: plan.amount,
@@ -292,7 +347,7 @@ impl FedimintExecutor {
         // A DirectInflow is receive-only, so validate the gateway against the destination only.
         let gateway = self.resolve_gateway(&to, None).await?;
         let grossed = self.quote_receive_gross_up(&to, &gateway, amount).await?;
-        ensure_minimum_incoming_contract(amount, grossed.contract_amount)
+        ensure_minimum_incoming_contract("direct inflow", amount, grossed.contract_amount)
     }
 
     /// Size the receive invoice via the §6 fixed point and apply the lnv2 minimum-contract guard
@@ -306,7 +361,7 @@ impl FedimintExecutor {
         let grossed = self
             .quote_receive_gross_up(&rec.to, &rec.gateway, rec.amount)
             .await?;
-        ensure_minimum_incoming_contract(rec.amount, grossed.contract_amount)?;
+        ensure_minimum_incoming_contract("direct inflow", rec.amount, grossed.contract_amount)?;
         Ok(grossed)
     }
 
@@ -651,9 +706,389 @@ impl FedimintExecutor {
     }
 }
 
-#[async_trait]
-impl Executor for FedimintExecutor {
-    async fn perform(&self, intent: &Intent) -> Result<PerformOutcome, ExecError> {
+impl FedimintExecutor {
+    async fn verify_raw_receive_fee_cap(
+        &self,
+        intent: &Intent,
+        to: FederationId,
+        amount: Msat,
+        fee_cap: Msat,
+        operation_id: OperationId,
+        invoice: &Invoice,
+    ) -> Result<(), ExecError> {
+        let (committed_contract, _) = self
+            .mc
+            .receive_contract_amounts(&to, operation_id)
+            .await
+            .map_err(retryable)?;
+        let federation_quote = self
+            .mc
+            .receive_fee_quote(&to, committed_contract)
+            .await
+            .map_err(retryable)?;
+        let actual_quote = amount
+            .0
+            .saturating_sub(committed_contract.0)
+            .saturating_add(federation_quote.0);
+        if actual_quote > fee_cap.0 {
+            self.journal
+                .set_operation_artifact(&intent.idempotency_key, operation_id, Some(invoice))
+                .await?;
+            return Err(ExecError::Permanent(format!(
+                "raw receive committed fee {actual_quote} msat exceeds fee cap {} msat",
+                fee_cap.0
+            )));
+        }
+        Ok(())
+    }
+
+    async fn enforce_pre_fund_admission(&self, intent: &Intent) -> Result<(), ExecError> {
+        let Some((source, destination)) = pre_fund_endpoints(&intent.action) else {
+            return Ok(());
+        };
+        if self
+            .journal
+            .get_move(&intent.idempotency_key)
+            .await?
+            .is_some_and(|record| {
+                matches!(
+                    record.phase,
+                    MovePhase::Sending
+                        | MovePhase::Settled
+                        | MovePhase::Refunded
+                        | MovePhase::Failed
+                        | MovePhase::Stranded
+                )
+            })
+        {
+            return Ok(());
+        }
+
+        let mut in_flight = self
+            .journal
+            .reservation_intents()
+            .await
+            .map_err(pre_fund_reservation_error)?;
+        in_flight.retain(|other| other.idempotency_key != intent.idempotency_key);
+        let mut records = BTreeMap::new();
+        for other in &in_flight {
+            if let Some(record) = self
+                .journal
+                .get_move(&other.idempotency_key)
+                .await
+                .map_err(pre_fund_reservation_error)?
+            {
+                records.insert(other.idempotency_key.clone(), record);
+            }
+        }
+        let reservations =
+            wallet_core::project_reservations(&in_flight, |key| records.get(key).cloned());
+        let mut balances = BTreeMap::new();
+        if let Some(source) = source {
+            balances.insert(source, self.mc.balance(&source).await.map_err(retryable)?);
+        }
+        if self.hard_cap.is_some() {
+            if let Some(destination) = destination {
+                balances.insert(
+                    destination,
+                    self.mc.balance(&destination).await.map_err(retryable)?,
+                );
+            }
+        }
+        wallet_core::admit_intent(intent, Some(&balances), self.hard_cap, &reservations)
+    }
+
+    /// Drive the network work for one journaled intent. Raw operations complete one SDK
+    /// issue step; move-shaped intents resume through the existing per-leg loop.
+    pub async fn drive_intent_step(&self, intent: &Intent) -> Result<PerformOutcome, ExecError> {
+        match &intent.action {
+            Action::Pay {
+                from,
+                invoice,
+                amount,
+                fee_cap,
+                payment_hash,
+                gateway,
+                ..
+            } => {
+                if let Some(operation_id) = self
+                    .mc
+                    .find_send_op_by_payment_hash(*from, *payment_hash)
+                    .await?
+                {
+                    let observation = self.mc.observe_op(*from, operation_id).await?;
+                    if observation
+                        .terminal
+                        .as_ref()
+                        .is_none_or(|terminal| terminal.succeeded)
+                    {
+                        self.journal
+                            .set_operation_artifact(&intent.idempotency_key, operation_id, None)
+                            .await?;
+                        if observation.terminal.is_some() {
+                            self.journal
+                                .record_raw_observation(
+                                    &intent.idempotency_key,
+                                    operation_id,
+                                    &observation,
+                                )
+                                .await?;
+                        }
+                        return Ok(if observation.terminal.is_some() {
+                            PerformOutcome::Done
+                        } else {
+                            PerformOutcome::AwaitingAlreadyInFlight
+                        });
+                    }
+                }
+                validate_raw_pay_invoice(invoice)?;
+                self.enforce_pre_fund_admission(intent).await?;
+                // Same precedence as `resolve_gateway`: the intent's own gateway, else the
+                // constructor pin (walletd.toml / standalone --gateway — devimint's LDK gateway
+                // is never in the registered list), else the fed's registered scan. The pin is
+                // deliberately NOT journaled into the intent, so a pin change applies to
+                // re-drives after a restart.
+                let candidates = match gateway.clone().or_else(|| self.pinned_gateway.clone()) {
+                    Some(gateway) => vec![gateway],
+                    None => self.mc.gateways(from).await.map_err(retryable)?,
+                };
+                let mut selected_gateway = None;
+                let mut lowest_quote = None;
+                for candidate in candidates {
+                    let gateway_fee =
+                        match self.mc.send_gateway_fee(from, &candidate, invoice).await {
+                            Ok(fee) => fee,
+                            Err(_) => continue,
+                        };
+                    let gateway_quote = gateway_fee.on(*amount);
+                    let contract = Msat(amount.0.saturating_add(gateway_quote.0));
+                    let federation_quote =
+                        match self.mc.send_fee_quote_for_amount(from, contract).await {
+                            Ok(quote) => quote,
+                            Err(_) => continue,
+                        };
+                    let total = gateway_quote.0.saturating_add(federation_quote.0);
+                    lowest_quote =
+                        Some(lowest_quote.map_or(total, |lowest: u64| lowest.min(total)));
+                    if raw_pay_fee_fits(gateway_quote, federation_quote, *fee_cap) {
+                        selected_gateway = Some(candidate);
+                        break;
+                    }
+                }
+                let gateway = match selected_gateway {
+                    Some(gateway) => gateway,
+                    None => {
+                        return Err(raw_pay_quote_error(lowest_quote, *fee_cap, *from));
+                    }
+                };
+                let meta = serde_json::json!({
+                    "role": "send",
+                    "correlation_key": intent.operation_correlation_key().0,
+                });
+                let outcome = self
+                    .mc
+                    .pay(from, invoice.clone(), Some(gateway), meta)
+                    .await
+                    .map_err(map_raw_pay_send_error)?;
+                let (operation_id, already_in_flight) = match outcome {
+                    SendOutcome::Started(operation_id) => (operation_id, false),
+                    // In flight OR settled — the awaiter attaches and terminalizes from the
+                    // op's own final state (a settled op's await resolves immediately).
+                    SendOutcome::AlreadyInFlight(operation_id) => (operation_id, true),
+                };
+                self.journal
+                    .set_operation_artifact(&intent.idempotency_key, operation_id, None)
+                    .await?;
+                return Ok(if already_in_flight {
+                    PerformOutcome::AwaitingAlreadyInFlight
+                } else {
+                    PerformOutcome::Awaiting
+                });
+            }
+            Action::Receive {
+                to,
+                amount,
+                fee_cap,
+                gateway,
+                ..
+            } => {
+                if let Some(operation_id) = intent.operation_id {
+                    let invoice = intent.invoice.as_ref().ok_or_else(|| {
+                        ExecError::Permanent(
+                            "raw receive operation artifact has no durable invoice".into(),
+                        )
+                    })?;
+                    self.verify_raw_receive_fee_cap(
+                        intent,
+                        *to,
+                        *amount,
+                        *fee_cap,
+                        operation_id,
+                        invoice,
+                    )
+                    .await?;
+                    return Ok(PerformOutcome::Awaiting);
+                }
+                if let Some((invoice, operation_id)) = self
+                    .mc
+                    .find_receive_artifact_by_correlation_key(
+                        to,
+                        &intent.operation_correlation_key(),
+                    )
+                    .await?
+                {
+                    self.verify_raw_receive_fee_cap(
+                        intent,
+                        *to,
+                        *amount,
+                        *fee_cap,
+                        operation_id,
+                        &invoice,
+                    )
+                    .await?;
+                    self.journal
+                        .set_operation_artifact(
+                            &intent.idempotency_key,
+                            operation_id,
+                            Some(&invoice),
+                        )
+                        .await?;
+                    return Ok(PerformOutcome::AwaitingAlreadyInFlight);
+                }
+                self.enforce_pre_fund_admission(intent).await?;
+                // Pin fallback as in the raw pay arm above (and `resolve_gateway`).
+                let candidates = match gateway.clone().or_else(|| self.pinned_gateway.clone()) {
+                    Some(gateway) => vec![gateway],
+                    None => self.mc.gateways(to).await.map_err(retryable)?,
+                };
+                let mut selected_gateway = None;
+                let mut lowest_quote = None;
+                let mut minimum_contract_error = None;
+                let mut quote_unavailable = false;
+                for candidate in candidates {
+                    let gateway_fee = match self.mc.receive_gateway_fee(to, &candidate).await {
+                        Ok(fee) => fee,
+                        Err(_) => {
+                            quote_unavailable = true;
+                            continue;
+                        }
+                    };
+                    let gateway_quote = gateway_fee.on(*amount);
+                    let contract = Msat(amount.0.saturating_sub(gateway_quote.0));
+                    if let Err(error) =
+                        ensure_minimum_incoming_contract("raw receive", *amount, contract)
+                    {
+                        minimum_contract_error = Some(error);
+                        continue;
+                    }
+                    let federation_quote = match self.mc.receive_fee_quote(to, contract).await {
+                        Ok(quote) => quote,
+                        Err(_) => {
+                            quote_unavailable = true;
+                            continue;
+                        }
+                    };
+                    let total = gateway_quote.0.saturating_add(federation_quote.0);
+                    lowest_quote =
+                        Some(lowest_quote.map_or(total, |lowest: u64| lowest.min(total)));
+                    if raw_receive_fee_fits(gateway_quote, federation_quote, *fee_cap) {
+                        selected_gateway = Some(candidate);
+                        break;
+                    }
+                }
+                let gateway = match selected_gateway {
+                    Some(gateway) => gateway,
+                    None if lowest_quote.is_some() && !quote_unavailable => {
+                        return Err(raw_fee_cap_error(
+                            "raw receive",
+                            lowest_quote.expect("checked above"),
+                            *fee_cap,
+                        ));
+                    }
+                    None if lowest_quote.is_some() => {
+                        return Err(ExecError::Retryable(format!(
+                            "raw receive fee quote {} msat exceeds fee cap {} msat",
+                            lowest_quote.expect("checked above"),
+                            fee_cap.0
+                        )));
+                    }
+                    None if minimum_contract_error.is_some() && !quote_unavailable => {
+                        return Err(minimum_contract_error.expect("checked above"));
+                    }
+                    None => {
+                        return Err(ExecError::Retryable(format!(
+                            "no lnv2 gateway produced a receive fee quote for federation {}",
+                            to.to_hex()
+                        )));
+                    }
+                };
+                let meta = serde_json::json!({
+                    "role": "receive",
+                    "correlation_key": intent.operation_correlation_key().0,
+                });
+                let (invoice, operation_id) = self
+                    .mc
+                    .receive(to, *amount, Some(gateway), meta)
+                    .await
+                    .map_err(retryable)?;
+                self.verify_raw_receive_fee_cap(
+                    intent,
+                    *to,
+                    *amount,
+                    *fee_cap,
+                    operation_id,
+                    &invoice,
+                )
+                .await?;
+                self.journal
+                    .set_operation_artifact(&intent.idempotency_key, operation_id, Some(&invoice))
+                    .await?;
+                return Ok(PerformOutcome::Awaiting);
+            }
+            Action::Join {
+                federation,
+                invite,
+                membership_preexisting,
+            } => {
+                let invite = InviteCode::from_str(invite).map_err(|error| {
+                    ExecError::Permanent(format!("parsing federation invite: {error}"))
+                })?;
+                let outcome = self.mc.join(invite.clone()).await.map_err(retryable)?;
+                let registered_invite = if *membership_preexisting || outcome.newly_joined {
+                    None
+                } else {
+                    self.journal
+                        .get_federation(federation)
+                        .await?
+                        .map(|info| info.invite)
+                };
+                let newly_joined = recovered_join_was_new(
+                    *membership_preexisting,
+                    outcome.newly_joined,
+                    &invite.to_string(),
+                    registered_invite.as_deref(),
+                );
+                if intent.actor == Actor::User {
+                    // The network join succeeded. Persist explicit user ownership before the
+                    // terminal transition; a retry is idempotent, while AutoJoined remains owned
+                    // by the agent until the separately-audited approve verb runs.
+                    self.journal
+                        .mark_candidate_user_approved(*federation, &invite)
+                        .await?;
+                }
+                self.journal
+                    .record_join_outcome(&intent.idempotency_key, newly_joined)
+                    .await?;
+                return Ok(PerformOutcome::Done);
+            }
+            Action::DirectInflow { .. }
+            | Action::Move { .. }
+            | Action::Evacuate { .. }
+            | Action::RefuseInflow { .. } => {}
+        }
+
+        self.enforce_pre_fund_admission(intent).await?;
+
         // Only the advisory `RefuseInflow` action maps to `None` → `Unsupported` (§7);
         // `Move`/`Evacuate`/`DirectInflow` all yield an executable plan.
         let Some(plan) = MovePlan::from_action(&intent.action) else {
@@ -731,7 +1166,7 @@ impl Executor for FedimintExecutor {
                     // history with the receive quote blanked.
                     self.journal.put_move(&rec).await?;
                     let meta = MoveMeta {
-                        move_id: rec.key.clone(),
+                        move_id: intent.operation_correlation_key(),
                         role: MoveRole::Receive,
                         amount: net_amount,
                         from: rec.from,
@@ -862,7 +1297,7 @@ impl Executor for FedimintExecutor {
                     pay_step_cap_verdict(receive_quote, send_quote, rec.fee_cap)?;
 
                     let meta = MoveMeta {
-                        move_id: rec.key.clone(),
+                        move_id: intent.operation_correlation_key(),
                         role: MoveRole::Send,
                         amount: rec.amount,
                         from: rec.from,
@@ -877,16 +1312,14 @@ impl Executor for FedimintExecutor {
                         .await
                         .map_err(map_send_error)?
                     {
-                        // All three are the SAME committed send (the client dedups on the
+                        // Both are the SAME committed send (the client dedups on the
                         // deterministic op-id): reattach, never double-pay (spec §4).
-                        SendOutcome::Started(op)
-                        | SendOutcome::AlreadyInFlight(op)
-                        | SendOutcome::AlreadyPaid(op) => op,
+                        SendOutcome::Started(op) | SendOutcome::AlreadyInFlight(op) => op,
                     };
                     // KILLPOINT (§5 backfill window): the send op is committed in the CLIENT db,
                     // but our MoveRecord does NOT yet carry `send_op`. A crash here must NOT
                     // double-pay: backfill recovers the send op by `move_id`; if that misses, a
-                    // re-`pay` dedups to `AlreadyInFlight`/`AlreadyPaid`.
+                    // re-`pay` dedups to `AlreadyInFlight`.
                     maybe_crash("after-send-commit");
                     rec.send_op = Some(send_op);
                     rec.phase = MovePhase::Sending;
@@ -971,6 +1404,32 @@ impl Executor for FedimintExecutor {
                 }
             }
         }
+    }
+}
+
+fn pre_fund_endpoints(action: &Action) -> Option<(Option<FederationId>, Option<FederationId>)> {
+    match action {
+        Action::Move { from, to, .. } => Some((Some(*from), Some(*to))),
+        Action::DirectInflow { to, .. } | Action::Receive { to, .. } => Some((None, Some(*to))),
+        Action::Pay { from, .. } => Some((Some(*from), None)),
+        Action::Evacuate { .. } | Action::Join { .. } | Action::RefuseInflow { .. } => None,
+    }
+}
+
+fn recovered_join_was_new(
+    membership_preexisting: bool,
+    join_reported_new: bool,
+    intent_invite: &str,
+    registered_invite: Option<&str>,
+) -> bool {
+    !membership_preexisting
+        && (join_reported_new || registered_invite.is_some_and(|stored| stored == intent_invite))
+}
+
+#[async_trait]
+impl Executor for FedimintExecutor {
+    async fn perform(&self, intent: &Intent) -> Result<PerformOutcome, ExecError> {
+        self.drive_intent_step(intent).await
     }
 }
 
@@ -1192,10 +1651,14 @@ fn solve_gross_up(
     })
 }
 
-fn ensure_minimum_incoming_contract(amount: Msat, contract_amount: Msat) -> Result<(), ExecError> {
+fn ensure_minimum_incoming_contract(
+    operation: &str,
+    amount: Msat,
+    contract_amount: Msat,
+) -> Result<(), ExecError> {
     if contract_amount.0 < MINIMUM_INCOMING_CONTRACT_MSAT {
         return Err(ExecError::Permanent(format!(
-            "direct inflow amount too small: net {} msat produces a {} msat incoming contract; \
+            "{operation} amount too small: net {} msat produces a {} msat incoming contract; \
              lnv2 requires at least {} msat",
             amount.0, contract_amount.0, MINIMUM_INCOMING_CONTRACT_MSAT
         )));
@@ -1427,9 +1890,34 @@ fn delivered_move_amount(delivered: Msat, ask: Msat) -> Msat {
 /// succeed — a fresh occurrence must re-mint), a `Transport` fault stays `Retryable`.
 fn map_send_error(e: SendError) -> ExecError {
     match e {
-        SendError::Rejected(msg) => ExecError::Permanent(msg),
+        SendError::InvoiceRejected(msg) | SendError::RouteRejected(msg) => {
+            ExecError::Permanent(msg)
+        }
         SendError::Transport(err) => ExecError::Retryable(err.to_string()),
     }
+}
+
+fn map_raw_pay_send_error(e: SendError) -> ExecError {
+    match e {
+        SendError::InvoiceRejected(msg) => ExecError::Permanent(msg),
+        // Deterministic per route: a retry rebuilds the same ordered candidate list and
+        // re-selects the same gateway, so Retryable here reconcile-loops forever on the
+        // rejected route. One-shot user semantics: terminalize; a deliberate retry is a
+        // new operation (and may see a changed gateway set).
+        SendError::RouteRejected(msg) => ExecError::Permanent(msg),
+        // Ambiguous — the send MAY have been issued. Retryable is a RESUME, not a blind
+        // retry: the deterministic send op id + lnv2 dedup reattach instead of re-paying.
+        SendError::Transport(err) => ExecError::Retryable(err.to_string()),
+    }
+}
+
+fn validate_raw_pay_invoice(invoice: &Invoice) -> Result<(), ExecError> {
+    let parsed = Bolt11Invoice::from_str(&invoice.0)
+        .map_err(|error| ExecError::Permanent(format!("parsing raw pay invoice: {error}")))?;
+    if parsed.is_expired() {
+        return Err(ExecError::Permanent("raw pay invoice has expired".into()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1437,19 +1925,54 @@ mod tests {
     use super::*;
     use fedimint_bip39::Mnemonic;
     use fedimint_core::db::mem_impl::MemDatabase;
-    use fedimint_core::db::IRawDatabaseExt as _;
+    use fedimint_core::db::{IDatabaseTransactionOpsCore as _, IRawDatabaseExt as _};
     use wallet_core::{Action, Actor, IdempotencyKey, IntentStatus, ReasonCode};
 
     const FED_A: FederationId = FederationId([0xAA; 32]);
     const FED_B: FederationId = FederationId([0xBB; 32]);
 
+    #[test]
+    fn raw_receive_is_rechecked_as_a_destination_before_minting() {
+        let action = Action::Receive {
+            to: FED_B,
+            amount: Msat(50_000),
+            fee_cap: Msat(1_000),
+            nonce: "retry".into(),
+            gateway: None,
+        };
+        assert_eq!(pre_fund_endpoints(&action), Some((None, Some(FED_B))));
+    }
+
+    #[test]
+    fn evacuation_reaches_its_perform_time_downsizer_without_full_amount_admission() {
+        let action = Action::Evacuate {
+            from: FED_A,
+            to: FED_B,
+            amount: Msat(50_000),
+            fee_cap: Msat(1_000),
+        };
+        assert_eq!(pre_fund_endpoints(&action), None);
+    }
+
+    #[test]
+    fn expired_raw_pay_is_terminal_before_gateway_fee_quoting() {
+        let invoice = Invoice(
+            "lnbc25m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5vdhkven9v5sxyetpdeessp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs9q5sqqqqqqqqqqqqqqqqsgq2a25dxl5hrntdtn6zvydt7d66hyzsyhqs4wdynavys42xgl6sgx9c4g7me86a27t07mdtfry458rtjr0v92cnmswpsjscgt2vcse3sgpz3uapa".into(),
+        );
+        assert!(matches!(
+            validate_raw_pay_invoice(&invoice),
+            Err(ExecError::Permanent(reason)) if reason.contains("expired")
+        ));
+    }
+
     /// A constructible executor over an in-memory db — enough to exercise the `perform` gate,
     /// which decides `Move`/`Evacuate` BEFORE any federation I/O (no join needed).
     async fn test_executor() -> FedimintExecutor {
         let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
         let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
-        let mc = Arc::new(MultiClient::new(db.clone(), mnemonic).await);
-        let journal = Arc::new(FedimintJournal::new(db));
+        let mc = Arc::new(MultiClient::new(db, journal_db.clone(), mnemonic).await);
+        let journal = Arc::new(FedimintJournal::new(journal_db));
         FedimintExecutor::new(mc, journal, None, None)
     }
 
@@ -1457,12 +1980,15 @@ mod tests {
         let max_fee = action.fee_cap();
         Intent {
             idempotency_key: IdempotencyKey("gate-test".into()),
+            attempt: 0,
             action,
             max_fee,
             status: IntentStatus::Pending,
             reason: ReasonCode::UserInitiated,
             actor: Actor::User,
             created_at_ms: 0,
+            operation_id: None,
+            invoice: None,
         }
     }
 
@@ -1545,6 +2071,46 @@ mod tests {
             !evacuation_cost_fits(over_cap, Msat(1_000), Msat(100_000)),
             "fee_cap still bounds the total move cost"
         );
+    }
+
+    #[test]
+    fn raw_pay_fee_cap_bounds_gateway_plus_federation_cost() {
+        assert!(raw_pay_fee_fits(Msat(400), Msat(600), Msat(1_000)));
+        assert!(!raw_pay_fee_fits(Msat(401), Msat(600), Msat(1_000)));
+        assert!(!raw_pay_fee_fits(
+            Msat(u64::MAX),
+            Msat(1),
+            Msat(u64::MAX - 1)
+        ));
+    }
+
+    #[test]
+    fn raw_receive_fee_cap_bounds_gateway_plus_federation_cost() {
+        assert!(raw_receive_fee_fits(Msat(400), Msat(600), Msat(1_000)));
+        assert!(!raw_receive_fee_fits(Msat(401), Msat(600), Msat(1_000)));
+    }
+
+    #[test]
+    fn join_recovery_preserves_the_membership_creator() {
+        assert!(recovered_join_was_new(false, true, "invite-a", None));
+        assert!(recovered_join_was_new(
+            false,
+            false,
+            "invite-a",
+            Some("invite-a")
+        ));
+        assert!(!recovered_join_was_new(
+            false,
+            false,
+            "invite-a",
+            Some("invite-b")
+        ));
+        assert!(!recovered_join_was_new(
+            true,
+            false,
+            "invite-a",
+            Some("invite-a")
+        ));
     }
 
     /// The downsizing search must not assume its predicate is monotone below the lnv2
@@ -1710,10 +2276,15 @@ mod tests {
         // §15.4. A deterministic rejection from the send leg (expired / wrong-currency /
         // unsupported / fee-limit) maps to a terminal Permanent with an actionable message — the
         // move does NOT reset to Pending and livelock. A transport fault stays Retryable.
-        let rejected = map_send_error(SendError::Rejected(
+        let rejected = map_send_error(SendError::InvoiceRejected(
             "lnv2 send deterministically rejected the invoice: Invoice has expired".into(),
         ));
         assert!(matches!(rejected, ExecError::Permanent(msg) if msg.contains("expired")));
+
+        let rejected = map_send_error(SendError::RouteRejected(
+            "lnv2 send rejected the selected gateway route: fee limit".into(),
+        ));
+        assert!(matches!(rejected, ExecError::Permanent(msg) if msg.contains("fee limit")));
 
         let transport = map_send_error(SendError::Transport(anyhow::anyhow!(
             "connection reset by peer"
@@ -1722,14 +2293,98 @@ mod tests {
     }
 
     #[test]
+    fn raw_pay_route_rejection_is_terminal_before_funding() {
+        let rejected = map_raw_pay_send_error(SendError::RouteRejected(
+            "lnv2 send rejected the selected gateway route: fee limit".into(),
+        ));
+        assert!(matches!(rejected, ExecError::Permanent(msg) if msg.contains("fee limit")));
+    }
+
+    #[test]
+    fn raw_receive_fee_over_cap_is_terminal_before_funding() {
+        assert!(matches!(
+            raw_fee_cap_error("raw receive", 300_000, Msat(200_000)),
+            ExecError::Permanent(message)
+                if message == "raw receive fee quote 300000 msat exceeds fee cap 200000 msat"
+        ));
+    }
+
+    #[test]
+    fn raw_pay_fee_over_cap_is_terminal_before_funding() {
+        assert!(matches!(
+            raw_pay_quote_error(Some(300_000), Msat(200_000), FED_A),
+            ExecError::Permanent(message)
+                if message == "raw pay fee quote 300000 msat exceeds fee cap 200000 msat"
+        ));
+    }
+
+    #[test]
+    fn raw_pay_missing_gateway_quote_is_terminal_before_funding() {
+        assert!(matches!(
+            raw_pay_quote_error(None, Msat(200_000), FED_A),
+            ExecError::Permanent(message)
+                if message.contains("no lnv2 gateway produced a send fee quote")
+        ));
+    }
+
+    #[tokio::test]
+    async fn poison_reservation_row_does_not_terminalize_a_healthy_move() {
+        let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
+        let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
+        let mc = Arc::new(MultiClient::new(db, journal_db.clone(), mnemonic).await);
+        let journal = Arc::new(FedimintJournal::new(journal_db.clone()));
+        let executor = FedimintExecutor::new(mc, journal, None, None);
+
+        // The poison row targets the JOURNAL's partition — on its own db after the split.
+        let app_db = journal_db.with_prefix(vec![0x00]);
+        let mut dbtx = app_db.begin_transaction().await;
+        let mut poison_index_key = vec![0x04, 0x00];
+        poison_index_key.extend_from_slice(b"missing-intent");
+        dbtx.raw_insert_bytes(&poison_index_key, &[])
+            .await
+            .expect("insert dangling reservation index");
+        dbtx.commit_tx_result()
+            .await
+            .expect("commit dangling reservation index");
+
+        let error = executor
+            .perform(&intent(Action::Move {
+                from: FED_A,
+                to: FED_B,
+                amount: Msat(50_000),
+                fee_cap: Msat(10_000),
+            }))
+            .await
+            .expect_err("fail closed before any network I/O");
+        assert!(
+            matches!(error, ExecError::Retryable(_)),
+            "an unrelated poison row must leave the healthy move re-drivable: {error:?}"
+        );
+    }
+
+    #[test]
+    fn raw_receive_fee_over_cap_is_terminal_when_all_quotes_are_known() {
+        assert!(matches!(
+            raw_fee_cap_error("raw receive", 300_000, Msat(200_000)),
+            ExecError::Permanent(message)
+                if message == "raw receive fee quote 300000 msat exceeds fee cap 200000 msat"
+        ));
+    }
+
+    #[test]
     fn minimum_incoming_contract_guard_matches_pinned_lnv2_boundary() {
         assert_eq!(MINIMUM_INCOMING_CONTRACT_MSAT, 5_000);
-        ensure_minimum_incoming_contract(Msat(4_000), Msat(5_000))
+        ensure_minimum_incoming_contract("direct inflow", Msat(4_000), Msat(5_000))
             .expect("lnv2 accepts exactly the minimum incoming contract");
 
-        let err = ensure_minimum_incoming_contract(Msat(3_999), Msat(4_999))
+        let err = ensure_minimum_incoming_contract("raw receive", Msat(3_999), Msat(4_999))
             .expect_err("contract below lnv2's minimum is terminal");
-        assert!(matches!(err, ExecError::Permanent(msg) if msg.contains("amount too small")));
+        assert!(matches!(
+            err,
+            ExecError::Permanent(msg)
+                if msg.starts_with("raw receive amount too small:")
+        ));
     }
 
     #[test]

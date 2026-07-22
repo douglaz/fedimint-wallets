@@ -3,42 +3,77 @@
 //! parses arguments, drives the engine, and formats output. No interactive prompts (the
 //! engine assumes no UI).
 
+mod client;
+mod exit;
+mod render;
+
+use crate::client::WalletdClient;
+use crate::exit::CliExit;
+use crate::render::AwaitVerb;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use fedimint_bip39::{Bip39RootSecretStrategy, Mnemonic};
 use fedimint_client::secret::RootSecretStrategy as _;
 use fedimint_client::Client;
 use fedimint_core::db::Database;
 use fedimint_core::invite_code::InviteCode;
+use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::Instant;
+use wallet_api::{AwaitTarget, OperationStatusDto, Policy};
 use wallet_core::{
     Action, ActiveProbeVerdict, Actor, AllocatorDecision, DiscoveryPolicy, DiscoverySource,
-    ExecutionSummary, FederationId, FeeBreakdown, IdempotencyKey, IntentStatus, Journal, Msat,
-    Occurrence, OperationKind, OperationRecord, OperationStatus, ProbePolicy, RawOpUpdate,
-    ReasonCode,
+    ExecutionSummary, FederationId, IdempotencyKey, IntentStatus, Journal, Msat, Occurrence,
+    OperationKind, OperationRecord, OperationStatus, ProbePolicy, ReasonCode, RefusalDiagnostics,
 };
 use wallet_fedimint::{
-    parse_invoice, AutoJoinReport, CandidateSource, CandidateState, DiscoverReport,
-    DiscoverSourceReport, FedimintJournal, FinalizeOutcome, GatewayUrl, Invoice,
-    LedgerRepairOracle, ManualSource, MoveOutcome, MultiClient, ObserverSource, OperationId,
-    OperationRef, ProbeOutcome, ReceiveState, Runtime, ScoredFed, SendOutcome, SendState,
-    TickPolicy, JOIN_NOOP_REOPEN_NOTE,
+    direct_inflow_nonce_key, join_intent_key, move_key, parse_invoice, raw_pay_key,
+    raw_receive_key, AutoJoinReport, AwaitOutcome, CandidateSource, CandidateState, DiscoverReport,
+    DiscoverSourceReport, FederationInfo, FedimintJournal, GatewayUrl, Invoice, ManualSource,
+    MultiClient, ObserverSource, OpRequest, OperationId, OperationRef, ProbeOutcome, Runtime,
+    ScoredFed, ServiceError, Snapshot, SnapshotScope, TickPolicy, WalletClient, WalletService,
 };
 
 #[derive(Parser)]
 #[command(name = "wallet-cli", about = "Headless multi-federation ecash wallet")]
 struct Cli {
-    /// Directory holding the wallet's RocksDB and mnemonic.
-    #[arg(long, default_value = "./.wallet-cli-data")]
-    data_dir: PathBuf,
+    /// Talk to the wallet store DIRECTLY (spec §6a.7): take the exclusive `db.lock` and spin up
+    /// the same in-process actor + drivers `walletd` runs, run the one command, shut down. The
+    /// DEFAULT is client mode — every operational verb is an HTTP call to a running `walletd`.
+    /// `--standalone` is a deliberate flag: a silent fallback would block a supervisor-restarting
+    /// daemon behind a lock race the user did not choose.
+    #[arg(long, global = true)]
+    standalone: bool,
 
-    /// Max wall-clock SECONDS for a single executor `perform` before it is abandoned and left
-    /// Pending for the next reconcile (§15.9 — one stalled gateway must not freeze a whole tick).
-    /// `0` disables the deadline. Default 600 (10 min).
-    #[arg(long, default_value_t = 600)]
-    perform_timeout: u64,
+    /// Client mode: override the daemon URL from `~/.config/walletd/client.toml` (devimint gates).
+    #[arg(long, global = true)]
+    url: Option<String>,
+
+    /// Client mode: override the bearer-token file path from the client pointer (devimint gates).
+    #[arg(long, global = true)]
+    token_path: Option<PathBuf>,
+
+    /// `--standalone` only: directory holding the wallet's RocksDB and mnemonic. Defaults to the
+    /// `data_dir` in walletd.toml, then `$XDG_DATA_HOME/walletd` or `~/.local/share/walletd`.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+
+    /// `--standalone` only: max wall-clock SECONDS for a single executor `perform` before it is
+    /// abandoned and left Pending for the next reconcile (§15.9 — one stalled gateway must not
+    /// freeze a whole tick). `0` disables the deadline. Default 600 (10 min).
+    #[arg(long)]
+    perform_timeout: Option<u64>,
+
+    /// `--standalone` only: pin the shared lnv2 gateway URL for EVERY route this invocation
+    /// resolves (money verbs, probes, ticks). Required against devimint, whose LDK gateway is
+    /// not registered into any federation's lnv2 set (runbook §4); omitted, routes resolve from
+    /// each federation's registered gateway list. Client mode rejects it — walletd's pin is host
+    /// config (`walletd.toml`), and the wire has no gateway field (§6a.6).
+    #[arg(long, global = true)]
+    gateway: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -65,9 +100,6 @@ enum Command {
         /// Auto-join structurally-passing discovered candidates within the configured caps.
         #[arg(long)]
         auto_join: bool,
-        /// Shared lnv2 gateway URL reserved for follow-on probe/tick flows.
-        #[arg(long)]
-        gateway: Option<String>,
         /// Allow regtest/signet in the structural scorer. Intended for devimint.
         #[arg(long)]
         scorer_allow_regtest: bool,
@@ -96,104 +128,89 @@ enum Command {
     Balance,
     /// List joined federations.
     ListFeds,
-    /// Receive Lightning into a federation: print the BOLT11 invoice to stdout and its
-    /// operation id (hex) to stderr. The invoice is the payable result; persist the op id
-    /// to `await-receive` its settlement.
+    /// Receive Lightning into a federation: print the BOLT11 invoice to stdout (the payable
+    /// result) and the operation `key:` to stderr. `await-receive <key>` its settlement. The
+    /// gateway is auto-selected by the engine (the wire has no gateway field, §6a.6).
     Receive {
         /// Amount to receive, in millisatoshis.
         #[arg(long)]
         amount: u64,
-        /// Federation to receive into (hex id). Defaults to the sole joined federation.
+        /// Maximum receive-side cost; defaults from the DB `Policy` per-move cap (both modes).
+        #[arg(long)]
+        fee_cap: Option<u64>,
+        /// Stable client nonce used to attach a retry to the same receive intent. A fresh nonce
+        /// is generated when omitted (each receive is distinct).
+        #[arg(long)]
+        nonce: Option<String>,
+        /// Federation to receive into (hex id). Defaults to the policy spending pin / sole fed.
         #[arg(long)]
         to: Option<String>,
-        /// lnv2 gateway URL to mint the invoice. Defaults to lnv2 auto-selecting a live
-        /// registered gateway; pass one explicitly against devimint (its LDK gateway is not
-        /// auto-registered — see docs/devimint-runbook.md §4).
-        #[arg(long)]
-        gateway: Option<String>,
     },
-    /// Pay a BOLT11 invoice from a federation. Prints the outcome (started / already-in-flight
-    /// / already-paid) and the operation id to stdout.
+    /// Pay a BOLT11 invoice. Async (§6a.6): prints a phase-1 line (`started`/`already-in-flight`/
+    /// `already-paid <key>`) to stdout and the operation `key:` to stderr; `await-send <key>` its
+    /// settlement.
     Pay {
         /// The BOLT11 invoice to pay.
         invoice: String,
-        /// Federation to pay from (hex id). Defaults to the sole joined federation.
+        /// Amount in millisatoshis, as a cross-check: if present it must match the invoice
+        /// amount. Amountless invoices are refused — the lnv2 send API cannot supply an amount.
+        #[arg(long)]
+        amount: Option<u64>,
+        /// Maximum send cost; defaults from the DB `Policy` per-move cap.
+        #[arg(long)]
+        fee_cap: Option<u64>,
+        /// Federation to pay from (hex id). Defaults to the policy spending pin / sole fed.
         #[arg(long)]
         fed: Option<String>,
-        /// lnv2 gateway URL. Defaults to lnv2 auto-select (the invoice's issuing gateway,
-        /// for the direct-swap path); pass one explicitly against devimint.
-        #[arg(long)]
-        gateway: Option<String>,
     },
-    /// Block until a receive operation reaches a final state, then print it
-    /// (claimed / expired / failed).
+    /// Block (re-polling until terminal or `--timeout`) on a receive operation, then print its
+    /// terminal state (`claimed` / `failed: …`). Keyed by the operation key from `receive`.
     AwaitReceive {
-        /// The receive operation id (hex), as printed by `receive`.
-        op: String,
-        /// The federation the receive was created on (hex id).
-        #[arg(long)]
-        fed: String,
-        /// The correlation key printed by `receive` (`key: …`). When given, the ledger row is
-        /// advanced to its terminal state here; without it, reconcile repair advances it later.
-        #[arg(long)]
-        key: Option<String>,
+        /// The operation key printed by `receive` (`key: …`).
+        key: String,
+        /// Seconds to keep polling before giving up (transport timeout). Default 600.
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
     },
-    /// Block until a send operation reaches a final state, then print it
-    /// (success <preimage> / refunded / failed).
+    /// Block (re-polling until terminal or `--timeout`) on a send operation, then print its
+    /// terminal state (`success` / `failed: …`). Keyed by the operation key from `pay`.
     AwaitSend {
-        /// The send operation id (hex), as printed by `pay`.
-        op: String,
-        /// The federation the payment was sent from (hex id).
-        #[arg(long)]
-        fed: String,
-        /// The correlation key printed by `pay` (`key: …`). When given, the ledger row is
-        /// advanced to its terminal state here; without it, reconcile repair advances it later.
-        #[arg(long)]
-        key: Option<String>,
+        /// The operation key printed by `pay` (`key: …`).
+        key: String,
+        /// Seconds to keep polling before giving up (transport timeout). Default 600.
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
     },
-    /// Route an inflow to a chosen federation via the executor (spec §6/§7): size + cap-check
-    /// the receive invoice so the wallet nets EXACTLY `amount`, print the BOLT11 to stdout and
-    /// the intent key to stderr, then `await-move <key>` once the external payer has paid.
+    /// Route an inflow to a chosen federation (spec §6/§7): size + cap-check the receive invoice
+    /// so the wallet nets EXACTLY `amount`, print the BOLT11 to stdout and the operation `key:` to
+    /// stderr, then `await-move <key>` once the external payer has paid.
     DirectInflow {
         /// Net amount the destination must end up with, in millisatoshis.
         #[arg(long)]
         amount: u64,
-        /// Federation to receive into (hex id). Defaults to the sole joined federation.
+        /// Federation to receive into (hex id). Defaults to the policy spending pin / sole fed.
         #[arg(long)]
         to: Option<String>,
-        /// Receive-side fee cap, in millisatoshis. Defaults to a deliberately generous guard
-        /// (amount + 1000 sat); pass this to enforce a tight maximum receive fee.
+        /// Receive-side fee cap, in millisatoshis. Defaults from the DB `Policy`.
         #[arg(long)]
         fee_cap: Option<u64>,
-        /// lnv2 gateway URL to route the inflow. Defaults to the first registered lnv2
-        /// gateway; pass one explicitly against devimint (its LDK gateway is not
-        /// auto-registered — see docs/devimint-runbook.md §4).
-        #[arg(long)]
-        gateway: Option<String>,
-        /// Allow the destination to exceed the hard per-fed balance cap (ADR-0018). Off by
-        /// default: an inflow that would push the destination over the cap is refused pre-mint.
-        /// Operator override only — an explicit escape hatch, never silent.
-        #[arg(long)]
-        allow_over_cap: bool,
-        /// Idempotency occurrence. Reusing the same occurrence returns the same invoice; bump it
-        /// to create another same-amount inflow after the first one settles or fails.
-        #[arg(long, default_value_t = 0)]
-        occurrence: u64,
+        /// Stable client nonce for idempotency: the same nonce returns the same invoice (no second
+        /// mint); change it for another same-amount inflow. Defaults to `0`.
+        #[arg(long, default_value = "0")]
+        nonce: String,
     },
-    /// Finalize an awaiting DirectInflow: block on its receive op, then print the final intent
-    /// status (done / failed).
+    /// Block (re-polling until terminal or `--timeout`) on a move / direct-inflow operation, then
+    /// print its terminal state (`done` / `failed: …`). Keyed by the operation key.
     AwaitMove {
-        /// The intent key (as printed to stderr by `direct-inflow`).
+        /// The operation key printed by `move` / `direct-inflow` (`key: …`).
         key: String,
-        /// The federation the inflow receives into (hex id). Optional guard; the destination is
-        /// read from the intent's move record.
-        #[arg(long)]
-        fed: Option<String>,
+        /// Seconds to keep polling before giving up (transport timeout). Default 600.
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
     },
-    /// Move ecash between two joined federations through a shared gateway's internal swap
-    /// (spec §7 — the wallet's core cross-federation capability): federation `--from` pays an
-    /// invoice minted on `--to`, so `--to` nets EXACTLY `--amount`. Synchronous: blocks until the
-    /// move settles, then prints done/failed to stdout and the move key to stderr.
+    /// Move ecash between two joined federations through a shared gateway's internal swap (spec §7).
+    /// Async (§6a.6): prints a phase-1 line (`started`/`already-in-flight <key>`) to stdout and the
+    /// operation `key:` to stderr; `await-move <key>` its settlement.
     Move {
         /// Source federation to move ecash FROM (hex id).
         #[arg(long)]
@@ -204,20 +221,9 @@ enum Command {
         /// Net amount the destination must end up with, in millisatoshis.
         #[arg(long)]
         amount: u64,
-        /// Total move fee cap (BOTH legs), in millisatoshis. Defaults to a deliberately generous
-        /// guard (amount + 1000 sat); pass this to bound the total move cost tightly.
+        /// Total move fee cap (BOTH legs), in millisatoshis. Defaults from the DB `Policy`.
         #[arg(long)]
         fee_cap: Option<u64>,
-        /// Shared lnv2 gateway URL routing the swap — it must serve BOTH federations. Defaults to
-        /// the first gateway registered on `--to`; pass one explicitly against devimint (its LDK
-        /// gateway is not auto-registered — see docs/devimint-runbook.md §4).
-        #[arg(long)]
-        gateway: Option<String>,
-        /// Allow the destination to exceed the hard per-fed balance cap (ADR-0018). Off by
-        /// default: a move that would push the destination over the cap is refused pre-mint.
-        /// Operator override only — an explicit escape hatch, never silent.
-        #[arg(long)]
-        allow_over_cap: bool,
         /// Idempotency occurrence. Reusing the same occurrence reattaches to the same move (no
         /// re-mint/re-pay); bump it to start another same-params move after the first settles.
         #[arg(long, default_value_t = 0)]
@@ -252,25 +258,11 @@ enum Command {
         /// Seconds before the newest success goes stale (default 7d). SHRINK-ONLY.
         #[arg(long)]
         ttl_secs: Option<u64>,
-        /// Shared lnv2 gateway URL routing both probe legs — it must serve BOTH the source
-        /// and the candidate. Defaults to each fed's first registered gateway; pass one
-        /// explicitly against devimint (its LDK gateway is not auto-registered — see
-        /// docs/devimint-runbook.md §4).
-        #[arg(long)]
-        gateway: Option<String>,
     },
-    /// Re-drive pending intents and rebuild move records from the op-log (spec §9 resume loop):
-    /// print performed/failed/skipped/retryable/awaiting counts; awaiting intent keys go to stderr.
-    Reconcile {
-        /// Per-fed balance cap to enforce while resuming pending pre-mint intents. Use the same
-        /// value that authorized the original tick when reconciling work from `tick --per-fed-cap`.
-        #[arg(long)]
-        per_fed_cap: Option<u64>,
-        /// Resume pending intents that were originally authorized with an over-cap operator
-        /// override (`direct-inflow --allow-over-cap` / `move --allow-over-cap`).
-        #[arg(long)]
-        allow_over_cap: bool,
-    },
+    /// Re-drive pending intents on demand (spec §6a.6 — the "it's wedged" button): the actor
+    /// reads the current `Policy` for caps, so this takes no arguments. Prints the redriven /
+    /// awaiters-rehydrated / executing-normalized counts.
+    Reconcile,
     /// Run ONE orchestrator tick (Phase 2 step 2.2): probe every open federation, score them,
     /// build the allocator snapshot from the standing-instruction policy, decide, and APPLY the
     /// decisions through the executor — the wallet actually rebalances/tops-up. Prints the
@@ -280,25 +272,21 @@ enum Command {
     Tick {
         #[command(flatten)]
         policy: PolicyFlags,
-        /// Shared lnv2 gateway URL routing any rebalance `Move` this tick performs — it must
-        /// serve BOTH endpoints of the move. Defaults to each fed's first registered gateway;
-        /// pass one explicitly against devimint (its LDK gateway is not auto-registered — see
-        /// docs/devimint-runbook.md §4).
-        #[arg(long)]
-        gateway: Option<String>,
     },
-    /// DRY-RUN a tick (Phase 2 step 2.2): probe, score, and decide, but do NOT apply. Prints the
-    /// per-federation scored view (eligibility, rank, balance) and the decisions that WOULD run.
-    /// Use the same `--occurrence` value you would pass to `tick`; recurring schedulers must
-    /// advance it after a settled move.
+    /// DRY-RUN a tick (Phase 2 step 2.2): probe, score, and decide, but do NOT apply. Client mode
+    /// uses walletd's stored policy; the per-invocation flags below require `--standalone`.
     Status {
         #[command(flatten)]
         policy: PolicyFlags,
-        /// Shared lnv2 gateway URL to validate route availability for the dry run. Pass the same
-        /// value as `tick --gateway` against devimint, where the LDK gateway is not
-        /// auto-registered.
-        #[arg(long)]
-        gateway: Option<String>,
+    },
+    /// Daemon health (spec §6a.6, NEW): actor queue depth, in-flight driver count, scheduler
+    /// liveness. In `--standalone` it reflects the one-shot in-process service.
+    Health,
+    /// Read or edit the standing-instruction `Policy` (spec §6a.6): the user-decided targets,
+    /// caps, fees, and budgets stored in the wallet DB and read by the actor at decide time.
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
     },
     /// Print the operation ledger newest-first (§11): one TAB-separated row per operation
     /// (`seq  updated_at  kind  status  amount_msat  recv_fee_msat  send_fee_quoted_msat  actor
@@ -321,8 +309,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Show one operation's full record + its live linked intent status (§11). Offline. Resolve
-    /// by correlation key or by numeric seq.
+    /// Show one operation. Client mode resolves correlation keys through walletd; numeric sequence
+    /// lookup and the richer offline record require `--standalone`.
     Show {
         /// A correlation key (e.g. `pay:…`) OR a numeric seq.
         reference: String,
@@ -332,16 +320,89 @@ enum Command {
     },
 }
 
-/// `--actor` filter for `history` (spec §11).
+/// `wallet-cli policy get|set` (spec §6a.6): `get` prints the stored `Policy`; `set` fetches it,
+/// edits the fields named by flags, and PUTs the whole struct back.
+#[derive(Subcommand)]
+enum PolicyCommand {
+    /// Print the stored `Policy` as pretty JSON.
+    Get,
+    /// Edit the named fields on the fetched `Policy` and PUT the whole struct (the rest is
+    /// preserved). Only flags you pass change; omitted fields keep their stored value.
+    Set(Box<PolicySetFlags>),
+}
+
+/// Per-field overrides for `policy set`. Every field is optional: only the ones passed change the
+/// fetched `Policy`. `spending-fed`/`standby-fed` take a hex id; `--clear-*` unpins them.
+#[derive(Args, Debug, Default)]
+struct PolicySetFlags {
+    #[arg(long)]
+    per_fed_cap: Option<u64>,
+    #[arg(long)]
+    spending_target: Option<u64>,
+    #[arg(long)]
+    standby_target: Option<u64>,
+    #[arg(long)]
+    max_fee: Option<u64>,
+    #[arg(long)]
+    spending_fed: Option<String>,
+    #[arg(long)]
+    standby_fed: Option<String>,
+    /// Unpin the spending federation (mutually exclusive with --spending-fed).
+    #[arg(long, conflicts_with = "spending_fed")]
+    clear_spending_fed: bool,
+    /// Unpin the standby federation (mutually exclusive with --standby-fed).
+    #[arg(long, conflicts_with = "standby_fed")]
+    clear_standby_fed: bool,
+    #[arg(long)]
+    probe_min_span_secs: Option<u64>,
+    #[arg(long)]
+    probe_min_successes: Option<u32>,
+    #[arg(long)]
+    probe_ttl_secs: Option<u64>,
+    #[arg(long)]
+    probe_amount: Option<u64>,
+    #[arg(long)]
+    max_probe_attempts_per_week: Option<u32>,
+    #[arg(long)]
+    max_probe_spend_per_week: Option<u64>,
+    #[arg(long)]
+    base_interval_secs: Option<u64>,
+    #[arg(long)]
+    min_interval_secs: Option<u64>,
+    #[arg(long)]
+    evacuation_lead_secs: Option<u64>,
+    #[arg(long)]
+    discover_every_secs: Option<u64>,
+    #[arg(long)]
+    probe_retry_backoff_secs: Option<u64>,
+    #[arg(long)]
+    probe_refresh_lead_secs: Option<u64>,
+    #[arg(long)]
+    max_auto_joins_per_week: Option<u32>,
+    #[arg(long)]
+    auto_join_lifetime_cap: Option<u32>,
+    #[arg(long)]
+    max_candidates_per_pass: Option<u32>,
+    #[arg(long)]
+    per_preview_timeout_secs: Option<u64>,
+    #[arg(long)]
+    discover_pass_deadline_secs: Option<u64>,
+    #[arg(long)]
+    auto_join: Option<bool>,
+    #[arg(long)]
+    require_mainnet: Option<bool>,
+}
+
+/// `--actor` filter for `history` (spec §11). `pub(crate)` so client mode can filter wire rows.
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum ActorFilter {
+pub(crate) enum ActorFilter {
     User,
     Agent,
 }
 
 /// `--status` filter for `history` (spec §11).
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum StatusFilter {
+pub(crate) enum StatusFilter {
     Started,
     Awaiting,
     Succeeded,
@@ -355,16 +416,15 @@ enum DiscoverSourceArg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum CandidateStateArg {
+pub(crate) enum CandidateStateArg {
     Discovered,
     Autojoined,
     Userapproved,
     Rejected,
 }
 
-/// The standing-instruction (ADR-0009) flags shared by `tick` and `status`. Every numeric flag
-/// falls back to [`TickPolicy::default`]'s v1 default; the designation flags fall back to
-/// auto-designation from the scored-eligible feds.
+/// Per-invocation standing-instruction overrides shared by standalone `tick` and `status`.
+/// Omitted fields retain the DB-stored [`Policy`]; these flags never persist changes.
 #[derive(Args, Default)]
 struct PolicyFlags {
     /// Per-fed balance cap (ADR-0018), in millisatoshis.
@@ -404,6 +464,21 @@ struct PolicyFlags {
     probe_ttl_secs: Option<u64>,
 }
 
+impl PolicyFlags {
+    fn has_overrides(&self) -> bool {
+        self.per_fed_cap.is_some()
+            || self.spending_target.is_some()
+            || self.standby_target.is_some()
+            || self.max_fee.is_some()
+            || self.spending.is_some()
+            || self.standby.is_some()
+            || self.occurrence != 0
+            || self.probe_min_span_secs.is_some()
+            || self.probe_min_successes.is_some()
+            || self.probe_ttl_secs.is_some()
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Restore the default SIGPIPE disposition. Rust sets SIGPIPE to SIG_IGN at startup, which
@@ -425,26 +500,244 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .init();
-    let cli = Cli::parse();
-    // §15.9: the per-`perform` deadline threaded into every engine verb that drives money. `0`
-    // disables it.
-    let perform_timeout =
-        (cli.perform_timeout > 0).then(|| Duration::from_secs(cli.perform_timeout));
+    // clap's default parse path exits with status 2 for malformed invocations, but exit 2 is
+    // reserved for a decide-time REFUSED outcome. Keep help/version at 0 and route every actual
+    // usage error through the pinned usage/other code 1.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = if error.exit_code() == 0 { 0 } else { 1 };
+            error.print()?;
+            std::process::exit(code);
+        }
+    };
 
-    tokio::fs::create_dir_all(&cli.data_dir).await?;
-    let db_path = cli.data_dir.join("client.db");
-    let db: Database = fedimint_rocksdb::RocksDb::build(db_path)
-        .open()
-        .await?
+    // Client mode is the DEFAULT (spec §6a.7); `--standalone` is a deliberate opt-in. The two
+    // modes both funnel their outcome into the [`CliExit`] taxonomy → distinct process exit codes.
+    let outcome = if cli.standalone {
+        run_standalone(cli).await
+    } else {
+        run_client(cli).await
+    };
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(exit) => {
+            eprintln!("{}", exit.message());
+            std::process::exit(exit.code());
+        }
+    }
+}
+
+/// Client mode (THE DEFAULT, spec §6a.7): every operational verb becomes an HTTP call to a running
+/// `walletd`. The three standalone-only agent/diagnostic verbs (discover/probe/tick — no daemon
+/// endpoint, §6a.6) refuse with the two-options message rather than a silent fallback.
+async fn run_client(cli: Cli) -> Result<(), CliExit> {
+    // `--data-dir` selects the STANDALONE wallet store; in client mode the daemon owns the store
+    // (config comes from `client.toml`). Silently ignoring a wallet-SELECTION flag could target a
+    // different wallet than the user named — for a money tool that is a spend-from-the-wrong-wallet
+    // footgun — so fail loud (§6a.7: never a silent fallback), pointing at the flag it belongs to.
+    if cli.data_dir.is_some() {
+        return Err(CliExit::Usage(anyhow::anyhow!(
+            "--data-dir selects the standalone wallet store and has no effect in client mode; \
+             rerun with --standalone to use it, or drop it to target the configured walletd"
+        )));
+    }
+    // Same fail-loud rule for the other standalone-only globals: silently discarding a MONEY
+    // deadline (--perform-timeout) or a route pin (--gateway) would give the caller different
+    // money behavior than the flag they typed — the daemon keeps its own deadline and pin.
+    if cli.perform_timeout.is_some() {
+        return Err(CliExit::Usage(anyhow::anyhow!(
+            "--perform-timeout bounds the standalone in-process executor and has no effect in \
+             client mode (walletd keeps its own deadline); rerun with --standalone to use it"
+        )));
+    }
+    if cli.gateway.is_some() {
+        return Err(CliExit::Usage(anyhow::anyhow!(
+            "--gateway pins the standalone route and has no effect in client mode (walletd's pin \
+             is host config in walletd.toml; the wire has no gateway field); rerun with --standalone"
+        )));
+    }
+    match &cli.command {
+        Command::Discover { .. } | Command::Probe { .. } | Command::Tick { .. } => {
+            return Err(CliExit::Usage(anyhow::anyhow!(
+                "standalone-only verb: rerun with --standalone (this agent verb has no daemon endpoint)"
+            )));
+        }
+        Command::History { fed: Some(_), .. } => {
+            return Err(CliExit::Usage(anyhow::anyhow!(
+                "history --fed requires --standalone (the daemon history view omits the source federation)"
+            )));
+        }
+        Command::Show { reference, .. } if reference.parse::<u64>().is_ok() => {
+            return Err(CliExit::Usage(anyhow::anyhow!(
+                "show by numeric sequence requires --standalone (the daemon operation endpoint accepts keys only)"
+            )));
+        }
+        Command::Status { policy } if policy.has_overrides() => {
+            return Err(CliExit::Usage(anyhow::anyhow!(
+                "status overrides require --standalone (the daemon status endpoint uses the stored policy)"
+            )));
+        }
+        _ => {}
+    }
+    let client = WalletdClient::resolve(cli.url.as_deref(), cli.token_path.as_deref())?;
+    match cli.command {
+        Command::Balance => client.balance().await,
+        Command::ListFeds => client.list_feds().await,
+        Command::History {
+            limit,
+            fed: _,
+            actor,
+            status,
+            json,
+        } => client.history(limit, actor, status, json).await,
+        Command::Show { reference, json } => client.show(&reference, json).await,
+        Command::Candidates { state, json } => client.candidates(state, json).await,
+        Command::Join { invite } => client.join(invite).await,
+        Command::Approve { fed } => client.approve(parse_fed_id(&fed)?).await,
+        Command::Receive {
+            amount,
+            fee_cap,
+            nonce,
+            to,
+        } => {
+            client
+                .receive(
+                    amount,
+                    fee_cap,
+                    nonce.unwrap_or_else(cli_nonce),
+                    parse_fed_opt(to.as_deref())?,
+                )
+                .await
+        }
+        Command::Pay {
+            invoice,
+            amount,
+            fee_cap,
+            fed,
+        } => {
+            client
+                .pay(invoice, amount, fee_cap, parse_fed_opt(fed.as_deref())?)
+                .await
+        }
+        Command::DirectInflow {
+            amount,
+            to,
+            fee_cap,
+            nonce,
+        } => {
+            client
+                .direct_inflow(amount, fee_cap, nonce, parse_fed_opt(to.as_deref())?)
+                .await
+        }
+        Command::Move {
+            from,
+            to,
+            amount,
+            fee_cap,
+            occurrence,
+        } => {
+            client
+                .move_op(
+                    parse_fed_id(&from)?,
+                    parse_fed_id(&to)?,
+                    amount,
+                    fee_cap,
+                    occurrence,
+                )
+                .await
+        }
+        Command::AwaitReceive { key, timeout } => {
+            client
+                .await_op(AwaitVerb::Receive, &key, Duration::from_secs(timeout))
+                .await
+        }
+        Command::AwaitSend { key, timeout } => {
+            client
+                .await_op(AwaitVerb::Send, &key, Duration::from_secs(timeout))
+                .await
+        }
+        Command::AwaitMove { key, timeout } => {
+            client
+                .await_op(AwaitVerb::Move, &key, Duration::from_secs(timeout))
+                .await
+        }
+        Command::Reconcile => client.reconcile().await,
+        Command::Health => client.health().await,
+        Command::Status { .. } => client.status().await,
+        Command::Policy { command } => match command {
+            PolicyCommand::Get => {
+                let policy = client.get_policy().await?;
+                print_policy(&policy)
+            }
+            PolicyCommand::Set(flags) => {
+                let mut policy = client.get_policy().await?;
+                apply_policy_set(&mut policy, &flags)?;
+                let updated = client.put_policy(&policy).await?;
+                print_policy(&updated)
+            }
+        },
+        // Handled above (standalone-only refusal).
+        Command::Discover { .. } | Command::Probe { .. } | Command::Tick { .. } => unreachable!(),
+    }
+}
+
+/// `--standalone` (spec §6a.7): take the exclusive `db.lock` and spin up the same in-process actor
+/// and drivers `walletd` runs, run the one command through the same `WalletClient` command path the
+/// daemon handlers use, then shut down. A silent fallback to this mode was rejected: it would block
+/// a supervisor-restarting daemon behind a lock race the user did not choose.
+async fn run_standalone(cli: Cli) -> Result<(), CliExit> {
+    let perform_timeout_secs = cli.perform_timeout.unwrap_or(600);
+    let perform_timeout =
+        (perform_timeout_secs > 0).then(|| Duration::from_secs(perform_timeout_secs));
+    let gateway = cli.gateway.clone().map(GatewayUrl);
+    let data_dir = resolve_standalone_data_dir(cli.data_dir)?;
+
+    // 0700 like the daemon (`wallet-daemon::config::ensure_private_data_dir`): the mnemonic and
+    // wallet store live here, and the process umask (commonly 022) would otherwise leave a fresh
+    // default directory world-readable before RocksDB writes the seed.
+    ensure_private_data_dir(&data_dir)?;
+    let db_path = data_dir.join("client.db");
+    // Fast-fail db.lock pre-check (spec §6a.7): fedimint's `open` BLOCKS on a held lock, so a
+    // running `walletd` would HANG the CLI here instead of giving the deliberate lock-held error.
+    check_db_lock(&db_path)?;
+    // The pre-check releases its probe lock before `open` re-acquires — a daemon (re)starting in
+    // exactly that window would make `open` block indefinitely. Bound it: past the deadline this
+    // IS the lock-held case, reported as such rather than hanging a supervisor-adjacent race.
+    let open = fedimint_rocksdb::RocksDb::build(db_path).open();
+    let db: Database = tokio::time::timeout(Duration::from_secs(10), open)
+        .await
+        .map_err(|_| {
+            CliExit::Usage(anyhow::anyhow!(
+                "opening the wallet store timed out waiting for its lock — another process took \
+                 it after the pre-check (walletd restarting?); stop it, or use client mode \
+                 (drop --standalone)"
+            ))
+        })?
+        .map_err(|e| CliExit::Usage(anyhow::anyhow!("opening the wallet store: {e:#}")))?
         .into();
 
-    let journal = Arc::new(FedimintJournal::new(db.clone()));
+    // The journal's OWN RocksDB, matching walletd's split (client.db FIRST — the exclusivity
+    // anchor above — then journal.db, always in that order so two processes can never deadlock).
+    // A co-located journal's write churn flushes fedimint's tiny no-history memtable out from
+    // under any transaction fedimint holds open and fails its commit (the 24h-soak wedge;
+    // fixed at our pinned rev, upstream PR #8816, but the isolation stands).
+    let journal_open = fedimint_rocksdb::RocksDb::build(data_dir.join("journal.db")).open();
+    let journal_db: Database = tokio::time::timeout(Duration::from_secs(10), journal_open)
+        .await
+        .map_err(|_| {
+            CliExit::Usage(anyhow::anyhow!(
+                "opening the journal store timed out waiting for its lock (walletd restarting?); \
+                 stop it, or use client mode (drop --standalone)"
+            ))
+        })?
+        .map_err(|e| CliExit::Usage(anyhow::anyhow!("opening the journal store: {e:#}")))?
+        .into();
 
-    // §11: `history`/`show` are OFFLINE journal scans and MUST work with only the journal open.
-    // Dispatch them BEFORE any wallet-client setup — `load_or_generate_mnemonic` would persist a
-    // fresh seed and `MultiClient::open_all` reaches the network to resume each federation's state
-    // machines, both of which defeat "read-only, never touches the network" (and a corrupt/absent
-    // client secret must not block a diagnostic ledger read).
+    let journal = Arc::new(FedimintJournal::new(journal_db.clone()));
+
+    // §11: `history`/`show`/`candidates`/`approve` are OFFLINE journal reads and MUST work with only
+    // the journal open — dispatch them BEFORE any client/network setup (see the phase-4/5 rationale).
     let command = match cli.command {
         Command::History {
             limit,
@@ -452,107 +745,219 @@ async fn main() -> anyhow::Result<()> {
             actor,
             status,
             json,
-        } => return run_history(&journal, limit, fed, actor, status, json).await,
-        Command::Show { reference, json } => return run_show(&journal, reference, json).await,
-        Command::Candidates { state, json } => return run_candidates(&journal, state, json).await,
+        } => {
+            return run_history(&journal, limit, fed, actor, status, json)
+                .await
+                .map_err(CliExit::from)
+        }
+        Command::Show { reference, json } => {
+            return run_show(&journal, reference, json)
+                .await
+                .map_err(CliExit::from)
+        }
+        Command::Candidates { state, json } => {
+            return run_candidates(&journal, state, json)
+                .await
+                .map_err(CliExit::from)
+        }
         Command::Approve { fed } => return run_approve(&journal, fed).await,
         other => other,
     };
 
-    let mnemonic = load_or_generate_mnemonic(&db).await?;
-    let multi_client = Arc::new(MultiClient::new(db, mnemonic).await);
+    let mnemonic = load_or_generate_mnemonic(&db)
+        .await
+        .map_err(CliExit::from)?;
+    let multi_client = Arc::new(MultiClient::new(db, journal_db, mnemonic).await);
 
     let joined = journal
         .list_federations()
         .await
-        .map_err(|e| anyhow::anyhow!("reading federation registry: {e:?}"))?;
+        .map_err(|e| CliExit::Usage(anyhow::anyhow!("reading federation registry: {e:?}")))?;
     let joined_ids: Vec<_> = joined.iter().map(|(id, _)| *id).collect();
     let infos: Vec<_> = joined.iter().map(|(_, info)| info.clone()).collect();
-    multi_client.open_all(&infos).await?;
+    multi_client
+        .open_all(&infos)
+        .await
+        .map_err(|e| CliExit::Usage(anyhow::anyhow!("opening joined federations: {e:#}")))?;
     let open_ids = multi_client.federations();
 
-    match command {
-        Command::Join { invite } => {
-            let invite = InviteCode::from_str(&invite)?;
-            let fed_id = {
-                use fedimint_core::BitcoinHash as _;
-                FederationId(invite.federation_id().0.to_byte_array())
-            };
-            // §10.2: check the membership registry FIRST — an already-joined fed is (re)opened
-            // only, with NO ledger row (the idempotent fast path; nothing happened).
-            let already = journal
-                .get_federation(&fed_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("reading federation registry: {e:?}"))?
-                .is_some();
-            if already {
-                let outcome = multi_client.join(invite.clone()).await?;
-                note_candidate(
-                    mark_candidate_user_approved(
-                        journal.as_ref(),
-                        outcome.id,
-                        &invite,
-                        cli_now_ms(),
-                    )
-                    .await,
-                );
-                println!("{}", outcome.id.to_hex());
-            } else {
-                // A fresh join: write the `Started` attempt row BEFORE the join, then terminalize
-                // truthfully — `newly_joined` distinguishes a real membership from the
-                // concurrent-registration window (the pre-written row cannot be un-written).
-                let key = IdempotencyKey(format!("join:{}:{}", fed_id.to_hex(), cli_nonce()));
-                journal
-                    .record_started(
-                        &key,
-                        OperationKind::Join { fed: fed_id },
-                        Actor::User,
-                        ReasonCode::UserInitiated,
-                        cli_now_ms(),
-                        None,
-                    )
-                    .await
-                    .map_err(ledger_err)?;
-                let outcome = match multi_client.join(invite.clone()).await {
-                    Ok(outcome) => outcome,
-                    Err(e) => {
-                        let _ = journal
-                            .record_terminal(
-                                &key,
-                                OperationStatus::Failed,
-                                cli_now_ms(),
-                                Some(&e.to_string()),
-                                None,
-                            )
-                            .await;
-                        return Err(e);
-                    }
-                };
-                let note = (!outcome.newly_joined).then_some(JOIN_NOOP_REOPEN_NOTE);
-                note_ledger(
-                    journal
-                        .record_terminal(&key, OperationStatus::Succeeded, cli_now_ms(), note, None)
-                        .await,
-                );
-                note_candidate(
-                    mark_candidate_user_approved(
-                        journal.as_ref(),
-                        outcome.id,
-                        &invite,
-                        cli_now_ms(),
-                    )
-                    .await,
-                );
-                println!("{}", outcome.id.to_hex());
-                eprintln!("key: {}", key.0);
-            }
+    // Money/actor verbs run through the SAME `WalletClient` command path the daemon handlers use
+    // (actor + drivers + scheduler). The agent/diagnostic verbs (discover/probe/tick) and the live
+    // reads (balance/list-feds/status) stay Runtime-direct one-shots — validated, no actor needed.
+    if is_actor_verb(&command) {
+        return run_standalone_actor(
+            command,
+            journal,
+            multi_client,
+            joined_ids,
+            gateway,
+            perform_timeout,
+        )
+        .await;
+    }
+    run_standalone_direct(
+        command,
+        journal,
+        multi_client,
+        joined,
+        joined_ids,
+        open_ids,
+        gateway,
+        perform_timeout,
+    )
+    .await
+    .map_err(CliExit::from)
+}
+
+/// The host-config fields accepted by `walletd`. Standalone only consumes `data_dir`, but parsing
+/// the real shape (including `deny_unknown_fields`) keeps a malformed host config from silently
+/// selecting a different wallet store than the daemon.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WalletdHostConfig {
+    data_dir: Option<String>,
+    #[serde(rename = "address")]
+    _address: Option<String>,
+    #[serde(rename = "port")]
+    _port: Option<u16>,
+    #[serde(rename = "token_path")]
+    _token_path: Option<String>,
+    #[serde(rename = "log_level")]
+    _log_level: Option<String>,
+    // The daemon's route pin is NOT inherited by standalone (route pinning stays the explicit
+    // `--gateway` flag — money routing must never change based on a file the user didn't name);
+    // parsed only so a pinned host config doesn't fail `deny_unknown_fields` here.
+    #[serde(rename = "gateway")]
+    _gateway: Option<String>,
+}
+
+/// Resolve the store selected by `walletd`: an explicit CLI override wins; otherwise read
+/// `~/.config/walletd/walletd.toml` (honoring XDG), then fall back to the owner-ratified default
+/// only when that file or its `data_dir` field is absent. This prevents `--standalone` from
+/// silently opening a fresh default wallet when the daemon was configured with a custom store.
+fn resolve_standalone_data_dir(override_path: Option<PathBuf>) -> Result<PathBuf, CliExit> {
+    if let Some(path) = override_path {
+        return Ok(path);
+    }
+    let config_path = walletd_config_home()?.join("walletd.toml");
+    let text = match std::fs::read_to_string(&config_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return default_walletd_data_dir()
         }
+        Err(error) => {
+            return Err(CliExit::Usage(anyhow::anyhow!(
+                "reading host config {}: {error}",
+                config_path.display()
+            )))
+        }
+    };
+    let config: WalletdHostConfig = toml::from_str(&text).map_err(|error| {
+        CliExit::Usage(anyhow::anyhow!(
+            "parsing host config {}: {error}",
+            config_path.display()
+        ))
+    })?;
+    match config.data_dir {
+        Some(path) => resolve_walletd_path(&path),
+        None => default_walletd_data_dir(),
+    }
+}
+
+fn walletd_config_home() -> Result<PathBuf, CliExit> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        return Ok(xdg.join("walletd"));
+    }
+    Ok(walletd_home_dir()?.join(".config").join("walletd"))
+}
+
+fn resolve_walletd_path(raw: &str) -> Result<PathBuf, CliExit> {
+    let expanded = if raw == "~" {
+        walletd_home_dir()?
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        walletd_home_dir()?.join(rest)
+    } else {
+        PathBuf::from(raw)
+    };
+    if !expanded.is_absolute() {
+        return Err(CliExit::Usage(anyhow::anyhow!(
+            "path {raw:?} resolves to a non-absolute path {}; use an absolute path or a ~-prefixed one",
+            expanded.display()
+        )));
+    }
+    Ok(expanded)
+}
+
+fn walletd_home_dir() -> Result<PathBuf, CliExit> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            CliExit::Usage(anyhow::anyhow!(
+                "HOME is not set; pass --data-dir for standalone mode"
+            ))
+        })
+}
+
+/// The owner-ratified walletd store location (§6a.6), kept byte-for-byte equivalent to
+/// `wallet-daemon::config` for an absent/default host config.
+fn default_walletd_data_dir() -> Result<PathBuf, CliExit> {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        return Ok(xdg.join("walletd"));
+    }
+    Ok(walletd_home_dir()?
+        .join(".local")
+        .join("share")
+        .join("walletd"))
+}
+
+/// Create the wallet data dir with owner-only permissions, byte-for-byte the daemon's
+/// `wallet-daemon::config::ensure_private_data_dir` behavior — the store holds the mnemonic.
+fn ensure_private_data_dir(path: &std::path::Path) -> Result<(), CliExit> {
+    std::fs::create_dir_all(path).map_err(|e| {
+        CliExit::Usage(anyhow::anyhow!("creating data dir {}: {e}", path.display()))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            CliExit::Usage(anyhow::anyhow!(
+                "setting private permissions on {}: {e}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// The Runtime-direct standalone verbs (spec §6a.7): the diagnostic reads (balance/list-feds/status)
+/// and the standalone-only agent one-shots (discover/probe/tick), UNCHANGED in semantics — they
+/// call `Runtime` directly (no actor), exactly as before phase 6a.
+#[allow(clippy::too_many_arguments)]
+async fn run_standalone_direct(
+    command: Command,
+    journal: Arc<FedimintJournal>,
+    multi_client: Arc<MultiClient>,
+    joined: Vec<(FederationId, FederationInfo)>,
+    joined_ids: Vec<FederationId>,
+    open_ids: Vec<FederationId>,
+    gateway: Option<GatewayUrl>,
+    perform_timeout: Option<Duration>,
+) -> anyhow::Result<()> {
+    match command {
         Command::Discover {
             source,
             observer_url,
             invite,
             auto_join,
-            gateway,
             scorer_allow_regtest,
             max_auto_joins_per_week,
             lifetime_cap,
@@ -573,7 +978,7 @@ async fn main() -> anyhow::Result<()> {
             let runtime = Runtime::new(
                 multi_client.clone(),
                 journal.clone(),
-                gateway.map(GatewayUrl),
+                gateway,
                 operator_hard_cap(false),
                 perform_timeout,
             );
@@ -625,334 +1030,6 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        Command::Receive {
-            amount,
-            to,
-            gateway,
-        } => {
-            let id = select_fed(&joined_ids, &open_ids, to.as_deref())?;
-            let amount = Msat(amount);
-            // §10.1: open the recorded window BEFORE gateway resolution — a nonce-only per-attempt
-            // key, so the row exists even if the (below) resolution/SDK call fails synchronously.
-            let key = IdempotencyKey(format!("recv:{}:{}", id.to_hex(), cli_nonce()));
-            journal
-                .record_started(
-                    &key,
-                    OperationKind::Receive {
-                        fed: id,
-                        amount_invoiced: amount,
-                        op_id: None,
-                        gateway: None,
-                    },
-                    Actor::User,
-                    ReasonCode::UserInitiated,
-                    cli_now_ms(),
-                    None,
-                )
-                .await
-                .map_err(ledger_err)?;
-            // `pick_receive_gateway` bails on no-registered-gateway — inside the window, so it
-            // lands a `Failed` row (§10.1).
-            let sdk_gateway = match pick_receive_gateway(&multi_client, &id, gateway).await {
-                Ok(g) => g,
-                Err(e) => return fail_raw_row(&journal, &key, e).await,
-            };
-            // Two-stage fee capture (§9.3): a pre-call best-effort ESTIMATE against a concrete
-            // gateway (the `gateway` field stays None — the auto-selected choice is unknown).
-            if let Some(fee) =
-                estimate_receive_fee(&multi_client, &id, amount, sdk_gateway.clone()).await
-            {
-                note_ledger(journal.record_update(&key, receive_fee_upd(fee)).await);
-            }
-            let meta = serde_json::json!({ "role": "receive", "correlation_key": key.0 });
-            let (invoice, op) = match multi_client.receive(&id, amount, sdk_gateway, meta).await {
-                Ok(result) => result,
-                Err(e) => return fail_raw_row(&journal, &key, e).await,
-            };
-            // The op id advances the row `Started → Awaiting` (the federation accepted the op).
-            note_ledger(journal.record_update(&key, op_id_upd(op)).await);
-            // Invoice -> stdout (the payable result); op id + key -> stderr (diagnostic handles).
-            println!("{}", invoice.0);
-            eprintln!("operation_id: {}", to_hex(&op.0));
-            eprintln!("key: {}", key.0);
-        }
-        Command::Pay {
-            invoice,
-            fed,
-            gateway,
-        } => {
-            let id = select_fed(&joined_ids, &open_ids, fed.as_deref())?;
-            // §10.1: the window opens BEFORE parsing — a malformed BOLT11 has no payment hash,
-            // yet its failed attempt must still be a durable row.
-            let key = IdempotencyKey(format!("pay:{}:{}", id.to_hex(), cli_nonce()));
-            journal
-                .record_started(
-                    &key,
-                    OperationKind::Pay {
-                        fed: id,
-                        invoice_amount: None,
-                        payment_hash: None,
-                        op_id: None,
-                        gateway: None,
-                    },
-                    Actor::User,
-                    ReasonCode::UserInitiated,
-                    cli_now_ms(),
-                    None,
-                )
-                .await
-                .map_err(ledger_err)?;
-            let invoice = Invoice(invoice);
-            // Parse (amount + payment hash) — a parse failure is the synchronous-error path.
-            let details = match parse_invoice(&invoice) {
-                Ok(details) => details,
-                Err(e) => return fail_raw_row(&journal, &key, e).await,
-            };
-            // Post-parse `record_update` (amount + hash, durable BEFORE the SDK call) plus a
-            // best-effort send-fee estimate (§9.3 / §10.1).
-            let send_fee = estimate_send_fee(
-                &multi_client,
-                &id,
-                &invoice,
-                gateway.clone().map(GatewayUrl),
-            )
-            .await;
-            journal
-                .record_update(
-                    &key,
-                    pay_parse_upd(details.amount, details.payment_hash, send_fee),
-                )
-                .await
-                .map_err(ledger_err)?;
-            let meta = serde_json::json!({ "role": "send", "correlation_key": key.0 });
-            let outcome = match multi_client
-                .pay(&id, invoice, gateway.map(GatewayUrl), meta)
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(e) => return fail_raw_row(&journal, &key, e.into()).await,
-            };
-            match outcome {
-                SendOutcome::Started(op) => {
-                    note_ledger(journal.record_update(&key, op_id_upd(op)).await);
-                    println!("started {}", to_hex(&op.0));
-                }
-                SendOutcome::AlreadyInFlight(op) => {
-                    note_ledger(journal.record_update(&key, op_id_upd(op)).await);
-                    println!("already-in-flight {}", to_hex(&op.0));
-                }
-                SendOutcome::AlreadyPaid(op) => {
-                    // Terminal at creation. Read the ORIGINAL op-log meta for definitive fees
-                    // FIRST, THEN terminalize — freezing the row before the lookup would keep
-                    // blank/estimated fees (§10.1).
-                    let upd = settlement_upd(&multi_client, &id, op).await;
-                    note_ledger(
-                        journal
-                            .record_terminal(
-                                &key,
-                                OperationStatus::Succeeded,
-                                cli_now_ms(),
-                                None,
-                                Some(upd),
-                            )
-                            .await,
-                    );
-                    println!("already-paid {}", to_hex(&op.0));
-                }
-            }
-            eprintln!("key: {}", key.0);
-        }
-        Command::AwaitReceive { op, fed, key } => {
-            let id = select_fed(&joined_ids, &open_ids, Some(&fed))?;
-            let op = OperationId(parse_hex32(&op)?);
-            let state = multi_client.await_receive(&id, op).await?;
-            if let Some(key) = &key {
-                let (status, error) = match &state {
-                    ReceiveState::Claimed => (OperationStatus::Succeeded, None),
-                    ReceiveState::Expired => {
-                        (OperationStatus::Failed, Some("receive expired".to_string()))
-                    }
-                    ReceiveState::Failed(msg) => (OperationStatus::Failed, Some(msg.clone())),
-                };
-                terminalize_awaited(
-                    &journal,
-                    &multi_client,
-                    &id,
-                    op,
-                    key,
-                    AwaitRole::Receive,
-                    (status, error),
-                )
-                .await;
-            }
-            match state {
-                ReceiveState::Claimed => println!("claimed"),
-                ReceiveState::Expired => println!("expired"),
-                ReceiveState::Failed(msg) => println!("failed: {msg}"),
-            }
-        }
-        Command::AwaitSend { op, fed, key } => {
-            let id = select_fed(&joined_ids, &open_ids, Some(&fed))?;
-            let op = OperationId(parse_hex32(&op)?);
-            let state = multi_client.await_send(&id, op).await?;
-            if let Some(key) = &key {
-                let (status, error) = match &state {
-                    SendState::Success(_) => (OperationStatus::Succeeded, None),
-                    SendState::Refunded => {
-                        (OperationStatus::Failed, Some("send refunded".to_string()))
-                    }
-                    SendState::Failed(msg) => (OperationStatus::Failed, Some(msg.clone())),
-                };
-                terminalize_awaited(
-                    &journal,
-                    &multi_client,
-                    &id,
-                    op,
-                    key,
-                    AwaitRole::Send,
-                    (status, error),
-                )
-                .await;
-            }
-            match state {
-                SendState::Success(preimage) => println!("success {}", to_hex(&preimage.0)),
-                SendState::Refunded => println!("refunded"),
-                SendState::Failed(msg) => println!("failed: {msg}"),
-            }
-        }
-        Command::DirectInflow {
-            amount,
-            to,
-            fee_cap,
-            gateway,
-            allow_over_cap,
-            occurrence,
-        } => {
-            let id = select_fed(&joined_ids, &open_ids, to.as_deref())?;
-            let gateway = pick_receive_gateway(&multi_client, &id, gateway).await?;
-            let amount = Msat(amount);
-            let fee_cap = Msat(fee_cap.unwrap_or_else(|| default_direct_inflow_fee_cap(amount.0)));
-            let runtime = Runtime::new(
-                multi_client.clone(),
-                journal.clone(),
-                gateway,
-                operator_hard_cap(allow_over_cap),
-                perform_timeout,
-            );
-            let outcome = runtime
-                .direct_inflow(id, amount, fee_cap, Occurrence(occurrence))
-                .await?;
-            // Surface the invoice to stdout ONLY when it is a real, payable result: an
-            // `Awaiting` inflow (payable now) or an already-settled `Done` idempotent re-run
-            // (same invoice, proving no second mint). A terminal `Failed` intent keeps a DEAD
-            // invoice that must never be presented as the scriptable result, and a still-`Pending`
-            // / absent one has nothing to pay — both `bail!` with guidance and a non-zero exit.
-            match (
-                direct_inflow_surfaces_invoice(outcome.status),
-                outcome.invoice,
-            ) {
-                (true, Some(invoice)) => {
-                    // Invoice -> stdout (the payable result); key + status -> stderr (handles).
-                    println!("{}", invoice.0);
-                    eprintln!("intent_key: {}", outcome.key.0);
-                    eprintln!("status: {}", status_label(outcome.status));
-                    if outcome.status == Some(IntentStatus::Done) {
-                        eprintln!(
-                            "note: intent already settled; bump --occurrence for a new inflow"
-                        );
-                    }
-                }
-                (_, _) => anyhow::bail!(
-                    "{}",
-                    missing_direct_inflow_invoice_message(&outcome.key, outcome.status)
-                ),
-            }
-        }
-        Command::AwaitMove { key, fed } => {
-            let expected_fed = match fed.as_deref() {
-                Some(hex) => Some(select_fed(&joined_ids, &open_ids, Some(hex))?),
-                None => None,
-            };
-            // `await-move` never mints (it finalizes an existing inflow), so the cap is moot —
-            // pass `None`; the perform deadline is still threaded for consistency.
-            let runtime = Runtime::new(
-                multi_client.clone(),
-                journal.clone(),
-                None,
-                None,
-                perform_timeout,
-            );
-            let key = IdempotencyKey(key);
-            match runtime.await_move(&key, expected_fed).await? {
-                FinalizeOutcome::Done => println!("done"),
-                FinalizeOutcome::Failed(msg) => {
-                    // Report the terminal status on stdout (the scriptable result), then fail the
-                    // process so a caller gating on the exit code (`if wallet-cli await-move …`)
-                    // never mistakes a failed finalization for a settled receive — matching
-                    // direct-inflow's deliberate non-zero-on-non-payable stance.
-                    println!("failed: {msg}");
-                    anyhow::bail!("await-move: inflow {} did not settle", key.0);
-                }
-            }
-        }
-        Command::Move {
-            from,
-            to,
-            amount,
-            fee_cap,
-            gateway,
-            allow_over_cap,
-            occurrence,
-        } => {
-            let from_id = select_fed(&joined_ids, &open_ids, Some(&from))?;
-            let to_id = select_fed(&joined_ids, &open_ids, Some(&to))?;
-            anyhow::ensure!(
-                from_id != to_id,
-                "move --from and --to must be different federations (from == to is a no-op)"
-            );
-            // Resolve the shared gateway relative to the RECEIVE leg (`to`), which is where the
-            // executor pins it for a fresh move; it must also serve `from` for the internal swap.
-            let gateway = pick_receive_gateway(&multi_client, &to_id, gateway).await?;
-            let amount = Msat(amount);
-            let fee_cap = Msat(fee_cap.unwrap_or_else(|| default_move_fee_cap(amount.0)));
-            let runtime = Runtime::new(
-                multi_client.clone(),
-                journal.clone(),
-                gateway,
-                operator_hard_cap(allow_over_cap),
-                perform_timeout,
-            );
-            let outcome = runtime
-                .do_move(
-                    from_id,
-                    to_id,
-                    amount,
-                    fee_cap,
-                    Occurrence(occurrence),
-                    ReasonCode::UserInitiated,
-                    Actor::User,
-                )
-                .await?;
-            // done/failed -> stdout (the scriptable result); the move key -> stderr (the handle).
-            match outcome.status {
-                Some(IntentStatus::Done) => {
-                    println!("done");
-                    eprintln!("move_key: {}", outcome.key.0);
-                }
-                status => {
-                    // Non-`Done` is not a settled move: report it and fail the process so a caller
-                    // gating on the exit code never mistakes it for success (matching await-move /
-                    // direct-inflow's deliberate non-zero-on-non-settled stance).
-                    println!("failed: {}", move_failure_reason(&outcome));
-                    eprintln!("move_key: {}", outcome.key.0);
-                    anyhow::bail!(
-                        "move {} did not settle (status {})",
-                        outcome.key.0,
-                        status_label(status)
-                    );
-                }
-            }
-        }
         Command::Probe {
             fed,
             from,
@@ -961,7 +1038,6 @@ async fn main() -> anyhow::Result<()> {
             min_successes,
             min_span_secs,
             ttl_secs,
-            gateway,
         } => {
             // Parse-only — deliberately NOT `select_fed`: a not-joined candidate must
             // still reach the runtime's preflight so the refusal lands in `history`
@@ -988,7 +1064,7 @@ async fn main() -> anyhow::Result<()> {
             let runtime = Runtime::new(
                 multi_client.clone(),
                 journal.clone(),
-                gateway.map(GatewayUrl),
+                gateway,
                 operator_hard_cap(false),
                 perform_timeout,
             );
@@ -1029,46 +1105,16 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Reconcile {
-            per_fed_cap,
-            allow_over_cap,
-        } => {
-            // Reconcile re-drives already-journaled intents. The intent itself does not persist
-            // cap authorization, so expose the same resume policy explicitly: default ADR-0018
-            // cap unless the operator supplies the original tick cap or the over-cap override.
-            let hard_cap = reconcile_hard_cap(per_fed_cap, allow_over_cap)?;
-            let runtime = Runtime::new(
-                multi_client.clone(),
-                journal.clone(),
-                None,
-                hard_cap,
-                perform_timeout,
-            );
-            let summary = runtime.reconcile().await?;
-            // Counts -> stdout (the scriptable result); awaiting keys -> stderr (handles). §15.11:
-            // `retryable` is the subset of `failed` left Pending for a later pass, so a scheduler
-            // looping reconcile can tell a transient retry from a terminal `failed − retryable`.
-            println!(
-                "performed={} failed={} skipped={} retryable={} awaiting={}",
-                summary.performed,
-                summary.failed,
-                summary.skipped,
-                summary.retryable,
-                summary.awaiting
-            );
-            for key in &summary.awaiting_keys {
-                eprintln!("awaiting: {}", key.0);
-            }
-        }
-        Command::Tick { policy, gateway } => {
+        Command::Tick { policy } => {
             // §15.8: a tick must NOT drive money decisions from a partial world-view. Refuse (no
             // action, non-zero exit) BEFORE probing if any joined fed failed to open.
             refuse_on_partial_open(&joined_ids, &open_ids)?;
-            let tick_policy = build_tick_policy(&policy, &joined_ids, &open_ids)?;
+            let tick_policy =
+                build_standalone_tick_policy(&journal, &policy, &joined_ids, &open_ids).await?;
             let runtime = Runtime::new(
                 multi_client.clone(),
                 journal.clone(),
-                gateway.map(GatewayUrl),
+                gateway.clone(),
                 Some(tick_policy.per_fed_cap),
                 perform_timeout,
             );
@@ -1091,16 +1137,17 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("{msg}");
             }
         }
-        Command::Status { policy, gateway } => {
+        Command::Status { policy } => {
             // §15.8: status is the DIAGNOSTIC, so it still prints the scored view even under a
             // partial open — but it reports the unopened feds as rows and exits non-zero.
             let unopened = unopened_feds(&joined_ids, &open_ids);
-            let tick_policy = build_tick_policy(&policy, &joined_ids, &open_ids)?;
+            let tick_policy =
+                build_standalone_tick_policy(&journal, &policy, &joined_ids, &open_ids).await?;
             // Dry-run only, but the route gate must match the tick that would apply.
             let runtime = Runtime::new(
                 multi_client.clone(),
                 journal.clone(),
-                gateway.map(GatewayUrl),
+                gateway.clone(),
                 Some(tick_policy.per_fed_cap),
                 perform_timeout,
             );
@@ -1128,17 +1175,728 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        // §11: dispatched OFFLINE before any client setup (see the top of `main`).
-        Command::History { .. }
-        | Command::Show { .. }
-        | Command::Candidates { .. }
-        | Command::Approve { .. } => {
-            unreachable!(
-                "history/show/candidates/approve are dispatched offline before the wallet client is opened"
-            )
-        }
+        // Offline verbs (history/show/candidates/approve) are dispatched before this function; the
+        // money/actor verbs (pay/move/receive/direct-inflow/join/await-*/reconcile/policy/health)
+        // run through `run_standalone_actor`. The `watch` verb was DELETED (§6a.7 — the daemon's
+        // scheduler IS the watch). So only the Runtime-direct verbs reach here.
+        _ => unreachable!("non-Runtime-direct standalone verbs are dispatched elsewhere"),
     }
 
+    Ok(())
+}
+
+/// Fast-fail `db.lock` pre-check (spec §6a.7). fedimint's `db_locked` layer BLOCKS on a held lock
+/// (`new_exclusive` after a failed `new_try_exclusive`), so opening the store would HANG when
+/// `walletd` owns it. We non-blockingly probe the SAME `<data_dir>/client.db.lock` (same crate,
+/// guaranteed interop), then RELEASE it so the real open can re-acquire it: a held lock is the
+/// deliberate "another process owns the store" error, exit 1.
+fn check_db_lock(db_path: &std::path::Path) -> Result<(), CliExit> {
+    let lock_path = db_path.with_extension("db.lock");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&lock_path)
+        .map_err(|e| {
+            CliExit::Usage(anyhow::anyhow!(
+                "opening lock file {}: {e}",
+                lock_path.display()
+            ))
+        })?;
+    match fs_lock::FileLock::new_try_exclusive(file) {
+        // Free: drop the probe lock so fedimint's own open re-acquires it.
+        Ok(lock) => {
+            drop(lock);
+            Ok(())
+        }
+        // Contention (`WouldBlock`, no io error): walletd (or another process) holds the store.
+        Err((_, None)) => Err(CliExit::Usage(anyhow::anyhow!(
+            "another process owns the wallet store (walletd?); stop it, or use client mode (drop --standalone)"
+        ))),
+        // A genuine lock syscall fault (e.g. a filesystem without advisory-lock support, or a
+        // permission error) is NOT contention — surface it honestly instead of blaming walletd.
+        Err((_, Some(error))) => Err(CliExit::Usage(anyhow::anyhow!(
+            "probing the wallet store lock {} failed: {error}",
+            lock_path.display()
+        ))),
+    }
+}
+
+/// The verbs that go through the in-process `WalletService` (actor + drivers) in `--standalone`,
+/// mirroring the daemon handlers' `WalletClient` command path exactly.
+fn is_actor_verb(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Join { .. }
+            | Command::Receive { .. }
+            | Command::Pay { .. }
+            | Command::AwaitReceive { .. }
+            | Command::AwaitSend { .. }
+            | Command::DirectInflow { .. }
+            | Command::AwaitMove { .. }
+            | Command::Move { .. }
+            | Command::Reconcile
+            | Command::Health
+            | Command::Policy { .. }
+    )
+}
+
+/// The invoice-mint hard deadline for receive/direct-inflow (spec §6a.6, a const not policy).
+const INVOICE_MINT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Spin up the same actor + drivers the daemon runs (spec §6a.7: "minus HTTP"), MINUS the watch
+/// scheduler — a one-shot standalone command must not fire the background rebalancer (that is the
+/// daemon's job; the `watch` verb was deleted for exactly this reason). Drive the ONE money/actor
+/// verb through the same `WalletClient` command path the daemon handlers use, then shut down (abort
+/// drivers first, then drain the actor — the daemon's SIGTERM order).
+async fn run_standalone_actor(
+    command: Command,
+    journal: Arc<FedimintJournal>,
+    multi_client: Arc<MultiClient>,
+    joined_ids: Vec<FederationId>,
+    gateway: Option<GatewayUrl>,
+    perform_timeout: Option<Duration>,
+) -> Result<(), CliExit> {
+    // No hard cap: the actor reads the DB `Policy` per decide (§6a.6), exactly like the daemon's
+    // service runtime. The gateway pin comes from the standalone-only `--gateway` — REQUIRED
+    // against devimint, whose LDK gateway is never registered into the lnv2 set (runbook §4);
+    // without a pin the driver's registered-gateway scan finds nothing and the operation sits
+    // Pending until the mint deadline.
+    let runtime = Runtime::new(
+        multi_client.clone(),
+        journal.clone(),
+        gateway,
+        None,
+        perform_timeout,
+    );
+    let service = WalletService::start_without_scheduler(runtime)
+        .await
+        .map_err(service_err_to_exit)?;
+    let client = service.client();
+    let result = actor_command(
+        command,
+        &client,
+        &journal,
+        &multi_client,
+        &joined_ids,
+        &service,
+    )
+    .await;
+    let shutdown = service.shutdown().await;
+    match (result, shutdown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(e)) => Err(CliExit::Usage(anyhow::anyhow!(
+            "wallet service shutdown failed: {e}"
+        ))),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(e)) => {
+            // The command error is the actionable one; the shutdown fault is a stderr footnote.
+            eprintln!("warning: wallet service shutdown failed: {e}");
+            Err(err)
+        }
+    }
+}
+
+/// Translate ONE money/actor verb into the `WalletClient` command path, mirroring the daemon
+/// handlers (parse → build `Action` → `decide_op`/`resolve_await`/`reconcile`/policy), then render
+/// the frozen contract. This is the "one code path" the spec demands — no legacy `Runtime::pay`
+/// fork; the actor owns admission, reservations, holds, and (async) driving.
+async fn actor_command(
+    command: Command,
+    client: &WalletClient,
+    journal: &FedimintJournal,
+    multi_client: &MultiClient,
+    joined_ids: &[FederationId],
+    service: &WalletService,
+) -> Result<(), CliExit> {
+    match command {
+        Command::Join { invite } => {
+            let parsed = InviteCode::from_str(&invite)
+                .map_err(|e| CliExit::Refused(format!("invalid invite code: {e}")))?;
+            let federation = {
+                use fedimint_core::BitcoinHash as _;
+                FederationId(parsed.federation_id().0.to_byte_array())
+            };
+            let invite = parsed.to_string();
+            let key = join_intent_key(federation, &invite);
+            let membership_preexisting = journal
+                .get_federation(&federation)
+                .await
+                .map_err(storage_cli)?
+                .is_some();
+            let action = Action::Join {
+                federation,
+                invite,
+                membership_preexisting,
+            };
+            let decided = client
+                .decide_op(op_request(
+                    action,
+                    key.clone(),
+                    Occurrence(0),
+                    BTreeMap::new(),
+                ))
+                .await
+                .map_err(service_err_to_exit)?;
+            render::print_phase1(
+                render::phase1_word(
+                    decided.status == IntentStatus::Done,
+                    decided.deduplicated,
+                    "already-joined",
+                ),
+                &key.0,
+            );
+            Ok(())
+        }
+        Command::Pay {
+            invoice,
+            amount,
+            fee_cap,
+            fed,
+        } => {
+            let policy = client.get_policy().await.map_err(service_err_to_exit)?;
+            let details = parse_invoice(&Invoice(invoice.clone()))
+                .map_err(|e| CliExit::Refused(format!("invalid BOLT11 invoice: {e}")))?;
+            let amount = match (details.amount, amount.map(Msat)) {
+                (Some(inv), Some(stated)) if inv != stated => {
+                    return Err(CliExit::Refused(
+                        "stated --amount does not match the invoice amount".to_owned(),
+                    ))
+                }
+                (Some(inv), _) => inv,
+                // The pinned lnv2 send API takes no amount parameter (`MultiClient::pay` →
+                // `LightningClientModule::send(bolt11, gateway, meta)`), so an amountless
+                // invoice is UNPAYABLE by the engine — refuse at admission rather than admit
+                // an operation whose driver can only fail after the 202-equivalent.
+                (None, _) => {
+                    return Err(CliExit::Refused(
+                        "amountless BOLT11 invoices are not payable (the lnv2 send API cannot \
+                         supply an amount); request an amount-carrying invoice"
+                            .to_owned(),
+                    ))
+                }
+            };
+            let fee_cap = fee_cap.map(Msat).unwrap_or(policy.max_fee);
+            let from = resolve_fed_standalone(
+                parse_fed_opt(fed.as_deref())?,
+                policy.spending_fed,
+                joined_ids,
+            )?;
+            let key = raw_pay_key(details.payment_hash);
+            let action = Action::Pay {
+                from,
+                invoice: Invoice(invoice),
+                amount,
+                fee_cap,
+                payment_hash: details.payment_hash,
+                gateway: None,
+            };
+            let balances = sample_balances_standalone(multi_client, &[from]).await?;
+            let decided = client
+                .decide_op(op_request(action, key.clone(), Occurrence(0), balances))
+                .await
+                .map_err(service_err_to_exit)?;
+            render::print_phase1(
+                render::phase1_word(
+                    decided.status == IntentStatus::Done,
+                    decided.deduplicated,
+                    "already-paid",
+                ),
+                &key.0,
+            );
+            Ok(())
+        }
+        Command::Move {
+            from,
+            to,
+            amount,
+            fee_cap,
+            occurrence,
+        } => {
+            let from = parse_fed_id(&from)?;
+            let to = parse_fed_id(&to)?;
+            if from == to {
+                return Err(CliExit::Refused(
+                    "move --from and --to must be different federations (from == to is a no-op)"
+                        .to_owned(),
+                ));
+            }
+            ensure_joined_standalone(from, joined_ids)?;
+            ensure_joined_standalone(to, joined_ids)?;
+            let policy = client.get_policy().await.map_err(service_err_to_exit)?;
+            let fee_cap = fee_cap.map(Msat).unwrap_or(policy.max_fee);
+            let key = move_key(&from, &to, Msat(amount), fee_cap, Occurrence(occurrence));
+            let action = Action::Move {
+                from,
+                to,
+                amount: Msat(amount),
+                fee_cap,
+            };
+            let balances = sample_balances_standalone(multi_client, &[from, to]).await?;
+            let decided = client
+                .decide_op(op_request(
+                    action,
+                    key.clone(),
+                    Occurrence(occurrence),
+                    balances,
+                ))
+                .await
+                .map_err(service_err_to_exit)?;
+            render::print_phase1(
+                render::phase1_word(
+                    decided.status == IntentStatus::Done,
+                    decided.deduplicated,
+                    "already-done",
+                ),
+                &key.0,
+            );
+            Ok(())
+        }
+        Command::Receive {
+            amount,
+            fee_cap,
+            nonce,
+            to,
+        } => {
+            let nonce = nonce.unwrap_or_else(cli_nonce);
+            validate_nonce_cli(&nonce)?;
+            let policy = client.get_policy().await.map_err(service_err_to_exit)?;
+            let to = resolve_fed_standalone(
+                parse_fed_opt(to.as_deref())?,
+                policy.spending_fed,
+                joined_ids,
+            )?;
+            let fee_cap = fee_cap.map(Msat).unwrap_or(policy.max_fee);
+            let key = raw_receive_key(to, Msat(amount), &nonce);
+            let action = Action::Receive {
+                to,
+                amount: Msat(amount),
+                fee_cap,
+                nonce,
+                gateway: None,
+            };
+            let balances = sample_balances_standalone(multi_client, &[to]).await?;
+            block_for_invoice_standalone(client, action, key, balances).await
+        }
+        Command::DirectInflow {
+            amount,
+            to,
+            fee_cap,
+            nonce,
+        } => {
+            validate_nonce_cli(&nonce)?;
+            let policy = client.get_policy().await.map_err(service_err_to_exit)?;
+            let to = resolve_fed_standalone(
+                parse_fed_opt(to.as_deref())?,
+                policy.spending_fed,
+                joined_ids,
+            )?;
+            let fee_cap = fee_cap.map(Msat).unwrap_or(policy.max_fee);
+            let key = direct_inflow_nonce_key(to, Msat(amount), &nonce);
+            let action = Action::DirectInflow {
+                to,
+                amount: Msat(amount),
+                fee_cap,
+            };
+            let balances = sample_balances_standalone(multi_client, &[to]).await?;
+            block_for_invoice_standalone(client, action, key, balances).await
+        }
+        Command::AwaitReceive { key, timeout } => {
+            await_standalone(
+                client,
+                journal,
+                multi_client,
+                AwaitVerb::Receive,
+                key,
+                timeout,
+            )
+            .await
+        }
+        Command::AwaitSend { key, timeout } => {
+            await_standalone(client, journal, multi_client, AwaitVerb::Send, key, timeout).await
+        }
+        Command::AwaitMove { key, timeout } => {
+            await_standalone(client, journal, multi_client, AwaitVerb::Move, key, timeout).await
+        }
+        Command::Reconcile => {
+            // Mirror the daemon's `/v1/reconcile` handler exactly: actor-side intent re-drive
+            // first (idempotent; the actor registers the re-drive drivers itself), THEN the
+            // off-actor O(ledger) ledger repair (§10.3 / TL-4). The repair runs here — AFTER
+            // reconcile returns, OUTSIDE the actor's critical section — and its CAS hardening
+            // makes it a no-op against any row the actor already terminalized. Best-effort: a
+            // repair I/O fault is logged, never fails the button (the re-drive already committed).
+            // Standalone is often the ONLY recovery path (walletd is down — that's why the user
+            // chose it); omitting the repair here would leave crash-orphaned ledger rows —
+            // nonterminal after their intent stopped being pending/awaiting, which the actor
+            // re-drive cannot discover — permanently stale in `history`/`show` with no daemon to
+            // fix them later.
+            let report = client.reconcile().await.map_err(service_err_to_exit)?;
+            if let Err(error) = journal.repair_ledger(multi_client).await {
+                // Diagnostics go to stderr (the CLI convention), matching the daemon's warn-log.
+                eprintln!(
+                    "warning: reconcile: off-actor ledger repair faulted; continuing: {error:?}"
+                );
+            }
+            println!(
+                "redriven={} awaiters_rehydrated={} executing_normalized={}",
+                report.redriven, report.awaiters_rehydrated, report.executing_normalized
+            );
+            Ok(())
+        }
+        Command::Health => {
+            let inflight = match client.snapshot(SnapshotScope::Registry).await {
+                Ok(Snapshot::Registry { drivers }) => drivers,
+                _ => 0,
+            };
+            println!(
+                "actor_queue_depth={} inflight_drivers={} scheduler_alive={}",
+                client.queue_depth(),
+                inflight,
+                service
+                    .scheduler_liveness()
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            );
+            Ok(())
+        }
+        Command::Policy { command } => match command {
+            PolicyCommand::Get => {
+                let policy = client.get_policy().await.map_err(service_err_to_exit)?;
+                print_policy(&policy)
+            }
+            PolicyCommand::Set(flags) => {
+                let mut policy = client.get_policy().await.map_err(service_err_to_exit)?;
+                apply_policy_set(&mut policy, &flags)?;
+                let updated = client
+                    .put_policy(policy)
+                    .await
+                    .map_err(service_err_to_exit)?;
+                print_policy(&updated)
+            }
+        },
+        _ => unreachable!("actor_command received a non-actor verb"),
+    }
+}
+
+/// Build an `OpRequest` for a user-initiated verb (the daemon handlers' `submit_operation` shape).
+fn op_request(
+    action: Action,
+    key: IdempotencyKey,
+    occurrence: Occurrence,
+    balances: BTreeMap<FederationId, Msat>,
+) -> OpRequest {
+    OpRequest {
+        decision: AllocatorDecision {
+            action,
+            reason: ReasonCode::UserInitiated,
+            occurrence,
+            idempotency_key: key,
+        },
+        actor: Actor::User,
+        now_ms: cli_now_ms(),
+        balances,
+        probe_session_nonce: None,
+    }
+}
+
+/// Mirror handlers::block_for_invoice: admit the receive/direct-inflow, then BLOCK for its minted
+/// BOLT11 under the hard mint deadline. The invoice is the payable result on stdout; a terminal
+/// without an invoice is a journaled failure (exit 3); the deadline is a transport timeout (exit 4).
+async fn block_for_invoice_standalone(
+    client: &WalletClient,
+    action: Action,
+    key: IdempotencyKey,
+    balances: BTreeMap<FederationId, Msat>,
+) -> Result<(), CliExit> {
+    client
+        .decide_op(op_request(action, key.clone(), Occurrence(0), balances))
+        .await
+        .map_err(service_err_to_exit)?;
+    let deadline = Instant::now() + INVOICE_MINT_DEADLINE;
+    match client
+        .resolve_await(key.clone(), AwaitTarget::InvoiceArtifact, deadline)
+        .await
+    {
+        Ok(AwaitOutcome::Invoice(invoice)) => {
+            render::print_value_with_key(&invoice.0, &key.0);
+            Ok(())
+        }
+        Ok(AwaitOutcome::Terminal(_)) => Err(CliExit::Failed(format!(
+            "operation {} terminalized without a payable invoice",
+            key.0
+        ))),
+        Err(ServiceError::Timeout) => Err(CliExit::Transport(format!(
+            "invoice mint deadline elapsed for {}; settlement continues asynchronously",
+            key.0
+        ))),
+        Err(e) => Err(service_err_to_exit(e)),
+    }
+}
+
+/// Mirror the daemon's `GET /v1/operations/{key}?wait=true`: park until the operation is terminal
+/// (or `--timeout`), then render its terminal state from the ledger row. In a one-shot standalone
+/// process the pending intent has no live driver, so re-drive it first (abandon-and-resume, §6a.8).
+async fn await_standalone(
+    client: &WalletClient,
+    journal: &FedimintJournal,
+    multi_client: &MultiClient,
+    verb: AwaitVerb,
+    key: String,
+    timeout: u64,
+) -> Result<(), CliExit> {
+    let key = IdempotencyKey(key);
+    client.reconcile().await.map_err(service_err_to_exit)?;
+    // Off-actor ledger repair, mirroring the daemon (its scheduler runs this every cycle; a
+    // one-shot standalone process has no scheduler). Without it, a crash that left the intent
+    // terminal but its ledger row non-terminal would render "not terminal yet" FOREVER below —
+    // resolve_await reads intent terminality, the render reads the row. Best-effort like the
+    // daemon's: a repair fault must not fail the await (the re-drive above already committed).
+    if let Err(error) = journal.repair_ledger(multi_client).await {
+        eprintln!("warning: ledger repair failed: {error:?}");
+    }
+    let deadline = Instant::now() + Duration::from_secs(timeout);
+    match client
+        .resolve_await(key.clone(), AwaitTarget::Terminal, deadline)
+        .await
+    {
+        Ok(_) => {}
+        Err(ServiceError::Timeout) => {
+            return Err(CliExit::Transport(format!(
+                "await timed out after {timeout}s waiting for operation {} to terminalize",
+                key.0
+            )))
+        }
+        Err(ServiceError::NotFound(m)) => return Err(CliExit::Usage(anyhow::anyhow!(m))),
+        Err(e) => return Err(service_err_to_exit(e)),
+    }
+    let record = journal
+        .operation(&OperationRef::Key(key.clone()))
+        .await
+        .map_err(|e| CliExit::Usage(anyhow::anyhow!("reading operation ledger: {e:?}")))?
+        .ok_or_else(|| CliExit::Usage(anyhow::anyhow!("no operation found for key {}", key.0)))?;
+    render::await_terminal(
+        verb,
+        kind_and_amount(&record.kind).0,
+        record_status_dto(record.status),
+        record.error.as_deref(),
+        &key.0,
+    )
+}
+
+/// Mirror handlers::resolve_fed: the explicit `--fed`/`--to`/`--from`, else the policy pin, else the
+/// sole joined federation. An unopened fed is left to admission (sample_balances omits it, so a
+/// spend refuses cleanly with insufficient-after-reservations rather than admitting an unfunded one).
+fn resolve_fed_standalone(
+    explicit: Option<FederationId>,
+    pin: Option<FederationId>,
+    joined: &[FederationId],
+) -> Result<FederationId, CliExit> {
+    let chosen = match explicit.or(pin) {
+        Some(id) => id,
+        None => match joined {
+            [only] => *only,
+            [] => {
+                return Err(CliExit::Refused(
+                    "no federations joined; run `join <invite>` first".to_owned(),
+                ))
+            }
+            _ => {
+                return Err(CliExit::Refused(
+                    "multiple federations joined; name one with --fed/--to/--from".to_owned(),
+                ))
+            }
+        },
+    };
+    ensure_joined_standalone(chosen, joined)?;
+    Ok(chosen)
+}
+
+fn ensure_joined_standalone(id: FederationId, joined: &[FederationId]) -> Result<(), CliExit> {
+    if joined.contains(&id) {
+        Ok(())
+    } else {
+        Err(CliExit::Refused(format!(
+            "federation {} is not joined",
+            id.to_hex()
+        )))
+    }
+}
+
+/// Mirror handlers::sample_balances: omit unopened feds (admission treats a missing fed as zero),
+/// but fail CLOSED on a balance read that faults — never size an admission against a silently-zeroed
+/// balance.
+async fn sample_balances_standalone(
+    mc: &MultiClient,
+    feds: &[FederationId],
+) -> Result<BTreeMap<FederationId, Msat>, CliExit> {
+    let mut balances = BTreeMap::new();
+    let open = mc.federations();
+    for fed in feds {
+        if !open.contains(fed) {
+            continue;
+        }
+        match mc.balance(fed).await {
+            Ok(msat) => {
+                balances.insert(*fed, msat);
+            }
+            Err(e) => {
+                return Err(CliExit::Usage(anyhow::anyhow!(
+                    "reading balance for federation {} failed: {e}",
+                    fed.to_hex()
+                )))
+            }
+        }
+    }
+    Ok(balances)
+}
+
+/// Mirror handlers::validate_nonce: non-empty, RFC 3986 unreserved bytes only (the nonce becomes the
+/// `{key}` path segment of `/v1/operations/{key}`, so it must be a round-trippable single segment).
+fn validate_nonce_cli(nonce: &str) -> Result<(), CliExit> {
+    if nonce.is_empty() {
+        return Err(CliExit::Refused("nonce must not be empty".to_owned()));
+    }
+    if !nonce
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+    {
+        return Err(CliExit::Refused(
+            "nonce must contain only unreserved URL characters (A-Z a-z 0-9 - . _ ~)".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn record_status_dto(status: OperationStatus) -> OperationStatusDto {
+    match status {
+        OperationStatus::Started => OperationStatusDto::Started,
+        OperationStatus::Awaiting => OperationStatusDto::Awaiting,
+        OperationStatus::Succeeded => OperationStatusDto::Succeeded,
+        OperationStatus::Failed => OperationStatusDto::Failed,
+    }
+}
+
+fn parse_fed_opt(hex: Option<&str>) -> Result<Option<FederationId>, CliExit> {
+    match hex {
+        Some(h) => Ok(Some(parse_fed_id(h)?)),
+        None => Ok(None),
+    }
+}
+
+/// Map the layered `ServiceError` (spec §6a.6 taxonomy) onto the CLI exit-code taxonomy: Refused =
+/// decide-time, nothing journaled (exit 2); timeout and transient service/storage availability =
+/// transport (exit 4); not-found is usage/other (exit 1). This mirrors the daemon's 500/503
+/// `Failed` responses, which the thin client maps to exit 4. A driver FAILED terminal is surfaced
+/// by the await/block-for-invoice paths, not here.
+fn service_err_to_exit(error: ServiceError) -> CliExit {
+    match error {
+        ServiceError::Refused { reason, message } => {
+            CliExit::Refused(format!("{message} ({reason:?})"))
+        }
+        ServiceError::Timeout => CliExit::Transport("operation wait deadline elapsed".to_owned()),
+        ServiceError::NotFound(m) => CliExit::Usage(anyhow::anyhow!(m)),
+        ServiceError::Storage(m) => CliExit::Transport(format!("storage error: {m}")),
+        ServiceError::ShuttingDown | ServiceError::ActorStopped => {
+            CliExit::Transport(error.to_string())
+        }
+    }
+}
+
+fn storage_cli(error: wallet_core::ExecError) -> CliExit {
+    CliExit::Usage(anyhow::anyhow!("wallet store error: {error:?}"))
+}
+
+/// `policy get` output: the stored `Policy` as pretty JSON (shared by client + standalone).
+fn print_policy(policy: &Policy) -> Result<(), CliExit> {
+    let json = serde_json::to_string_pretty(policy)
+        .map_err(|e| CliExit::Usage(anyhow::anyhow!("serializing policy: {e}")))?;
+    println!("{json}");
+    Ok(())
+}
+
+/// Apply `policy set` flag overrides onto a fetched `Policy` (only the named fields change). The
+/// resulting struct is PUT whole; validation (contradiction checks) happens server/actor-side.
+fn apply_policy_set(policy: &mut Policy, flags: &PolicySetFlags) -> Result<(), CliExit> {
+    if let Some(v) = flags.per_fed_cap {
+        policy.per_fed_cap = Msat(v);
+    }
+    if let Some(v) = flags.spending_target {
+        policy.spending_target = Msat(v);
+    }
+    if let Some(v) = flags.standby_target {
+        policy.standby_target = Msat(v);
+    }
+    if let Some(v) = flags.max_fee {
+        policy.max_fee = Msat(v);
+    }
+    if flags.clear_spending_fed {
+        policy.spending_fed = None;
+    }
+    if let Some(hex) = &flags.spending_fed {
+        policy.spending_fed = Some(parse_fed_id(hex)?);
+    }
+    if flags.clear_standby_fed {
+        policy.standby_fed = None;
+    }
+    if let Some(hex) = &flags.standby_fed {
+        policy.standby_fed = Some(parse_fed_id(hex)?);
+    }
+    if let Some(v) = flags.probe_min_span_secs {
+        policy.probe_min_span_secs = v;
+    }
+    if let Some(v) = flags.probe_min_successes {
+        policy.probe_min_successes = v;
+    }
+    if let Some(v) = flags.probe_ttl_secs {
+        policy.probe_ttl_secs = v;
+    }
+    if let Some(v) = flags.probe_amount {
+        policy.probe_amount = Msat(v);
+    }
+    if let Some(v) = flags.max_probe_attempts_per_week {
+        policy.max_probe_attempts_per_week = v;
+    }
+    if let Some(v) = flags.max_probe_spend_per_week {
+        policy.max_probe_spend_per_week = Msat(v);
+    }
+    if let Some(v) = flags.base_interval_secs {
+        policy.base_interval_secs = v;
+    }
+    if let Some(v) = flags.min_interval_secs {
+        policy.min_interval_secs = v;
+    }
+    if let Some(v) = flags.evacuation_lead_secs {
+        policy.evacuation_lead_secs = v;
+    }
+    if let Some(v) = flags.discover_every_secs {
+        policy.discover_every_secs = v;
+    }
+    if let Some(v) = flags.probe_retry_backoff_secs {
+        policy.probe_retry_backoff_secs = v;
+    }
+    if let Some(v) = flags.probe_refresh_lead_secs {
+        policy.probe_refresh_lead_secs = v;
+    }
+    if let Some(v) = flags.max_auto_joins_per_week {
+        policy.max_auto_joins_per_week = v;
+    }
+    if let Some(v) = flags.auto_join_lifetime_cap {
+        policy.auto_join_lifetime_cap = v;
+    }
+    if let Some(v) = flags.max_candidates_per_pass {
+        policy.max_candidates_per_pass = v;
+    }
+    if let Some(v) = flags.per_preview_timeout_secs {
+        policy.per_preview_timeout_secs = v;
+    }
+    if let Some(v) = flags.discover_pass_deadline_secs {
+        policy.discover_pass_deadline_secs = v;
+    }
+    if let Some(v) = flags.auto_join {
+        policy.auto_join = v;
+    }
+    if let Some(v) = flags.require_mainnet {
+        policy.require_mainnet = v;
+    }
     Ok(())
 }
 
@@ -1240,9 +1998,31 @@ async fn run_candidates(
     Ok(())
 }
 
-async fn run_approve(journal: &FedimintJournal, fed: String) -> anyhow::Result<()> {
-    let id = parse_fed_id(&fed)?;
-    let key = approve_candidate(journal, id, cli_now_ms(), &cli_nonce()).await?;
+async fn run_approve(journal: &FedimintJournal, fed: String) -> Result<(), CliExit> {
+    let id = parse_fed_id(&fed).map_err(CliExit::from)?;
+    match journal.get_candidate(&id).await.map_err(storage_cli)? {
+        None => {
+            return Err(CliExit::Usage(anyhow::anyhow!(
+                "candidate {} was not found",
+                id.to_hex()
+            )))
+        }
+        Some(candidate) if candidate.state != CandidateState::AutoJoined => {
+            return Err(CliExit::Refused(format!(
+                "candidate {} is {:?}, not AutoJoined",
+                id.to_hex(),
+                candidate.state
+            )))
+        }
+        Some(_) => {}
+    }
+    let key = approve_candidate(journal, id, cli_now_ms(), &cli_nonce())
+        .await
+        .map_err(|error| match error {
+            // A concurrent approval can win after the state check, just as in the daemon handler.
+            wallet_core::ExecError::Permanent(message) => CliExit::Refused(message),
+            error => storage_cli(error),
+        })?;
     println!("{}", id.to_hex());
     eprintln!("key: {}", key.0);
     Ok(())
@@ -1266,12 +2046,11 @@ async fn approve_candidate(
     id: FederationId,
     now_ms: u64,
     nonce: &str,
-) -> anyhow::Result<IdempotencyKey> {
+) -> Result<IdempotencyKey, wallet_core::ExecError> {
     let key = IdempotencyKey(format!("approve:{}:{nonce}", id.to_hex()));
     journal
         .approve_auto_joined_candidate(id, &key, now_ms)
-        .await
-        .map_err(|e| anyhow::anyhow!("approve failed: {e:?}"))?;
+        .await?;
     Ok(key)
 }
 
@@ -1396,9 +2175,27 @@ fn discover_progress_summary_line(report: &DiscoverReport) -> String {
     )
 }
 
-/// Build a [`TickPolicy`] from the shared policy flags: each numeric flag overrides the v1
-/// default, and each designation flag (when given) is validated as a joined+open federation.
+/// Load the persisted standing instruction for a standalone `tick` / override-`status`, then
+/// layer the invocation-only flags without writing the row (§6a.6's DRY ruling).
+async fn build_standalone_tick_policy(
+    journal: &FedimintJournal,
+    flags: &PolicyFlags,
+    joined_ids: &[FederationId],
+    open_ids: &[FederationId],
+) -> anyhow::Result<TickPolicy> {
+    let stored = journal
+        .get_policy()
+        .await
+        .map_err(|error| anyhow::anyhow!("reading stored policy: {error:?}"))?
+        .unwrap_or_default();
+    build_tick_policy(&stored, flags, joined_ids, open_ids)
+}
+
+/// Build a [`TickPolicy`] from the supplied standing instruction plus this invocation's flags:
+/// each supplied flag overrides the stored field, and each designation flag is validated as a
+/// joined+open federation.
 fn build_tick_policy(
+    stored: &Policy,
     flags: &PolicyFlags,
     joined_ids: &[FederationId],
     open_ids: &[FederationId],
@@ -1411,10 +2208,8 @@ fn build_tick_policy(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut policy = TickPolicy {
-        now,
-        ..TickPolicy::default()
-    };
+    let mut policy = TickPolicy::from(stored);
+    policy.now = now;
     if let Some(v) = flags.per_fed_cap {
         policy.per_fed_cap = Msat(v);
     }
@@ -1527,9 +2322,16 @@ fn describe_decision(decision: &AllocatorDecision) -> String {
             fee_cap.0,
             decision.reason
         ),
-        Action::RefuseInflow { fed, reason } => {
+        Action::RefuseInflow { fed, reason, .. } => {
             format!("refuse-inflow {} (reason {reason:?})", fed.to_hex())
         }
+        Action::Pay { from, amount, .. } => {
+            format!("pay {} msat from {}", amount.0, from.to_hex())
+        }
+        Action::Receive { to, amount, .. } => {
+            format!("receive {} msat into {}", amount.0, to.to_hex())
+        }
+        Action::Join { federation, .. } => format!("join {}", federation.to_hex()),
     }
 }
 
@@ -1732,85 +2534,6 @@ fn opt_fed_hex(id: Option<FederationId>) -> String {
     id.map_or_else(|| "none".to_string(), |fed| fed.to_hex())
 }
 
-/// A deliberately loose default receive-side fee cap for a CLI `direct-inflow`: the net amount
-/// plus 1000 sat of headroom. This is an intentional no-surprises guard for the happy path, not
-/// meaningful fee protection; pass `--fee-cap` to bound the receive cost tightly.
-fn default_direct_inflow_fee_cap(amount_msat: u64) -> u64 {
-    amount_msat.saturating_add(1_000_000)
-}
-
-/// A deliberately loose default fee cap for a CLI `move`: the net amount plus 1000 sat of
-/// headroom, covering BOTH legs' federation + gateway fees on the happy path. This is a
-/// no-surprises guard, not meaningful fee protection; pass `--fee-cap` to bound the move cost.
-fn default_move_fee_cap(amount_msat: u64) -> u64 {
-    amount_msat.saturating_add(1_000_000)
-}
-
-/// A human-readable reason a `move` did not settle. A `Permanent` failure (fee over cap,
-/// refund/failed settlement) records its cause on the `MoveRecord`; a transient fault leaves the
-/// move `Pending` with no recorded outcome, so point the operator at the re-drive paths.
-fn move_failure_reason(outcome: &MoveOutcome) -> String {
-    if let Some(reason) = &outcome.outcome {
-        return reason.clone();
-    }
-    match outcome.status {
-        Some(IntentStatus::Pending) | Some(IntentStatus::Executing) => format!(
-            "move not settled (status {}); a transient fault left it re-drivable — run \
-             reconcile, or re-run move with the same --occurrence and --gateway",
-            status_label(outcome.status)
-        ),
-        other => format!("move not settled (status {})", status_label(other)),
-    }
-}
-
-/// Whether a finished `direct-inflow` should surface its invoice on stdout as the scriptable
-/// result (spec §7). Only an `Awaiting` inflow (payable now) or an already-settled `Done`
-/// idempotent re-run (the same invoice, proving no second mint) does. A terminal `Failed` intent
-/// keeps a DEAD invoice that must never be presented as payable, and a still-`Pending`/`Executing`
-/// or absent one has nothing to pay.
-fn direct_inflow_surfaces_invoice(status: Option<IntentStatus>) -> bool {
-    matches!(status, Some(IntentStatus::Awaiting | IntentStatus::Done))
-}
-
-/// A stable, lowercase label for an intent status (never the `Debug`-rendered `Some(..)` wrapper).
-fn status_label(status: Option<IntentStatus>) -> &'static str {
-    match status {
-        Some(IntentStatus::Pending) => "pending",
-        Some(IntentStatus::Executing) => "executing",
-        Some(IntentStatus::Awaiting) => "awaiting",
-        Some(IntentStatus::Done) => "done",
-        Some(IntentStatus::Failed) => "failed",
-        None => "unknown",
-    }
-}
-
-fn missing_direct_inflow_invoice_message(
-    key: &IdempotencyKey,
-    status: Option<IntentStatus>,
-) -> String {
-    match status {
-        Some(IntentStatus::Failed) => format!(
-            "direct-inflow has no payable invoice (intent {} status Failed); this intent is \
-             terminal and any minted invoice is dead — retry/reconcile will not re-drive it. \
-             Correct the inputs, then start a fresh inflow with a new --occurrence value",
-            key.0
-        ),
-        Some(IntentStatus::Pending) | Some(IntentStatus::Executing) | None => format!(
-            "direct-inflow has no payable invoice (intent {} status {}); the receive may have \
-             failed before the invoice was persisted — retry direct-inflow with the same \
-             --occurrence or run reconcile",
-            key.0,
-            status_label(status)
-        ),
-        Some(IntentStatus::Awaiting) | Some(IntentStatus::Done) => format!(
-            "direct-inflow has no payable invoice (intent {} status {}); run reconcile to rebuild \
-             the move record from the operation log, then retry the command",
-            key.0,
-            status_label(status)
-        ),
-    }
-}
-
 /// Select the federation to act on: the explicit `--to`/`--fed` hex if given (and joined),
 /// else the sole joined federation. Errors clearly when the choice is empty or ambiguous.
 fn select_fed(
@@ -1879,71 +2602,6 @@ fn refuse_on_partial_open(joined: &[FederationId], open: &[FederationId]) -> any
     Ok(())
 }
 
-async fn mark_candidate_user_approved(
-    journal: &FedimintJournal,
-    fed_id: FederationId,
-    invite: &InviteCode,
-    updated_at_ms: u64,
-) -> anyhow::Result<()> {
-    // A fresh UserApproved record for the fed we just successfully joined (we hold id + invite),
-    // used whenever there is no usable prior row to transition.
-    let fresh_user_approved = wallet_fedimint::CandidateRecord {
-        id: fed_id,
-        invite: invite.clone(),
-        source: wallet_core::DiscoverySource::Manual,
-        discovered_at_ms: updated_at_ms,
-        structural: wallet_fedimint::StructuralOutcome::Passed,
-        structural_checked_at_ms: updated_at_ms,
-        state: CandidateState::UserApproved,
-        updated_at_ms,
-    };
-    let existing = match journal.get_candidate(&fed_id).await {
-        Ok(existing) => existing,
-        Err(e) => {
-            // A CORRUPT `0x09` row must not strand a user-joined fed behind the probe gate:
-            // `auto_joined_candidates()` fail-closes an UNREADABLE id to `AutoJoined`, so
-            // skipping the ownership update here would keep an EXPLICITLY user-joined fed gated
-            // until a manual DB repair. We hold the fed's id + invite from the successful join,
-            // so OVERWRITE the poisoned row with a fresh `UserApproved` record (noted, not silent).
-            eprintln!(
-                "note: candidate row unreadable on user join ({e:?}); overwriting with a fresh \
-                 UserApproved record"
-            );
-            journal
-                .put_candidate(&fresh_user_approved)
-                .await
-                .map_err(|e| anyhow::anyhow!("writing candidate registry: {e:?}"))?;
-            return Ok(());
-        }
-    };
-    let Some(mut candidate) = existing else {
-        journal
-            .put_candidate(&fresh_user_approved)
-            .await
-            .map_err(|e| anyhow::anyhow!("writing candidate registry: {e:?}"))?;
-        return Ok(());
-    };
-    // §5.1.4a bullet 1: a user `join` confers ownership on a `Discovered`/`Rejected`/absent
-    // candidate. An `AutoJoined` candidate is agent-owned and already a member, so a re-`join`
-    // reaches the §10.2 no-ledger fast path; flipping it to `UserApproved` here would leave the
-    // probe gate + concurrent cap with NO audit row. That transition is the `approve` verb's job
-    // (§5.1.4a bullet 2 / 5.1b), which writes an `OperationKind::Approve` row explaining why the
-    // fed left the gate. So leave `AutoJoined` (and an already-`UserApproved`) row untouched.
-    if matches!(
-        candidate.state,
-        CandidateState::AutoJoined | CandidateState::UserApproved
-    ) {
-        return Ok(());
-    }
-    candidate.state = CandidateState::UserApproved;
-    candidate.updated_at_ms = updated_at_ms;
-    journal
-        .put_candidate(&candidate)
-        .await
-        .map_err(|e| anyhow::anyhow!("writing candidate registry: {e:?}"))?;
-    Ok(())
-}
-
 /// The hard per-fed balance cap for an OPERATOR verb (§15.2): the ADR-0018 v1 default unless
 /// `--allow-over-cap` was passed, in which case the cap is DISABLED (`None`) — an explicit
 /// override, never silence.
@@ -1955,56 +2613,12 @@ fn operator_hard_cap(allow_over_cap: bool) -> Option<Msat> {
     }
 }
 
-/// The hard cap policy used while resuming already-journaled pending work. Reconcile cannot infer
-/// the cap that authorized an intent from the legacy intent shape, so callers can restate it:
-/// default ADR-0018 cap, an explicit tick cap, or the operator over-cap override.
-fn reconcile_hard_cap(
-    per_fed_cap: Option<u64>,
-    allow_over_cap: bool,
-) -> anyhow::Result<Option<Msat>> {
-    anyhow::ensure!(
-        !(allow_over_cap && per_fed_cap.is_some()),
-        "--allow-over-cap and --per-fed-cap are mutually exclusive"
-    );
-    if allow_over_cap {
-        Ok(None)
-    } else {
-        Ok(Some(
-            per_fed_cap
-                .map(Msat)
-                .unwrap_or_else(|| TickPolicy::default().per_fed_cap),
-        ))
-    }
-}
-
 /// Comma-join federation ids as hex for a diagnostic message.
 fn hex_list(ids: &[FederationId]) -> String {
     ids.iter()
         .map(|id| id.to_hex())
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-/// Resolve the optional CLI gateway flag. An explicit URL becomes a pinned gateway. Without one,
-/// require at least one registered lnv2 gateway and return `None`: raw `receive` passes that to
-/// lnv2's auto-selection, while `direct-inflow` pins the executor to the first registered gateway
-/// for crash-stable replay. Use `--gateway` when liveness or devimint routing matters.
-async fn pick_receive_gateway(
-    multi_client: &MultiClient,
-    id: &FederationId,
-    explicit: Option<String>,
-) -> anyhow::Result<Option<GatewayUrl>> {
-    if let Some(url) = explicit {
-        return Ok(Some(GatewayUrl(url)));
-    }
-    if multi_client.gateways(id).await?.is_empty() {
-        anyhow::bail!(
-            "no lnv2 gateways registered for {}; pass one explicitly with --gateway \
-             (see docs/devimint-runbook.md §4)",
-            id.to_hex()
-        );
-    }
-    Ok(None)
 }
 
 /// Parse a 64-char hex federation id into `wallet_core::FederationId`, reusing fedimint's
@@ -2026,30 +2640,6 @@ fn to_hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
-}
-
-/// Parse exactly 32 bytes of hex (an operation id) into `[u8; 32]`.
-fn parse_hex32(s: &str) -> anyhow::Result<[u8; 32]> {
-    anyhow::ensure!(
-        s.len() == 64,
-        "expected a 64-char hex operation id, got {} chars",
-        s.len()
-    );
-    let bytes = s.as_bytes();
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = (hex_nibble(bytes[i * 2])? << 4) | hex_nibble(bytes[i * 2 + 1])?;
-    }
-    Ok(out)
-}
-
-fn hex_nibble(c: u8) -> anyhow::Result<u8> {
-    match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(c - b'a' + 10),
-        b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => anyhow::bail!("invalid hex character: {:?}", c as char),
-    }
 }
 
 /// Load the wallet's mnemonic from `db`, or generate + persist a new one. Mirrors
@@ -2085,26 +2675,6 @@ fn ledger_err(e: impl std::fmt::Debug) -> anyhow::Error {
     anyhow::anyhow!("ledger write failed: {e:?}")
 }
 
-/// Log a best-effort raw-op ledger write failure without failing the command — used AFTER the
-/// SDK call, where the money op is already authoritative and reconcile repair (§10.3) heals any
-/// resulting history gap. A recording hiccup must never regress the live money operation.
-fn note_ledger(result: Result<(), impl std::fmt::Debug>) {
-    if let Err(e) = result {
-        eprintln!("note: raw-op ledger write failed (reconcile will repair): {e:?}");
-    }
-}
-
-/// Log a best-effort candidate-ownership update failure without failing the command — used AFTER a
-/// successful `join`, where the membership AND the terminal ledger row are already durable. A
-/// registry hiccup (a transient read/write error or a corrupt `0x09` row that `get_candidate`
-/// surfaces) must never regress the join or withhold the joined fed id from stdout; the update is
-/// ownership bookkeeping, not the money op — mirroring the best-effort `note_ledger` above it.
-fn note_candidate(result: anyhow::Result<()>) {
-    if let Err(e) = result {
-        eprintln!("note: candidate ownership update failed (join already durable): {e:?}");
-    }
-}
-
 /// Wall-clock unix millis for a caller-provided ledger timestamp (§9.4). Display material.
 fn cli_now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -2122,256 +2692,20 @@ fn cli_nonce() -> String {
     to_hex(&bytes)
 }
 
-/// Terminalize a raw op's pre-written ledger row `Failed` with `error`, then surface `error` —
-/// the synchronous-error path (§10.1): never leave the `Started` row for a repair to mislabel.
-async fn fail_raw_row(
-    journal: &FedimintJournal,
-    key: &IdempotencyKey,
-    error: anyhow::Error,
-) -> anyhow::Result<()> {
-    if let Err(e) = journal
-        .record_terminal(
-            key,
-            OperationStatus::Failed,
-            cli_now_ms(),
-            Some(&error.to_string()),
-            None,
-        )
-        .await
-    {
-        eprintln!("note: recording the failed ledger row failed: {e:?}");
-    }
-    Err(error)
-}
-
-fn op_id_upd(op: OperationId) -> RawOpUpdate {
-    RawOpUpdate {
-        op_id: Some(op),
-        ..Default::default()
-    }
-}
-
-fn receive_fee_upd(fee: Msat) -> RawOpUpdate {
-    RawOpUpdate {
-        fees: Some(FeeBreakdown {
-            receive_fee: Some(fee),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
-}
-
-fn pay_parse_upd(
-    amount: Option<Msat>,
-    payment_hash: [u8; 32],
-    send_fee: Option<Msat>,
-) -> RawOpUpdate {
-    RawOpUpdate {
-        invoice_amount: amount,
-        payment_hash: Some(payment_hash),
-        fees: send_fee.map(|f| FeeBreakdown {
-            send_fee_quoted: Some(f),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
-}
-
-/// Pre-call receive-fee estimate (§9.3): the gateway deduction on the invoiced amount plus the
-/// fed claim fee on the post-gateway contract, quoted against a concrete gateway. Best-effort —
-/// any quote failure degrades to `None` (never blocks the receive; the definitive value
-/// backfills at settlement).
-async fn estimate_receive_fee(
-    mc: &MultiClient,
-    id: &FederationId,
-    amount: Msat,
-    sdk_gateway: Option<GatewayUrl>,
-) -> Option<Msat> {
-    let gateway = estimate_gateway(mc, id, sdk_gateway).await?;
-    let gateway_deduction = mc.receive_gateway_fee(id, &gateway).await.ok()?.on(amount);
-    let contract = Msat(amount.0.saturating_sub(gateway_deduction.0));
-    let fed_fee = mc.receive_fee_quote(id, contract).await.ok()?;
-    Some(Msat(gateway_deduction.0.saturating_add(fed_fee.0)))
-}
-
-/// Pre-call send-fee estimate (§9.3): the gateway send fee on the invoice plus the fed send-tx
-/// fee on the funded contract, quoted against a concrete gateway. Best-effort (degrades to
-/// `None`; the exact value backfills from the op-log contract at settlement).
-async fn estimate_send_fee(
-    mc: &MultiClient,
-    id: &FederationId,
-    invoice: &Invoice,
-    sdk_gateway: Option<GatewayUrl>,
-) -> Option<Msat> {
-    let amount = parse_invoice(invoice).ok()?.amount?;
-    let gateway = estimate_gateway(mc, id, sdk_gateway).await?;
-    let gateway_quote = mc
-        .send_gateway_fee(id, &gateway, invoice)
-        .await
-        .ok()?
-        .on(amount);
-    let contract = Msat(amount.0.saturating_add(gateway_quote.0));
-    let fed_fee = mc.send_fee_quote_for_amount(id, contract).await.ok()?;
-    Some(Msat(gateway_quote.0.saturating_add(fed_fee.0)))
-}
-
-/// The concrete gateway to quote a raw-op fee ESTIMATE against: the explicit `--gateway` if
-/// given, else the fed's first registered gateway; `None` when none is available (the estimate
-/// then degrades to a blank fee — the definitive value backfills at settlement, §9.3). The
-/// actual auto-selected gateway is unknown pre-call, so the row's `gateway` field stays `None`.
-async fn estimate_gateway(
-    mc: &MultiClient,
-    id: &FederationId,
-    sdk_gateway: Option<GatewayUrl>,
-) -> Option<GatewayUrl> {
-    match sdk_gateway {
-        Some(gateway) => Some(gateway),
-        None => mc.gateways(id).await.ok()?.into_iter().next(),
-    }
-}
-
-/// The definitive settlement enrichment for a raw op (§9.3 backfill), read from its op-log meta
-/// via the repair oracle. On failure the fees degrade to `None` (the op id is still recorded).
-async fn settlement_upd(mc: &MultiClient, id: &FederationId, op: OperationId) -> RawOpUpdate {
-    match mc.observe_op(*id, op).await {
-        Ok(obs) => RawOpUpdate {
-            op_id: Some(op),
-            gateway: obs.gateway,
-            invoice_amount: obs.invoice_amount,
-            payment_hash: obs.payment_hash,
-            fees: Some(obs.fees),
-            // Definitive iff the op is TERMINAL: settlement fees then replace any pre-call
-            // estimate outright (even with `None`) so a terminal row never freezes an
-            // estimate as an observed cost.
-            fees_definitive: obs.terminal.is_some(),
-        },
-        Err(e) => {
-            eprintln!(
-                "note: could not read settlement fees for {}: {e:?}",
-                to_hex(&op.0)
-            );
-            op_id_upd(op)
-        }
-    }
-}
-
-/// Whether an `await-*` `--key` names a `send` (`pay:`) or a `receive` (`recv:`) row.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AwaitRole {
-    Send,
-    Receive,
-}
-
-/// Verify a `--key`-named ledger row is the one this `await-*` op belongs to before a terminal
-/// write (§10.1). A terminal ledger row is IMMUTABLE, so a `--key` naming an UNRELATED row (wrong
-/// verb, wrong federation, or a different in-flight op) would permanently corrupt that row's
-/// history — refuse instead. Returns `Ok(true)` for a BLANK row (op id not yet recorded — the
-/// crash-before-`record_update` window): the caller must then prove via the op-log's
-/// `correlation_key` meta that the awaited op really is this row's before terminalizing —
-/// a blank row of the same kind/federation could belong to a DIFFERENT attempt.
-fn awaited_row_matches(
-    row: &OperationRecord,
-    role: AwaitRole,
-    id: &FederationId,
-    op: OperationId,
-) -> Result<bool, String> {
-    let (row_fed, row_op) = match (&row.kind, role) {
-        (OperationKind::Pay { fed, op_id, .. }, AwaitRole::Send) => (fed, op_id),
-        (OperationKind::Receive { fed, op_id, .. }, AwaitRole::Receive) => (fed, op_id),
-        _ => return Err("its kind is not the awaited pay/receive operation".to_owned()),
-    };
-    if row_fed != id {
-        return Err("it belongs to a different federation".to_owned());
-    }
-    match row_op {
-        Some(existing) if *existing != op => {
-            Err("it already tracks a different operation".to_owned())
-        }
-        Some(_) => Ok(false),
-        None => Ok(true),
-    }
-}
-
-/// Advance the `--key` ledger row to its terminal state after an `await-*` (§10.1), carrying
-/// the definitive settlement enrichment. Auxiliary — a recording fault is logged, not fatal.
-async fn terminalize_awaited(
-    journal: &FedimintJournal,
-    mc: &MultiClient,
-    id: &FederationId,
-    op: OperationId,
-    key: &str,
-    role: AwaitRole,
-    outcome: (OperationStatus, Option<String>),
-) {
-    let (status, error) = outcome;
-    let key = IdempotencyKey(key.to_owned());
-    // Guard against a mistyped/mismatched `--key`: a terminal row cannot be un-written, so verify
-    // the row is this op's before touching it (§10.1). A missing row is a no-op anyway.
-    match journal.operation(&OperationRef::Key(key.clone())).await {
-        Ok(Some(row)) => {
-            match awaited_row_matches(&row, role, id, op) {
-                Err(why) => {
-                    eprintln!(
-                        "note: --key {} does not match this operation ({why}); not recording",
-                        key.0
-                    );
-                    return;
-                }
-                // A BLANK row (op id never recorded) is only accepted when the op-log proves
-                // the awaited op was created under THIS correlation key — the pre-call meta
-                // embeds it, so a genuine crash-before-`record_update` attempt matches. A
-                // deduped retry (the op carries another attempt's key) or a wrong blank row
-                // is refused and left to reconcile's hash-dedup repair, which records the
-                // attribution ambiguity honestly instead of silently mis-attaching history.
-                Ok(true) => match mc.find_op_by_correlation_key(*id, &key).await {
-                    Ok(Some(found)) if found == op => {}
-                    Ok(_) => {
-                        eprintln!(
-                            "note: --key {} has no recorded op id and the op-log does not tie \
-                             this operation to it; not recording (reconcile repairs it)",
-                            key.0
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "note: could not verify --key {} against the op-log: {e:?}; \
-                             not recording",
-                            key.0
-                        );
-                        return;
-                    }
-                },
-                Ok(false) => {}
-            }
-        }
-        Ok(None) => {
-            eprintln!("note: no ledger row for --key {}; not recording", key.0);
-            return;
-        }
-        Err(e) => {
-            eprintln!(
-                "note: could not read the ledger row for --key {}: {e:?}",
-                key.0
-            );
-            return;
-        }
-    }
-    let upd = settlement_upd(mc, id, op).await;
-    if let Err(e) = journal
-        .record_terminal(&key, status, cli_now_ms(), error.as_deref(), Some(upd))
-        .await
-    {
-        eprintln!("note: recording the terminal ledger row failed: {e:?}");
-    }
-}
-
 impl ActorFilter {
     fn matches(self, actor: Actor) -> bool {
         matches!(
             (self, actor),
             (ActorFilter::User, Actor::User) | (ActorFilter::Agent, Actor::Agent { .. })
         )
+    }
+
+    /// Match a wire `OperationView.actor` tag (`"user"` / `"agent:<n>"`), for client-mode filtering.
+    pub(crate) fn matches_actor_tag(self, tag: &str) -> bool {
+        match self {
+            ActorFilter::User => tag == "user",
+            ActorFilter::Agent => tag.starts_with("agent"),
+        }
     }
 }
 
@@ -2383,6 +2717,17 @@ impl StatusFilter {
                 | (StatusFilter::Awaiting, OperationStatus::Awaiting)
                 | (StatusFilter::Succeeded, OperationStatus::Succeeded)
                 | (StatusFilter::Failed, OperationStatus::Failed)
+        )
+    }
+
+    /// Match a wire `OperationStatusDto`, for client-mode filtering.
+    pub(crate) fn matches_status_dto(self, status: OperationStatusDto) -> bool {
+        matches!(
+            (self, status),
+            (StatusFilter::Started, OperationStatusDto::Started)
+                | (StatusFilter::Awaiting, OperationStatusDto::Awaiting)
+                | (StatusFilter::Succeeded, OperationStatusDto::Succeeded)
+                | (StatusFilter::Failed, OperationStatusDto::Failed)
         )
     }
 }
@@ -2400,12 +2745,22 @@ impl CandidateStateArg {
                 | (CandidateStateArg::Rejected, CandidateState::Rejected)
         )
     }
+
+    /// The lowercase tag matching a wire `CandidateView.state`, for client-mode filtering.
+    pub(crate) fn tag(self) -> &'static str {
+        match self {
+            CandidateStateArg::Discovered => "discovered",
+            CandidateStateArg::Autojoined => "autojoined",
+            CandidateStateArg::Userapproved => "userapproved",
+            CandidateStateArg::Rejected => "rejected",
+        }
+    }
 }
 
 /// Whether a record involves `fed` (for `history --fed`): a `Move` matches either endpoint.
 fn record_involves_fed(record: &OperationRecord, fed: FederationId) -> bool {
     match &record.kind {
-        OperationKind::Join { fed: f } | OperationKind::Refusal { fed: f } => *f == fed,
+        OperationKind::Join { fed: f } | OperationKind::Refusal { fed: f, .. } => *f == fed,
         OperationKind::Receive { fed: f, .. } | OperationKind::Pay { fed: f, .. } => *f == fed,
         OperationKind::DirectInflow { to, .. } => *to == fed,
         OperationKind::Move { from, to, .. } => *from == fed || *to == fed,
@@ -2460,10 +2815,46 @@ fn print_show_record(r: &OperationRecord) {
     println!("error: {}", r.error.as_deref().unwrap_or("-"));
 }
 
+/// Print the recorded refusal arithmetic (§9.3), one line per figure the deciding site
+/// computed. Shared by the standalone `show` (over an `OperationRecord`) and the client `show`
+/// (over an `OperationView.refusal`) so both diagnose a refusal identically.
+pub(crate) fn print_refusal_diagnostics(diagnostics: &RefusalDiagnostics) {
+    if let Some(v) = diagnostics.source {
+        println!("source: {}", v.to_hex());
+    }
+    if let Some(v) = diagnostics.want {
+        println!("want_msat: {}", v.0);
+    }
+    if let Some(v) = diagnostics.available {
+        println!("available_msat: {}", v.0);
+    }
+    if let Some(v) = diagnostics.source_spendable {
+        println!("source_spendable_msat: {}", v.0);
+    }
+    if let Some(v) = diagnostics.max_fee {
+        println!("max_fee_msat: {}", v.0);
+    }
+    if let Some(v) = diagnostics.cap_room {
+        println!("cap_room_msat: {}", v.0);
+    }
+    if let Some(v) = diagnostics.amount {
+        // Distinct label: the row's headline `amount_msat` is `-` for a refusal (no operation
+        // amount), so a second `amount_msat` here would be a conflicting duplicate key.
+        println!("decision_amount_msat: {}", v.0);
+    }
+    if let Some(v) = diagnostics.min_move {
+        println!("min_move_msat: {}", v.0);
+    }
+}
+
 fn print_kind_details(kind: &OperationKind) {
     match kind {
-        OperationKind::Join { fed } | OperationKind::Refusal { fed } => {
+        OperationKind::Join { fed } => {
             println!("fed: {}", fed.to_hex())
+        }
+        OperationKind::Refusal { fed, diagnostics } => {
+            println!("fed: {}", fed.to_hex());
+            print_refusal_diagnostics(diagnostics);
         }
         OperationKind::Receive { op_id, gateway, .. } => {
             println!("op_id: {}", opt_op(op_id));
@@ -2663,6 +3054,18 @@ fn reason_tag(reason: ReasonCode) -> &'static str {
     }
 }
 
+/// A stable, lowercase label for an intent status (never the `Debug`-rendered `Some(..)` wrapper).
+fn status_label(status: Option<IntentStatus>) -> &'static str {
+    match status {
+        Some(IntentStatus::Pending) => "pending",
+        Some(IntentStatus::Executing) => "executing",
+        Some(IntentStatus::Awaiting) => "awaiting",
+        Some(IntentStatus::Done) => "done",
+        Some(IntentStatus::Failed) => "failed",
+        None => "unknown",
+    }
+}
+
 fn intent_status_tag(status: IntentStatus) -> &'static str {
     status_label(Some(status))
 }
@@ -2731,6 +3134,7 @@ fn gate_policy_override(flags: &PolicyFlags) -> Option<wallet_core::ProbePolicy>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wallet_core::FeeBreakdown;
     use wallet_fedimint::DiscoverPassProgress;
 
     #[test]
@@ -2786,70 +3190,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_join_marks_candidate_user_approved() -> anyhow::Result<()> {
-        use fedimint_core::db::mem_impl::MemDatabase;
-        use fedimint_core::db::IRawDatabaseExt as _;
-
-        let journal = FedimintJournal::new(MemDatabase::new().into_database());
-        // §5.1.4a bullet 1: a user `join` grandfathers a `Discovered`/`Rejected` candidate to
-        // `UserApproved`. An `AutoJoined` candidate is left untouched here — promoting it is the
-        // `approve` verb's job (bullet 2 / 5.1b), which writes an `Approve` audit row; the
-        // no-ledger re-join fast path must not flip it silently.
-        for (byte, state, expected) in [
-            (0x20, CandidateState::Rejected, CandidateState::UserApproved),
-            (
-                0x21,
-                CandidateState::Discovered,
-                CandidateState::UserApproved,
-            ),
-            (0x22, CandidateState::AutoJoined, CandidateState::AutoJoined),
-        ] {
-            let id = fed(byte);
-            let original = test_candidate(id, state);
-            journal.put_candidate(&original).await.map_err(exec_err)?;
-
-            mark_candidate_user_approved(&journal, id, &original.invite, 1_700_000_000_300).await?;
-
-            let updated = journal
-                .get_candidate(&id)
-                .await
-                .map_err(exec_err)?
-                .expect("candidate remains present");
-            assert_eq!(updated.state, expected);
-            // A promoted row bumps `updated_at_ms`; the untouched `AutoJoined` row keeps its own.
-            let expected_updated_at_ms = if expected == CandidateState::UserApproved {
-                1_700_000_000_300
-            } else {
-                original.updated_at_ms
-            };
-            assert_eq!(updated.updated_at_ms, expected_updated_at_ms);
-            assert_eq!(updated.source, original.source);
-            assert_eq!(updated.invite, original.invite);
-            assert_eq!(updated.structural, original.structural);
-        }
-
-        let absent_id = fed(0x23);
-        let invite = test_invite();
-        mark_candidate_user_approved(&journal, absent_id, &invite, 1_700_000_000_400).await?;
-        let inserted = journal
-            .get_candidate(&absent_id)
-            .await
-            .map_err(exec_err)?
-            .expect("absent candidate is inserted");
-        assert_eq!(inserted.id, absent_id);
-        assert_eq!(inserted.invite, invite);
-        assert_eq!(inserted.source, wallet_core::DiscoverySource::Manual);
-        assert_eq!(
-            inserted.structural,
-            wallet_fedimint::StructuralOutcome::Passed
-        );
-        assert_eq!(inserted.structural_checked_at_ms, 1_700_000_000_400);
-        assert_eq!(inserted.state, CandidateState::UserApproved);
-        assert_eq!(inserted.updated_at_ms, 1_700_000_000_400);
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn approve_flips_autojoined_candidate_and_writes_ledger() -> anyhow::Result<()> {
         use fedimint_core::db::mem_impl::MemDatabase;
         use fedimint_core::db::IRawDatabaseExt as _;
@@ -2861,7 +3201,9 @@ mod tests {
             .await
             .map_err(exec_err)?;
 
-        let key = approve_candidate(&journal, id, 1_700_000_001_000, "abc").await?;
+        let key = approve_candidate(&journal, id, 1_700_000_001_000, "abc")
+            .await
+            .map_err(exec_err)?;
 
         let updated = journal
             .get_candidate(&id)
@@ -2899,7 +3241,13 @@ mod tests {
             .await
             .expect_err("non-AutoJoined candidates are refused");
 
-        assert!(err.to_string().contains("not AutoJoined"), "{err}");
+        assert!(
+            matches!(
+                &err,
+                wallet_core::ExecError::Permanent(message) if message.contains("not AutoJoined")
+            ),
+            "{err:?}"
+        );
         let unchanged = journal
             .get_candidate(&id)
             .await
@@ -2914,6 +3262,11 @@ mod tests {
             .await
             .map_err(exec_err)?
             .is_none());
+
+        let cli_error = run_approve(&journal, id.to_hex())
+            .await
+            .expect_err("standalone approval preserves the refused exit category");
+        assert_eq!(cli_error.code(), 2);
         Ok(())
     }
 
@@ -3092,69 +3445,6 @@ mod tests {
         assert_eq!(select_fed(&[a], &[a], None).unwrap(), a);
     }
 
-    #[test]
-    fn failed_direct_inflow_missing_invoice_message_does_not_suggest_reconcile_retry() {
-        let key = IdempotencyKey("direct-inflow:test:0".into());
-        let msg = missing_direct_inflow_invoice_message(&key, Some(IntentStatus::Failed));
-
-        assert!(msg.contains("terminal"), "{msg}");
-        assert!(msg.contains("new --occurrence"), "{msg}");
-        assert!(!msg.contains("run reconcile"), "{msg}");
-        assert!(!msg.contains("retry direct-inflow"), "{msg}");
-    }
-
-    #[test]
-    fn pending_direct_inflow_missing_invoice_message_is_retryable() {
-        let key = IdempotencyKey("direct-inflow:test:0".into());
-        let msg = missing_direct_inflow_invoice_message(&key, Some(IntentStatus::Pending));
-
-        assert!(msg.contains("same --occurrence"), "{msg}");
-        assert!(msg.contains("run reconcile"), "{msg}");
-    }
-
-    #[test]
-    fn only_awaiting_or_done_direct_inflow_surfaces_the_invoice() {
-        // Payable now, or an idempotent post-settlement re-run (same invoice, no second mint).
-        assert!(direct_inflow_surfaces_invoice(Some(IntentStatus::Awaiting)));
-        assert!(direct_inflow_surfaces_invoice(Some(IntentStatus::Done)));
-        // A terminal Failed intent keeps a DEAD invoice: it must NEVER be surfaced as the
-        // scriptable stdout result (a scripted `INV=$(direct-inflow …)` must not get a dead
-        // BOLT11 with exit 0). Pending/Executing/absent have nothing payable to surface.
-        assert!(!direct_inflow_surfaces_invoice(Some(IntentStatus::Failed)));
-        assert!(!direct_inflow_surfaces_invoice(Some(IntentStatus::Pending)));
-        assert!(!direct_inflow_surfaces_invoice(Some(
-            IntentStatus::Executing
-        )));
-        assert!(!direct_inflow_surfaces_invoice(None));
-    }
-
-    #[test]
-    fn move_failure_reason_prefers_the_recorded_outcome() {
-        // A `Permanent` move failure records its cause on the MoveRecord; the CLI surfaces it
-        // verbatim rather than a generic status line.
-        let recorded = MoveOutcome {
-            key: IdempotencyKey("move:aa:bb:0".into()),
-            status: Some(IntentStatus::Failed),
-            outcome: Some("fee over cap".into()),
-        };
-        assert_eq!(move_failure_reason(&recorded), "fee over cap");
-    }
-
-    #[test]
-    fn move_failure_reason_points_a_pending_move_at_the_re_drive_paths() {
-        // A transient fault leaves the move `Pending` with no recorded outcome: the message must
-        // tell the operator it is re-drivable (reconcile / same-occurrence re-run), not terminal.
-        let pending = MoveOutcome {
-            key: IdempotencyKey("move:aa:bb:0".into()),
-            status: Some(IntentStatus::Pending),
-            outcome: None,
-        };
-        let msg = move_failure_reason(&pending);
-        assert!(msg.contains("re-drivable"), "{msg}");
-        assert!(msg.contains("reconcile"), "{msg}");
-        assert!(msg.contains("--occurrence"), "{msg}");
-    }
-
     fn policy_flags_with_designation(
         spending: Option<String>,
         standby: Option<String>,
@@ -3172,7 +3462,8 @@ mod tests {
         // diagnostic, matching `move`'s `from == to` stance.
         let a = fed(1);
         let flags = policy_flags_with_designation(Some(a.to_hex()), Some(a.to_hex()));
-        let err = build_tick_policy(&flags, &[a], &[a]).expect_err("equal pin must be rejected");
+        let err = build_tick_policy(&Policy::default(), &flags, &[a], &[a])
+            .expect_err("equal pin must be rejected");
         assert!(
             err.to_string().contains("must be different federations"),
             "{err}"
@@ -3186,9 +3477,67 @@ mod tests {
         let a = fed(1);
         let b = fed(2);
         let flags = policy_flags_with_designation(Some(a.to_hex()), None);
-        let policy = build_tick_policy(&flags, &[a, b], &[a, b]).expect("single pin is valid");
+        let policy = build_tick_policy(&Policy::default(), &flags, &[a, b], &[a, b])
+            .expect("single pin is valid");
         assert_eq!(policy.spending_fed, Some(a));
         assert_eq!(policy.standby_fed, None);
+    }
+
+    #[tokio::test]
+    async fn standalone_tick_reads_stored_policy_then_layers_flags() -> anyhow::Result<()> {
+        use fedimint_core::db::mem_impl::MemDatabase;
+        use fedimint_core::db::IRawDatabaseExt as _;
+
+        let a = fed(1);
+        let b = fed(2);
+        let stored = Policy {
+            per_fed_cap: Msat(9_000_000),
+            spending_target: Msat(4_000_000),
+            standby_target: Msat(2_000_000),
+            max_fee: Msat(90_000),
+            spending_fed: Some(a),
+            standby_fed: Some(b),
+            probe_min_span_secs: 123,
+            probe_min_successes: 7,
+            probe_ttl_secs: 456,
+            probe_amount: Msat(33_000),
+            ..Policy::default()
+        };
+        let journal = FedimintJournal::new(MemDatabase::new().into_database());
+        journal.put_policy(&stored).await.map_err(exec_err)?;
+
+        let flags = PolicyFlags {
+            max_fee: Some(12_000),
+            occurrence: 8,
+            ..PolicyFlags::default()
+        };
+        let policy = build_standalone_tick_policy(&journal, &flags, &[a, b], &[a, b])
+            .await
+            .expect("stored policy with one invocation override is valid");
+
+        assert_eq!(policy.per_fed_cap, stored.per_fed_cap);
+        assert_eq!(policy.target_spending_balance, stored.spending_target);
+        assert_eq!(policy.standby_target, stored.standby_target);
+        assert_eq!(policy.max_fee, Msat(12_000));
+        assert_eq!(policy.spending_fed, Some(a));
+        assert_eq!(policy.standby_fed, Some(b));
+        assert_eq!(policy.occurrence, Occurrence(8));
+        assert_eq!(policy.probe_gate_policy.min_span_ms, 123_000);
+        assert_eq!(policy.probe_gate_policy.min_successes, 7);
+        assert_eq!(policy.probe_gate_policy.ttl_ms, 456_000);
+        assert_eq!(policy.probe_gate_policy.amount_msat, 33_000);
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_service_faults_match_client_transport_exit() {
+        for error in [
+            ServiceError::Storage("read fault".to_owned()),
+            ServiceError::ShuttingDown,
+            ServiceError::ActorStopped,
+        ] {
+            assert_eq!(service_err_to_exit(error).code(), 4);
+        }
     }
 
     #[test]
@@ -3271,28 +3620,6 @@ mod tests {
         );
         // `--allow-over-cap` -> None (an explicit override, cap disabled).
         assert_eq!(operator_hard_cap(true), None);
-    }
-
-    #[test]
-    fn reconcile_hard_cap_can_restate_the_original_resume_policy() {
-        // Default reconcile still enforces ADR-0018 on pre-mint resumes.
-        assert_eq!(
-            reconcile_hard_cap(None, false).expect("default cap"),
-            Some(TickPolicy::default().per_fed_cap)
-        );
-        // Work created by `tick --per-fed-cap` can be resumed under the same cap.
-        assert_eq!(
-            reconcile_hard_cap(Some(42), false).expect("custom cap"),
-            Some(Msat(42))
-        );
-        // Work created by an operator `--allow-over-cap` verb can be resumed without a cap.
-        assert_eq!(
-            reconcile_hard_cap(None, true).expect("allow over cap"),
-            None
-        );
-        // The two policies are intentionally exclusive: one sets a cap, the other disables it.
-        let err = reconcile_hard_cap(Some(42), true).expect_err("conflicting cap flags");
-        assert!(err.to_string().contains("mutually exclusive"), "{err}");
     }
 
     #[test]
@@ -3396,7 +3723,10 @@ mod tests {
         };
         assert_eq!(kind_and_amount(&evac), ("evacuation", Some(Msat(40_000))));
         assert_eq!(
-            kind_and_amount(&OperationKind::Refusal { fed: fed(1) }),
+            kind_and_amount(&OperationKind::Refusal {
+                fed: fed(1),
+                diagnostics: Default::default()
+            }),
             ("refusal", None)
         );
         assert_eq!(
@@ -3494,65 +3824,6 @@ mod tests {
             OperationStatus::Succeeded,
         );
         assert!(!record_involves_fed(&autojoin, fed(1)));
-    }
-
-    fn op(byte: u8) -> OperationId {
-        OperationId([byte; 32])
-    }
-
-    fn pay_row(fed_id: FederationId, op_id: Option<OperationId>) -> OperationRecord {
-        ledger_record(
-            OperationKind::Pay {
-                fed: fed_id,
-                invoice_amount: None,
-                payment_hash: None,
-                op_id,
-                gateway: None,
-            },
-            Actor::User,
-            OperationStatus::Awaiting,
-        )
-    }
-
-    #[test]
-    fn awaited_row_matches_accepts_the_awaited_pay_row() {
-        // No op id yet (crash before the op-id update): accepted as BLANK — the caller must
-        // then prove the correlation via the op-log meta before terminalizing (§10.1).
-        assert_eq!(
-            awaited_row_matches(&pay_row(fed(1), None), AwaitRole::Send, &fed(1), op(7)),
-            Ok(true)
-        );
-        // Op id present and equal → accepted outright (not blank).
-        assert_eq!(
-            awaited_row_matches(
-                &pay_row(fed(1), Some(op(7))),
-                AwaitRole::Send,
-                &fed(1),
-                op(7)
-            ),
-            Ok(false)
-        );
-    }
-
-    #[test]
-    fn awaited_row_matches_rejects_a_mismatched_key() {
-        // Wrong verb: a pay row cannot be terminalized by an `await-receive --key`.
-        assert!(
-            awaited_row_matches(&pay_row(fed(1), None), AwaitRole::Receive, &fed(1), op(7))
-                .is_err()
-        );
-        // Wrong federation: a valid key from another fed must not corrupt this row.
-        assert!(
-            awaited_row_matches(&pay_row(fed(2), None), AwaitRole::Send, &fed(1), op(7)).is_err()
-        );
-        // A different in-flight op already recorded on the row.
-        assert!(awaited_row_matches(
-            &pay_row(fed(1), Some(op(9))),
-            AwaitRole::Send,
-            &fed(1),
-            op(7)
-        )
-        .is_err());
     }
 
     fn probe_session_from(source: FederationId) -> wallet_fedimint::ProbeSession {

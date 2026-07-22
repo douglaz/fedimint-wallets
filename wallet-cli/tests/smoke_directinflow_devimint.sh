@@ -33,7 +33,8 @@
 # it is a distinct client; the inflow flows from the funded client through the shared LDK gateway.
 #
 # IMPORTANT: the lnv2 gateway is NOT auto-registered into the federation's vetted list (runbook
-# §4), so EVERY lnv2 call passes `--gateway "$GW"` explicitly (direct-inflow REQUIRES it here).
+# §4), so the external `fedimint-cli` payment pins `--gateway "$GW"`; wallet-cli's operational
+# verbs use the engine's gateway selection and no longer expose a per-call gateway flag.
 #
 # The EXACT-net gate: devimint zeroes only the gateway's LIGHTNING routing fee
 # (FM_DEFAULT_ROUTING_FEES=0,0), NOT its TRANSACTION fee — so the gateway's lnv2 receive_fee is
@@ -43,13 +44,13 @@
 # tx fee, and nets EXACTLY the target. That EXACT equality is what this asserts.
 #
 # Flow (RELIABLE await-send-first pattern, per smoke_money_devimint.sh + the runbook):
-#   direct-inflow --to FED --amount N --gateway GW   -> invoice INV_A (+ intent key KEY on stderr)
+#   direct-inflow --to FED --amount N                -> invoice INV_A (+ operation key on stderr)
 #   fedimint-cli module lnv2 send INV_A --gateway GW  (funded client pays; gateway swaps in)
 #   fedimint-cli module lnv2 await-send SEND_A        (await the send FIRST -> contract funded)
 #   wallet-cli await-move KEY                         -> done  (recv_op subscription finalizes)
 #   wallet-cli balance                                -> EXACTLY N
 #   direct-inflow (same args) -> SAME invoice, balance still N  (idempotent: no second mint)
-#   reconcile -> awaiting=0, balance still N
+#   reconcile -> redriven=0, balance still N
 set -euo pipefail
 
 : "${FM_INVITE_CODE:?FM_INVITE_CODE not set — run this inside \`devimint dev-fed --exec\`}"
@@ -71,28 +72,36 @@ DI_ERR="$(mktemp)"
 DI2_ERR="$(mktemp)"
 trap 'rm -rf "$DATA_DIR" "$DI_ERR" "$DI2_ERR"' EXIT
 
-wcli() { "$WALLET_CLI" --data-dir "$DATA_DIR" "$@"; }
+wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" --gateway "$GW" "$@"; }
+join_fed() {
+  local started key state
+  started=$(wcli join "$1") || return
+  key=${started#* }
+  state=$(wcli await-move "$key") || return
+  [[ "$state" == "done" ]] || { echo "join $key did not settle: $state" >&2; return 1; }
+  cut -d: -f2 <<<"$key"
+}
 balance_msat_for_fed() {
   local fed_id="$1"
   wcli balance | awk -v id="$fed_id" '$1 == id ":" && $3 == "msat" { print $2; exit }'
 }
 
 echo "== join =="
-FED_ID=$(wcli join "$FM_INVITE_CODE")
+FED_ID=$(join_fed "$FM_INVITE_CODE")
 echo "joined federation: $FED_ID"
 
 # ---------------------------------------------------------------------------------------
 echo "== DIRECT-INFLOW: route ${INFLOW_MSAT} msat to our wallet via the executor =="
-# Invoice -> stdout; "intent_key: <key>" + "status: ..." -> stderr (captured to $DI_ERR).
-INV_A=$(wcli direct-inflow --to "$FED_ID" --amount "$INFLOW_MSAT" --gateway "$GW" 2>"$DI_ERR")
-KEY=$(sed -n 's/^intent_key: //p' "$DI_ERR")
+# Invoice -> stdout; "key: <operation key>" -> stderr (captured to $DI_ERR).
+INV_A=$(wcli direct-inflow --to "$FED_ID" --amount "$INFLOW_MSAT" 2>"$DI_ERR")
+KEY=$(sed -n 's/^key: //p' "$DI_ERR")
 if [[ -z "$INV_A" || -z "$KEY" ]]; then
-  echo "FAIL: direct-inflow did not yield an invoice (stdout) and an intent key (stderr):" >&2
+  echo "FAIL: direct-inflow did not yield an invoice (stdout) and an operation key (stderr):" >&2
   echo "  invoice=$INV_A" >&2; echo "  --- direct-inflow stderr ---" >&2; cat "$DI_ERR" >&2
   exit 1
 fi
 echo "invoice: $INV_A"
-echo "intent key: $KEY"
+echo "operation key: $KEY"
 
 # devimint's funded client pays the invoice; the LDK gateway direct-swaps it into our wallet.
 # IMPORTANT (devimint investigation): await the payer's SEND to Success FIRST. lnv2's internal
@@ -135,9 +144,9 @@ fi
 
 # ---------------------------------------------------------------------------------------
 echo "== IDEMPOTENCY: re-running direct-inflow must NOT mint a second invoice =="
-# Same (to, amount, default fee_cap, occurrence) -> same intent key -> apply SKIPS the drive and
+# Same (to, amount, default nonce) -> same operation key -> apply SKIPS the drive and
 # surfaces the already-minted invoice from the journal. The invoice string must be identical.
-INV_A2=$(wcli direct-inflow --to "$FED_ID" --amount "$INFLOW_MSAT" --gateway "$GW" 2>"$DI2_ERR")
+INV_A2=$(wcli direct-inflow --to "$FED_ID" --amount "$INFLOW_MSAT" 2>"$DI2_ERR")
 echo "re-run invoice: $INV_A2"
 if [[ "$INV_A2" != "$INV_A" ]]; then
   echo "FAIL: re-run minted a DIFFERENT invoice (expected the same, no second mint):" >&2
@@ -159,8 +168,8 @@ echo "-- reconcile: a Done inflow must not be re-driven or re-minted --"
 RECONCILE_OUT=$(wcli reconcile)
 echo "reconcile: $RECONCILE_OUT"
 case "$RECONCILE_OUT" in
-  *"awaiting=0"*) : ;;
-  *) echo "FAIL: expected reconcile to report 'awaiting=0', got '$RECONCILE_OUT'" >&2; exit 1 ;;
+  *"redriven=0"*) : ;;  # summary format changed in phase 6a step 3 (redriven=, was awaiting=)
+  *) echo "FAIL: expected reconcile to report 'redriven=0', got '$RECONCILE_OUT'" >&2; exit 1 ;;
 esac
 BAL_RECONCILE=$(balance_msat_for_fed "$FED_ID")
 if (( BAL_RECONCILE != BAL_AFTER )); then

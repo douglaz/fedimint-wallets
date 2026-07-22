@@ -17,6 +17,10 @@
 /target-review
 # stray build artifacts sometimes emitted at the repo root
 /test
+/move_index
 # wallet-cli local data dir (RocksDB + mnemonic) when run by hand
 /.wallet-cli-data/
 .rb-lite/
+# isolated target dir for dependency-bump validation (keeps target-nix binaries
+# untouched while a soak/smoke runs from them)
+/target-pinbump

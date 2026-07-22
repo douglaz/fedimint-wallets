@@ -16,7 +16,7 @@ macro_rules! fed {
     ($id:expr, $balance:expr, $probed:expr, $reputation:expr, $shutdown:expr, $healthy:expr, $elig:expr) => { FederationStatus { id: id!($id), balance: balance!($balance), probed_ok: $probed, reputation: $reputation, shutdown_notice: $shutdown, healthy: $healthy, eligible_to_fund: $elig } };
 }
 macro_rules! snap {
-    ([$($fed:expr),*], $spending:expr, $standby:expr, $cap:expr, $target:expr, $standby_target:expr, $now:expr) => { AllocatorSnapshot { federations: vec![$($fed),*], spending_fed: $spending, standby_fed: $standby, per_fed_cap: msat!($cap), target_spending_balance: msat!($target), standby_target: msat!($standby_target), max_fee: msat!(500), now: $now } };
+    ([$($fed:expr),*], $spending:expr, $standby:expr, $cap:expr, $target:expr, $standby_target:expr, $now:expr) => { AllocatorSnapshot { federations: vec![$($fed),*], spending_fed: $spending, standby_fed: $standby, per_fed_cap: msat!($cap), target_spending_balance: msat!($target), standby_target: msat!($standby_target), max_fee: msat!(500), min_move: Msat(0), reservations: Reservations::default(), now: $now } };
 }
 macro_rules! decision {
     ($action:expr, $reason:expr, $occurrence:expr, $key:expr) => { vec![AllocatorDecision { action: $action, reason: $reason, occurrence: $occurrence, idempotency_key: $key }] };
@@ -28,7 +28,11 @@ macro_rules! evacuate {
     ($from:expr, $to:expr, $amount:expr) => { Action::Evacuate { from: id!($from), to: id!($to), amount: msat!($amount), fee_cap: msat!(500) } };
 }
 macro_rules! refuse {
-    ($fed:expr, $reason:expr) => { Action::RefuseInflow { fed: id!($fed), reason: $reason } };
+    // `diagnostics` is intentionally omitted from the expected value: `RefusalDiagnostics`
+    // compares equal always (it is observational metadata), so these goldens assert the
+    // DECISION — which fed, which reason — not the incidental figures. The figures are
+    // covered by the `refusal_*` content tests below.
+    ($fed:expr, $reason:expr) => { Action::RefuseInflow { fed: id!($fed), reason: $reason, diagnostics: RefusalDiagnostics::default() } };
 }
 
 fn occ(n: u64) -> Occurrence { Occurrence(n) }
@@ -81,6 +85,37 @@ fn self_fund_standby_is_silent_noop() {
 }
 
 #[test]
+fn sub_floor_standby_shortfall_is_silent_dust() {
+    // Standby 96_000 vs target 100_000: the 4_000 shortfall is below the 5_000 protocol
+    // move floor (lnv2's minimum incoming contract) — effectively AT target. The 24h soak
+    // logged 91 doomed sub-minimum moves retried every tick before this floor existed.
+    // Silent like the self-fund no-op: no move, no refusal.
+    let mut snapshot = snap!([fed!(1, 200_000, true, false, true), fed!(2, 96_000, true, false, true)], Some(id!(1)), Some(id!(2)), 500_000, 50_000, 100_000, 2600);
+    snapshot.min_move = Msat(5_000);
+    assert!(decide(&snapshot, occ(1)).is_empty());
+}
+
+#[test]
+fn floor_does_not_block_a_real_shortfall() {
+    // Same shape with a 6_000 shortfall (>= the floor): the move is emitted exactly as
+    // without the floor.
+    let mut snapshot = snap!([fed!(1, 200_000, true, false, true), fed!(2, 94_000, true, false, true)], Some(id!(1)), Some(id!(2)), 500_000, 50_000, 100_000, 2700);
+    snapshot.min_move = Msat(5_000);
+    assert_eq!(decide(&snapshot, occ(1)), decision!(move_action!(1, 2, 6_000), ReasonCode::StandbyBelowTarget, occ(1), move_key(1, 2, 1)));
+}
+
+#[test]
+fn sub_floor_available_crumbs_skip_the_move_but_keep_the_refusal() {
+    // A REAL 50_000 shortfall, but the source's spendable surplus after its own target and
+    // the fee reservation is only 3_000 (53_500 - 50_000 - 500) — sub-floor crumbs that
+    // could only fail lnv2's minimum at perform time. No move; the shortfall refusal STILL
+    // records why the standby stays underfunded (unlike the dust case, this is actionable).
+    let mut snapshot = snap!([fed!(1, 53_500, true, false, true), fed!(2, 0, true, false, true)], Some(id!(1)), Some(id!(2)), 500_000, 50_000, 50_000, 2800);
+    snapshot.min_move = Msat(5_000);
+    assert_eq!(decide(&snapshot, occ(1)), decision!(refuse!(2, ReasonCode::StandbyBelowTarget), ReasonCode::StandbyBelowTarget, occ(1), refuse_key(2, ReasonCode::StandbyBelowTarget, 1)));
+}
+
+#[test]
 fn evacuate_on_shutdown_notice() {
     // fed 2 is the configured standby and is healthy/probed: `safest_other` picks it as
     // the evacuation destination. `amount` is the evacuating fed's FULL spendable (§4.2
@@ -124,6 +159,107 @@ fn low_reputation_blocks_receive() {
     // Negative reputation demotes below the receive floor: do not fund into it (ADR-0017).
     let snapshot = snap!([fed!(1, 20_000, true, -1, false, true), fed!(2, 80_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 60_000, 0, 7000);
     assert_eq!(decide(&snapshot, occ(1)), decision!(refuse!(1, ReasonCode::LowReputation), ReasonCode::LowReputation, occ(1), refuse_key(1, ReasonCode::LowReputation, 1)));
+}
+
+// The `refuse!` goldens above assert WHICH refusal (fed + reason), since `RefusalDiagnostics`
+// compares equal always. These two assert the recorded FIGURES directly — the diagnostic the
+// journal keeps so a refusal is reconstructible after a restart (the motivating case).
+fn first_refusal_diagnostics(decisions: &[AllocatorDecision]) -> RefusalDiagnostics {
+    decisions
+        .iter()
+        .find_map(|d| match &d.action {
+            Action::RefuseInflow { diagnostics, .. } => Some(*diagnostics),
+            _ => None,
+        })
+        .expect("a RefuseInflow decision")
+}
+
+#[test]
+fn refusal_records_the_full_shortfall_arithmetic() {
+    // fed 1 wants 50_000 to reach target, but cap_room (40_000) and then the source's
+    // available surplus (9_500 = source 10_000 − max_fee 500) each bind below it, so only
+    // 9_500 moves. The recorded figures — including the source fed and its raw spendable —
+    // let a reader recover exactly that chain without the live snapshot.
+    let snapshot = snap!([fed!(1, 60_000, true, false, true), fed!(2, 10_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 110_000, 0, 9100);
+    let diag = first_refusal_diagnostics(&decide(&snapshot, occ(1)));
+    assert_eq!(diag.source, Some(id!(2)));
+    assert_eq!(diag.want, Some(Msat(50_000)));
+    assert_eq!(diag.source_spendable, Some(Msat(10_000)));
+    assert_eq!(diag.max_fee, Some(Msat(500)));
+    assert_eq!(diag.available, Some(Msat(9_500)));
+    assert_eq!(diag.cap_room, Some(Msat(40_000)));
+    assert_eq!(diag.amount, Some(Msat(9_500)));
+    assert_eq!(diag.min_move, Some(Msat(0)));
+}
+
+#[test]
+fn refusal_with_no_usable_source_records_available_none() {
+    // The spending fed is below target but there is no standby to fund it. `available`,
+    // `source`, and `source_spendable` are all None — NOT Some(0) — the distinction between
+    // "no source" and "a source with no surplus". This is the exact ambiguity the motivating
+    // unreproducible refusal turned on. `max_fee` is still recorded (a snapshot constant).
+    let snapshot = snap!([fed!(1, 20_000, true, false, true)], Some(id!(1)), None, 100_000, 60_000, 0, 9200);
+    let diag = first_refusal_diagnostics(&decide(&snapshot, occ(1)));
+    assert_eq!(diag.want, Some(Msat(40_000)));
+    assert_eq!(diag.source, None);
+    assert_eq!(diag.source_spendable, None);
+    assert_eq!(diag.available, None);
+    assert_eq!(diag.max_fee, Some(Msat(500)));
+    assert_eq!(diag.amount, Some(Msat(0)));
+}
+
+#[test]
+fn receive_blocked_refusal_records_source_side_figures_only() {
+    // fed 1 (spending) is unprobed, so fund_into refuses at the receive-blocker gate BEFORE
+    // cap room / the amount are computed: those stay None, but the source-side figures (the
+    // standby fed 2, its 80_000 spendable, available 79_500 = 80_000 − max_fee 500) are known.
+    let snapshot = snap!([fed!(1, 10_000, false, 100, false, true), fed!(2, 80_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 60_000, 0, 9300);
+    let diag = first_refusal_diagnostics(&decide(&snapshot, occ(1)));
+    assert_eq!(diag.want, Some(Msat(50_000)));
+    assert_eq!(diag.source, Some(id!(2)));
+    assert_eq!(diag.source_spendable, Some(Msat(80_000)));
+    assert_eq!(diag.available, Some(Msat(79_500)));
+    assert_eq!(diag.max_fee, Some(Msat(500)));
+    assert_eq!(diag.cap_room, None);
+    assert_eq!(diag.amount, None);
+}
+
+#[test]
+fn evacuation_drained_source_refusal_records_source_figures_without_max_fee() {
+    // fed 1 has a shutdown notice but 0 spendable: `safest_other` guarantees the destination
+    // (fed 2) has cap room, so `amount == 0` means the SOURCE is drained. Record the source
+    // side; `max_fee` is None because an evacuation does not reserve the fee cap. The
+    // figure-blind goldens can't catch a regression here — this asserts the figures directly.
+    let snapshot = snap!([fed!(1, 0, true, true, true), fed!(2, 30_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 100_000, 0, 9900);
+    let diag = first_refusal_diagnostics(&decide(&snapshot, occ(1)));
+    assert_eq!(diag.source, Some(id!(1)));
+    assert_eq!(diag.available, Some(Msat(0)));
+    assert_eq!(diag.source_spendable, Some(Msat(0)));
+    assert_eq!(diag.cap_room, Some(Msat(70_000)));
+    assert_eq!(diag.amount, Some(Msat(0)));
+    assert_eq!(diag.max_fee, None);
+    assert_eq!(diag.want, None);
+    assert_eq!(diag.min_move, None);
+}
+
+#[test]
+fn colliding_over_cap_refusals_keep_the_populated_figures() {
+    // target_spending (150_000) exceeds per_fed_cap (100_000): fed 1 is BOTH over cap and
+    // below target. The top-level over-cap site emits empty figures and fund_into's over-cap
+    // emits full ones under the SAME key; the populated refusal must win the dedup
+    // (push_decision replace-if-richer), or the row would say only "fed 1, over cap".
+    let snapshot = snap!([fed!(1, 120_000, true, false, true), fed!(2, 80_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 150_000, 0, 9400);
+    let decisions = decide(&snapshot, occ(1));
+    let refusals = decisions
+        .iter()
+        .filter(|d| matches!(d.action, Action::RefuseInflow { .. }))
+        .count();
+    assert_eq!(refusals, 1, "the two same-key over-cap refusals dedup to one");
+    let diag = first_refusal_diagnostics(&decisions);
+    assert!(diag.is_populated(), "the populated over-cap refusal must survive dedup");
+    assert_eq!(diag.want, Some(Msat(30_000)));
+    assert_eq!(diag.cap_room, Some(Msat(0)));
+    assert_eq!(diag.source, Some(id!(2)));
 }
 
 #[test]
@@ -261,6 +397,54 @@ fn scorer_rejected_fed_is_never_an_evacuation_destination() {
     // to an advisory RefuseInflow rather than draining fed 1 into a distrusted fed.
     let snapshot = snap!([fed!(1, 50_000, true, true, true), fed!(2, 40_000, true, 0, false, true, false)], None, Some(id!(2)), 100_000, 100_000, 0, 500);
     assert_eq!(decide(&snapshot, occ(1)), decision!(refuse!(1, ReasonCode::ShutdownNotice), ReasonCode::ShutdownNotice, occ(1), refuse_key(1, ReasonCode::ShutdownNotice, 1)));
+}
+
+#[test]
+fn cross_operation_reservations_only_change_source_availability_and_cap_room() {
+    let mut snapshot = snap!([fed!(1, 100, true, false, true), fed!(2, 900, true, false, true)], Some(id!(1)), Some(id!(2)), 1_000, 500, 0, 600);
+    snapshot
+        .reservations
+        .per_fed_inbound
+        .insert(id!(1), msat!(200));
+    snapshot
+        .reservations
+        .per_fed_outbound
+        .insert(id!(2), msat!(150));
+
+    let decisions = decide(&snapshot, occ(1));
+    assert!(
+        decisions.iter().any(|decision| matches!(
+            decision.action,
+            Action::Move { amount: Msat(250), .. }
+        )),
+        "the source reservation reduces available funds without treating speculative inbound as target credit"
+    );
+
+    snapshot
+        .reservations
+        .per_fed_inbound
+        .insert(id!(1), msat!(900));
+    assert!(decide(&snapshot, occ(1))
+        .iter()
+        .all(|decision| !matches!(decision.action, Action::Move { .. })));
+}
+
+#[test]
+fn speculative_receive_reservation_does_not_suppress_a_needed_top_up() {
+    let mut snapshot = snap!([fed!(1, 100, true, false, true), fed!(2, 2_000, true, false, true)], Some(id!(1)), Some(id!(2)), 1_100, 500, 0, 601);
+    snapshot
+        .reservations
+        .per_fed_inbound
+        .insert(id!(1), msat!(500));
+
+    assert!(decide(&snapshot, occ(1)).iter().any(|decision| matches!(
+        decision.action,
+        Action::Move {
+            to,
+            amount: Msat(400),
+            ..
+        } if to == id!(1)
+    )));
 }
 
 // Sum of `Evacuate` amounts targeting `dest` across the emitted decisions.

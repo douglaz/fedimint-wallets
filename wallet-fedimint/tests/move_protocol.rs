@@ -113,6 +113,7 @@ fn resume_after_send_only_no_double_invoice_or_pay() {
     let k = key("move-send-only");
     let params = MoveParams {
         key: k.clone(),
+        operation_key: k.clone(),
         from: Some(FED_A),
         to: FED_B,
         amount: Msat(100_000),
@@ -137,6 +138,37 @@ fn resume_after_send_only_no_double_invoice_or_pay() {
     assert_eq!(next_step(&rec), MoveStep::AwaitSettle);
     assert_ne!(next_step(&rec), MoveStep::CreateInvoice);
     assert_ne!(next_step(&rec), MoveStep::Pay);
+}
+
+#[test]
+fn manual_retry_does_not_recover_the_terminal_attempts_sdk_artifacts() {
+    let public_key = key("move-manual-retry");
+    let retry_key = key("retry:17:move-manual-retry:1");
+    let params = MoveParams {
+        key: public_key.clone(),
+        operation_key: retry_key,
+        from: Some(FED_A),
+        to: FED_B,
+        amount: Msat(100_000),
+        fee_cap: Msat(2_000),
+        gateway: gateway(),
+        send_required: true,
+    };
+    let preceding_attempt = vec![OpArtifact {
+        move_id: public_key.clone(),
+        leg: Leg::Receive,
+        op_id: RECV_OP,
+        amount: Msat(100_000),
+        invoice: Some(stale_invoice()),
+    }];
+
+    let rec = assemble_move_record(params, &preceding_attempt, None);
+
+    assert_eq!(rec.key, public_key);
+    assert_eq!(rec.invoice, None);
+    assert_eq!(rec.recv_op, None);
+    assert_eq!(rec.phase, MovePhase::Created);
+    assert_eq!(next_step(&rec), MoveStep::CreateInvoice);
 }
 
 /// Test 4: a `DirectInflow` (`send_required = false`) skips `Pay` entirely — full
@@ -212,6 +244,7 @@ fn assemble_merges_both_legs() {
     let k = key("move-merge");
     let params = MoveParams {
         key: k.clone(),
+        operation_key: k.clone(),
         from: Some(FED_A),
         to: FED_B,
         amount: Msat(100_000),
@@ -254,6 +287,7 @@ fn assemble_preserves_newest_duplicate_leg_artifacts() {
     let k = key("move-duplicate-leg");
     let params = MoveParams {
         key: k.clone(),
+        operation_key: k.clone(),
         from: Some(FED_A),
         to: FED_B,
         amount: Msat(100_000),
@@ -325,6 +359,7 @@ fn assemble_does_not_blank_existing_leg() {
     };
     let params = MoveParams {
         key: k.clone(),
+        operation_key: k.clone(),
         from: Some(FED_A),
         to: FED_B,
         amount: Msat(100_000),
@@ -350,6 +385,7 @@ fn assemble_directinflow_receive_only() {
     let k = key("inflow-assemble");
     let params = MoveParams {
         key: k.clone(),
+        operation_key: k.clone(),
         from: None,
         to: FED_B,
         amount: Msat(20_000),
@@ -407,7 +443,8 @@ fn assemble_preserves_cached_terminal_phase() {
             send_fee_quoted: None,
         };
         let params = MoveParams {
-            key: k,
+            key: k.clone(),
+            operation_key: k,
             from: Some(FED_A),
             to: FED_B,
             amount: Msat(100_000),
@@ -452,6 +489,7 @@ fn assemble_keeps_cached_preimage_and_fee_quotes() {
     };
     let params = MoveParams {
         key: k.clone(),
+        operation_key: k.clone(),
         from: Some(FED_A),
         to: FED_B,
         amount: Msat(100_000),
@@ -498,6 +536,7 @@ fn assemble_keeps_cached_downsized_amount() {
     let k = key("evac-downsized");
     let params = || MoveParams {
         key: k.clone(),
+        operation_key: k.clone(),
         from: Some(FED_A),
         to: FED_B,
         amount: Msat(100_000), // the intent's full desired amount
@@ -567,7 +606,8 @@ fn assemble_ignores_foreign_move_artifacts() {
     let k = key("move-filter");
     let foreign = key("move-filter-foreign");
     let params = MoveParams {
-        key: k,
+        key: k.clone(),
+        operation_key: k,
         from: Some(FED_A),
         to: FED_B,
         amount: Msat(100_000),
@@ -628,6 +668,7 @@ fn assemble_partial_backfill_send_leg_does_not_blank_receive() {
     };
     let params = MoveParams {
         key: k.clone(),
+        operation_key: k.clone(),
         from: Some(FED_A),
         to: FED_B,
         amount: Msat(100_000),
@@ -666,6 +707,7 @@ fn assemble_receive_artifact_without_invoice_trips_contract() {
     let k = key("move-bad-receive");
     let params = MoveParams {
         key: k.clone(),
+        operation_key: k.clone(),
         from: Some(FED_A),
         to: FED_B,
         amount: Msat(100_000),
@@ -696,6 +738,7 @@ fn assemble_invoice_less_receive_artifact_never_half_states() {
     let k = key("move-bad-receive-release");
     let params = || MoveParams {
         key: k.clone(),
+        operation_key: k.clone(),
         from: Some(FED_A),
         to: FED_B,
         amount: Msat(100_000),

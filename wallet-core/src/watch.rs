@@ -7,6 +7,7 @@
 use crate::ledger::{Actor, OperationKind, OperationRecord};
 use crate::probe::{ActiveProbeVerdict, ProbePolicy};
 use crate::types::{FederationId, Msat};
+use std::collections::BTreeSet;
 
 pub const WATCH_BUSY_SPIN_FLOOR_MS: u64 = 1_000;
 
@@ -201,19 +202,65 @@ pub fn adaptive_sleep_ms(
         .max(policy.min_interval_ms)
         .min(policy.base_interval_ms);
 
-    let concrete = deadlines
+    // Expiry deadlines are evaluated at their evacuation point. Once that point is
+    // already at/behind `now` — the pre-shutdown window §5.2 exists to handle — the
+    // tick evacuates on this very cycle, so re-waking sooner than `min_interval_ms`
+    // buys nothing and would pin the loop to the 1s busy-spin floor for the whole
+    // window. Floor an in-window expiry to the min interval; honor a future one exactly.
+    // Probe deadlines are discrete, self-consuming events, so they keep the tight floor.
+    let expiry_delay = deadlines
         .expiries_ms
         .iter()
-        .map(|expiry| expiry.saturating_sub(policy.evacuation_lead_ms))
-        .chain(deadlines.probe_due_ms.iter().copied())
-        .map(|deadline| deadline.saturating_sub(now_ms))
+        .map(|expiry| {
+            let evac_point = expiry.saturating_sub(policy.evacuation_lead_ms);
+            match evac_point.checked_sub(now_ms) {
+                // Future evacuation point: wake exactly then.
+                Some(delay) if delay > 0 => delay,
+                // In-window (evacuation point already reached): drive/retry the evacuation
+                // without busy-spinning the whole window — cap the cadence at min_interval
+                // — but never sleep past the actual shutdown, so a load-bearing retry still
+                // lands before expiry even when evacuation_lead < min_interval.
+                _ => policy.min_interval_ms.min(expiry.saturating_sub(now_ms)),
+            }
+        })
         .min();
+    // Probe deadlines can recur at ~0 indefinitely (e.g. a budget-blocked NeverProbed fed
+    // is due every cycle), so they keep the busy-spin floor. An expiry is one-shot —
+    // `add_expiry_deadline` drops it once it passes — so a genuine sub-second time-to-
+    // shutdown is honored exactly, never rounded up past the expiry and lost.
+    let probe_delay = deadlines
+        .probe_due_ms
+        .iter()
+        .map(|deadline| {
+            deadline
+                .saturating_sub(now_ms)
+                .max(WATCH_BUSY_SPIN_FLOOR_MS)
+        })
+        .min();
+    let concrete = match (expiry_delay, probe_delay) {
+        (Some(e), Some(p)) => Some(e.min(p)),
+        (only, None) | (None, only) => only,
+    };
 
     match concrete {
-        Some(delay) if delay < routine => delay.max(WATCH_BUSY_SPIN_FLOOR_MS),
         Some(delay) => routine.min(delay),
         None => routine,
     }
+}
+
+pub fn probe_wake_due_ms(
+    next_due_ms: u64,
+    now_ms: u64,
+    budget_ok: bool,
+    budget_reset_ms: Option<u64>,
+    policy: &WatchPolicy,
+) -> u64 {
+    if budget_ok {
+        return next_due_ms;
+    }
+    let budget_ready_ms =
+        budget_reset_ms.unwrap_or_else(|| now_ms.saturating_add(policy.min_interval_ms));
+    next_due_ms.max(budget_ready_ms)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -228,7 +275,21 @@ pub fn discover_pass_plan(
     all_candidate_ids_sorted: &[FederationId],
     max_candidates_per_pass: usize,
 ) -> DiscoverPassPlan {
-    if all_candidate_ids_sorted.is_empty() {
+    discover_pass_plan_in_rotation(
+        cursor,
+        all_candidate_ids_sorted,
+        all_candidate_ids_sorted,
+        max_candidates_per_pass,
+    )
+}
+
+pub fn discover_pass_plan_in_rotation(
+    cursor: Option<FederationId>,
+    rotation_order: &[FederationId],
+    current_candidate_ids_sorted: &[FederationId],
+    max_candidates_per_pass: usize,
+) -> DiscoverPassPlan {
+    if current_candidate_ids_sorted.is_empty() {
         return DiscoverPassPlan {
             window: Vec::new(),
             next_cursor: None,
@@ -238,26 +299,46 @@ pub fn discover_pass_plan(
     if max_candidates_per_pass == 0 {
         return DiscoverPassPlan {
             window: Vec::new(),
-            next_cursor: cursor,
+            next_cursor: None,
             wrapped: false,
         };
     }
 
-    let len = all_candidate_ids_sorted.len();
-    let cursor_index =
-        cursor.and_then(|cursor| all_candidate_ids_sorted.iter().position(|id| *id == cursor));
-    let successor =
-        cursor.and_then(|cursor| all_candidate_ids_sorted.iter().position(|id| *id > cursor));
-    let start = successor.unwrap_or(0);
-    let take = max_candidates_per_pass.min(len);
+    let current_ids = current_candidate_ids_sorted
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let order = if rotation_order.is_empty() {
+        current_candidate_ids_sorted
+    } else {
+        rotation_order
+    };
+    let len = order.len();
+    let cursor_index = cursor.and_then(|cursor| order.iter().position(|id| *id == cursor));
+    let successor = cursor.and_then(|cursor| {
+        order
+            .iter()
+            .position(|id| current_ids.contains(id) && *id > cursor)
+    });
+    let start = cursor_index.map_or_else(|| successor.unwrap_or(0), |index| (index + 1) % len);
+    let take = max_candidates_per_pass.min(current_ids.len());
     let mut window = Vec::with_capacity(take);
-    for offset in 0..take {
-        let index = (start + offset) % len;
-        window.push(all_candidate_ids_sorted[index]);
+    let mut crossed_end = false;
+    let mut index = start;
+    for _ in 0..len {
+        if cursor_index.is_some() && start != 0 && index == len - 1 {
+            crossed_end = true;
+        }
+        let id = order[index];
+        if current_ids.contains(&id) {
+            window.push(id);
+            if window.len() == take {
+                break;
+            }
+        }
+        index = (index + 1) % len;
     }
-    let reaches_or_crosses_end = successor.is_some() && start.saturating_add(take) >= len;
-    let crosses_end = start.saturating_add(take) > len;
-    let wrapped = take == len || crosses_end || (cursor_index.is_some() && reaches_or_crosses_end);
+    let wrapped = window.len() == current_ids.len() || crossed_end;
     let next_cursor = window.last().copied();
     DiscoverPassPlan {
         window,

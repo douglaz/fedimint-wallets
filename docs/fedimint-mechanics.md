@@ -58,8 +58,10 @@ ADR-0022 — see "What this means for us".
 - **The federation does NOT dedup by payment hash** (outgoing contracts keyed by funding
   outpoint, fresh keys per contract — `lnv2-server/lib.rs:552`). But the **client does**:
   the deterministic op id `from_encodable((invoice, attempt=0))` + an `operation_exists`
-  check returns `PaymentInProgress` / `InvoiceAlreadyPaid` (`lib.rs:679-701`). The gateway
-  adds a second dedup on the contract.
+  check returns `DuplicatePaymentAttempt(op)` (one attempt per invoice — upstream collapsed
+  the old `PaymentInProgress`/`InvoiceAlreadyPaid` pair and removed the retry counter,
+  commit 703a37e8f3f). The existing op may be in flight OR settled; attach and await its
+  final state. The gateway adds a second dedup on the contract.
 - **So re-calling `send(invoice)` after a crash cannot double-pay, as long as A's client DB
   survives** (it's persistent + self-resuming). We don't strictly need to persist
   `send_op_id` for safety — A's DB is the dedup. The **one** dangerous case: restore from

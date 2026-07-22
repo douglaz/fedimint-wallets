@@ -32,9 +32,18 @@ pub fn decide(snapshot: &AllocatorSnapshot, occurrence: Occurrence) -> Vec<Alloc
         // ADR-0018: a federation already over the per-fed cap (e.g. from an inbound
         // payment, not from our funding) is a cap violation the executor must reduce.
         if fed.balance.spendable > snapshot.per_fed_cap {
+            // An externally-caused over-cap fed: no funding shortfall is computed here, so the
+            // figures are empty. If this same fed is ALSO below target this pass, `fund_into`
+            // emits an over-cap refusal under the same key WITH figures, and `push_decision`
+            // lets that populated refusal replace this empty one.
             push_decision(
                 &mut decisions,
-                refuse_decision(fed.id, ReasonCode::OverCap, occurrence),
+                refuse_decision(
+                    fed.id,
+                    ReasonCode::OverCap,
+                    occurrence,
+                    RefusalDiagnostics::default(),
+                ),
             );
         }
     }
@@ -52,6 +61,7 @@ pub fn decide(snapshot: &AllocatorSnapshot, occurrence: Occurrence) -> Vec<Alloc
                 s.balance
                     .spendable
                     .0
+                    .saturating_sub(snapshot.reservations.outbound(s.id).0)
                     .saturating_sub(reserved(&debited, s.id))
                     .saturating_sub(snapshot.max_fee.0)
             });
@@ -85,6 +95,7 @@ pub fn decide(snapshot: &AllocatorSnapshot, occurrence: Occurrence) -> Vec<Alloc
                     .spendable
                     .0
                     .saturating_sub(snapshot.target_spending_balance.0)
+                    .saturating_sub(snapshot.reservations.outbound(s.id).0)
                     .saturating_sub(reserved(&debited, s.id))
                     .saturating_sub(snapshot.max_fee.0)
             });
@@ -140,8 +151,29 @@ fn fund_into(
     debited: &mut BTreeMap<FederationId, u64>,
     out: &mut Vec<AllocatorDecision>,
 ) {
+    // Source-side figures, shared by every refusal this function can emit. `source`-derived
+    // fields are `None` exactly when there is no usable source; `max_fee` is a snapshot
+    // constant, recorded even when sourceless so a cap-too-large refusal is legible.
+    let source_id = source.map(|s| s.id);
+    let source_spendable = source.map(|s| s.balance.spendable);
+    let source_available = source.map(|_| Msat(available));
+
     if let Some(blocker) = receive_blocker(dest) {
-        push_decision(out, refuse_decision(dest.id, blocker, occurrence));
+        // Refused before cap room / the move amount are computed, so those stay `None`.
+        let diagnostics = RefusalDiagnostics {
+            source: source_id,
+            want: Some(Msat(want)),
+            available: source_available,
+            source_spendable,
+            max_fee: Some(snapshot.max_fee),
+            cap_room: None,
+            amount: None,
+            min_move: Some(snapshot.min_move),
+        };
+        push_decision(
+            out,
+            refuse_decision(dest.id, blocker, occurrence, diagnostics),
+        );
         return;
     }
 
@@ -151,11 +183,27 @@ fn fund_into(
         return;
     }
 
+    // A shortfall below the protocol move floor is DUST: the destination is effectively at
+    // target, and a sub-floor move could only fail lnv2's minimum-incoming-contract check at
+    // perform time — every tick, forever (the 24h soak logged 91 such doomed moves). Silent
+    // like the self-fund no-op: a refusal row every cycle for a sub-5-sat gap would itself
+    // be the noise this floor removes.
+    if want < snapshot.min_move.0 {
+        return;
+    }
+
     // Reservation-aware cap room: any inbound already committed to `dest` this pass is
     // subtracted, so a same-tick evacuation into it and this top-up cannot jointly
     // exceed the cap.
     let cap_room = cap_room_with(snapshot, dest, credited);
     let amount = want.min(cap_room).min(available);
+    // Cap/available CRUMBS below the floor are equally unperformable: emit no move — the
+    // shortfall refusals below still record WHY the destination stays underfunded.
+    let amount = if amount < snapshot.min_move.0 {
+        0
+    } else {
+        amount
+    };
     if let Some(src) = source.filter(|_| amount > 0) {
         push_and_reserve(
             out,
@@ -164,28 +212,67 @@ fn fund_into(
             debited,
         );
     }
+    // Both refusals below share the full arithmetic: `amount` (the emitted move, possibly 0)
+    // was clamped by whichever of `want` / `cap_room` / `available` was smallest, and a reader
+    // recovers WHICH from these figures alone. `available` is `None` iff there was no source.
+    let diagnostics = RefusalDiagnostics {
+        source: source_id,
+        want: Some(Msat(want)),
+        available: source_available,
+        source_spendable,
+        max_fee: Some(snapshot.max_fee),
+        cap_room: Some(Msat(cap_room)),
+        amount: Some(Msat(amount)),
+        min_move: Some(snapshot.min_move),
+    };
     if want > cap_room {
         push_decision(
             out,
-            refuse_decision(dest.id, ReasonCode::OverCap, occurrence),
+            refuse_decision(dest.id, ReasonCode::OverCap, occurrence, diagnostics),
         );
     }
     if amount < want.min(cap_room) {
-        push_decision(out, refuse_decision(dest.id, kind.reason(), occurrence));
+        push_decision(
+            out,
+            refuse_decision(dest.id, kind.reason(), occurrence, diagnostics),
+        );
     }
 }
 
 /// Push a decision if its idempotency key is not already present; returns whether it was
 /// actually pushed (a duplicate key is a silent no-op).
+///
+/// One refinement for refusals: the same fed can be refused for the SAME reason by two sites
+/// in one pass under one key — the top-level over-cap check (empty figures) and `fund_into`'s
+/// over-cap (full figures) when a fed is both over cap AND below target. When that happens,
+/// the later populated refusal REPLACES the earlier empty one in place, so the richer figures
+/// survive dedup. This only ever fires refusal-vs-refusal: refusal keys (`refuse:`) never
+/// collide with move keys (`move:`/`evac:`), and refusals carry no reservation, so the
+/// in-place replace cannot affect `push_and_reserve`'s bookkeeping.
 fn push_decision(out: &mut Vec<AllocatorDecision>, decision: AllocatorDecision) -> bool {
-    if out
-        .iter()
-        .all(|existing| existing.idempotency_key != decision.idempotency_key)
+    if let Some(existing) = out
+        .iter_mut()
+        .find(|existing| existing.idempotency_key == decision.idempotency_key)
     {
+        if let (
+            Action::RefuseInflow {
+                diagnostics: incoming,
+                ..
+            },
+            Action::RefuseInflow {
+                diagnostics: present,
+                ..
+            },
+        ) = (&decision.action, &existing.action)
+        {
+            if incoming.is_populated() && !present.is_populated() {
+                *existing = decision;
+            }
+        }
+        false
+    } else {
         out.push(decision);
         true
-    } else {
-        false
     }
 }
 
@@ -264,6 +351,7 @@ fn cap_room_with(
         .per_fed_cap
         .0
         .saturating_sub(fed.balance.spendable.0)
+        .saturating_sub(snapshot.reservations.inbound(fed.id).0)
         .saturating_sub(reserved(credited, fed.id))
 }
 
@@ -377,10 +465,31 @@ fn evacuate_decision(
                 .balance
                 .spendable
                 .0
+                .saturating_sub(snapshot.reservations.outbound(from.id).0)
                 .saturating_sub(reserved(debited, from.id));
-            let amount = Msat(src_available.min(cap_room_with(snapshot, to, credited)));
+            let cap_room = cap_room_with(snapshot, to, credited);
+            let amount = Msat(src_available.min(cap_room));
             if amount.0 == 0 {
-                return refuse_decision(from.id, reason, occurrence);
+                // `safest_other` only returns a destination with positive cap room
+                // (`eligible_for_evacuation`), so `amount == 0` means the SOURCE has nothing
+                // left to evacuate after its reservations — not that the destination is
+                // capped. Record that: `available == 0` against a positive `cap_room` is the
+                // whole story. `want`/`min_move` do not apply (an evacuation drains its source
+                // rather than filling a target, and does not gate on the move floor).
+                let diagnostics = RefusalDiagnostics {
+                    source: Some(from.id),
+                    want: None,
+                    available: Some(Msat(src_available)),
+                    source_spendable: Some(from.balance.spendable),
+                    // An evacuation does NOT pre-reserve `max_fee` (the executor sizes for it
+                    // at perform time), so `available` here has no fee-cap term — record None
+                    // rather than imply a subtraction that did not happen.
+                    max_fee: None,
+                    cap_room: Some(Msat(cap_room)),
+                    amount: Some(amount),
+                    min_move: None,
+                };
+                return refuse_decision(from.id, reason, occurrence, diagnostics);
             }
             AllocatorDecision {
                 action: Action::Evacuate {
@@ -394,7 +503,9 @@ fn evacuate_decision(
                 idempotency_key: idem_evac(from.id, to.id, occurrence),
             }
         }
-        None => refuse_decision(from.id, reason, occurrence),
+        // No safe destination exists to evacuate into: the condition is surfaced as an
+        // advisory refusal with no shortfall arithmetic to record.
+        None => refuse_decision(from.id, reason, occurrence, RefusalDiagnostics::default()),
     }
 }
 
@@ -402,9 +513,16 @@ fn refuse_decision(
     fed: FederationId,
     reason: ReasonCode,
     occurrence: Occurrence,
+    diagnostics: RefusalDiagnostics,
 ) -> AllocatorDecision {
     AllocatorDecision {
-        action: Action::RefuseInflow { fed, reason },
+        // `diagnostics` is deliberately absent from `idem_refuse`: the recorded figures are
+        // observational, so re-ticks of the same (fed, reason, occurrence) still dedup.
+        action: Action::RefuseInflow {
+            fed,
+            reason,
+            diagnostics,
+        },
         reason,
         occurrence,
         idempotency_key: idem_refuse(fed, reason, occurrence),

@@ -28,7 +28,15 @@ fi
 WCLI_DIR=$(mktemp -d)
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
 FED_B_INV="${FED_B_INVITE:-${FM_INVITE_CODE_B:?two-fed harness did not export FED_B_INVITE}}"
-wcli() { "$WALLET_CLI" --data-dir "$WCLI_DIR" "$@"; }
+wcli() { "$WALLET_CLI" --standalone --data-dir "$WCLI_DIR" --gateway "$GW" "$@"; }
+join_fed() {
+  local started key state
+  started=$(wcli join "$1") || return
+  key=${started#* }
+  state=$(wcli await-move "$key") || return
+  [[ "$state" == "done" ]] || { echo "join $key did not settle: $state" >&2; return 1; }
+  cut -d: -f2 <<<"$key"
+}
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # Per-fed spendable (msat). NOTE: no `exit` in the awk (SIGPIPE-safe with multiple feds).
@@ -45,13 +53,13 @@ command -v gateway-ldk >/dev/null && gateway-ldk connect-fed "$FED_B_INV" >/dev/
 
 # ---------------------------------------------------------------------------------------
 echo "== JOIN both federations; FUND fed A (the spending source) =="
-FED_A=$(wcli join "$FM_INVITE_CODE")
-FED_B=$(wcli join "$FED_B_INV")
+FED_A=$(join_fed "$FM_INVITE_CODE")
+FED_B=$(join_fed "$FED_B_INV")
 echo "A=$FED_A (source)  B=$FED_B (candidate)"
 
 DI_ERR=$(mktemp)
-INV_A=$(wcli direct-inflow --to "$FED_A" --amount 500000 --gateway "$GW" 2>"$DI_ERR")
-KEY_FUND=$(sed -n 's/^intent_key: //p' "$DI_ERR")
+INV_A=$(wcli direct-inflow --to "$FED_A" --amount 500000 2>"$DI_ERR")
+KEY_FUND=$(sed -n 's/^key: //p' "$DI_ERR")
 [[ -n "$INV_A" && -n "$KEY_FUND" ]] || { cat "$DI_ERR" >&2; fail "direct-inflow gave no invoice/key"; }
 SEND1=$(fedimint-cli module lnv2 send "$INV_A" --gateway "$GW" 2>/dev/null | tr -d '"[:space:]')
 fedimint-cli module lnv2 await-send "$SEND1" >/dev/null 2>&1 || true
@@ -66,7 +74,7 @@ A0=$(bal_for "$FED_A"); B0=$(bal_for "$FED_B")
 echo "pre-probe: A=$A0 msat  B=$B0 msat"
 
 P_OUT=$(mktemp); P_ERR=$(mktemp)
-if ! wcli probe "$FED_B" --from "$FED_A" --gateway "$GW" >"$P_OUT" 2>"$P_ERR"; then
+if ! wcli probe "$FED_B" --from "$FED_A" >"$P_OUT" 2>"$P_ERR"; then
   echo "  --- probe stdout ---" >&2; cat "$P_OUT" >&2
   echo "  --- probe stderr ---" >&2; cat "$P_ERR" >&2
   fail "a healthy probe B from A must succeed (exit 0)"
@@ -106,7 +114,7 @@ echo "== SUSTAINED WINDOW: 2 more probes -> the verb's verdict flips to 'passed'
 # The verb evaluates verdict_after under ITS OWN (shrunk-span) policy; status uses DEFAULT.
 # Capture output so a failure is diagnosable (a probe is a real two-leg money op).
 run_probe() { # run_probe <label> <outfile> <errfile>
-  if ! wcli probe "$FED_B" --from "$FED_A" --gateway "$GW" --min-span-secs 1 >"$2" 2>"$3"; then
+  if ! wcli probe "$FED_B" --from "$FED_A"  --min-span-secs 1 >"$2" 2>"$3"; then
     echo "  --- $1 stdout ---" >&2; cat "$2" >&2
     echo "  --- $1 stderr ---" >&2; cat "$3" >&2
     fail "$1 failed"
@@ -136,13 +144,13 @@ echo "status OK: default-policy verdict stays 'insufficient' under the test-shru
 echo "== NO-ATTEMPT FAILURE: probing an UNJOINED fed exits non-zero, never demotes =="
 UNJOINED="$(printf '%064d' 0)"  # a 32-byte zero fed id we never joined
 NA_OUT=$(mktemp)
-if wcli probe "$UNJOINED" --from "$FED_A" --gateway "$GW" >"$NA_OUT" 2>/dev/null; then
+if wcli probe "$UNJOINED" --from "$FED_A" >"$NA_OUT" 2>/dev/null; then
   cat "$NA_OUT" >&2; fail "probing an unjoined fed must exit non-zero"
 fi
 grep -q '^attempt: none ' "$NA_OUT" || { cat "$NA_OUT" >&2; fail "an unjoined-fed probe must print 'attempt: none <diagnostic>'"; }
 # B's verdict history is untouched by the unrelated failure (still 'passed' under the shrunk verb policy).
 V_OUT=$(mktemp)
-wcli probe "$FED_B" --from "$FED_A" --gateway "$GW" --min-span-secs 1 >"$V_OUT" 2>/dev/null || fail "post-failure re-probe failed"
+wcli probe "$FED_B" --from "$FED_A"  --min-span-secs 1 >"$V_OUT" 2>/dev/null || fail "post-failure re-probe failed"
 grep -q '^verdict: passed$' "$V_OUT" || { cat "$V_OUT" >&2; fail "B's verdict must be untouched by an unrelated unjoined-fed failure"; }
 echo "no-attempt OK: unjoined-fed probe exits non-zero with 'attempt: none'; B's verdict untouched"
 

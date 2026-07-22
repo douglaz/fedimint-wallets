@@ -90,6 +90,15 @@ pub struct AllocatorSnapshot {
     pub target_spending_balance: Msat,
     pub standby_target: Msat,
     pub max_fee: Msat,
+    /// The smallest fund/top-up move worth emitting, injected by the I/O layer from the
+    /// protocol floor (lnv2 refuses incoming contracts below its 5-sat minimum). A top-up
+    /// whose whole SHORTFALL is below this is dust — the destination is effectively at
+    /// target, and the move could only fail at perform time, every tick, forever (the 24h
+    /// soak logged 91 such doomed sub-minimum moves). Zero disables the floor.
+    pub min_move: Msat,
+    /// Durable cross-operation reservations projected from the journal. The allocator's
+    /// local `credited`/`debited` maps remain the intra-batch layer.
+    pub reservations: Reservations,
     pub now: u64,
 }
 
@@ -124,14 +133,138 @@ pub enum Action {
         amount: Msat,
         fee_cap: Msat,
     },
+    /// Pay a user-supplied BOLT11 directly from one federation. The payment hash is the
+    /// natural user-API idempotency anchor; all sizing fields remain in the intent so an
+    /// attach can verify the original reservation bounds.
+    Pay {
+        from: FederationId,
+        invoice: Invoice,
+        amount: Msat,
+        fee_cap: Msat,
+        payment_hash: [u8; 32],
+        gateway: Option<GatewayUrl>,
+    },
+    /// Mint a raw receive invoice on one federation. `nonce` distinguishes deliberate
+    /// repeated receives because the request has no natural external anchor.
+    Receive {
+        to: FederationId,
+        amount: Msat,
+        fee_cap: Msat,
+        nonce: String,
+        gateway: Option<GatewayUrl>,
+    },
+    /// Join a federation under the invite-derived operation identity.
+    Join {
+        federation: FederationId,
+        invite: String,
+        /// Whether membership already existed when this intent was admitted. Recovery uses
+        /// this durable fact to distinguish a no-op reopen from a crash after this intent
+        /// persisted the federation registry but before it terminalized its ledger row.
+        membership_preexisting: bool,
+    },
     /// Advisory: do not route the next inflow to `fed` / do not cap allocation here.
     /// Never becomes an executor `Intent` (see `Action::is_executable`); the ledger's
-    /// `Refusal` kind records the concept.
+    /// `Refusal` kind records the concept. `diagnostics` carries the balance/threshold
+    /// figures that produced the refusal so it stays reconstructible after a restart.
     RefuseInflow {
         fed: FederationId,
         reason: ReasonCode,
+        diagnostics: RefusalDiagnostics,
     },
 }
+
+/// The balance/threshold figures a `RefuseInflow` was decided from, persisted alongside the
+/// refusal so "why didn't the wallet act?" is answerable from the journal row alone, without
+/// live tracing (the motivating case: a refusal whose arithmetic could not be reconstructed
+/// after the pod that logged it restarted). These are the figures at FIRST observation: a
+/// persisting condition re-ticks under the same idempotency key and `record_refusals` keeps
+/// the first row (§9.3 append-once), so the figures do not track later ticks.
+///
+/// Every field is optional because the refusal sites compute different subsets: a
+/// `receive_blocker` gate refuses before cap room or the move amount is known, and an
+/// evacuation with no safe destination has neither a shortfall nor an amount. `available` is
+/// `None` (not `Some(0)`) precisely when there was no usable funding source — the case that
+/// distinguishes "the source had nothing to give" from "there was no source at all".
+///
+/// These are OBSERVATIONAL metadata, not part of the refusal's identity: two refusals of the
+/// same federation for the same reason are the same advisory signal regardless of the figures
+/// captured at each. `PartialEq`/`Eq` are therefore hand-written to compare equal always, so
+/// equality agrees with the idempotency key (`allocator::idem_refuse`), which likewise
+/// excludes them — that agreement is the reason. The actor's sizing-conflict recheck
+/// (`service::actor`) also compares `RefuseInflow` actions by value, but that arm is
+/// unreachable for refusals (they are filtered as non-executable before any attach), so it is
+/// defensive here, not load-bearing.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct RefusalDiagnostics {
+    /// The federation that would have SOURCED the move, when there was a usable one. Names the
+    /// fed the source-side figures (`available`, `source_spendable`) describe.
+    pub source: Option<FederationId>,
+    /// The shortfall the decision was trying to fill (`target − spendable`), when it had one.
+    /// `None` for an evacuation, which drains its source rather than filling a target.
+    pub want: Option<Msat>,
+    /// The source surplus available to fund the move: `source_spendable` minus the source's
+    /// own reservations, the per-move `max_fee` (funding paths only — an evacuation does not
+    /// reserve it), and — on the standby-funding path — the spending fed's target. `None` when
+    /// there was no usable source at all (as opposed to
+    /// `Some(Msat(0))`, a source with no surplus). It is a residue of several subtractions;
+    /// `source_spendable − max_fee − available` recovers the aggregate of the OTHER deductions
+    /// (reservations, and the target floor on the standby path), which are not split out. The
+    /// operationally decisive split — was `max_fee` the culprit? — IS recoverable, since
+    /// `max_fee` is recorded separately.
+    pub available: Option<Msat>,
+    /// The source federation's raw spendable balance, the top of the `available` subtraction
+    /// chain.
+    pub source_spendable: Option<Msat>,
+    /// The per-move fee cap (`max_fee`) subtracted when computing `available` ON THE FUNDING
+    /// PATHS. Recorded so a cap larger than the surplus — the known foot-gun that zeroes
+    /// `available` and refuses an otherwise-fundable move — is visible in the row rather than
+    /// inferred. `None` on an evacuation refusal, which does not pre-reserve `max_fee`.
+    pub max_fee: Option<Msat>,
+    /// The destination's remaining per-fed cap room, once it had been computed.
+    pub cap_room: Option<Msat>,
+    /// The move amount the allocator settled on before refusing the remainder.
+    pub amount: Option<Msat>,
+    /// The protocol move floor (`min_move`) in effect, below which a move is dust.
+    pub min_move: Option<Msat>,
+}
+
+impl RefusalDiagnostics {
+    /// Whether any figure was recorded. Used to prefer a populated refusal over an empty
+    /// same-key one when the allocator dedups (`allocator::push_decision`) and to omit the
+    /// wire object for a figure-less refusal. Destructured so a field added later must be
+    /// added here too (or the compiler complains) — otherwise it would be silently dropped
+    /// from both the dedup preference and the daemon projection.
+    pub fn is_populated(&self) -> bool {
+        let Self {
+            source,
+            want,
+            available,
+            source_spendable,
+            max_fee,
+            cap_room,
+            amount,
+            min_move,
+        } = self;
+        source.is_some()
+            || want.is_some()
+            || available.is_some()
+            || source_spendable.is_some()
+            || max_fee.is_some()
+            || cap_room.is_some()
+            || amount.is_some()
+            || min_move.is_some()
+    }
+}
+
+impl PartialEq for RefusalDiagnostics {
+    /// Always equal: the figures are observational metadata, so refusal identity (and hence
+    /// equality) is `fed` + `reason`, matching the idempotency key. See the type doc.
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for RefusalDiagnostics {}
 
 impl Action {
     /// Whether `apply()` should create an executor `Intent` for this action.
@@ -139,20 +272,28 @@ impl Action {
     pub fn is_executable(&self) -> bool {
         matches!(
             self,
-            Action::DirectInflow { .. } | Action::Move { .. } | Action::Evacuate { .. }
+            Action::DirectInflow { .. }
+                | Action::Move { .. }
+                | Action::Evacuate { .. }
+                | Action::Pay { .. }
+                | Action::Receive { .. }
+                | Action::Join { .. }
         )
     }
 
     /// The fee budget authoritative for this action, if it has one.
     /// `Move`/`Evacuate` carry a `fee_cap` bounding the total move cost;
-    /// `DirectInflow` carries one bounding its receive-side gross-up (spec §6).
-    /// Advisory actions are never executed, so they have none.
+    /// `DirectInflow` carries one bounding its receive-side gross-up (spec §6), and
+    /// raw pay/receive intents retain their user-supplied sizing bound. `Join` and
+    /// advisory actions have no fee budget.
     pub fn fee_cap(&self) -> Option<Msat> {
         match self {
             Action::Move { fee_cap, .. }
             | Action::Evacuate { fee_cap, .. }
-            | Action::DirectInflow { fee_cap, .. } => Some(*fee_cap),
-            Action::RefuseInflow { .. } => None,
+            | Action::DirectInflow { fee_cap, .. }
+            | Action::Pay { fee_cap, .. }
+            | Action::Receive { fee_cap, .. } => Some(*fee_cap),
+            Action::Join { .. } | Action::RefuseInflow { .. } => None,
         }
     }
 }
@@ -225,3 +366,54 @@ pub struct GatewayUrl(pub String);
     Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub struct Invoice(pub String);
+
+/// Where a durable move currently sits in its lifecycle. The type lives in core because
+/// reservation projection is pure and must not depend on the fedimint adapter crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MovePhase {
+    Created,
+    Invoiced,
+    Sending,
+    Settled,
+    Refunded,
+    Failed,
+    Stranded,
+}
+
+/// Durable derived artifacts for a move-shaped intent. Network code owns the writes; core
+/// consumes only the phase and sizing fields when projecting reservations.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MoveRecord {
+    pub key: IdempotencyKey,
+    pub from: Option<FederationId>,
+    pub to: FederationId,
+    pub amount: Msat,
+    pub fee_cap: Msat,
+    pub gateway: GatewayUrl,
+    pub send_required: bool,
+    pub invoice: Option<Invoice>,
+    pub recv_op: Option<OperationId>,
+    pub send_op: Option<OperationId>,
+    pub phase: MovePhase,
+    pub outcome: Option<String>,
+    pub preimage: Option<Preimage>,
+    pub receive_fee_quoted: Option<Msat>,
+    pub send_fee_quoted: Option<Msat>,
+}
+
+/// Cross-operation reservations that have not yet been absorbed by live balances.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reservations {
+    pub per_fed_outbound: std::collections::BTreeMap<FederationId, Msat>,
+    pub per_fed_inbound: std::collections::BTreeMap<FederationId, Msat>,
+}
+
+impl Reservations {
+    pub fn outbound(&self, fed: FederationId) -> Msat {
+        self.per_fed_outbound.get(&fed).copied().unwrap_or(Msat(0))
+    }
+
+    pub fn inbound(&self, fed: FederationId) -> Msat {
+        self.per_fed_inbound.get(&fed).copied().unwrap_or(Msat(0))
+    }
+}
