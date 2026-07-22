@@ -578,6 +578,9 @@ fn print_operation_view(view: &OperationView) {
     println!("amount_msat: {}", opt_msat(view.amount));
     println!("receive_fee_msat: {}", opt_msat(view.receive_fee));
     println!("send_fee_quoted_msat: {}", opt_msat(view.send_fee_quoted));
+    if let Some(diagnostics) = &view.refusal {
+        crate::print_refusal_diagnostics(diagnostics);
+    }
     println!("error: {}", view.error.as_deref().unwrap_or("-"));
 }
 

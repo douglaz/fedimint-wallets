@@ -1185,5 +1185,6 @@ fn succeeded_view(key: &str) -> OperationView {
         reason: "user_initiated".to_owned(),
         operation_key: key.to_owned(),
         error: None,
+        refusal: None,
     }
 }

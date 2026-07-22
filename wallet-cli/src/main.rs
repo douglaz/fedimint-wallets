@@ -27,7 +27,7 @@ use wallet_api::{AwaitTarget, OperationStatusDto, Policy};
 use wallet_core::{
     Action, ActiveProbeVerdict, Actor, AllocatorDecision, DiscoveryPolicy, DiscoverySource,
     ExecutionSummary, FederationId, IdempotencyKey, IntentStatus, Journal, Msat, Occurrence,
-    OperationKind, OperationRecord, OperationStatus, ProbePolicy, ReasonCode,
+    OperationKind, OperationRecord, OperationStatus, ProbePolicy, ReasonCode, RefusalDiagnostics,
 };
 use wallet_fedimint::{
     direct_inflow_nonce_key, join_intent_key, move_key, parse_invoice, raw_pay_key,
@@ -2815,6 +2815,36 @@ fn print_show_record(r: &OperationRecord) {
     println!("error: {}", r.error.as_deref().unwrap_or("-"));
 }
 
+/// Print the recorded refusal arithmetic (§9.3), one line per figure the deciding site
+/// computed. Shared by the standalone `show` (over an `OperationRecord`) and the client `show`
+/// (over an `OperationView.refusal`) so both diagnose a refusal identically.
+pub(crate) fn print_refusal_diagnostics(diagnostics: &RefusalDiagnostics) {
+    if let Some(v) = diagnostics.source {
+        println!("source: {}", v.to_hex());
+    }
+    if let Some(v) = diagnostics.want {
+        println!("want_msat: {}", v.0);
+    }
+    if let Some(v) = diagnostics.available {
+        println!("available_msat: {}", v.0);
+    }
+    if let Some(v) = diagnostics.source_spendable {
+        println!("source_spendable_msat: {}", v.0);
+    }
+    if let Some(v) = diagnostics.max_fee {
+        println!("max_fee_msat: {}", v.0);
+    }
+    if let Some(v) = diagnostics.cap_room {
+        println!("cap_room_msat: {}", v.0);
+    }
+    if let Some(v) = diagnostics.amount {
+        println!("amount_msat: {}", v.0);
+    }
+    if let Some(v) = diagnostics.min_move {
+        println!("min_move_msat: {}", v.0);
+    }
+}
+
 fn print_kind_details(kind: &OperationKind) {
     match kind {
         OperationKind::Join { fed } => {
@@ -2822,32 +2852,7 @@ fn print_kind_details(kind: &OperationKind) {
         }
         OperationKind::Refusal { fed, diagnostics } => {
             println!("fed: {}", fed.to_hex());
-            // The recorded refusal arithmetic (§9.3): only the figures the deciding site
-            // computed are printed, so a refusal is diagnosable from a standalone `show`.
-            if let Some(v) = diagnostics.source {
-                println!("source: {}", v.to_hex());
-            }
-            if let Some(v) = diagnostics.want {
-                println!("want_msat: {}", v.0);
-            }
-            if let Some(v) = diagnostics.available {
-                println!("available_msat: {}", v.0);
-            }
-            if let Some(v) = diagnostics.source_spendable {
-                println!("source_spendable_msat: {}", v.0);
-            }
-            if let Some(v) = diagnostics.max_fee {
-                println!("max_fee_msat: {}", v.0);
-            }
-            if let Some(v) = diagnostics.cap_room {
-                println!("cap_room_msat: {}", v.0);
-            }
-            if let Some(v) = diagnostics.amount {
-                println!("amount_msat: {}", v.0);
-            }
-            if let Some(v) = diagnostics.min_move {
-                println!("min_move_msat: {}", v.0);
-            }
+            print_refusal_diagnostics(diagnostics);
         }
         OperationKind::Receive { op_id, gateway, .. } => {
             println!("op_id: {}", opt_op(op_id));

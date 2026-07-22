@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-pub use wallet_core::{FederationId, Msat};
+pub use wallet_core::{FederationId, Msat, RefusalDiagnostics};
 
 /// The standing instruction's user-owned allocation and automation parameters.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -272,6 +272,11 @@ pub struct OperationView {
     /// The ledger row's failure diagnostic (audit-honest: cleared on success). Without it a
     /// caller directed to `/v1/operations/{key}` after a failure learns only THAT it failed.
     pub error: Option<String>,
+    /// For a `refusal` row, the balance/threshold figures the refusal was decided from, so
+    /// "why didn't the wallet act?" is answerable from a LIVE daemon (`history`/`show`), not
+    /// only from a stopped-wallet journal read. `None` for every other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<RefusalDiagnostics>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -578,6 +583,78 @@ mod tests {
     }
 
     #[test]
+    fn refusal_operation_view_serdes_its_figures() {
+        // `RefusalDiagnostics` compares equal always, so a generic round-trip-equality check
+        // would pass even if the figures were dropped. Assert them field-by-field, and that a
+        // non-refusal view omits the `refusal` object entirely (`skip_serializing_if`).
+        let view = OperationView {
+            seq: 3,
+            updated_at_ms: 1_700_000_000_000,
+            kind: "refusal".to_owned(),
+            status: OperationStatusDto::Succeeded,
+            amount: None,
+            receive_fee: None,
+            send_fee_quoted: None,
+            actor: "agent:1".to_owned(),
+            reason: "spending_below_target".to_owned(),
+            operation_key: "refuse:spending_below_target:0101:0".to_owned(),
+            error: None,
+            refusal: Some(RefusalDiagnostics {
+                source: Some(fed(2)),
+                want: Some(Msat(50_000)),
+                available: Some(Msat(0)),
+                source_spendable: Some(Msat(120_000)),
+                max_fee: Some(Msat(200_000)),
+                cap_room: Some(Msat(96_000)),
+                amount: Some(Msat(0)),
+                min_move: Some(Msat(5_000)),
+            }),
+        };
+        let json = serde_json::to_string(&view).expect("serialize");
+        assert!(
+            json.contains("\"refusal\""),
+            "refusal object present: {json}"
+        );
+        assert!(
+            json.contains("\"max_fee\""),
+            "max_fee figure present: {json}"
+        );
+
+        let back: OperationView = serde_json::from_str(&json).expect("deserialize");
+        let d = back.refusal.expect("refusal figures survive the wire");
+        assert_eq!(d.source, Some(fed(2)));
+        assert_eq!(d.want, Some(Msat(50_000)));
+        assert_eq!(d.available, Some(Msat(0)));
+        assert_eq!(d.source_spendable, Some(Msat(120_000)));
+        assert_eq!(d.max_fee, Some(Msat(200_000)));
+        assert_eq!(d.cap_room, Some(Msat(96_000)));
+        assert_eq!(d.amount, Some(Msat(0)));
+        assert_eq!(d.min_move, Some(Msat(5_000)));
+
+        // A non-refusal view omits the `refusal` field entirely. Use a `move` view so the
+        // string "refusal" cannot appear via `kind`/`operation_key`.
+        let move_view = OperationView {
+            seq: 4,
+            updated_at_ms: 1_700_000_000_000,
+            kind: "move".to_owned(),
+            status: OperationStatusDto::Awaiting,
+            amount: Some(Msat(5_000)),
+            receive_fee: None,
+            send_fee_quoted: None,
+            actor: "user".to_owned(),
+            reason: "user_initiated".to_owned(),
+            operation_key: "move:example".to_owned(),
+            error: None,
+            refusal: None,
+        };
+        let move_json = serde_json::to_string(&move_view).expect("serialize non-refusal");
+        assert!(
+            !move_json.contains("refusal"),
+            "refusal omitted when None: {move_json}"
+        );
+    }
+
+    #[test]
     fn response_dtos_json_roundtrip() {
         let operation = OperationView {
             seq: 9,
@@ -591,6 +668,7 @@ mod tests {
             reason: "user_initiated".to_owned(),
             operation_key: "move:example".to_owned(),
             error: Some("gateway route rejected".to_owned()),
+            refusal: None,
         };
         assert_json_roundtrip(OperationAccepted {
             operation_key: "pay:example".to_owned(),

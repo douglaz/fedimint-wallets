@@ -765,6 +765,10 @@ fn operation_view(record: &OperationRecord) -> OperationView {
         reason: reason_tag(record.reason).to_owned(),
         operation_key: record.correlation_key.0.clone(),
         error: record.error.clone(),
+        refusal: match &record.kind {
+            OperationKind::Refusal { diagnostics, .. } => Some(*diagnostics),
+            _ => None,
+        },
     }
 }
 
