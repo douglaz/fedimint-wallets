@@ -15,7 +15,7 @@ pub struct Policy {
     /// use `max_fee_bps_of_move`.
     pub max_fee: Msat,
     /// PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
-    /// (0..=10000). Replaces the absolute `max_fee` for funding so sizing scales with the move
+    /// (1..=10000; Policy rejects 0). Replaces the absolute `max_fee` for funding so sizing scales with the move
     /// and a positive surplus never saturates to a refused (zero-amount) move.
     pub max_fee_bps_of_move: u16,
     pub spending_fed: Option<FederationId>,

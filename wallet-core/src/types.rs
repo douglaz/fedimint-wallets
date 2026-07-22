@@ -94,7 +94,7 @@ pub struct AllocatorSnapshot {
     /// the drain). Funding `Move`s use `max_fee_bps_of_move` instead.
     pub max_fee: Msat,
     /// The PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
-    /// (0..=10000). Funding-move sizing reserves `amount + amount*bps/10000` from the source
+    /// (1..=10000; Policy rejects 0). Funding-move sizing reserves `amount + amount*bps/10000` from the source
     /// budget — `amount ≤ budget * 10000/(10000+bps)` — so a positive budget never saturates
     /// `available` to zero, and the stamped `fee_cap` scales with the move. Does NOT bound
     /// `Evacuate` (see `max_fee`).

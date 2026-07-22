@@ -65,7 +65,7 @@ pub struct TickPolicy {
     /// use `max_fee_bps_of_move`.
     pub max_fee: Msat,
     /// PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
-    /// (0..=10000). Sizing reserves `amount + amount*bps/10000` from the source budget.
+    /// (1..=10000; Policy rejects 0). Sizing reserves `amount + amount*bps/10000` from the source budget.
     pub max_fee_bps_of_move: u16,
     /// The allocation epoch (T10) stamped into each decision's idempotency key.
     pub occurrence: Occurrence,

@@ -344,8 +344,8 @@ struct PolicySetFlags {
     /// Absolute evacuation and manual-operation fee cap, in millisatoshis.
     #[arg(long)]
     max_fee: Option<u64>,
-    /// Proportional funding-move fee cap, basis points (0-10000).
-    #[arg(long)]
+    /// Proportional funding-move fee cap, basis points (1-10000).
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=10_000))]
     max_fee_bps_of_move: Option<u16>,
     #[arg(long)]
     spending_fed: Option<String>,
@@ -444,7 +444,7 @@ struct PolicyFlags {
     #[arg(long)]
     max_fee: Option<u64>,
     /// Proportional funding-move fee cap, in basis points of the amount moved (1-10000).
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=10_000))]
     max_fee_bps_of_move: Option<u16>,
     /// Pin the spending federation (hex id). Default: auto-designate the best-ranked eligible fed.
     #[arg(long)]
