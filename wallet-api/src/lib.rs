@@ -125,6 +125,14 @@ impl Policy {
         if self.probe_retry_backoff_secs == 0 {
             return Err(PolicyValidationError::ZeroProbeRetryBackoffSecs);
         }
+        if self.max_fee_bps_of_move == 0 {
+            // A zero bps stamps `fee_cap: 0` on every funding move; the executor's pre-mint gate
+            // then refuses any nonzero receive quote, so the allocator re-emits the same doomed
+            // move each occurrence — a permanent-failure loop. Reject it like the sibling
+            // zero-knobs. (A low-but-nonzero bps can still under-cap SMALL moves — that economic
+            // floor is br-ljj.3's per-route work, deliberately out of scope here.)
+            return Err(PolicyValidationError::ZeroMaxFeeBps);
+        }
         if self.max_fee_bps_of_move > 10_000 {
             // Over 100% of the move: fees would exceed the amount moved (nonsensical), and the
             // sizing `amount <= budget * 10000/(10000+bps)` assumes a bounded bps.
@@ -148,6 +156,7 @@ pub enum PolicyValidationError {
     TargetExceedsPerFedCap,
     ZeroProbeRetryBackoffSecs,
     MaxFeeBpsExceedsCeiling,
+    ZeroMaxFeeBps,
 }
 
 impl PolicyValidationError {
@@ -162,7 +171,7 @@ impl PolicyValidationError {
             Self::ProbeSpanExceedsTtl => "probe_min_span_secs/probe_ttl_secs",
             Self::TargetExceedsPerFedCap => "spending_target/standby_target/per_fed_cap",
             Self::ZeroProbeRetryBackoffSecs => "probe_retry_backoff_secs",
-            Self::MaxFeeBpsExceedsCeiling => "max_fee_bps_of_move",
+            Self::MaxFeeBpsExceedsCeiling | Self::ZeroMaxFeeBps => "max_fee_bps_of_move",
         }
     }
 }
@@ -175,7 +184,8 @@ impl fmt::Display for PolicyValidationError {
             | Self::ZeroProbeMinSuccesses
             | Self::ZeroPerFedCap
             | Self::ZeroProbeTtlSecs
-            | Self::ZeroProbeRetryBackoffSecs => {
+            | Self::ZeroProbeRetryBackoffSecs
+            | Self::ZeroMaxFeeBps => {
                 write!(formatter, "{} must be non-zero", self.offending_field())
             }
             Self::MinIntervalExceedsBaseInterval => write!(
@@ -435,6 +445,7 @@ mod tests {
         assert_eq!(policy.spending_target, Msat(500_000_000));
         assert_eq!(policy.standby_target, Msat(150_000_000));
         assert_eq!(policy.max_fee, Msat(200_000));
+        assert_eq!(policy.max_fee_bps_of_move, 300);
         assert_eq!(policy.spending_fed, None);
         assert_eq!(policy.standby_fed, None);
         assert_eq!(policy.probe_min_span_secs, 86_400);
@@ -544,6 +555,20 @@ mod tests {
                 },
                 PolicyValidationError::ZeroPerFedCap,
             ),
+            (
+                Policy {
+                    max_fee_bps_of_move: 10_001,
+                    ..Policy::default()
+                },
+                PolicyValidationError::MaxFeeBpsExceedsCeiling,
+            ),
+            (
+                Policy {
+                    max_fee_bps_of_move: 0,
+                    ..Policy::default()
+                },
+                PolicyValidationError::ZeroMaxFeeBps,
+            ),
         ];
 
         for (policy, expected) in cases {
@@ -558,6 +583,12 @@ mod tests {
             },
             Policy {
                 standby_fed: Some(fed(1)),
+                ..Policy::default()
+            },
+            // 10_000 bps (100%) is the inclusive ceiling: the rule is `> 10_000`, so the
+            // boundary itself must stay accepted.
+            Policy {
+                max_fee_bps_of_move: 10_000,
                 ..Policy::default()
             },
         ] {

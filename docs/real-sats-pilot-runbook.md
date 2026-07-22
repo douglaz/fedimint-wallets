@@ -56,15 +56,22 @@ Pilot policy: keep the total at an amount you are genuinely willing to lose. Sug
 starting point (~150k sats total ceiling across feds):
 
 ```bash
+# 100k sats concentration ceiling per federation
+# 50k sats float in the spending fed
+# 20k sats in standby
+# 50 sats absolute cap: evacuations + manual --fee-cap default
+# 3% proportional cap on funding moves (top-up/standby)
 wallet-cli policy set \
-  --per-fed-cap 100000000 \        # 100k sats concentration ceiling per federation
-  --spending-target 50000000 \     # 50k sats float in the spending fed
-  --standby-target 20000000 \      # 20k sats in standby
-  --max-fee 50000                  # 50 sats per-move fee cap
+  --per-fed-cap 100000000 \
+  --spending-target 50000000 \
+  --standby-target 20000000 \
+  --max-fee 50000 \
+  --max-fee-bps-of-move 300
 wallet-cli policy get              # verify what is actually stored
 ```
 
-(Values are msat. Raise them only after a clean first week.)
+(Values are msat, except `--max-fee-bps-of-move`, which is basis points, 0-10000. Raise
+them only after a clean first week.)
 
 ## Daily — the one-minute glance
 

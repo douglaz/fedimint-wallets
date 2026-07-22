@@ -173,8 +173,9 @@ fn fund_into(
     out: &mut Vec<AllocatorDecision>,
 ) {
     // Source-side figures, shared by every refusal this function can emit. `source`-derived
-    // fields are `None` exactly when there is no usable source; `max_fee` is a snapshot
-    // constant, recorded even when sourceless so a cap-too-large refusal is legible.
+    // fields are `None` exactly when there is no usable source. `max_fee` is NOT among them:
+    // since br-ljj.2 every funding refusal below records it as `None` (see the sites), because
+    // funding sizes off the proportional `max_fee_bps_of_move`, not the absolute cap.
     let source_id = source.map(|s| s.id);
     let source_spendable = source.map(|s| s.balance.spendable);
     let source_available = source.map(|_| Msat(available));
@@ -187,8 +188,8 @@ fn fund_into(
             available: source_available,
             source_spendable,
             // Funding sizing uses the proportional `max_fee_bps_of_move`, NOT the absolute cap, so
-        // recording `max_fee` here would mislead; `available` already reflects the bps reserve.
-        max_fee: None,
+            // recording `max_fee` here would mislead; `available` already reflects the bps reserve.
+            max_fee: None,
             cap_room: None,
             amount: None,
             min_move: Some(snapshot.min_move),

@@ -169,7 +169,16 @@ work — the invariant THIS phase buys is that the proof is durable and the stat
    - `cap_room(snapshot, fed)` becomes `cap_room_with(snapshot, fed, &credited)` =
      `per_fed_cap − spendable − credited[fed]` (saturating).
    - The reservation ADJUSTS each branch's EXISTING availability formula — it never replaces
-     branch invariants (all saturating, `fee_cap = snapshot.max_fee`):
+     branch invariants (all saturating, `fee_cap = snapshot.max_fee` — but see the funding
+     amendment first):
+     - **Funding branches superseded by the proportional cap (br-ljj.2, 2026-07-22):** the two
+       funding formulas below now yield a *budget* — they drop their own `− fee_cap` term — and
+       the move is sized against it as
+       `available = budget * 10000 / (10000 + max_fee_bps_of_move)`, stamping
+       `fee_cap = amount * max_fee_bps_of_move / 10000`. `amount + fee_cap ≤ budget` still
+       holds, but a flat cap can no longer exceed a small surplus and refuse the whole move.
+       `Evacuate` alone still carries `fee_cap = snapshot.max_fee`; the
+       `debited[from] += amount + fee_cap` bound below is unchanged.
      - TopUp (standby → spending): `available = spendable − debited[src] − fee_cap`.
      - Standby funding (spending → standby): the surplus floor STAYS —
        `available = (spendable − target_spending_balance) − debited[src] − fee_cap` — the

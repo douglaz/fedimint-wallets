@@ -341,8 +341,12 @@ struct PolicySetFlags {
     spending_target: Option<u64>,
     #[arg(long)]
     standby_target: Option<u64>,
+    /// Absolute evacuation and manual-operation fee cap, in millisatoshis.
     #[arg(long)]
     max_fee: Option<u64>,
+    /// Proportional funding-move fee cap, basis points (0-10000).
+    #[arg(long)]
+    max_fee_bps_of_move: Option<u16>,
     #[arg(long)]
     spending_fed: Option<String>,
     #[arg(long)]
@@ -436,9 +440,12 @@ struct PolicyFlags {
     /// Target warm-standby balance, in millisatoshis (fund below it).
     #[arg(long)]
     standby_target: Option<u64>,
-    /// Per-move fee cap, in millisatoshis.
+    /// Absolute evacuation fee cap, in millisatoshis.
     #[arg(long)]
     max_fee: Option<u64>,
+    /// Proportional funding-move fee cap, in basis points of the amount moved (1-10000).
+    #[arg(long)]
+    max_fee_bps_of_move: Option<u16>,
     /// Pin the spending federation (hex id). Default: auto-designate the best-ranked eligible fed.
     #[arg(long)]
     spending: Option<String>,
@@ -470,6 +477,7 @@ impl PolicyFlags {
             || self.spending_target.is_some()
             || self.standby_target.is_some()
             || self.max_fee.is_some()
+            || self.max_fee_bps_of_move.is_some()
             || self.spending.is_some()
             || self.standby.is_some()
             || self.occurrence != 0
@@ -1828,6 +1836,11 @@ fn apply_policy_set(policy: &mut Policy, flags: &PolicySetFlags) -> Result<(), C
     if let Some(v) = flags.max_fee {
         policy.max_fee = Msat(v);
     }
+    if let Some(v) = flags.max_fee_bps_of_move {
+        // Out-of-range values (> 10000) are rejected by `Policy::validate()` on the PUT, so the
+        // refusal surfaces through the same path as every other policy contradiction.
+        policy.max_fee_bps_of_move = v;
+    }
     if flags.clear_spending_fed {
         policy.spending_fed = None;
     }
@@ -2221,6 +2234,9 @@ fn build_tick_policy(
     }
     if let Some(v) = flags.max_fee {
         policy.max_fee = Msat(v);
+    }
+    if let Some(v) = flags.max_fee_bps_of_move {
+        policy.max_fee_bps_of_move = v;
     }
     policy.occurrence = Occurrence(flags.occurrence);
     if let Some(gate) = gate_policy_override(flags) {
