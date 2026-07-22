@@ -1837,8 +1837,9 @@ fn apply_policy_set(policy: &mut Policy, flags: &PolicySetFlags) -> Result<(), C
         policy.max_fee = Msat(v);
     }
     if let Some(v) = flags.max_fee_bps_of_move {
-        // Out-of-range values (> 10000) are rejected by `Policy::validate()` on the PUT, so the
-        // refusal surfaces through the same path as every other policy contradiction.
+        // Out-of-range values are already rejected at flag-parse time by the clap
+        // `value_parser!(u16).range(1..=10_000)`, so `v` here is always in range; this only
+        // applies the override.
         policy.max_fee_bps_of_move = v;
     }
     if flags.clear_spending_fed {

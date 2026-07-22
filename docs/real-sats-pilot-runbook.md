@@ -114,48 +114,17 @@ systemctl --user show walletd -p NRestarts
 
 ## Upgrades — a release that changes the stored-policy schema
 
-This is a greenfield, pre-1.0 wallet: the persisted `Policy` has **no serde migration**. When a
-release adds a required policy field (e.g. `max_fee_bps_of_move`), the policy row written by the
-previous release no longer decodes, and `seed_policy` fails that decode **before the actor
-starts** — so walletd will not come up after the upgrade until the stored policy is replaced.
-There is no in-place `policy set` fix: `policy set` reads the existing policy first and hits the
-same undecodable row.
+A release that ADDS a policy field marks it `#[serde(default)]`, so a policy row persisted by a
+previous release still decodes (the new field adopts its shipped default) and walletd starts
+normally. Just deploy and restart; re-run `policy set` afterward only if you want to set the new
+field to a non-default value.
 
-The recovery leans on the two-store split — **`client.db` holds the ecash + seed; `journal.db`
-holds only the operation ledger, policy, and federation registry** (no money). So you replace the
-journal without touching the wallet:
-
-`journal.db` and `client.db` are both RocksDB **directories** under the daemon's configured
-`data_dir` (the `data_dir` in `walletd.toml`; there is no env override for it — only
-`WALLETD_TOKEN_PATH` exists). Resolve `DATA_DIR` from your `walletd.toml` before running any of
-this:
-
-```bash
-DATA_DIR=/path/from/walletd.toml          # the `data_dir` value; e.g. ~/.local/share/walletd
-# 0. Confirm nothing is in flight (wiping the journal discards in-flight op state):
-wallet-cli history --limit 200 | grep -iE "started|awaiting" || echo "quiescent — safe"
-# 1. Stop the daemon.
-systemctl --user stop walletd             # or however it is supervised
-# 2. MOVE ASIDE (don't rm) ONLY the journal DIRECTORY, so a bad DATA_DIR fails loudly instead of
-#    deleting. NEVER touch client.db — that IS the wallet (see Never).
-test -d "$DATA_DIR/client.db" || { echo "DATA_DIR wrong — client.db not here; abort"; exit 1; }
-mv "$DATA_DIR/journal.db" "$DATA_DIR/journal.db.bak-$(date -u +%Y%m%dT%H%M%SZ)"
-# 3. Restart. A fresh journal re-seeds the DEFAULT policy, so the daemon starts.
-systemctl --user start walletd
-# 4. Re-join every federation from your recorded invites (§2). The seed in the untouched
-#    client.db lets fedimint recover each federation's ecash balance on rejoin.
-wallet-cli join <fed1...>                  # once per fed
-# 5. Re-apply your standing instruction — the whole Cap the exposure block (§4), INCLUDING the
-#    new field, so the policy is not left at defaults.
-wallet-cli policy set --per-fed-cap ... --max-fee-bps-of-move 300 ...
-# 6. Verify, then delete the journal.db.bak-* directory once balances are confirmed.
-wallet-cli policy get                      # the field is present and your values are back
-wallet-cli balance                         # ecash recovered per federation
-```
-
-Wiping the journal loses operation **history** permanently and forces the rejoin above; it does
-not lose money. If a settlement was in flight at step 0, reconcile it against the federations'
-view by hand (same caveat as **Disk dies** under Incidents).
+**Do NOT try to "reset" a stuck policy by wiping `journal.db`.** The federation registry
+(federation id → client db-prefix) lives in `journal.db`, and the wallet has no seed-recovery
+path wired: after a wipe, `wallet-cli join` allocates a fresh EMPTY client partition instead of
+reopening the funded one, so `balance` reads 0 and the ecash is stranded in an orphaned
+partition. Restoring the backup brings back the same undecodable row. If a policy row ever fails
+to decode on a real deployment, stop and treat it as an incident — do not wipe (see Never).
 
 ## Never
 

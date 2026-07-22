@@ -94,11 +94,13 @@ pub struct AllocatorSnapshot {
     /// the drain). Funding `Move`s use `max_fee_bps_of_move` instead.
     pub max_fee: Msat,
     /// The PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
-    /// (1..=10000; Policy rejects 0). Funding-move sizing reserves `amount + amount*bps/10000` from the source
-    /// budget — `amount ≤ budget * 10000/(10000+bps)` — so an absolute cap larger than the surplus no longer
-    /// cliffs `available` to zero (the saturation bug); a sub-unit budget still floors to 0. The
-    /// stamped `fee_cap` scales with the move. Does NOT bound
-    /// `Evacuate` (see `max_fee`).
+    /// (1..=10000; Policy rejects 0). Funding-move sizing reserves `amount + amount*bps/10000`
+    /// from the source budget by the EXACT integer inverse (`allocator::max_fundable`) — the
+    /// largest `amount` with `amount + floor(amount*bps/10000) ≤ budget`, NOT the naive
+    /// `floor(budget*10000/(10000+bps))`, which undershoots by 1 msat and can spuriously refuse
+    /// a viable move at the `min_move` floor. So an absolute cap larger than the surplus no
+    /// longer cliffs `available` to zero (the saturation bug); a sub-unit budget still floors to
+    /// 0. The stamped `fee_cap` scales with the move. Does NOT bound `Evacuate` (see `max_fee`).
     pub max_fee_bps_of_move: u16,
     /// The smallest fund/top-up move worth emitting, injected by the I/O layer from the
     /// protocol floor (lnv2 refuses incoming contracts below its 5-sat minimum). A top-up
@@ -212,11 +214,13 @@ pub struct RefusalDiagnostics {
     /// The shortfall the decision was trying to fill (`target − spendable`), when it had one.
     /// `None` for an evacuation, which drains its source rather than filling a target.
     pub want: Option<Msat>,
-    /// The largest amount fundable from the source: since br-ljj.2, `budget * 10000/(10000+bps)`
+    /// The largest amount fundable from the source: since br-ljj.2, the exact integer maximum
+    /// `amount` with `amount + floor(amount*bps/10000) ≤ budget` (`allocator::max_fundable`),
     /// where `budget = source_spendable − reservations − (standby path) the spending target` and
-    /// `bps = max_fee_bps_of_move`. Proportional — an oversized absolute cap no longer cliffs it to
-    /// zero (the old saturation bug); a sub-unit budget still floors to 0. `None` when there was no usable source at all (as
-    /// opposed to `Some(Msat(0))`, a source with no surplus).
+    /// `bps = max_fee_bps_of_move`. It exceeds the naive `floor(budget*10000/(10000+bps))` by up
+    /// to 1 msat by design. Proportional — an oversized absolute cap no longer cliffs it to zero
+    /// (the old saturation bug); a sub-unit budget still floors to 0. `None` when there was no
+    /// usable source at all (as opposed to `Some(Msat(0))`, a source with no surplus).
     pub available: Option<Msat>,
     /// The source federation's raw spendable balance, the top of the `available` chain.
     pub source_spendable: Option<Msat>,

@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 pub use wallet_core::{FederationId, Msat, RefusalDiagnostics};
 
+/// The shipped `max_fee_bps_of_move` default (300 bps). A named fn so serde's missing-field
+/// default and `Policy::default()` cannot drift apart.
+fn default_max_fee_bps_of_move() -> u16 {
+    300
+}
+
 /// The standing instruction's user-owned allocation and automation parameters.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -15,8 +21,15 @@ pub struct Policy {
     /// use `max_fee_bps_of_move`.
     pub max_fee: Msat,
     /// PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
-    /// (1..=10000; Policy rejects 0). Replaces the absolute `max_fee` for funding so sizing scales with the move
-    /// and a positive surplus never saturates to a refused (zero-amount) move.
+    /// (1..=10000; Policy rejects 0). Replaces the absolute `max_fee` for funding so sizing
+    /// scales with the move and a positive surplus never saturates to a refused (zero-amount)
+    /// move. `#[serde(default)]` so a policy row persisted before this field existed still
+    /// decodes (adopting the shipped default) and the daemon starts across the upgrade —
+    /// `seed_policy` decodes the stored row before the actor starts, so a hard decode failure
+    /// there would strand the wallet (wiping the journal to recover is NOT safe: it also
+    /// destroys the federation registry, orphaning the ecash — the wallet has no seed-recovery
+    /// path wired yet).
+    #[serde(default = "default_max_fee_bps_of_move")]
     pub max_fee_bps_of_move: u16,
     pub spending_fed: Option<FederationId>,
     pub standby_fed: Option<FederationId>,
@@ -53,7 +66,7 @@ impl Default for Policy {
             // ~258 bps — with ~2.3x headroom over a realistic two-leg gateway fee (~130 bps:
             // the executor fee model's "realistic" 0.5% ppm/leg plus base + federation fees).
             // Tune DOWN once br-ljj.3's per-route economics yield precise per-move fee data.
-            max_fee_bps_of_move: 300,
+            max_fee_bps_of_move: default_max_fee_bps_of_move(),
             spending_fed: None,
             standby_fed: None,
             // The verdict knobs and amount match wallet_core::ProbePolicy.
@@ -477,6 +490,21 @@ mod tests {
             ..Policy::default()
         };
         assert_json_roundtrip(policy);
+    }
+
+    #[test]
+    fn policy_missing_bps_field_decodes_with_default() {
+        // A policy row persisted before `max_fee_bps_of_move` existed must still decode — the
+        // daemon's `seed_policy` decodes the stored row BEFORE the actor starts, so a hard
+        // failure there would strand the wallet across the upgrade. `#[serde(default)]` adopts
+        // the shipped default instead. (`deny_unknown_fields` still rejects EXTRA fields.)
+        let mut json = serde_json::to_value(Policy::default()).expect("serialize");
+        json.as_object_mut()
+            .expect("object")
+            .remove("max_fee_bps_of_move");
+        let decoded: Policy =
+            serde_json::from_value(json).expect("old policy row (no bps field) still decodes");
+        assert_eq!(decoded.max_fee_bps_of_move, 300);
     }
 
     #[test]
