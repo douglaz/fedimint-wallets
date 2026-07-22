@@ -112,8 +112,8 @@ fn floor_does_not_block_a_real_shortfall() {
 #[test]
 fn sub_floor_available_crumbs_skip_the_move_but_keep_the_refusal() {
     // A REAL 50_000 shortfall, but the source's spendable surplus after its own target is only
-    // 3_500 (53_500 - 50_000), and the proportional fee reserve leaves 3_465 fundable of that
-    // (3_500 * 10000/10100) — sub-floor crumbs that could only fail lnv2's minimum at perform
+    // 3_500 (53_500 - 50_000), and the proportional fee reserve leaves 3_466 fundable of that
+    // (max_fundable(3_500, 100)) — sub-floor crumbs that could only fail lnv2's minimum at perform
     // time. No move; the shortfall refusal STILL records why the standby stays underfunded
     // (unlike the dust case, this is actionable).
     let mut snapshot = snap!([fed!(1, 53_500, true, false, true), fed!(2, 0, true, false, true)], Some(id!(1)), Some(id!(2)), 500_000, 50_000, 50_000, 2800);
@@ -183,8 +183,8 @@ fn first_refusal_diagnostics(decisions: &[AllocatorDecision]) -> RefusalDiagnost
 #[test]
 fn refusal_records_the_full_shortfall_arithmetic() {
     // fed 1 wants 50_000 to reach target, but cap_room (40_000) and then the source's
-    // available surplus (9_900 = source 10_000 * 10000/10100, the proportional fee reserve of
-    // br-ljj.2) each bind below it, so only 9_900 moves. The recorded figures — including the
+    // available surplus (9_901 = max_fundable(10_000, 100), the proportional fee reserve of
+    // br-ljj.2) each bind below it, so only 9_901 moves. The recorded figures — including the
     // source fed and its raw spendable — let a reader recover exactly that chain without the
     // live snapshot. `max_fee` is None: funding sizes off `max_fee_bps_of_move`, not the
     // absolute cap, and `available` already carries the bps reserve.
@@ -194,9 +194,9 @@ fn refusal_records_the_full_shortfall_arithmetic() {
     assert_eq!(diag.want, Some(Msat(50_000)));
     assert_eq!(diag.source_spendable, Some(Msat(10_000)));
     assert_eq!(diag.max_fee, None);
-    assert_eq!(diag.available, Some(Msat(9_900)));
+    assert_eq!(diag.available, Some(Msat(9_901)));
     assert_eq!(diag.cap_room, Some(Msat(40_000)));
-    assert_eq!(diag.amount, Some(Msat(9_900)));
+    assert_eq!(diag.amount, Some(Msat(9_901)));
     assert_eq!(diag.min_move, Some(Msat(0)));
 }
 
@@ -221,14 +221,14 @@ fn refusal_with_no_usable_source_records_available_none() {
 fn receive_blocked_refusal_records_source_side_figures_only() {
     // fed 1 (spending) is unprobed, so fund_into refuses at the receive-blocker gate BEFORE
     // cap room / the amount are computed: those stay None, but the source-side figures (the
-    // standby fed 2, its 80_000 spendable, available 79_207 = 80_000 * 10000/10100) are known.
+    // standby fed 2, its 80_000 spendable, available 79_208 = max_fundable(80_000, 100)) are known.
     // `max_fee` is None — funding sizes off `max_fee_bps_of_move` (br-ljj.2).
     let snapshot = snap!([fed!(1, 10_000, false, 100, false, true), fed!(2, 80_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 60_000, 0, 9300);
     let diag = first_refusal_diagnostics(&decide(&snapshot, occ(1)));
     assert_eq!(diag.want, Some(Msat(50_000)));
     assert_eq!(diag.source, Some(id!(2)));
     assert_eq!(diag.source_spendable, Some(Msat(80_000)));
-    assert_eq!(diag.available, Some(Msat(79_207)));
+    assert_eq!(diag.available, Some(Msat(79_208)));
     assert_eq!(diag.max_fee, None);
     assert_eq!(diag.cap_room, None);
     assert_eq!(diag.amount, None);
@@ -252,8 +252,8 @@ fn absolute_cap_no_longer_saturates_funding() {
             _ => None,
         })
         .expect("a funding move despite max_fee >> surplus");
-    // available = 100_000 * 10000/(10000+100) = 99_009; cap_room and want both larger.
-    assert_eq!(amount, 99_009);
+    // available = max_fundable(100_000, 100) = 99_010 (exact inverse); cap_room and want larger.
+    assert_eq!(amount, 99_010);
 }
 
 #[test]
@@ -273,8 +273,8 @@ fn funding_move_fee_cap_fits_the_source_budget() {
             _ => None,
         })
         .expect("a funding move");
-    assert_eq!(amount, 495_049); // 500_000 * 10000/10100
-    assert_eq!(fee_cap, 4_950); // 495_049 * 100/10000
+    assert_eq!(amount, 495_050); // max_fundable(500_000, 100), exact inverse
+    assert_eq!(fee_cap, 4_950); // 495_050 * 100/10000
     assert!(
         amount + fee_cap <= 500_000,
         "amount {amount} + fee_cap {fee_cap} overdraws the 500_000 budget"
@@ -392,13 +392,13 @@ fn colliding_over_cap_refusals_keep_the_populated_figures() {
 #[test]
 fn cap_and_liquidity_refusals_do_not_collide() {
     // cap_room=40k, want=50k. The source (fed 2) has 10k spendable, and the TopUp reserves its
-    // own PROPORTIONAL fee_cap, so available=9_900 (10_000 * 10000/10100, §4.2 + br-ljj.2).
+    // own PROPORTIONAL fee_cap, so available=9_901 (max_fundable(10_000, 100), §4.2 + br-ljj.2).
     // Both OverCap and SpendingBelowTarget remain true policy signals for the same destination.
     let snapshot = snap!([fed!(1, 60_000, true, false, true), fed!(2, 10_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 110_000, 0, 9000);
     assert_eq!(
         decide(&snapshot, occ(1)),
         vec![
-            AllocatorDecision { action: move_action!(2, 1, 9_900), reason: ReasonCode::SpendingBelowTarget, occurrence: occ(1), idempotency_key: move_key(2, 1, 1) },
+            AllocatorDecision { action: move_action!(2, 1, 9_901), reason: ReasonCode::SpendingBelowTarget, occurrence: occ(1), idempotency_key: move_key(2, 1, 1) },
             AllocatorDecision { action: refuse!(1, ReasonCode::OverCap), reason: ReasonCode::OverCap, occurrence: occ(1), idempotency_key: refuse_key(1, ReasonCode::OverCap, 1) },
             AllocatorDecision { action: refuse!(1, ReasonCode::SpendingBelowTarget), reason: ReasonCode::SpendingBelowTarget, occurrence: occ(1), idempotency_key: refuse_key(1, ReasonCode::SpendingBelowTarget, 1) },
         ]
@@ -531,7 +531,7 @@ fn cross_operation_reservations_only_change_source_availability_and_cap_room() {
     // The outbound reservation must still BIND the move for this golden to prove anything about
     // source availability. Under br-ljj.2's proportional reserve the source keeps far more of its
     // budget than the old flat `− max_fee 500` left it, so the reservation is sized to bind:
-    // budget = 900 − 600 = 300, available = 300 * 10000/10100 = 297, below the 400 want.
+    // budget = 900 − 600 = 300, available = max_fundable(300, 100) = 298, below the 400 want.
     // want stays 400 (500 target − 100 spendable), NOT 200 — the 200 speculative inbound on the
     // destination is deliberately not credited toward its target, only against its cap room.
     let mut snapshot = snap!([fed!(1, 100, true, false, true), fed!(2, 900, true, false, true)], Some(id!(1)), Some(id!(2)), 1_000, 500, 0, 600);
@@ -548,7 +548,7 @@ fn cross_operation_reservations_only_change_source_availability_and_cap_room() {
     assert!(
         decisions.iter().any(|decision| matches!(
             decision.action,
-            Action::Move { amount: Msat(297), .. }
+            Action::Move { amount: Msat(298), .. }
         )),
         "the source reservation reduces available funds without treating speculative inbound as target credit"
     );

@@ -127,14 +127,21 @@ fn reserved(map: &BTreeMap<FederationId, u64>, fed: FederationId) -> u64 {
     map.get(&fed).copied().unwrap_or(0)
 }
 
-/// The largest funding-move amount whose PROPORTIONAL fee cap still fits `budget`:
-/// `amount + amount*bps/10000 <= budget`, i.e. `amount <= budget * 10000/(10000+bps)`. Unlike
-/// the former absolute-cap reservation (`budget - max_fee`), a positive budget NEVER saturates
-/// to zero — the result is a fraction of budget — which is the saturation bug br-ljj.2 fixes.
-/// `u128` intermediate so a `per_fed_cap`-scale budget cannot overflow the `* 10000` multiply.
+/// The largest funding-move amount whose PROPORTIONAL fee cap still fits `budget`: the exact
+/// integer maximum `amount` with `amount + floor(amount*bps/10000) <= budget`. Unlike the
+/// former absolute-cap reservation (`budget - max_fee`), it is a fraction of budget, so the
+/// saturation bug br-ljj.2 fixes is gone — though a tiny budget can still floor to 0 (a 1-msat
+/// budget funds nothing).
+///
+/// The exact inverse, NOT the naive `floor(budget*10000/(10000+bps))`: that form undershoots
+/// the true maximum by up to 1 msat, which — when the undershoot drops the result below
+/// `min_move` — would fully refuse an otherwise-viable move. Brute-forced over budgets
+/// `0..=40000` x bps `1..=10000`: this form is both overdraw-safe (never breaks the invariant)
+/// AND maximal (`result + 1` always overdraws). `u128` intermediate so `(budget+1)*10000`
+/// cannot overflow even at `u64::MAX`.
 fn max_fundable(budget: u64, bps: u16) -> u64 {
     let denom = 10_000u128 + bps as u128;
-    ((budget as u128 * 10_000) / denom) as u64
+    (((budget as u128 + 1) * 10_000 - 1) / denom) as u64
 }
 
 /// The proportional fee cap stamped on a funding `Move`: `amount * bps / 10000`. Paired with

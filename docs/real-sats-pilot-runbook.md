@@ -70,7 +70,7 @@ wallet-cli policy set \
 wallet-cli policy get              # verify what is actually stored
 ```
 
-(Values are msat, except `--max-fee-bps-of-move`, which is basis points, 0-10000. Raise
+(Values are msat, except `--max-fee-bps-of-move`, which is basis points, 1-10000. Raise
 them only after a clean first week.)
 
 ## Daily — the one-minute glance
@@ -125,24 +125,32 @@ The recovery leans on the two-store split — **`client.db` holds the ecash + se
 holds only the operation ledger, policy, and federation registry** (no money). So you replace the
 journal without touching the wallet:
 
+`journal.db` and `client.db` are both RocksDB **directories** under the daemon's configured
+`data_dir` (the `data_dir` in `walletd.toml`; there is no env override for it — only
+`WALLETD_TOKEN_PATH` exists). Resolve `DATA_DIR` from your `walletd.toml` before running any of
+this:
+
 ```bash
+DATA_DIR=/path/from/walletd.toml          # the `data_dir` value; e.g. ~/.local/share/walletd
 # 0. Confirm nothing is in flight (wiping the journal discards in-flight op state):
 wallet-cli history --limit 200 | grep -iE "started|awaiting" || echo "quiescent — safe"
 # 1. Stop the daemon.
-systemctl --user stop walletd            # or however it is supervised
-# 2. Delete ONLY the journal store. NEVER delete client.db — that IS the wallet (see Never).
-rm -f "$WALLETD_DATA_DIR/journal.db"
+systemctl --user stop walletd             # or however it is supervised
+# 2. MOVE ASIDE (don't rm) ONLY the journal DIRECTORY, so a bad DATA_DIR fails loudly instead of
+#    deleting. NEVER touch client.db — that IS the wallet (see Never).
+test -d "$DATA_DIR/client.db" || { echo "DATA_DIR wrong — client.db not here; abort"; exit 1; }
+mv "$DATA_DIR/journal.db" "$DATA_DIR/journal.db.bak-$(date -u +%Y%m%dT%H%M%SZ)"
 # 3. Restart. A fresh journal re-seeds the DEFAULT policy, so the daemon starts.
 systemctl --user start walletd
 # 4. Re-join every federation from your recorded invites (§2). The seed in the untouched
 #    client.db lets fedimint recover each federation's ecash balance on rejoin.
-wallet-cli join <fed1...>                 # once per fed
+wallet-cli join <fed1...>                  # once per fed
 # 5. Re-apply your standing instruction — the whole Cap the exposure block (§4), INCLUDING the
 #    new field, so the policy is not left at defaults.
 wallet-cli policy set --per-fed-cap ... --max-fee-bps-of-move 300 ...
-# 6. Verify.
-wallet-cli policy get                     # the field is present and your values are back
-wallet-cli balance                        # ecash recovered per federation
+# 6. Verify, then delete the journal.db.bak-* directory once balances are confirmed.
+wallet-cli policy get                      # the field is present and your values are back
+wallet-cli balance                         # ecash recovered per federation
 ```
 
 Wiping the journal loses operation **history** permanently and forces the rejoin above; it does
