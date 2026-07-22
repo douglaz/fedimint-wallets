@@ -35,6 +35,7 @@ fn refuse_decision(key: &str) -> AllocatorDecision {
         Action::RefuseInflow {
             fed: FederationId([1; 32]),
             reason: ReasonCode::OverCap,
+            diagnostics: Default::default(),
         },
         ReasonCode::OverCap,
     )
@@ -1010,6 +1011,7 @@ async fn decide_and_journal_rejects_advisory_actions() {
         action: Action::RefuseInflow {
             fed: FederationId([9; 32]),
             reason: ReasonCode::OverCap,
+            diagnostics: Default::default(),
         },
         reason: ReasonCode::OverCap,
         occurrence: Occurrence(0),
@@ -1031,6 +1033,7 @@ fn advisory_actions_are_not_executable() {
     let refuse = Action::RefuseInflow {
         fed: FederationId([1; 32]),
         reason: ReasonCode::OverCap,
+        diagnostics: Default::default(),
     };
     assert!(!refuse.is_executable());
     assert_eq!(refuse.fee_cap(), None);

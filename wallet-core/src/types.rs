@@ -164,12 +164,58 @@ pub enum Action {
     },
     /// Advisory: do not route the next inflow to `fed` / do not cap allocation here.
     /// Never becomes an executor `Intent` (see `Action::is_executable`); the ledger's
-    /// `Refusal` kind records the concept.
+    /// `Refusal` kind records the concept. `diagnostics` carries the balance/threshold
+    /// figures that produced the refusal so it stays reconstructible after a restart.
     RefuseInflow {
         fed: FederationId,
         reason: ReasonCode,
+        diagnostics: RefusalDiagnostics,
     },
 }
+
+/// The balance/threshold figures a `RefuseInflow` was decided from, persisted alongside the
+/// refusal so "why didn't the wallet act?" is answerable from the journal row alone, without
+/// live tracing (the motivating case: a refusal whose arithmetic could not be reconstructed
+/// after the pod that logged it restarted).
+///
+/// Every field is optional because the refusal sites compute different subsets: a
+/// `receive_blocker` gate refuses before cap room or the move amount is known, and an
+/// evacuation with no safe destination has neither a shortfall nor an amount. `available` is
+/// `None` (not `Some(0)`) precisely when there was no usable funding source — the case that
+/// distinguishes "the source had nothing to give" from "there was no source at all".
+///
+/// These are OBSERVATIONAL metadata, not part of the refusal's identity: two refusals of the
+/// same federation for the same reason are the same advisory signal regardless of the figures
+/// captured at each. `PartialEq`/`Eq` are therefore hand-written to compare equal always, so
+/// equality agrees with the idempotency key (`allocator::idem_refuse`), which likewise
+/// excludes them. This is load-bearing: `Action` equality is used in the actor's
+/// sizing-conflict recheck, where an attach carrying different incidental figures must NOT
+/// read as a conflict.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct RefusalDiagnostics {
+    /// The shortfall the decision was trying to fill (`target − spendable`), when it had one.
+    pub want: Option<Msat>,
+    /// The source surplus available to fund the move, after reservations and the fee cap.
+    /// `None` when there was no usable source at all (as opposed to `Some(Msat(0))`, a source
+    /// with no surplus).
+    pub available: Option<Msat>,
+    /// The destination's remaining per-fed cap room, once it had been computed.
+    pub cap_room: Option<Msat>,
+    /// The move amount the allocator settled on before refusing the remainder.
+    pub amount: Option<Msat>,
+    /// The protocol move floor (`min_move`) in effect, below which a move is dust.
+    pub min_move: Option<Msat>,
+}
+
+impl PartialEq for RefusalDiagnostics {
+    /// Always equal: the figures are observational metadata, so refusal identity (and hence
+    /// equality) is `fed` + `reason`, matching the idempotency key. See the type doc.
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for RefusalDiagnostics {}
 
 impl Action {
     /// Whether `apply()` should create an executor `Intent` for this action.

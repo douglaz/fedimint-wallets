@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use wallet_core::{
     Action, Actor, AllocatorDecision, DiscoverySource, ExecError, FederationId, FeeBreakdown,
     IdempotencyKey, Intent, IntentStatus, Journal, Msat, Occurrence, OperationKind,
-    OperationRecord, OperationStatus, RawOpUpdate, ReasonCode, SourceStatus,
+    OperationRecord, OperationStatus, RawOpUpdate, ReasonCode, RefusalDiagnostics, SourceStatus,
 };
 use wallet_fedimint::{
     FederationInfo, FedimintJournal, GatewayUrl, Invoice, LedgerRepairOracle, MovePhase,
@@ -133,6 +133,7 @@ fn refuse_dec(target: FederationId, reason: ReasonCode, k: &str) -> AllocatorDec
         action: Action::RefuseInflow {
             fed: target,
             reason,
+            diagnostics: Default::default(),
         },
         reason,
         occurrence: Occurrence(0),
@@ -486,6 +487,52 @@ async fn record_refusals_are_deduped_terminal_rows() {
             occurrence: Occurrence(0)
         }
     );
+}
+
+#[tokio::test]
+async fn record_refusals_persist_diagnostics_across_serialization() {
+    // The point of the diagnostics: a refusal's figures reach the journal (serde_json over the
+    // raw byte store — a real serialize/deserialize), so it is reconstructible after a restart
+    // and not only via live tracing. This is the acceptance signal for the feature.
+    let j = mem_ledger();
+    let diagnostics = RefusalDiagnostics {
+        want: Some(Msat(50_000)),
+        available: Some(Msat(9_500)),
+        cap_room: Some(Msat(40_000)),
+        amount: Some(Msat(9_500)),
+        min_move: Some(Msat(0)),
+    };
+    let decision = AllocatorDecision {
+        action: Action::RefuseInflow {
+            fed: fed(1),
+            reason: ReasonCode::SpendingBelowTarget,
+            diagnostics,
+        },
+        reason: ReasonCode::SpendingBelowTarget,
+        occurrence: Occurrence(0),
+        idempotency_key: IdempotencyKey("refuse:spending_below_target:0101:0".into()),
+    };
+    j.record_refusals(std::slice::from_ref(&decision), Occurrence(0), BASE)
+        .await
+        .expect("refusals");
+
+    let hist = j.history(10, None).await.expect("history");
+    assert_eq!(hist.len(), 1);
+    match &hist[0].kind {
+        OperationKind::Refusal {
+            fed: f,
+            diagnostics: read_back,
+        } => {
+            assert_eq!(*f, fed(1));
+            // `RefusalDiagnostics` compares equal always, so assert every field explicitly.
+            assert_eq!(read_back.want, Some(Msat(50_000)));
+            assert_eq!(read_back.available, Some(Msat(9_500)));
+            assert_eq!(read_back.cap_room, Some(Msat(40_000)));
+            assert_eq!(read_back.amount, Some(Msat(9_500)));
+            assert_eq!(read_back.min_move, Some(Msat(0)));
+        }
+        other => panic!("expected a refusal row, got {other:?}"),
+    }
 }
 
 // --- §9.2 journal-integrated writes (same dbtx as the intent) ---

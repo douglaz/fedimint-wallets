@@ -704,6 +704,7 @@ mod tests {
                 Action::RefuseInflow {
                     fed,
                     reason: ReasonCode::NotProbed,
+                    ..
                 } if *fed == fed_id(2)
             )),
             "unpassed auto-joined standby must be refused, not funded: {gated_decisions:?}"
@@ -744,6 +745,7 @@ mod tests {
                 Action::RefuseInflow {
                     fed,
                     reason: ReasonCode::NotProbed,
+                    ..
                 } if *fed == fed_id(2)
             )),
             "unpassed auto-joined spending pin must be refused, not topped up: {spending_pin_decisions:?}"
@@ -1285,6 +1287,7 @@ mod tests {
                 Action::RefuseInflow {
                     fed,
                     reason: ReasonCode::OverCap,
+                    ..
                 } if *fed == fed_id(1)
             )),
             "expected an over-cap refusal for fed 1; decisions: {decisions:?}"

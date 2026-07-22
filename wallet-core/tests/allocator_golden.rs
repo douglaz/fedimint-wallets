@@ -28,7 +28,11 @@ macro_rules! evacuate {
     ($from:expr, $to:expr, $amount:expr) => { Action::Evacuate { from: id!($from), to: id!($to), amount: msat!($amount), fee_cap: msat!(500) } };
 }
 macro_rules! refuse {
-    ($fed:expr, $reason:expr) => { Action::RefuseInflow { fed: id!($fed), reason: $reason } };
+    // `diagnostics` is intentionally omitted from the expected value: `RefusalDiagnostics`
+    // compares equal always (it is observational metadata), so these goldens assert the
+    // DECISION — which fed, which reason — not the incidental figures. The figures are
+    // covered by dedicated tests in `allocator.rs`.
+    ($fed:expr, $reason:expr) => { Action::RefuseInflow { fed: id!($fed), reason: $reason, diagnostics: RefusalDiagnostics::default() } };
 }
 
 fn occ(n: u64) -> Occurrence { Occurrence(n) }
@@ -155,6 +159,45 @@ fn low_reputation_blocks_receive() {
     // Negative reputation demotes below the receive floor: do not fund into it (ADR-0017).
     let snapshot = snap!([fed!(1, 20_000, true, -1, false, true), fed!(2, 80_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 60_000, 0, 7000);
     assert_eq!(decide(&snapshot, occ(1)), decision!(refuse!(1, ReasonCode::LowReputation), ReasonCode::LowReputation, occ(1), refuse_key(1, ReasonCode::LowReputation, 1)));
+}
+
+// The `refuse!` goldens above assert WHICH refusal (fed + reason), since `RefusalDiagnostics`
+// compares equal always. These two assert the recorded FIGURES directly — the diagnostic the
+// journal keeps so a refusal is reconstructible after a restart (the motivating case).
+fn first_refusal_diagnostics(decisions: &[AllocatorDecision]) -> RefusalDiagnostics {
+    decisions
+        .iter()
+        .find_map(|d| match &d.action {
+            Action::RefuseInflow { diagnostics, .. } => Some(*diagnostics),
+            _ => None,
+        })
+        .expect("a RefuseInflow decision")
+}
+
+#[test]
+fn refusal_records_the_full_shortfall_arithmetic() {
+    // fed 1 wants 50_000 to reach target, but cap_room (40_000) and then the source's
+    // available surplus (9_500) each bind below it, so only 9_500 moves. The recorded figures
+    // let a reader recover exactly that chain without the live snapshot.
+    let snapshot = snap!([fed!(1, 60_000, true, false, true), fed!(2, 10_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 110_000, 0, 9100);
+    let diag = first_refusal_diagnostics(&decide(&snapshot, occ(1)));
+    assert_eq!(diag.want, Some(Msat(50_000)));
+    assert_eq!(diag.available, Some(Msat(9_500)));
+    assert_eq!(diag.cap_room, Some(Msat(40_000)));
+    assert_eq!(diag.amount, Some(Msat(9_500)));
+    assert_eq!(diag.min_move, Some(Msat(0)));
+}
+
+#[test]
+fn refusal_with_no_usable_source_records_available_none() {
+    // The spending fed is below target but there is no standby to fund it. `available` is
+    // None — NOT Some(0) — the distinction between "no source" and "a source with no surplus".
+    // This is the exact ambiguity the motivating unreproducible refusal turned on.
+    let snapshot = snap!([fed!(1, 20_000, true, false, true)], Some(id!(1)), None, 100_000, 60_000, 0, 9200);
+    let diag = first_refusal_diagnostics(&decide(&snapshot, occ(1)));
+    assert_eq!(diag.want, Some(Msat(40_000)));
+    assert_eq!(diag.available, None);
+    assert_eq!(diag.amount, Some(Msat(0)));
 }
 
 #[test]

@@ -2322,7 +2322,7 @@ fn describe_decision(decision: &AllocatorDecision) -> String {
             fee_cap.0,
             decision.reason
         ),
-        Action::RefuseInflow { fed, reason } => {
+        Action::RefuseInflow { fed, reason, .. } => {
             format!("refuse-inflow {} (reason {reason:?})", fed.to_hex())
         }
         Action::Pay { from, amount, .. } => {
@@ -2760,7 +2760,7 @@ impl CandidateStateArg {
 /// Whether a record involves `fed` (for `history --fed`): a `Move` matches either endpoint.
 fn record_involves_fed(record: &OperationRecord, fed: FederationId) -> bool {
     match &record.kind {
-        OperationKind::Join { fed: f } | OperationKind::Refusal { fed: f } => *f == fed,
+        OperationKind::Join { fed: f } | OperationKind::Refusal { fed: f, .. } => *f == fed,
         OperationKind::Receive { fed: f, .. } | OperationKind::Pay { fed: f, .. } => *f == fed,
         OperationKind::DirectInflow { to, .. } => *to == fed,
         OperationKind::Move { from, to, .. } => *from == fed || *to == fed,
@@ -2817,7 +2817,7 @@ fn print_show_record(r: &OperationRecord) {
 
 fn print_kind_details(kind: &OperationKind) {
     match kind {
-        OperationKind::Join { fed } | OperationKind::Refusal { fed } => {
+        OperationKind::Join { fed } | OperationKind::Refusal { fed, .. } => {
             println!("fed: {}", fed.to_hex())
         }
         OperationKind::Receive { op_id, gateway, .. } => {
@@ -3687,7 +3687,10 @@ mod tests {
         };
         assert_eq!(kind_and_amount(&evac), ("evacuation", Some(Msat(40_000))));
         assert_eq!(
-            kind_and_amount(&OperationKind::Refusal { fed: fed(1) }),
+            kind_and_amount(&OperationKind::Refusal {
+                fed: fed(1),
+                diagnostics: Default::default()
+            }),
             ("refusal", None)
         );
         assert_eq!(

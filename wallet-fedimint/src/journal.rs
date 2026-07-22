@@ -53,7 +53,8 @@ use wallet_core::{
     advance, kind_from_action, status_from_intent, Action, Actor, AllocatorDecision,
     DiscoverySource, ExecError, FederationId, FeeBreakdown, GatewayUrl, IdempotencyKey, Intent,
     IntentStatus, Journal, Msat, Occurrence, OperationId, OperationKind, OperationRecord,
-    OperationStatus, ProbeAttempt, ProbePolicy, RawOpUpdate, ReasonCode, WriteKind,
+    OperationStatus, ProbeAttempt, ProbePolicy, RawOpUpdate, ReasonCode, RefusalDiagnostics,
+    WriteKind,
 };
 
 /// The app-state partition prefix (spec §4/§8). Clients live at `[0x01, ..]`, see
@@ -1001,10 +1002,14 @@ impl FedimintJournal {
         now_ms: u64,
     ) -> Result<(), ExecError> {
         for decision in decisions {
-            let Action::RefuseInflow { fed, .. } = &decision.action else {
+            let Action::RefuseInflow {
+                fed, diagnostics, ..
+            } = &decision.action
+            else {
                 continue;
             };
             let fed = *fed;
+            let diagnostics = *diagnostics;
             let reason = decision.reason;
             let key = &decision.idempotency_key;
             let mut dbtx = self.db.begin_transaction().await;
@@ -1013,7 +1018,7 @@ impl FedimintJournal {
                 None => Some(OperationRecord {
                     seq,
                     correlation_key: key.clone(),
-                    kind: OperationKind::Refusal { fed },
+                    kind: OperationKind::Refusal { fed, diagnostics },
                     actor: Actor::Agent { occurrence },
                     reason,
                     status: OperationStatus::Succeeded,
@@ -1057,7 +1062,13 @@ impl FedimintJournal {
             None => Some(OperationRecord {
                 seq,
                 correlation_key: key.clone(),
-                kind: OperationKind::Refusal { fed },
+                // A commit-time admission drop of an EXECUTABLE decision — not an
+                // allocator refusal — so there is no shortfall arithmetic to carry; the
+                // `error` field below records why it was dropped.
+                kind: OperationKind::Refusal {
+                    fed,
+                    diagnostics: RefusalDiagnostics::default(),
+                },
                 actor: Actor::Agent { occurrence },
                 reason: decision.reason,
                 status: OperationStatus::Succeeded,
