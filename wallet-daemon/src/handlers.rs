@@ -859,3 +859,48 @@ fn structural_tag(structural: &wallet_fedimint::StructuralOutcome) -> String {
 /// shorten them; production uses these.
 pub const INVOICE_MINT_DEADLINE: Duration = Duration::from_secs(30);
 pub const AWAIT_LONGPOLL_DEADLINE: Duration = Duration::from_secs(60);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wallet_core::{FeeBreakdown, RefusalDiagnostics};
+
+    fn refusal_record(diagnostics: RefusalDiagnostics) -> OperationRecord {
+        OperationRecord {
+            seq: 1,
+            correlation_key: IdempotencyKey("refuse:spending_below_target:0101:0".into()),
+            kind: OperationKind::Refusal {
+                fed: FederationId([1; 32]),
+                diagnostics,
+            },
+            actor: Actor::Agent {
+                occurrence: Occurrence(0),
+            },
+            reason: ReasonCode::SpendingBelowTarget,
+            status: OperationStatus::Succeeded,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            fees: FeeBreakdown::default(),
+            error: None,
+            repaired: false,
+        }
+    }
+
+    #[test]
+    fn operation_view_carries_populated_refusal_and_omits_figure_less() {
+        // A figure-less refusal maps to no wire object (so `skip_serializing_if` omits it);
+        // a populated one is carried. Guards the `is_populated` gate against a silent revert —
+        // the always-equal `PartialEq` means a DTO round-trip alone would not catch it.
+        let empty = operation_view(&refusal_record(RefusalDiagnostics::default()));
+        assert!(empty.refusal.is_none());
+
+        let populated = operation_view(&refusal_record(RefusalDiagnostics {
+            want: Some(Msat(50_000)),
+            ..Default::default()
+        }));
+        assert_eq!(
+            populated.refusal.expect("populated refusal carried").want,
+            Some(Msat(50_000))
+        );
+    }
+}

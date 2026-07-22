@@ -203,8 +203,9 @@ pub struct RefusalDiagnostics {
     /// `None` for an evacuation, which drains its source rather than filling a target.
     pub want: Option<Msat>,
     /// The source surplus available to fund the move: `source_spendable` minus the source's
-    /// own reservations, the per-move `max_fee`, and — on the standby-funding path — the
-    /// spending fed's target. `None` when there was no usable source at all (as opposed to
+    /// own reservations, the per-move `max_fee` (funding paths only — an evacuation does not
+    /// reserve it), and — on the standby-funding path — the spending fed's target. `None` when
+    /// there was no usable source at all (as opposed to
     /// `Some(Msat(0))`, a source with no surplus). It is a residue of several subtractions;
     /// `source_spendable − max_fee − available` recovers the aggregate of the OTHER deductions
     /// (reservations, and the target floor on the standby path), which are not split out. The
@@ -229,16 +230,29 @@ pub struct RefusalDiagnostics {
 
 impl RefusalDiagnostics {
     /// Whether any figure was recorded. Used to prefer a populated refusal over an empty
-    /// same-key one when the allocator dedups (`allocator::push_decision`).
+    /// same-key one when the allocator dedups (`allocator::push_decision`) and to omit the
+    /// wire object for a figure-less refusal. Destructured so a field added later must be
+    /// added here too (or the compiler complains) — otherwise it would be silently dropped
+    /// from both the dedup preference and the daemon projection.
     pub fn is_populated(&self) -> bool {
-        self.source.is_some()
-            || self.want.is_some()
-            || self.available.is_some()
-            || self.source_spendable.is_some()
-            || self.max_fee.is_some()
-            || self.cap_room.is_some()
-            || self.amount.is_some()
-            || self.min_move.is_some()
+        let Self {
+            source,
+            want,
+            available,
+            source_spendable,
+            max_fee,
+            cap_room,
+            amount,
+            min_move,
+        } = self;
+        source.is_some()
+            || want.is_some()
+            || available.is_some()
+            || source_spendable.is_some()
+            || max_fee.is_some()
+            || cap_room.is_some()
+            || amount.is_some()
+            || min_move.is_some()
     }
 }
 

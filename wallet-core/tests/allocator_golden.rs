@@ -225,6 +225,24 @@ fn receive_blocked_refusal_records_source_side_figures_only() {
 }
 
 #[test]
+fn evacuation_drained_source_refusal_records_source_figures_without_max_fee() {
+    // fed 1 has a shutdown notice but 0 spendable: `safest_other` guarantees the destination
+    // (fed 2) has cap room, so `amount == 0` means the SOURCE is drained. Record the source
+    // side; `max_fee` is None because an evacuation does not reserve the fee cap. The
+    // figure-blind goldens can't catch a regression here — this asserts the figures directly.
+    let snapshot = snap!([fed!(1, 0, true, true, true), fed!(2, 30_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 100_000, 0, 9900);
+    let diag = first_refusal_diagnostics(&decide(&snapshot, occ(1)));
+    assert_eq!(diag.source, Some(id!(1)));
+    assert_eq!(diag.available, Some(Msat(0)));
+    assert_eq!(diag.source_spendable, Some(Msat(0)));
+    assert_eq!(diag.cap_room, Some(Msat(70_000)));
+    assert_eq!(diag.amount, Some(Msat(0)));
+    assert_eq!(diag.max_fee, None);
+    assert_eq!(diag.want, None);
+    assert_eq!(diag.min_move, None);
+}
+
+#[test]
 fn colliding_over_cap_refusals_keep_the_populated_figures() {
     // target_spending (150_000) exceeds per_fed_cap (100_000): fed 1 is BOTH over cap and
     // below target. The top-level over-cap site emits empty figures and fund_into's over-cap
