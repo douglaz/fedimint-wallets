@@ -173,10 +173,15 @@ work — the invariant THIS phase buys is that the proof is durable and the stat
      amendment first):
      - **Funding branches superseded by the proportional cap (br-ljj.2, 2026-07-22):** the two
        funding formulas below now yield a *budget* — they drop their own `− fee_cap` term — and
-       the move is sized against it as
-       `available = budget * 10000 / (10000 + max_fee_bps_of_move)`, stamping
-       `fee_cap = amount * max_fee_bps_of_move / 10000`. `amount + fee_cap ≤ budget` still
-       holds, but a flat cap can no longer exceed a small surplus and refuse the whole move.
+       the move is sized against it by the EXACT integer inverse: the largest `amount` with
+       `amount + floor(amount * bps / 10000) ≤ budget`, computed as
+       `available = ((budget + 1) * 10000 − 1) / (10000 + max_fee_bps_of_move)`, stamping
+       `fee_cap = amount * max_fee_bps_of_move / 10000`. Do NOT use the naive
+       `floor(budget * 10000 / (10000 + bps))`: it undershoots the true maximum by up to 1 msat
+       (e.g. `budget = 5000, bps = 1` yields 4999 although 5000 fits), and when that undershoot
+       drops the result below `min_move` it refuses an otherwise-viable move outright.
+       `amount + fee_cap ≤ budget` still holds, but a flat cap can no longer exceed a small
+       surplus and refuse the whole move.
        `Evacuate` alone still carries `fee_cap = snapshot.max_fee`; the
        `debited[from] += amount + fee_cap` bound below is unchanged.
      - TopUp (standby → spending): `available = spendable − debited[src] − fee_cap`.
