@@ -765,8 +765,13 @@ fn operation_view(record: &OperationRecord) -> OperationView {
         reason: reason_tag(record.reason).to_owned(),
         operation_key: record.correlation_key.0.clone(),
         error: record.error.clone(),
+        // Only a refusal that actually recorded figures carries a `refusal` object; a
+        // figure-less refusal (plain over-cap, no-destination evacuation, tick-drop) maps to
+        // `None` so the wire omits the field entirely rather than emitting eight nulls.
         refusal: match &record.kind {
-            OperationKind::Refusal { diagnostics, .. } => Some(*diagnostics),
+            OperationKind::Refusal { diagnostics, .. } if diagnostics.is_populated() => {
+                Some(*diagnostics)
+            }
             _ => None,
         },
     }

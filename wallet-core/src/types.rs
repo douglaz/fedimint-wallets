@@ -205,15 +205,19 @@ pub struct RefusalDiagnostics {
     /// The source surplus available to fund the move: `source_spendable` minus the source's
     /// own reservations, the per-move `max_fee`, and — on the standby-funding path — the
     /// spending fed's target. `None` when there was no usable source at all (as opposed to
-    /// `Some(Msat(0))`, a source with no surplus). A residue of several subtractions, so it is
-    /// recorded alongside its inputs (`source_spendable`, `max_fee`) for decomposition.
+    /// `Some(Msat(0))`, a source with no surplus). It is a residue of several subtractions;
+    /// `source_spendable − max_fee − available` recovers the aggregate of the OTHER deductions
+    /// (reservations, and the target floor on the standby path), which are not split out. The
+    /// operationally decisive split — was `max_fee` the culprit? — IS recoverable, since
+    /// `max_fee` is recorded separately.
     pub available: Option<Msat>,
-    /// The source federation's raw spendable balance, so `available` can be decomposed from
-    /// the row without the live snapshot.
+    /// The source federation's raw spendable balance, the top of the `available` subtraction
+    /// chain.
     pub source_spendable: Option<Msat>,
-    /// The per-move fee cap (`max_fee`) subtracted when computing `available`. Recorded so a
-    /// cap larger than the surplus — the known foot-gun that zeroes `available` and refuses an
-    /// otherwise-fundable move — is visible in the row rather than inferred.
+    /// The per-move fee cap (`max_fee`) subtracted when computing `available` ON THE FUNDING
+    /// PATHS. Recorded so a cap larger than the surplus — the known foot-gun that zeroes
+    /// `available` and refuses an otherwise-fundable move — is visible in the row rather than
+    /// inferred. `None` on an evacuation refusal, which does not pre-reserve `max_fee`.
     pub max_fee: Option<Msat>,
     /// The destination's remaining per-fed cap room, once it had been computed.
     pub cap_room: Option<Msat>,

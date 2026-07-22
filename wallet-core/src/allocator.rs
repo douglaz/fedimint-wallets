@@ -481,7 +481,10 @@ fn evacuate_decision(
                     want: None,
                     available: Some(Msat(src_available)),
                     source_spendable: Some(from.balance.spendable),
-                    max_fee: Some(snapshot.max_fee),
+                    // An evacuation does NOT pre-reserve `max_fee` (the executor sizes for it
+                    // at perform time), so `available` here has no fee-cap term — record None
+                    // rather than imply a subtraction that did not happen.
+                    max_fee: None,
                     cap_room: Some(Msat(cap_room)),
                     amount: Some(amount),
                     min_move: None,

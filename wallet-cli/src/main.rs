@@ -2838,7 +2838,9 @@ pub(crate) fn print_refusal_diagnostics(diagnostics: &RefusalDiagnostics) {
         println!("cap_room_msat: {}", v.0);
     }
     if let Some(v) = diagnostics.amount {
-        println!("amount_msat: {}", v.0);
+        // Distinct label: the row's headline `amount_msat` is `-` for a refusal (no operation
+        // amount), so a second `amount_msat` here would be a conflicting duplicate key.
+        println!("decision_amount_msat: {}", v.0);
     }
     if let Some(v) = diagnostics.min_move {
         println!("min_move_msat: {}", v.0);
