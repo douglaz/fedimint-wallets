@@ -191,7 +191,7 @@ impl Journal for ActorJournal {
         self.client
             .journal_transition(
                 intent.idempotency_key.clone(),
-                JournalTransition::Upsert(intent.clone()),
+                JournalTransition::Upsert(Box::new(intent.clone())),
             )
             .await
             .map(|_| ())

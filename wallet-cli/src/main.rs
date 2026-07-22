@@ -2817,8 +2817,37 @@ fn print_show_record(r: &OperationRecord) {
 
 fn print_kind_details(kind: &OperationKind) {
     match kind {
-        OperationKind::Join { fed } | OperationKind::Refusal { fed, .. } => {
+        OperationKind::Join { fed } => {
             println!("fed: {}", fed.to_hex())
+        }
+        OperationKind::Refusal { fed, diagnostics } => {
+            println!("fed: {}", fed.to_hex());
+            // The recorded refusal arithmetic (§9.3): only the figures the deciding site
+            // computed are printed, so a refusal is diagnosable from a standalone `show`.
+            if let Some(v) = diagnostics.source {
+                println!("source: {}", v.to_hex());
+            }
+            if let Some(v) = diagnostics.want {
+                println!("want_msat: {}", v.0);
+            }
+            if let Some(v) = diagnostics.available {
+                println!("available_msat: {}", v.0);
+            }
+            if let Some(v) = diagnostics.source_spendable {
+                println!("source_spendable_msat: {}", v.0);
+            }
+            if let Some(v) = diagnostics.max_fee {
+                println!("max_fee_msat: {}", v.0);
+            }
+            if let Some(v) = diagnostics.cap_room {
+                println!("cap_room_msat: {}", v.0);
+            }
+            if let Some(v) = diagnostics.amount {
+                println!("amount_msat: {}", v.0);
+            }
+            if let Some(v) = diagnostics.min_move {
+                println!("min_move_msat: {}", v.0);
+            }
         }
         OperationKind::Receive { op_id, gateway, .. } => {
             println!("op_id: {}", opt_op(op_id));

@@ -176,7 +176,9 @@ pub enum Action {
 /// The balance/threshold figures a `RefuseInflow` was decided from, persisted alongside the
 /// refusal so "why didn't the wallet act?" is answerable from the journal row alone, without
 /// live tracing (the motivating case: a refusal whose arithmetic could not be reconstructed
-/// after the pod that logged it restarted).
+/// after the pod that logged it restarted). These are the figures at FIRST observation: a
+/// persisting condition re-ticks under the same idempotency key and `record_refusals` keeps
+/// the first row (§9.3 append-once), so the figures do not track later ticks.
 ///
 /// Every field is optional because the refusal sites compute different subsets: a
 /// `receive_blocker` gate refuses before cap room or the move amount is known, and an
@@ -188,23 +190,52 @@ pub enum Action {
 /// same federation for the same reason are the same advisory signal regardless of the figures
 /// captured at each. `PartialEq`/`Eq` are therefore hand-written to compare equal always, so
 /// equality agrees with the idempotency key (`allocator::idem_refuse`), which likewise
-/// excludes them. This is load-bearing: `Action` equality is used in the actor's
-/// sizing-conflict recheck, where an attach carrying different incidental figures must NOT
-/// read as a conflict.
+/// excludes them — that agreement is the reason. The actor's sizing-conflict recheck
+/// (`service::actor`) also compares `RefuseInflow` actions by value, but that arm is
+/// unreachable for refusals (they are filtered as non-executable before any attach), so it is
+/// defensive here, not load-bearing.
 #[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct RefusalDiagnostics {
+    /// The federation that would have SOURCED the move, when there was a usable one. Names the
+    /// fed the source-side figures (`available`, `source_spendable`) describe.
+    pub source: Option<FederationId>,
     /// The shortfall the decision was trying to fill (`target − spendable`), when it had one.
+    /// `None` for an evacuation, which drains its source rather than filling a target.
     pub want: Option<Msat>,
-    /// The source surplus available to fund the move, after reservations and the fee cap.
-    /// `None` when there was no usable source at all (as opposed to `Some(Msat(0))`, a source
-    /// with no surplus).
+    /// The source surplus available to fund the move: `source_spendable` minus the source's
+    /// own reservations, the per-move `max_fee`, and — on the standby-funding path — the
+    /// spending fed's target. `None` when there was no usable source at all (as opposed to
+    /// `Some(Msat(0))`, a source with no surplus). A residue of several subtractions, so it is
+    /// recorded alongside its inputs (`source_spendable`, `max_fee`) for decomposition.
     pub available: Option<Msat>,
+    /// The source federation's raw spendable balance, so `available` can be decomposed from
+    /// the row without the live snapshot.
+    pub source_spendable: Option<Msat>,
+    /// The per-move fee cap (`max_fee`) subtracted when computing `available`. Recorded so a
+    /// cap larger than the surplus — the known foot-gun that zeroes `available` and refuses an
+    /// otherwise-fundable move — is visible in the row rather than inferred.
+    pub max_fee: Option<Msat>,
     /// The destination's remaining per-fed cap room, once it had been computed.
     pub cap_room: Option<Msat>,
     /// The move amount the allocator settled on before refusing the remainder.
     pub amount: Option<Msat>,
     /// The protocol move floor (`min_move`) in effect, below which a move is dust.
     pub min_move: Option<Msat>,
+}
+
+impl RefusalDiagnostics {
+    /// Whether any figure was recorded. Used to prefer a populated refusal over an empty
+    /// same-key one when the allocator dedups (`allocator::push_decision`).
+    pub fn is_populated(&self) -> bool {
+        self.source.is_some()
+            || self.want.is_some()
+            || self.available.is_some()
+            || self.source_spendable.is_some()
+            || self.max_fee.is_some()
+            || self.cap_room.is_some()
+            || self.amount.is_some()
+            || self.min_move.is_some()
+    }
 }
 
 impl PartialEq for RefusalDiagnostics {

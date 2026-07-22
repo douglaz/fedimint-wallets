@@ -237,7 +237,9 @@ pub enum Snapshot {
 
 #[derive(Clone, Debug)]
 pub enum JournalTransition {
-    Upsert(Intent),
+    // Boxed: `Intent` is by far the largest variant (it carries a full `Action`), and boxing
+    // keeps `JournalTransition` — which is cloned and moved through the actor loop — small.
+    Upsert(Box<Intent>),
     CompareAndSet {
         expected: IntentStatus,
         new: IntentStatus,

@@ -31,7 +31,7 @@ macro_rules! refuse {
     // `diagnostics` is intentionally omitted from the expected value: `RefusalDiagnostics`
     // compares equal always (it is observational metadata), so these goldens assert the
     // DECISION — which fed, which reason — not the incidental figures. The figures are
-    // covered by dedicated tests in `allocator.rs`.
+    // covered by the `refusal_*` content tests below.
     ($fed:expr, $reason:expr) => { Action::RefuseInflow { fed: id!($fed), reason: $reason, diagnostics: RefusalDiagnostics::default() } };
 }
 
@@ -177,11 +177,15 @@ fn first_refusal_diagnostics(decisions: &[AllocatorDecision]) -> RefusalDiagnost
 #[test]
 fn refusal_records_the_full_shortfall_arithmetic() {
     // fed 1 wants 50_000 to reach target, but cap_room (40_000) and then the source's
-    // available surplus (9_500) each bind below it, so only 9_500 moves. The recorded figures
+    // available surplus (9_500 = source 10_000 − max_fee 500) each bind below it, so only
+    // 9_500 moves. The recorded figures — including the source fed and its raw spendable —
     // let a reader recover exactly that chain without the live snapshot.
     let snapshot = snap!([fed!(1, 60_000, true, false, true), fed!(2, 10_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 110_000, 0, 9100);
     let diag = first_refusal_diagnostics(&decide(&snapshot, occ(1)));
+    assert_eq!(diag.source, Some(id!(2)));
     assert_eq!(diag.want, Some(Msat(50_000)));
+    assert_eq!(diag.source_spendable, Some(Msat(10_000)));
+    assert_eq!(diag.max_fee, Some(Msat(500)));
     assert_eq!(diag.available, Some(Msat(9_500)));
     assert_eq!(diag.cap_room, Some(Msat(40_000)));
     assert_eq!(diag.amount, Some(Msat(9_500)));
@@ -190,14 +194,54 @@ fn refusal_records_the_full_shortfall_arithmetic() {
 
 #[test]
 fn refusal_with_no_usable_source_records_available_none() {
-    // The spending fed is below target but there is no standby to fund it. `available` is
-    // None — NOT Some(0) — the distinction between "no source" and "a source with no surplus".
-    // This is the exact ambiguity the motivating unreproducible refusal turned on.
+    // The spending fed is below target but there is no standby to fund it. `available`,
+    // `source`, and `source_spendable` are all None — NOT Some(0) — the distinction between
+    // "no source" and "a source with no surplus". This is the exact ambiguity the motivating
+    // unreproducible refusal turned on. `max_fee` is still recorded (a snapshot constant).
     let snapshot = snap!([fed!(1, 20_000, true, false, true)], Some(id!(1)), None, 100_000, 60_000, 0, 9200);
     let diag = first_refusal_diagnostics(&decide(&snapshot, occ(1)));
     assert_eq!(diag.want, Some(Msat(40_000)));
+    assert_eq!(diag.source, None);
+    assert_eq!(diag.source_spendable, None);
     assert_eq!(diag.available, None);
+    assert_eq!(diag.max_fee, Some(Msat(500)));
     assert_eq!(diag.amount, Some(Msat(0)));
+}
+
+#[test]
+fn receive_blocked_refusal_records_source_side_figures_only() {
+    // fed 1 (spending) is unprobed, so fund_into refuses at the receive-blocker gate BEFORE
+    // cap room / the amount are computed: those stay None, but the source-side figures (the
+    // standby fed 2, its 80_000 spendable, available 79_500 = 80_000 − max_fee 500) are known.
+    let snapshot = snap!([fed!(1, 10_000, false, 100, false, true), fed!(2, 80_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 60_000, 0, 9300);
+    let diag = first_refusal_diagnostics(&decide(&snapshot, occ(1)));
+    assert_eq!(diag.want, Some(Msat(50_000)));
+    assert_eq!(diag.source, Some(id!(2)));
+    assert_eq!(diag.source_spendable, Some(Msat(80_000)));
+    assert_eq!(diag.available, Some(Msat(79_500)));
+    assert_eq!(diag.max_fee, Some(Msat(500)));
+    assert_eq!(diag.cap_room, None);
+    assert_eq!(diag.amount, None);
+}
+
+#[test]
+fn colliding_over_cap_refusals_keep_the_populated_figures() {
+    // target_spending (150_000) exceeds per_fed_cap (100_000): fed 1 is BOTH over cap and
+    // below target. The top-level over-cap site emits empty figures and fund_into's over-cap
+    // emits full ones under the SAME key; the populated refusal must win the dedup
+    // (push_decision replace-if-richer), or the row would say only "fed 1, over cap".
+    let snapshot = snap!([fed!(1, 120_000, true, false, true), fed!(2, 80_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 150_000, 0, 9400);
+    let decisions = decide(&snapshot, occ(1));
+    let refusals = decisions
+        .iter()
+        .filter(|d| matches!(d.action, Action::RefuseInflow { .. }))
+        .count();
+    assert_eq!(refusals, 1, "the two same-key over-cap refusals dedup to one");
+    let diag = first_refusal_diagnostics(&decisions);
+    assert!(diag.is_populated(), "the populated over-cap refusal must survive dedup");
+    assert_eq!(diag.want, Some(Msat(30_000)));
+    assert_eq!(diag.cap_room, Some(Msat(0)));
+    assert_eq!(diag.source, Some(id!(2)));
 }
 
 #[test]

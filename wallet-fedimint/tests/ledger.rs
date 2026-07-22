@@ -496,8 +496,11 @@ async fn record_refusals_persist_diagnostics_across_serialization() {
     // and not only via live tracing. This is the acceptance signal for the feature.
     let j = mem_ledger();
     let diagnostics = RefusalDiagnostics {
+        source: Some(fed(2)),
         want: Some(Msat(50_000)),
         available: Some(Msat(9_500)),
+        source_spendable: Some(Msat(10_000)),
+        max_fee: Some(Msat(500)),
         cap_room: Some(Msat(40_000)),
         amount: Some(Msat(9_500)),
         min_move: Some(Msat(0)),
@@ -525,8 +528,11 @@ async fn record_refusals_persist_diagnostics_across_serialization() {
         } => {
             assert_eq!(*f, fed(1));
             // `RefusalDiagnostics` compares equal always, so assert every field explicitly.
+            assert_eq!(read_back.source, Some(fed(2)));
             assert_eq!(read_back.want, Some(Msat(50_000)));
             assert_eq!(read_back.available, Some(Msat(9_500)));
+            assert_eq!(read_back.source_spendable, Some(Msat(10_000)));
+            assert_eq!(read_back.max_fee, Some(Msat(500)));
             assert_eq!(read_back.cap_room, Some(Msat(40_000)));
             assert_eq!(read_back.amount, Some(Msat(9_500)));
             assert_eq!(read_back.min_move, Some(Msat(0)));
