@@ -119,6 +119,12 @@ pub enum ServiceError {
     },
     Storage(String),
     NotFound(String),
+    /// A FRESH dest-side admission (receive/direct-inflow/move) named a destination that is
+    /// JOINED but not currently OPEN. Fail fast so the caller retries once the fed reconnects,
+    /// instead of journaling a Pending row that can only stall (the receive/direct-inflow driver
+    /// stalls on the invoice deadline). Money-safe: nothing is debited before the destination
+    /// opens. The daemon maps this to a 503 (the status code is the "retry shortly" signal).
+    DestinationUnavailable(String),
     Timeout,
     ShuttingDown,
     ActorStopped,
@@ -127,9 +133,10 @@ pub enum ServiceError {
 impl fmt::Display for ServiceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Refused { message, .. } | Self::Storage(message) | Self::NotFound(message) => {
-                formatter.write_str(message)
-            }
+            Self::Refused { message, .. }
+            | Self::Storage(message)
+            | Self::NotFound(message)
+            | Self::DestinationUnavailable(message) => formatter.write_str(message),
             Self::Timeout => formatter.write_str("operation wait deadline elapsed"),
             Self::ShuttingDown => formatter.write_str("wallet service is shutting down"),
             Self::ActorStopped => formatter.write_str("wallet service actor stopped"),
@@ -148,6 +155,14 @@ pub struct OpRequest {
     pub balances: BTreeMap<FederationId, Msat>,
     /// Present only for a leg owned by the named durable probe session.
     pub probe_session_nonce: Option<String>,
+    /// Set by a dest-side handler (receive/direct-inflow/move) to the destination federation when
+    /// it is JOINED but not currently open — computed from the same detached `mc.federations()`
+    /// read `sample_balances` performs before entering the actor. On the FRESH admission branch
+    /// the actor fails fast with [`ServiceError::DestinationUnavailable`] (503) rather than
+    /// journaling a Pending row that can only stall. `None` for source-side verbs, for the
+    /// scheduler/probe paths, and whenever the destination is open. EXISTING (attach/retrieve)
+    /// requests never consult this — the actor takes the attach path before the gate.
+    pub dest_unavailable: Option<FederationId>,
 }
 
 #[derive(Clone, Debug)]

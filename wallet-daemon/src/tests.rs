@@ -17,12 +17,12 @@ use std::time::Duration;
 use tower::ServiceExt as _;
 use wallet_api::Policy;
 use wallet_core::{
-    Action, Actor, AllocatorDecision, ExecError, Executor, FederationId, Intent, Journal, Msat,
-    Occurrence, PerformOutcome, ReasonCode,
+    Action, Actor, AllocatorDecision, ExecError, Executor, FederationId, Intent, IntentStatus,
+    Journal, Msat, Occurrence, PerformOutcome, ReasonCode,
 };
 use wallet_fedimint::{
-    move_key, CandidateRecord, CandidateState, FederationInfo, FedimintJournal, StructuralOutcome,
-    WalletService,
+    move_key, raw_receive_key, CandidateRecord, CandidateState, FederationInfo, FedimintJournal,
+    Invoice, MultiClient, StructuralOutcome, WalletService,
 };
 
 const TOKEN: &str = "test-bearer-token";
@@ -82,6 +82,31 @@ async fn fixture() -> (AppState, WalletService, Arc<FedimintJournal>) {
         invoice_deadline: Duration::from_millis(120),
         await_deadline: Duration::from_millis(120),
     };
+    (state, service, journal)
+}
+
+/// Like [`fixture`], but with a REAL (empty) `MultiClient` attached. fed(2) stays JOINED in the
+/// journal yet is ABSENT from `mc.federations()` (no client is ever opened) — i.e. joined-but-not-
+/// open, the exact state the dest-side 503 fail-fast (br-u2o) targets. Building the mc performs no
+/// I/O (mirrors wallet-fedimint's own mc unit tests), so this remains a deterministic, socketless
+/// in-process test.
+async fn fixture_with_unopened_dest() -> (AppState, WalletService, Arc<FedimintJournal>) {
+    use fedimint_bip39::Mnemonic;
+    use fedimint_core::db::mem_impl::MemDatabase;
+    use fedimint_core::db::IRawDatabaseExt as _;
+    let (mut state, service, journal) = fixture().await;
+    let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
+    let mc = Arc::new(
+        MultiClient::new(
+            MemDatabase::new().into_database(),
+            MemDatabase::new().into_database(),
+            mnemonic,
+        )
+        .await,
+    );
+    // No `open_all` — the open set is empty, so every joined fed reads as joined-but-not-open.
+    assert!(mc.federations().is_empty());
+    state.mc = Some(mc);
     (state, service, journal)
 }
 
@@ -275,8 +300,12 @@ async fn malformed_and_unknown_json_fields_use_the_api_error_body() {
 #[tokio::test]
 async fn receive_invoice_deadline_returns_timeout_not_a_hang() {
     let (state, service, _) = fixture().await;
-    // A fresh receive admits (no source balance needed), spawns a driver that never mints an
-    // invoice, so the InvoiceArtifact wait must return a Timeout ApiError within the deadline.
+    // This fixture attaches NO runtime (`mc: None`), so the destination-openness signal is
+    // unknown and the dest-side 503 fail-fast is (correctly) NOT armed — admission proceeds
+    // exactly as before. A fresh receive admits (no source balance needed), spawns a driver that
+    // never mints an invoice, so the InvoiceArtifact wait must return a Timeout ApiError within
+    // the deadline. This is the "not a hang" deadline contract; the joined-but-UNOPENED path
+    // (which now fail-fasts to 503, never reaching this deadline) is covered separately below.
     let body = json!({
         "to": fed(2),
         "amount": Msat(10),
@@ -292,6 +321,143 @@ async fn receive_invoice_deadline_returns_timeout_not_a_hang() {
     assert_eq!(response["kind"], "timeout");
     // The op was admitted+journaled, so the timeout carries its key for later inspection.
     assert!(response["operation_key"].is_string());
+    service.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn fresh_receive_to_joined_but_unopened_destination_returns_503() {
+    // br-u2o: a FRESH receive whose destination is JOINED but not currently open fails fast with
+    // 503 at admission — an actionable "retry shortly" — instead of admitting a Pending row that
+    // stalls ~the invoice-mint deadline before a 504. fed(2) is joined in the journal but absent
+    // from the (empty) mc open set.
+    let (state, service, journal) = fixture_with_unopened_dest().await;
+    let body = json!({
+        "to": fed(2),
+        "amount": Msat(10),
+        "fee_cap": Msat(5),
+        "nonce": "recv-unopened",
+    });
+    let (status, response) = send(
+        &state,
+        request("POST", "/v1/receive", Some(TOKEN), Some(body)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response["kind"], "failed");
+    assert!(response["message"]
+        .as_str()
+        .expect("message")
+        .contains("joined but not currently open"));
+    // Fail-fast BEFORE admission: nothing is journaled (contrast the admitted-then-stall it
+    // replaces), so no money-side state exists and the caller simply retries.
+    assert!(journal.history(10, None).await.expect("history").is_empty());
+    service.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn fresh_direct_inflow_to_joined_but_unopened_destination_returns_503() {
+    // br-u2o: the direct-inflow sibling of the receive fail-fast — same joined-but-not-open 503.
+    let (state, service, journal) = fixture_with_unopened_dest().await;
+    let body = json!({
+        "to": fed(2),
+        "amount": Msat(10),
+        "fee_cap": Msat(5),
+        "nonce": "di-unopened",
+    });
+    let (status, response) = send(
+        &state,
+        request("POST", "/v1/direct-inflow", Some(TOKEN), Some(body)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response["kind"], "failed");
+    assert!(response["message"]
+        .as_str()
+        .expect("message")
+        .contains("joined but not currently open"));
+    assert!(journal.history(10, None).await.expect("history").is_empty());
+    service.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn fresh_move_to_joined_but_unopened_destination_returns_503() {
+    // br-u2o: `move`'s DESTINATION is gated the same way. Both endpoints are joined (fed(1)
+    // source, fed(2) dest) so this is NOT the unjoined-422 path; the dest is joined-but-not-open,
+    // so admission fails fast with 503. Source openness is intentionally NOT gated.
+    let (state, service, journal) = fixture_with_unopened_dest().await;
+    journal
+        .put_federation(
+            &fed(1),
+            &FederationInfo {
+                invite: "fixture source federation".to_owned(),
+                db_prefix: 1,
+                joined_at: 0,
+            },
+        )
+        .await
+        .expect("seed joined source federation");
+    let body = json!({
+        "from": fed(1),
+        "to": fed(2),
+        "amount": Msat(10),
+        "fee_cap": Msat(5),
+        "occurrence": 0,
+    });
+    let (status, response) =
+        send(&state, request("POST", "/v1/move", Some(TOKEN), Some(body))).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response["kind"], "failed");
+    assert!(response["message"]
+        .as_str()
+        .expect("message")
+        .contains("joined but not currently open"));
+    assert!(journal.history(10, None).await.expect("history").is_empty());
+    service.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn existing_receive_still_returns_its_minted_invoice_while_destination_closed() {
+    // Preserved (br-u2o MUST-PRESERVE): an already-admitted receive whose invoice was already
+    // minted stays retrievable via an idempotent replay even after `to` closes. The replay's key
+    // already exists, so the actor takes the ATTACH path before the FRESH openness gate — the
+    // minted BOLT11 is returned (200), never a 503. Openness gates the FRESH branch only.
+    let (state, service, journal) = fixture_with_unopened_dest().await;
+    let to = fed(2);
+    let key = raw_receive_key(to, Msat(10), "recv-existing");
+    let decision = AllocatorDecision {
+        action: Action::Receive {
+            to,
+            amount: Msat(10),
+            fee_cap: Msat(5),
+            nonce: "recv-existing".to_owned(),
+            gateway: None,
+        },
+        reason: ReasonCode::UserInitiated,
+        occurrence: Occurrence(0),
+        idempotency_key: key.clone(),
+    };
+    let mut intent = Intent::from_decision(&decision, Actor::User, 0);
+    intent.status = IntentStatus::Awaiting;
+    intent.invoice = Some(Invoice("lnbc-minted-fixture".to_owned()));
+    journal
+        .upsert(&intent)
+        .await
+        .expect("seed already-minted receive");
+
+    let body = json!({
+        "to": to,
+        "amount": Msat(10),
+        "fee_cap": Msat(5),
+        "nonce": "recv-existing",
+    });
+    let (status, response) = send(
+        &state,
+        request("POST", "/v1/receive", Some(TOKEN), Some(body)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["operation_key"], key.0);
+    assert_eq!(response["invoice"], "lnbc-minted-fixture");
     service.shutdown().await.expect("shutdown");
 }
 
