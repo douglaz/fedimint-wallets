@@ -2851,6 +2851,9 @@ pub(crate) fn print_refusal_diagnostics(diagnostics: &RefusalDiagnostics) {
     if let Some(v) = diagnostics.max_fee {
         println!("max_fee_msat: {}", v.0);
     }
+    if let Some(v) = diagnostics.max_fee_bps {
+        println!("max_fee_bps: {}", v);
+    }
     if let Some(v) = diagnostics.cap_room {
         println!("cap_room_msat: {}", v.0);
     }
