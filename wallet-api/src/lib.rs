@@ -688,6 +688,7 @@ mod tests {
                 available: Some(Msat(0)),
                 source_spendable: Some(Msat(120_000)),
                 max_fee: Some(Msat(200_000)),
+                max_fee_bps: Some(300),
                 cap_room: Some(Msat(96_000)),
                 amount: Some(Msat(0)),
                 min_move: Some(Msat(5_000)),
@@ -710,6 +711,7 @@ mod tests {
         assert_eq!(d.available, Some(Msat(0)));
         assert_eq!(d.source_spendable, Some(Msat(120_000)));
         assert_eq!(d.max_fee, Some(Msat(200_000)));
+        assert_eq!(d.max_fee_bps, Some(300));
         assert_eq!(d.cap_room, Some(Msat(96_000)));
         assert_eq!(d.amount, Some(Msat(0)));
         assert_eq!(d.min_move, Some(Msat(5_000)));

@@ -197,6 +197,10 @@ fn fund_into(
             // Funding sizing uses the proportional `max_fee_bps_of_move`, NOT the absolute cap, so
             // recording `max_fee` here would mislead; `available` already reflects the bps reserve.
             max_fee: None,
+            // The proportional bps that sized `available`, recorded so the funding refusal is
+            // reconstructible from the row alone (br-nsx). A snapshot figure, present even here
+            // where `source`/`available` are `None` (no usable source).
+            max_fee_bps: Some(snapshot.max_fee_bps_of_move),
             cap_room: None,
             amount: None,
             min_move: Some(snapshot.min_move),
@@ -254,6 +258,11 @@ fn fund_into(
         // Funding sizing uses the proportional `max_fee_bps_of_move`, NOT the absolute cap, so
         // recording `max_fee` here would mislead; `available` already reflects the bps reserve.
         max_fee: None,
+        // The proportional bps that sized `available`, recorded so the funding refusal is
+        // reconstructible from the row alone (br-nsx). This struct is SHARED by the shortfall
+        // refusal and the co-emitted funding-path over-cap refusal below, so both carry it —
+        // both had their `available` sized by this bps.
+        max_fee_bps: Some(snapshot.max_fee_bps_of_move),
         cap_room: Some(Msat(cap_room)),
         amount: Some(Msat(amount)),
         min_move: Some(snapshot.min_move),
@@ -518,6 +527,9 @@ fn evacuate_decision(
                     // at perform time), so `available` here has no fee-cap term — record None
                     // rather than imply a subtraction that did not happen.
                     max_fee: None,
+                    // Evacuation sizes off the ABSOLUTE `max_fee`, not the proportional bps, so
+                    // `max_fee_bps` is not a funding constraint here (br-nsx): record None.
+                    max_fee_bps: None,
                     cap_room: Some(Msat(cap_room)),
                     amount: Some(amount),
                     min_move: None,
