@@ -1603,6 +1603,9 @@ fn op_request(
         now_ms: cli_now_ms(),
         balances,
         probe_session_nonce: None,
+        // The standalone CLI runs `open_all` at startup, so its verbs already operate over the
+        // open set; the dest-side 503 fail-fast is a daemon-HTTP concern (br-u2o), not wired here.
+        dest_unavailable: None,
     }
 }
 
@@ -1803,9 +1806,12 @@ fn service_err_to_exit(error: ServiceError) -> CliExit {
         ServiceError::Timeout => CliExit::Transport("operation wait deadline elapsed".to_owned()),
         ServiceError::NotFound(m) => CliExit::Usage(anyhow::anyhow!(m)),
         ServiceError::Storage(m) => CliExit::Transport(format!("storage error: {m}")),
-        ServiceError::ShuttingDown | ServiceError::ActorStopped => {
-            CliExit::Transport(error.to_string())
-        }
+        // A joined-but-unopened destination is transient (retry once the fed reconnects) — the
+        // same transport class the daemon's 503 maps to. Unreachable on the standalone path,
+        // which runs `open_all` at startup and never sets `dest_unavailable`, but kept exhaustive.
+        ServiceError::DestinationUnavailable(_)
+        | ServiceError::ShuttingDown
+        | ServiceError::ActorStopped => CliExit::Transport(error.to_string()),
     }
 }
 

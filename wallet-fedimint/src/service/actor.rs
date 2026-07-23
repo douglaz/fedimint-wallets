@@ -588,6 +588,9 @@ impl ActorState {
                 now_ms: now,
                 balances: balances.clone(),
                 probe_session_nonce: None,
+                // The scheduler's own moves self-heal via the open_all retry; the dest-side 503
+                // gate is for FRESH user admissions only, so this path never fails fast.
+                dest_unavailable: None,
             };
             match self.decide_op(request, client).await {
                 Ok(decided) => report.accepted.push(decided.key),
@@ -784,6 +787,20 @@ impl ActorState {
         let key = req.decision.idempotency_key.clone();
         if let Some(existing) = self.journal.get(&key).await.map_err(storage_refusal)? {
             return self.decide_existing(req, existing, client).await;
+        }
+        // FRESH branch: no existing intent for this key (the existing-key attach returned above,
+        // so this can never intercept an idempotent replay). If a dest-side handler flagged the
+        // destination as joined-but-not-open, fail fast with 503 instead of journaling a Pending
+        // row that would stall — the receive/direct-inflow driver on the invoice deadline, a move
+        // parked unfunded. Money-safe: nothing is debited before the destination opens. This is
+        // the single-owner, race-free placement — the actor has just determined fresh-vs-existing
+        // under exclusive ownership, so a benign staleness (the flag races `to` opening) only
+        // costs the caller a retry and can never lose an attach.
+        if let Some(fed) = req.dest_unavailable {
+            return Err(ServiceError::DestinationUnavailable(format!(
+                "federation {} is joined but not currently open; it is reconnecting — retry shortly",
+                fed.to_hex()
+            )));
         }
         if let Some(nonce) = req.probe_session_nonce.as_deref() {
             self.validate_probe_leg_session(&req.decision.action, nonce)

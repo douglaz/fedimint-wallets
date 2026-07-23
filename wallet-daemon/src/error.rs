@@ -14,8 +14,9 @@
 //!   policy, admission-cap conflict) → `Refused` with the state reason.
 //! - **504** a bounded wait elapsed (the invoice-mint deadline, an await long-poll) →
 //!   `Timeout`. Carries the operation key when the op was already admitted.
-//! - **503** the actor is stopped or shutting down (transport-ish, server side) → `Failed`
-//!   with no key; the status code itself is the "unavailable, retry later" signal.
+//! - **503** the actor is stopped or shutting down, OR a FRESH dest-side admission named a
+//!   JOINED-but-not-currently-open destination (transport-ish, server side) → `Failed` with no
+//!   key; the status code itself is the "unavailable, retry later" signal.
 //! - **500** an unexpected server-side storage/read fault → `Failed` with no key.
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
@@ -155,6 +156,9 @@ impl From<ServiceError> for HttpError {
         match error {
             ServiceError::Refused { reason, message } => HttpError::refused(reason, message),
             ServiceError::NotFound(message) => HttpError::not_found(message),
+            // A FRESH dest-side admission to a joined-but-unopened federation: 503, the status
+            // code is the "retry shortly" signal, carrying the actionable message unchanged.
+            ServiceError::DestinationUnavailable(message) => HttpError::unavailable(message),
             ServiceError::Timeout => HttpError::timeout("operation wait deadline elapsed", None),
             ServiceError::ShuttingDown | ServiceError::ActorStopped => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,

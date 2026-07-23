@@ -133,6 +133,7 @@ fn pay(key: &str, from: FederationId, amount: u64, fee: u64, hash: u8) -> OpRequ
         now_ms: 1,
         balances: BTreeMap::from([(from, Msat(100))]),
         probe_session_nonce: None,
+        dest_unavailable: None,
     }
 }
 
@@ -179,6 +180,7 @@ fn move_request(
         now_ms: 2,
         balances,
         probe_session_nonce,
+        dest_unavailable: None,
     }
 }
 
@@ -3187,5 +3189,82 @@ async fn targeted_intent_read_failure_is_a_decide_time_storage_refusal() {
             ..
         }
     ));
+    service.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn fresh_admission_with_unopened_destination_fails_fast() {
+    // br-u2o: on the FRESH branch (no existing intent), a dest-side handler's joined-but-not-open
+    // signal (`dest_unavailable = Some`) makes the actor fail fast with DestinationUnavailable
+    // BEFORE anything is journaled — the single-owner, race-free gate. Nothing is admitted.
+    let executor = Arc::new(SlowExecutor::default());
+    let (service, journal) = fixture(executor).await;
+    let client = service.client();
+    let mut req = move_request(
+        "move:unopened-dest",
+        Action::Move {
+            from: fed(1),
+            to: fed(2),
+            amount: Msat(10),
+            fee_cap: Msat(1),
+        },
+        BTreeMap::from([(fed(1), Msat(100))]),
+        None,
+    );
+    req.dest_unavailable = Some(fed(2));
+    let error = client
+        .decide_op(req)
+        .await
+        .expect_err("a fresh admission to a joined-but-unopened dest must fail fast");
+    assert!(matches!(error, ServiceError::DestinationUnavailable(_)));
+    assert!(error.to_string().contains("joined but not currently open"));
+    assert!(journal
+        .get(&IdempotencyKey("move:unopened-dest".to_owned()))
+        .await
+        .expect("intent lookup")
+        .is_none());
+    service.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn admitted_while_open_then_closed_still_attaches_on_replay() {
+    // br-u2o MUST-PRESERVE: a request admitted while `to` was open must still ATTACH on an
+    // idempotent replay after `to` closes — the openness gate lives on the FRESH branch only, and
+    // an EXISTING key takes the attach path first. The replay carries `dest_unavailable = Some`
+    // (dest now closed) yet dedups instead of 503-ing.
+    let executor = Arc::new(SlowExecutor::default());
+    let (service, journal) = fixture(executor).await;
+    let client = service.client();
+    let action = Action::Move {
+        from: fed(1),
+        to: fed(2),
+        amount: Msat(10),
+        fee_cap: Msat(1),
+    };
+    let balances = BTreeMap::from([(fed(1), Msat(100))]);
+    let admitted = client
+        .decide_op(move_request(
+            "move:attach-after-close",
+            action.clone(),
+            balances.clone(),
+            None,
+        ))
+        .await
+        .expect("fresh admit while destination open");
+    assert!(!admitted.deduplicated);
+
+    let mut replay = move_request("move:attach-after-close", action, balances, None);
+    replay.dest_unavailable = Some(fed(2));
+    let attached = client
+        .decide_op(replay)
+        .await
+        .expect("replay of an existing key must attach, never 503");
+    assert!(attached.deduplicated);
+    // The intent is still journaled and live — the replay attached to it rather than refusing.
+    assert!(journal
+        .get(&IdempotencyKey("move:attach-after-close".to_owned()))
+        .await
+        .expect("intent lookup")
+        .is_some());
     service.shutdown().await.expect("shutdown");
 }
