@@ -679,14 +679,21 @@ async fn policy_get_prints_policy_json() {
 async fn policy_set_puts_the_edited_field() {
     let dir = scratch();
     let token = write_token(&dir);
-    // GET returns default; the CLI edits per_fed_cap and PUTs the whole struct back.
+    // GET returns default; the CLI edits the named fields and PUTs the whole struct back.
     let (url, log) = spawn_mock(200, json(&Policy::default())).await;
 
     let out = run_client(
         &url,
         &token,
         &dir,
-        &["policy", "set", "--per-fed-cap", "999000"],
+        &[
+            "policy",
+            "set",
+            "--per-fed-cap",
+            "999000",
+            "--max-fee-bps-of-move",
+            "250",
+        ],
     )
     .await;
 
@@ -701,6 +708,12 @@ async fn policy_set_puts_the_edited_field() {
     assert_eq!(put.path, "/v1/policy");
     assert!(
         put.body.contains("\"per_fed_cap\":999000"),
+        "put body: {}",
+        put.body
+    );
+    // The proportional funding-move cap lands on its OWN field, not on the absolute `max_fee`.
+    assert!(
+        put.body.contains("\"max_fee_bps_of_move\":250"),
         "put body: {}",
         put.body
     );

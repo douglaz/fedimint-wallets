@@ -56,15 +56,22 @@ Pilot policy: keep the total at an amount you are genuinely willing to lose. Sug
 starting point (~150k sats total ceiling across feds):
 
 ```bash
+# 100k sats concentration ceiling per federation
+# 50k sats float in the spending fed
+# 20k sats in standby
+# 50 sats absolute cap: evacuations + manual --fee-cap default
+# 3% proportional cap on funding moves (top-up/standby)
 wallet-cli policy set \
-  --per-fed-cap 100000000 \        # 100k sats concentration ceiling per federation
-  --spending-target 50000000 \     # 50k sats float in the spending fed
-  --standby-target 20000000 \      # 20k sats in standby
-  --max-fee 50000                  # 50 sats per-move fee cap
+  --per-fed-cap 100000000 \
+  --spending-target 50000000 \
+  --standby-target 20000000 \
+  --max-fee 50000 \
+  --max-fee-bps-of-move 300
 wallet-cli policy get              # verify what is actually stored
 ```
 
-(Values are msat. Raise them only after a clean first week.)
+(Values are msat, except `--max-fee-bps-of-move`, which is basis points, 1-10000. Raise
+them only after a clean first week.)
 
 ## Daily — the one-minute glance
 
@@ -104,6 +111,20 @@ systemctl --user show walletd -p NRestarts
   rejoin each federation from your recorded invites, then run fedimint recovery with the
   seed. Accept that any operation in flight at the moment of death may need manual
   reconciliation against the federations' view.
+
+## Upgrades — a release that changes the stored-policy schema
+
+A release that ADDS a policy field marks it `#[serde(default)]`, so a policy row persisted by a
+previous release still decodes (the new field adopts its shipped default) and walletd starts
+normally. Just deploy and restart; re-run `policy set` afterward only if you want to set the new
+field to a non-default value.
+
+**Do NOT try to "reset" a stuck policy by wiping `journal.db`.** The federation registry
+(federation id → client db-prefix) lives in `journal.db`, and the wallet has no seed-recovery
+path wired: after a wipe, `wallet-cli join` allocates a fresh EMPTY client partition instead of
+reopening the funded one, so `balance` reads 0 and the ecash is stranded in an orphaned
+partition. Restoring the backup brings back the same undecodable row. If a policy row ever fails
+to decode on a real deployment, stop and treat it as an incident — do not wipe (see Never).
 
 ## Never
 

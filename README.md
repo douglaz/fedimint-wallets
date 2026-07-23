@@ -45,6 +45,31 @@ and release hardening. See [docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md).
   original wallet survey and product design report. It is useful background, but the
   ADRs and roadmap supersede it where they differ.
 
+## Allocator policy
+
+The standing instructions the Allocator runs against live in one stored `Policy`, edited
+field-by-field with `wallet-cli policy set` and printed by `wallet-cli policy get`. The
+balance knobs are `--per-fed-cap`, `--spending-target`, and `--standby-target` (all msat);
+the two fee caps are deliberately different shapes:
+
+- `--max-fee` - ABSOLUTE fee cap in msat (a flat ceiling, not scaled by the amount). Of the
+  Allocator's own moves it bounds only evacuations, where the amount is whatever remnant a
+  dying federation still holds and a proportional cap could compute below the gateway's base
+  fee and refuse the drain. It is
+  also the default `--fee-cap` for the manual `pay`/`move`/`receive`/`direct-inflow`
+  commands, so setting it very low refuses those too.
+- `--max-fee-bps-of-move` - PROPORTIONAL fee cap for funding moves (top-up and standby), in
+  basis points of the amount moved, `1`-`10000`; default `300` (3%). Funding sizing reserves
+  it from the source, so `amount + amount * bps / 10000` always fits the source budget and a
+  positive surplus is never refused for being smaller than a flat cap.
+
+A `--max-fee-bps-of-move` of `0` (every funding move would get a zero cap and fail) or above
+`10000` is rejected by policy validation. Setting it very low can still under-cap small moves
+so they fail at perform time — a per-route economic floor is planned separately.
+
+See [docs/real-sats-pilot-runbook.md](./docs/real-sats-pilot-runbook.md) for suggested
+pilot values.
+
 ## Local development
 
 The workspace is pinned to `douglaz/fedimint` at commit

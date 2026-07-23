@@ -24,3 +24,6 @@
 # isolated target dir for dependency-bump validation (keeps target-nix binaries
 # untouched while a soak/smoke runs from them)
 /target-pinbump
+target-musl/
+result
+result-image

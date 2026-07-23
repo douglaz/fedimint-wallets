@@ -75,6 +75,7 @@ impl From<&Policy> for TickPolicy {
             target_spending_balance: policy.spending_target,
             standby_target: policy.standby_target,
             max_fee: policy.max_fee,
+            max_fee_bps_of_move: policy.max_fee_bps_of_move,
             spending_fed: policy.spending_fed,
             standby_fed: policy.standby_fed,
             probe_gate_policy: policy.probe_policy(),
