@@ -227,9 +227,16 @@ pub struct RefusalDiagnostics {
     /// The ABSOLUTE fee cap. `None` on a FUNDING refusal since br-ljj.2 — funding sizing uses
     /// the proportional `max_fee_bps_of_move` (and `available` already reflects it), so the
     /// absolute cap is not the funding constraint. Also `None` on an evacuation refusal, which
-    /// does not pre-reserve it. (A follow-up may record `max_fee_bps_of_move` here for full
-    /// funding-refusal reconstructibility.)
+    /// does not pre-reserve it. The proportional bps that sized a funding refusal is recorded
+    /// separately in `max_fee_bps` (br-nsx).
     pub max_fee: Option<Msat>,
+    /// The `max_fee_bps_of_move` in effect that sized the funding move. `Some(..)` on a funding
+    /// refusal; `None` on an evacuation refusal or a default/figure-less row.
+    ///
+    /// The explicit default documents the persisted journal contract: legacy refusal rows do
+    /// not contain this key and decode it as `None`.
+    #[serde(default)]
+    pub max_fee_bps: Option<u16>,
     /// The destination's remaining per-fed cap room, once it had been computed.
     pub cap_room: Option<Msat>,
     /// The move amount the allocator settled on before refusing the remainder.
@@ -251,6 +258,7 @@ impl RefusalDiagnostics {
             available,
             source_spendable,
             max_fee,
+            max_fee_bps,
             cap_room,
             amount,
             min_move,
@@ -260,6 +268,7 @@ impl RefusalDiagnostics {
             || available.is_some()
             || source_spendable.is_some()
             || max_fee.is_some()
+            || max_fee_bps.is_some()
             || cap_room.is_some()
             || amount.is_some()
             || min_move.is_some()

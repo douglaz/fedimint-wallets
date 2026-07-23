@@ -194,6 +194,9 @@ fn refusal_records_the_full_shortfall_arithmetic() {
     assert_eq!(diag.want, Some(Msat(50_000)));
     assert_eq!(diag.source_spendable, Some(Msat(10_000)));
     assert_eq!(diag.max_fee, None);
+    // The proportional bps that sized `available` is recorded (br-nsx), so the row is
+    // self-contained: a reader recovers `available = max_fundable(source_spendable − …, bps)`.
+    assert_eq!(diag.max_fee_bps, Some(GOLDEN_MOVE_BPS));
     assert_eq!(diag.available, Some(Msat(9_901)));
     assert_eq!(diag.cap_room, Some(Msat(40_000)));
     assert_eq!(diag.amount, Some(Msat(9_901)));
@@ -214,6 +217,9 @@ fn refusal_with_no_usable_source_records_available_none() {
     assert_eq!(diag.source_spendable, None);
     assert_eq!(diag.available, None);
     assert_eq!(diag.max_fee, None);
+    // `max_fee_bps` is a snapshot/policy figure, so it is recorded even here where there was
+    // no usable source (`source`/`available` are None) — unlike the source-derived figures.
+    assert_eq!(diag.max_fee_bps, Some(GOLDEN_MOVE_BPS));
     assert_eq!(diag.amount, Some(Msat(0)));
 }
 
@@ -230,6 +236,7 @@ fn receive_blocked_refusal_records_source_side_figures_only() {
     assert_eq!(diag.source_spendable, Some(Msat(80_000)));
     assert_eq!(diag.available, Some(Msat(79_208)));
     assert_eq!(diag.max_fee, None);
+    assert_eq!(diag.max_fee_bps, Some(GOLDEN_MOVE_BPS));
     assert_eq!(diag.cap_room, None);
     assert_eq!(diag.amount, None);
 }
@@ -351,6 +358,9 @@ fn diagnose_20260721_refusal_is_a_partial_topup_co_emission() {
     assert_eq!(diag.want, Some(Msat(46_063_874))); // model-independent: target − spendable
     assert_eq!(diag.source_spendable, Some(Msat(1_987_774)));
     assert_eq!(diag.max_fee, None); // funding sizes off bps, not the absolute cap (br-ljj.2)
+    // The bps that sized the move is now on the row (br-nsx), so the refusal is fully
+    // reconstructible without a separate `policy get`.
+    assert_eq!(diag.max_fee_bps, Some(GOLDEN_MOVE_BPS));
     assert_eq!(diag.available, Some(Msat(1_968_094)));
     assert_eq!(diag.amount, Some(Msat(1_968_094)));
     // amount == available == the move amount: the source, not the cap, was the binding limit.
@@ -374,6 +384,9 @@ fn evacuation_drained_source_refusal_records_source_figures_without_max_fee() {
     assert_eq!(diag.cap_room, Some(Msat(70_000)));
     assert_eq!(diag.amount, Some(Msat(0)));
     assert_eq!(diag.max_fee, None);
+    // An evacuation sizes off the ABSOLUTE `max_fee`, not the proportional bps, so a bps
+    // figure would not describe this refusal — None (br-nsx).
+    assert_eq!(diag.max_fee_bps, None);
     assert_eq!(diag.want, None);
     assert_eq!(diag.min_move, None);
 }
@@ -396,6 +409,10 @@ fn colliding_over_cap_refusals_keep_the_populated_figures() {
     assert_eq!(diag.want, Some(Msat(30_000)));
     assert_eq!(diag.cap_room, Some(Msat(0)));
     assert_eq!(diag.source, Some(id!(2)));
+    // This is the FUNDING-PATH over-cap from `fund_into`, which shares the funding
+    // diagnostics struct (its `available` was bps-sized), so it CARRIES the bps — unlike the
+    // source-less top-level over-cap (`RefusalDiagnostics::default()`), which is None (br-nsx).
+    assert_eq!(diag.max_fee_bps, Some(GOLDEN_MOVE_BPS));
 }
 
 #[test]

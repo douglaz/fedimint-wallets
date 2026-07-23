@@ -501,6 +501,7 @@ async fn record_refusals_persist_diagnostics_across_serialization() {
         available: Some(Msat(9_500)),
         source_spendable: Some(Msat(10_000)),
         max_fee: Some(Msat(500)),
+        max_fee_bps: Some(100),
         cap_room: Some(Msat(40_000)),
         amount: Some(Msat(9_500)),
         min_move: Some(Msat(0)),
@@ -533,12 +534,32 @@ async fn record_refusals_persist_diagnostics_across_serialization() {
             assert_eq!(read_back.available, Some(Msat(9_500)));
             assert_eq!(read_back.source_spendable, Some(Msat(10_000)));
             assert_eq!(read_back.max_fee, Some(Msat(500)));
+            assert_eq!(read_back.max_fee_bps, Some(100));
             assert_eq!(read_back.cap_room, Some(Msat(40_000)));
             assert_eq!(read_back.amount, Some(Msat(9_500)));
             assert_eq!(read_back.min_move, Some(Msat(0)));
         }
         other => panic!("expected a refusal row, got {other:?}"),
     }
+}
+
+#[test]
+fn refusal_diagnostics_missing_max_fee_bps_decodes_to_none() {
+    // A refusal row persisted before `max_fee_bps` existed (br-ljj.1/.2 wrote such rows to the
+    // live pilot journal) has no such key. Refusal rows are re-decoded on every `history` read,
+    // so document the persisted-row behavior directly: an object without the key adopts `None`
+    // while the other figures still decode as written.
+    let mut json = serde_json::to_value(RefusalDiagnostics {
+        source_spendable: Some(Msat(10_000)),
+        max_fee_bps: Some(100),
+        ..Default::default()
+    })
+    .expect("serialize");
+    json.as_object_mut().expect("object").remove("max_fee_bps");
+    let decoded: RefusalDiagnostics =
+        serde_json::from_value(json).expect("legacy refusal row (no max_fee_bps) still decodes");
+    assert_eq!(decoded.max_fee_bps, None);
+    assert_eq!(decoded.source_spendable, Some(Msat(10_000)));
 }
 
 // --- §9.2 journal-integrated writes (same dbtx as the intent) ---
