@@ -959,6 +959,7 @@ mod tests {
             target_spending_balance: Msat(1_000_000),
             standby_target: Msat(1_000_000),
             max_fee: Msat(10_000),
+            max_fee_bps_of_move: 100,
             min_move: Msat(5_000),
             reservations: wallet_core::Reservations::default(),
             now: 0,

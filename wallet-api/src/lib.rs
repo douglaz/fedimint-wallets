@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 pub use wallet_core::{FederationId, Msat, RefusalDiagnostics};
 
+/// The shipped `max_fee_bps_of_move` default (300 bps). A named fn so serde's missing-field
+/// default and `Policy::default()` cannot drift apart.
+fn default_max_fee_bps_of_move() -> u16 {
+    300
+}
+
 /// The standing instruction's user-owned allocation and automation parameters.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -11,7 +17,20 @@ pub struct Policy {
     pub per_fed_cap: Msat,
     pub spending_target: Msat,
     pub standby_target: Msat,
+    /// ABSOLUTE per-move fee cap. Since br-ljj.2 this bounds only `Evacuate`; funding `Move`s
+    /// use `max_fee_bps_of_move`.
     pub max_fee: Msat,
+    /// PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
+    /// (1..=10000; Policy rejects 0). Replaces the absolute `max_fee` for funding so sizing
+    /// scales with the move and a positive surplus never saturates to a refused (zero-amount)
+    /// move. `#[serde(default)]` so a policy row persisted before this field existed still
+    /// decodes (adopting the shipped default) and the daemon starts across the upgrade —
+    /// `seed_policy` decodes the stored row before the actor starts, so a hard decode failure
+    /// there would strand the wallet (wiping the journal to recover is NOT safe: it also
+    /// destroys the federation registry, orphaning the ecash — the wallet has no seed-recovery
+    /// path wired yet).
+    #[serde(default = "default_max_fee_bps_of_move")]
+    pub max_fee_bps_of_move: u16,
     pub spending_fed: Option<FederationId>,
     pub standby_fed: Option<FederationId>,
     pub probe_min_span_secs: u64,
@@ -42,6 +61,12 @@ impl Default for Policy {
             spending_target: Msat(500_000_000),
             standby_target: Msat(150_000_000),
             max_fee: Msat(200_000),
+            // br-ljj.2: 300 bps (3%) of the move. Chosen to preserve the pilot's current
+            // effective tightness — its 50-sat absolute cap on ~1_938-sat top-up moves is
+            // ~258 bps — with ~2.3x headroom over a realistic two-leg gateway fee (~130 bps:
+            // the executor fee model's "realistic" 0.5% ppm/leg plus base + federation fees).
+            // Tune DOWN once br-ljj.3's per-route economics yield precise per-move fee data.
+            max_fee_bps_of_move: default_max_fee_bps_of_move(),
             spending_fed: None,
             standby_fed: None,
             // The verdict knobs and amount match wallet_core::ProbePolicy.
@@ -113,6 +138,19 @@ impl Policy {
         if self.probe_retry_backoff_secs == 0 {
             return Err(PolicyValidationError::ZeroProbeRetryBackoffSecs);
         }
+        if self.max_fee_bps_of_move == 0 {
+            // A zero bps stamps `fee_cap: 0` on every funding move; the executor's pre-mint gate
+            // then refuses any nonzero receive quote, so the allocator re-emits the same doomed
+            // move each occurrence — a permanent-failure loop. Reject it like the sibling
+            // zero-knobs. (A low-but-nonzero bps can still under-cap SMALL moves — that economic
+            // floor is br-ljj.3's per-route work, deliberately out of scope here.)
+            return Err(PolicyValidationError::ZeroMaxFeeBps);
+        }
+        if self.max_fee_bps_of_move > 10_000 {
+            // Over 100% of the move: fees would exceed the amount moved (nonsensical), and the
+            // sizing `amount <= budget * 10000/(10000+bps)` assumes a bounded bps.
+            return Err(PolicyValidationError::MaxFeeBpsExceedsCeiling);
+        }
         Ok(())
     }
 }
@@ -130,6 +168,8 @@ pub enum PolicyValidationError {
     ProbeSpanExceedsTtl,
     TargetExceedsPerFedCap,
     ZeroProbeRetryBackoffSecs,
+    MaxFeeBpsExceedsCeiling,
+    ZeroMaxFeeBps,
 }
 
 impl PolicyValidationError {
@@ -144,6 +184,7 @@ impl PolicyValidationError {
             Self::ProbeSpanExceedsTtl => "probe_min_span_secs/probe_ttl_secs",
             Self::TargetExceedsPerFedCap => "spending_target/standby_target/per_fed_cap",
             Self::ZeroProbeRetryBackoffSecs => "probe_retry_backoff_secs",
+            Self::MaxFeeBpsExceedsCeiling | Self::ZeroMaxFeeBps => "max_fee_bps_of_move",
         }
     }
 }
@@ -156,7 +197,8 @@ impl fmt::Display for PolicyValidationError {
             | Self::ZeroProbeMinSuccesses
             | Self::ZeroPerFedCap
             | Self::ZeroProbeTtlSecs
-            | Self::ZeroProbeRetryBackoffSecs => {
+            | Self::ZeroProbeRetryBackoffSecs
+            | Self::ZeroMaxFeeBps => {
                 write!(formatter, "{} must be non-zero", self.offending_field())
             }
             Self::MinIntervalExceedsBaseInterval => write!(
@@ -175,6 +217,11 @@ impl fmt::Display for PolicyValidationError {
             Self::TargetExceedsPerFedCap => write!(
                 formatter,
                 "{}: targets must not exceed the per-fed cap",
+                self.offending_field()
+            ),
+            Self::MaxFeeBpsExceedsCeiling => write!(
+                formatter,
+                "{}: must not exceed 10000 (100% of the move)",
                 self.offending_field()
             ),
         }
@@ -411,6 +458,7 @@ mod tests {
         assert_eq!(policy.spending_target, Msat(500_000_000));
         assert_eq!(policy.standby_target, Msat(150_000_000));
         assert_eq!(policy.max_fee, Msat(200_000));
+        assert_eq!(policy.max_fee_bps_of_move, 300);
         assert_eq!(policy.spending_fed, None);
         assert_eq!(policy.standby_fed, None);
         assert_eq!(policy.probe_min_span_secs, 86_400);
@@ -442,6 +490,21 @@ mod tests {
             ..Policy::default()
         };
         assert_json_roundtrip(policy);
+    }
+
+    #[test]
+    fn policy_missing_bps_field_decodes_with_default() {
+        // A policy row persisted before `max_fee_bps_of_move` existed must still decode — the
+        // daemon's `seed_policy` decodes the stored row BEFORE the actor starts, so a hard
+        // failure there would strand the wallet across the upgrade. `#[serde(default)]` adopts
+        // the shipped default instead. (`deny_unknown_fields` still rejects EXTRA fields.)
+        let mut json = serde_json::to_value(Policy::default()).expect("serialize");
+        json.as_object_mut()
+            .expect("object")
+            .remove("max_fee_bps_of_move");
+        let decoded: Policy =
+            serde_json::from_value(json).expect("old policy row (no bps field) still decodes");
+        assert_eq!(decoded.max_fee_bps_of_move, 300);
     }
 
     #[test]
@@ -520,6 +583,20 @@ mod tests {
                 },
                 PolicyValidationError::ZeroPerFedCap,
             ),
+            (
+                Policy {
+                    max_fee_bps_of_move: 10_001,
+                    ..Policy::default()
+                },
+                PolicyValidationError::MaxFeeBpsExceedsCeiling,
+            ),
+            (
+                Policy {
+                    max_fee_bps_of_move: 0,
+                    ..Policy::default()
+                },
+                PolicyValidationError::ZeroMaxFeeBps,
+            ),
         ];
 
         for (policy, expected) in cases {
@@ -534,6 +611,12 @@ mod tests {
             },
             Policy {
                 standby_fed: Some(fed(1)),
+                ..Policy::default()
+            },
+            // 10_000 bps (100%) is the inclusive ceiling: the rule is `> 10_000`, so the
+            // boundary itself must stay accepted.
+            Policy {
+                max_fee_bps_of_move: 10_000,
                 ..Policy::default()
             },
         ] {

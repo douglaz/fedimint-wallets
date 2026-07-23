@@ -54,16 +54,19 @@ pub fn decide(snapshot: &AllocatorSnapshot, occurrence: Occurrence) -> Vec<Alloc
         {
             let want = snapshot.target_spending_balance.0 - spending.balance.spendable.0;
             let source = usable_source(snapshot.standby_fed.and_then(|id| find(snapshot, id)));
-            // TopUp availability reserves the move's OWN `fee_cap` on the source plus any
-            // outbound already committed this pass, so the executor's `amount + fee_cap`
-            // spend can never exceed the source balance.
+            // TopUp availability: the source budget is its spendable minus prior outbound and
+            // same-tick debits; the move's own PROPORTIONAL fee cap is then reserved inside
+            // `max_fundable` (`amount + amount*bps/10000 <= budget`), so the executor's
+            // `amount + fee_cap` spend can never exceed the source balance — and a positive
+            // budget never saturates `available` to zero (the old absolute-cap bug).
             let available = source.map_or(0, |s| {
-                s.balance
+                let budget = s
+                    .balance
                     .spendable
                     .0
                     .saturating_sub(snapshot.reservations.outbound(s.id).0)
-                    .saturating_sub(reserved(&debited, s.id))
-                    .saturating_sub(snapshot.max_fee.0)
+                    .saturating_sub(reserved(&debited, s.id));
+                max_fundable(budget, snapshot.max_fee_bps_of_move)
             });
             fund_into(
                 snapshot,
@@ -89,15 +92,16 @@ pub fn decide(snapshot: &AllocatorSnapshot, occurrence: Occurrence) -> Vec<Alloc
             let source = usable_source(spending);
             // The surplus floor STAYS — the spending fed is never drained below its
             // configured target to fund the standby — and, like TopUp, the move's own
-            // `fee_cap` and any prior outbound are reserved on top.
+            // PROPORTIONAL fee cap and any prior outbound are reserved inside `max_fundable`.
             let available = source.map_or(0, |s| {
-                s.balance
+                let budget = s
+                    .balance
                     .spendable
                     .0
                     .saturating_sub(snapshot.target_spending_balance.0)
                     .saturating_sub(snapshot.reservations.outbound(s.id).0)
-                    .saturating_sub(reserved(&debited, s.id))
-                    .saturating_sub(snapshot.max_fee.0)
+                    .saturating_sub(reserved(&debited, s.id));
+                max_fundable(budget, snapshot.max_fee_bps_of_move)
             });
             fund_into(
                 snapshot,
@@ -121,6 +125,30 @@ pub fn decide(snapshot: &AllocatorSnapshot, occurrence: Occurrence) -> Vec<Alloc
 /// absent). Keeps the reservation lookups saturating-friendly and readable.
 fn reserved(map: &BTreeMap<FederationId, u64>, fed: FederationId) -> u64 {
     map.get(&fed).copied().unwrap_or(0)
+}
+
+/// The largest funding-move amount whose PROPORTIONAL fee cap still fits `budget`: the exact
+/// integer maximum `amount` with `amount + floor(amount*bps/10000) <= budget`. Unlike the
+/// former absolute-cap reservation (`budget - max_fee`), it is a fraction of budget, so the
+/// saturation bug br-ljj.2 fixes is gone — though a tiny budget can still floor to 0 (a 1-msat
+/// budget funds nothing).
+///
+/// The exact inverse, NOT the naive `floor(budget*10000/(10000+bps))`: that form undershoots
+/// the true maximum by up to 1 msat, which — when the undershoot drops the result below
+/// `min_move` — would fully refuse an otherwise-viable move. Brute-forced over budgets
+/// `0..=40000` x bps `1..=10000`: this form is both overdraw-safe (never breaks the invariant)
+/// AND maximal (`result + 1` always overdraws). `u128` intermediate so `(budget+1)*10000`
+/// cannot overflow even at `u64::MAX`.
+fn max_fundable(budget: u64, bps: u16) -> u64 {
+    let denom = 10_000u128 + bps as u128;
+    (((budget as u128 + 1) * 10_000 - 1) / denom) as u64
+}
+
+/// The proportional fee cap stamped on a funding `Move`: `amount * bps / 10000`. Paired with
+/// [`max_fundable`] so `amount + move_fee_cap(amount) <= budget` holds under integer floors,
+/// keeping the executor's `amount + fee_cap` spend within the source balance.
+fn move_fee_cap(amount: Msat, bps: u16) -> Msat {
+    Msat((amount.0 as u128 * bps as u128 / 10_000) as u64)
 }
 
 #[derive(Clone, Copy)]
@@ -152,8 +180,9 @@ fn fund_into(
     out: &mut Vec<AllocatorDecision>,
 ) {
     // Source-side figures, shared by every refusal this function can emit. `source`-derived
-    // fields are `None` exactly when there is no usable source; `max_fee` is a snapshot
-    // constant, recorded even when sourceless so a cap-too-large refusal is legible.
+    // fields are `None` exactly when there is no usable source. `max_fee` is NOT among them:
+    // since br-ljj.2 every funding refusal below records it as `None` (see the sites), because
+    // funding sizes off the proportional `max_fee_bps_of_move`, not the absolute cap.
     let source_id = source.map(|s| s.id);
     let source_spendable = source.map(|s| s.balance.spendable);
     let source_available = source.map(|_| Msat(available));
@@ -165,7 +194,9 @@ fn fund_into(
             want: Some(Msat(want)),
             available: source_available,
             source_spendable,
-            max_fee: Some(snapshot.max_fee),
+            // Funding sizing uses the proportional `max_fee_bps_of_move`, NOT the absolute cap, so
+            // recording `max_fee` here would mislead; `available` already reflects the bps reserve.
+            max_fee: None,
             cap_room: None,
             amount: None,
             min_move: Some(snapshot.min_move),
@@ -220,7 +251,9 @@ fn fund_into(
         want: Some(Msat(want)),
         available: source_available,
         source_spendable,
-        max_fee: Some(snapshot.max_fee),
+        // Funding sizing uses the proportional `max_fee_bps_of_move`, NOT the absolute cap, so
+        // recording `max_fee` here would mislead; `available` already reflects the bps reserve.
+        max_fee: None,
         cap_room: Some(Msat(cap_room)),
         amount: Some(Msat(amount)),
         min_move: Some(snapshot.min_move),
@@ -542,7 +575,9 @@ fn move_decision(
             from,
             to,
             amount,
-            fee_cap: snapshot.max_fee,
+            // Proportional cap (br-ljj.2): scales with the move, unlike `Evacuate`'s absolute
+            // `snapshot.max_fee`. Sized to fit the source budget by `max_fundable` above.
+            fee_cap: move_fee_cap(amount, snapshot.max_fee_bps_of_move),
         },
         reason: kind.reason(),
         occurrence,
