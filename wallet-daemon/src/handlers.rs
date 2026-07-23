@@ -343,12 +343,16 @@ pub async fn move_op(
         fee_cap,
     };
     let balances = sample_balances(&state, &[request.from, request.to]).await?;
+    // Dest-side fail-fast: a FRESH move to a joined-but-unopened `to` returns 503 at admission
+    // rather than parking an unfunded Pending row. Source openness is intentionally NOT gated.
+    let dest_unavailable = unopened_destination(&state, request.to);
     submit_operation_at(
         &state,
         action,
         key,
         balances,
         Occurrence(request.occurrence),
+        dest_unavailable,
     )
     .await
 }
@@ -373,7 +377,10 @@ pub async fn receive(
         gateway: None,
     };
     let balances = sample_balances(&state, &[to]).await?;
-    block_for_invoice(&state, action, key, balances).await
+    // Dest-side fail-fast: a FRESH receive to a joined-but-unopened `to` returns 503 at admission
+    // rather than admitting and stalling ~the invoice-mint deadline before a 504.
+    let dest_unavailable = unopened_destination(&state, to);
+    block_for_invoice(&state, action, key, balances, dest_unavailable).await
 }
 
 pub async fn direct_inflow(
@@ -392,7 +399,10 @@ pub async fn direct_inflow(
         fee_cap,
     };
     let balances = sample_balances(&state, &[to]).await?;
-    block_for_invoice(&state, action, key, balances).await
+    // Dest-side fail-fast: a FRESH direct-inflow to a joined-but-unopened `to` returns 503 at
+    // admission rather than admitting and stalling ~the invoice-mint deadline before a 504.
+    let dest_unavailable = unopened_destination(&state, to);
+    block_for_invoice(&state, action, key, balances, dest_unavailable).await
 }
 
 // ---- join / approve / candidates ------------------------------------------------------------
@@ -560,7 +570,8 @@ async fn submit_operation(
     key: IdempotencyKey,
     balances: BTreeMap<FederationId, Msat>,
 ) -> Result<(StatusCode, Json<OperationAccepted>), HttpError> {
-    submit_operation_at(state, action, key, balances, Occurrence(0)).await
+    // pay/join carry no destination-openness gate — `dest_unavailable` is `None`.
+    submit_operation_at(state, action, key, balances, Occurrence(0), None).await
 }
 
 async fn submit_operation_at(
@@ -569,6 +580,7 @@ async fn submit_operation_at(
     key: IdempotencyKey,
     balances: BTreeMap<FederationId, Msat>,
     occurrence: Occurrence,
+    dest_unavailable: Option<FederationId>,
 ) -> Result<(StatusCode, Json<OperationAccepted>), HttpError> {
     state
         .client
@@ -583,6 +595,7 @@ async fn submit_operation_at(
             now_ms: now_ms(),
             balances,
             probe_session_nonce: None,
+            dest_unavailable,
         })
         .await?;
     Ok((
@@ -601,6 +614,7 @@ async fn block_for_invoice(
     action: Action,
     key: IdempotencyKey,
     balances: BTreeMap<FederationId, Msat>,
+    dest_unavailable: Option<FederationId>,
 ) -> Result<axum::response::Response, HttpError> {
     state
         .client
@@ -615,6 +629,7 @@ async fn block_for_invoice(
             now_ms: now_ms(),
             balances,
             probe_session_nonce: None,
+            dest_unavailable,
         })
         .await?;
     let deadline = Instant::now() + state.invoice_deadline;
@@ -674,6 +689,21 @@ async fn sample_balances(
         }
     }
     Ok(balances)
+}
+
+/// The FRESH-admission destination-openness signal for a dest-side verb (receive / direct-inflow
+/// / move). The destination `to` is already ensured JOINED by `resolve_fed` / `ensure_joined`, so
+/// this asks only whether it is currently OPEN — present in the live open set `mc.federations()`,
+/// the SAME detached read [`sample_balances`] performs before entering the actor. Returns
+/// `Some(to)` when `to` is joined-but-not-open (the actor fails a FRESH admission fast with 503
+/// instead of journaling a Pending row that can only stall), and `None` when `to` is open OR when
+/// openness is unknown because no runtime is attached (in-process/standalone: admission proceeds
+/// exactly as before). The read is detached, so it can be stale: a `Some` that races `to` opening
+/// merely costs the caller a retry — it never loses an attach, because the actor re-decides
+/// fresh-vs-existing under its single ownership and an EXISTING key takes the attach path first.
+fn unopened_destination(state: &AppState, to: FederationId) -> Option<FederationId> {
+    let mc = state.mc.as_ref()?;
+    (!mc.federations().contains(&to)).then_some(to)
 }
 
 /// Resolve the federation for a verb: the explicit request field, else the policy pin, else the

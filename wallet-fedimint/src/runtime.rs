@@ -2254,6 +2254,9 @@ impl Runtime {
                 now_ms: now_ms(),
                 balances,
                 probe_session_nonce: Some(session_nonce.to_owned()),
+                // Probe legs are internal and self-heal via reconcile; never fail-fast on
+                // destination openness (the dest-side 503 gate is for FRESH user admissions).
+                dest_unavailable: None,
             })
             .await
             .map_err(|error| anyhow::anyhow!("probe leg admission failed: {error}"))?;
