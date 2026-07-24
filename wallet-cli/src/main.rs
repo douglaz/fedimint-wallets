@@ -87,8 +87,9 @@ enum Command {
     Join { invite: String },
     /// Rebuild a federation's balance from the seed (`docs/wallet-recovery-spec.md`): a deliberate
     /// last resort for a wallet whose local stores were lost. Recovers into a FRESH partition and
-    /// never wipes one; refuses if the federation is already open. The seed must already be present
-    /// (from a prior run or `walletd restore-mnemonic`).
+    /// never wipes one; refuses if the federation is still registered (open OR
+    /// registered-but-unopened — a surviving journal could double-pay). The seed must already be
+    /// present (from a prior run or `walletd restore-mnemonic`).
     Recover { invite: String },
     /// Discover candidate federations from configured sources, structurally vet them, and
     /// optionally auto-join within the discovery caps.

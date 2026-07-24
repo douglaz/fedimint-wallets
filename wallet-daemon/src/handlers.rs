@@ -441,8 +441,9 @@ pub async fn join(
 /// `POST /v1/recover`: rebuild a federation's balance from the seed (`docs/wallet-recovery-spec.md`,
 /// D1). Mirrors [`join`] — admit and return the operation key; the long recovery drives in a
 /// detached task (D5), so the operator polls `GET /v1/operations/{key}` for the terminal state.
-/// Recovering an already-open federation, or a failed module recovery, terminalizes that operation
-/// `Failed` (the refusal lives in [`wallet_fedimint::MultiClient::recover`], not here).
+/// Recovering an already-registered federation (open OR registered-but-unopened), or a failed
+/// module recovery, terminalizes that operation `Failed` (the refusal lives in
+/// [`wallet_fedimint::MultiClient::recover`], not here).
 pub async fn recover(
     State(state): State<AppState>,
     request: Result<Json<RecoverRequest>, JsonRejection>,

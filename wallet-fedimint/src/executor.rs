@@ -1085,12 +1085,16 @@ impl FedimintExecutor {
                 let invite = InviteCode::from_str(invite).map_err(|error| {
                     ExecError::Permanent(format!("parsing federation invite: {error}"))
                 })?;
-                // Recovery is complete-or-fail (D5): EVERY failure — an already-live federation, a
-                // failed module recovery, a transport fault — terminalizes this intent `Failed`
-                // with the SDK's diagnostic (`Permanent`, not `Retryable`). The operator retries
-                // deliberately (the Failed+User manual-retry path re-drives into a clean FRESH
-                // prefix); nothing auto-re-drives it, so a deterministic refusal — recovering an
-                // already-open fed — can never wedge Pending forever.
+                // Recovery is complete-or-fail (D5): a failed module recovery, a transport fault, or
+                // the refuse-if-registered guard terminalizes this intent `Failed` with the
+                // SDK/refusal diagnostic (`Permanent`, not `Retryable`); a `Failed` intent is then
+                // retried only by the deliberate Failed+User manual path. A crash MID-recovery
+                // instead leaves the intent `Executing`, and reconcile DOES auto-re-drive it on the
+                // next startup — which is money-safe under D3/D4: the fresh partition was never
+                // registered (the crashed attempt never reached `complete_recovery`), so the re-drive
+                // recovers into a clean FRESH prefix; or the fed IS registered, and the
+                // refuse-if-registered guard makes the re-drive an honest, deterministic refusal.
+                // Either way it terminalizes and never double-recovers or wedges Pending forever.
                 self.mc
                     .recover(invite, &intent.idempotency_key)
                     .await

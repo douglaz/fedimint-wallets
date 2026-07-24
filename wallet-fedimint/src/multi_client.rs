@@ -267,10 +267,14 @@ impl MultiClient {
     /// auto-join and driver-retry paths keep calling [`Self::join`], and the allocator's
     /// `decide()` never emits it.
     ///
-    /// - If the federation is already **open/live** → REFUSE (recovering would run a second client
-    ///   on the same seed). Otherwise recover into a **FRESH** [`Self::next_db_prefix`]; V1 never
-    ///   wipes or reuses a partition, so any pre-existing partition for the federation is left
-    ///   untouched and inert (the registry row is simply repointed at the recovered partition).
+    /// - If the federation is still **REGISTERED** (a durable registry row exists — open OR
+    ///   registered-but-unopened) → REFUSE: a surviving journal still holds non-terminal `Pay`/
+    ///   `Move` intents that reconcile re-drives, and recovery's fresh EMPTY oplog would miss the
+    ///   cross-restart send-dedup → double-pay. Recovery only ever runs where NO registry row (and
+    ///   thus no surviving intent) exists. Otherwise recover into a **FRESH**
+    ///   [`Self::next_db_prefix`]; V1 never wipes or reuses a partition, so any pre-existing
+    ///   partition is left untouched and inert (recovery always INSERTS a new registry row for the
+    ///   unregistered fed).
     /// - Await completion via [`Client::wait_for_all_recoveries`] — the pinned SDK returns `Err` on
     ///   a failed module recovery instead of parking forever, so recovery is complete-or-fail —
     ///   while a side task logs progress from [`Client::subscribe_to_recovery_progress`].
@@ -278,8 +282,10 @@ impl MultiClient {
     ///   recovered module from its live registry and sits mid-init, so we stop it, REOPEN the
     ///   now-`done` partition (the normal init path, which registers every module), and drain its
     ///   state machines before registering — only then is `balance` readable (D4/D5).
-    /// - `put_federation` + the in-memory insert happen ONLY after the reopened client is usable.
-    ///   On any failure the fresh partition is abandoned inert; a retry gets a clean prefix (D4.7).
+    /// - The final [`FedimintJournal::complete_recovery`] commit + the in-memory insert run under
+    ///   `join_lock` with a re-checked `has_client`, so the registration cannot silently replace a
+    ///   client that went live meanwhile. On any failure the fresh partition is abandoned inert; a
+    ///   retry gets a clean prefix (D4.7).
     pub async fn recover(
         &self,
         invite: InviteCode,
@@ -287,17 +293,21 @@ impl MultiClient {
     ) -> anyhow::Result<FederationId> {
         let id = bridge_federation_id(invite.federation_id());
 
-        // Fast refuse before contending for the lock; re-checked authoritatively under it.
-        ensure_recover_not_live(self.has_client(&id), &id)?;
+        // Fast refuse before contending for the lock; re-checked authoritatively under it. Recovery
+        // refuses ANY registered fed (open OR registered-but-unopened), not merely an open one: a
+        // surviving journal still holds re-drivable `Pay`/`Move` intents that a fresh empty oplog
+        // would double-pay (D3).
+        ensure_recover_not_registered(self.is_registered(&id).await?, &id)?;
 
         // Serialize FRESH-prefix allocation + partition materialization with `join` (both take
         // `next_db_prefix`). Held only across the bounded preview fetch + `recover` init — NOT the
         // long module replay, which runs after the lock is released.
         let join_guard = self.join_lock.lock().await;
-        ensure_recover_not_live(self.has_client(&id), &id)?;
-        // Keep this per-fed reservation through registry insertion. The global join lock can then
-        // be released after the fresh partition is materialized, allowing unrelated federation
-        // joins to proceed without allowing a second client for THIS federation.
+        ensure_recover_not_registered(self.is_registered(&id).await?, &id)?;
+        // Keep this per-fed reservation from BEFORE prefix allocation through the in-memory insert.
+        // The global join lock can then be released after the fresh partition is materialized,
+        // letting unrelated federation joins proceed, while `join`/`open_one` still cannot open a
+        // second client for THIS federation until the reservation drops (D4 concurrency).
         let _recovery_reservation = self.reserve_recovery(id)?;
         let preview = self
             .client_builder()
@@ -343,12 +353,31 @@ impl MultiClient {
             db_prefix,
             joined_at: unix_now(),
         };
-        // Publish the registry row and terminalize this recovery's intent atomically. Otherwise a
-        // crash after registration but before the driver's ordinary Done write would reopen this
-        // client on startup and re-drive the still-Executing action into the "already open"
-        // refusal, falsely reporting a completed recovery as failed.
+        // Re-acquire the join lock for the final commit + insert. The recovery reservation has kept
+        // `join`/`open_one` off this federation throughout the replay; re-checking `has_client`
+        // under the lock closes the last window so the registration can never silently replace a
+        // client that went live meanwhile (it cannot, given the reservation — the invariant is
+        // enforced here, not merely assumed).
+        let _commit_guard = self.join_lock.lock().await;
+        if self.has_client(&id) {
+            // Unreachable given the reservation, but never REPLACE a live client: refuse and shut
+            // down our fresh handle. We hold the only `Arc` reference, so `try_unwrap` yields the
+            // `ClientHandle` for a clean shutdown (a failed unwrap falls through to `Drop`).
+            if let Ok(handle) = Arc::try_unwrap(client) {
+                handle.shutdown().await;
+            }
+            anyhow::bail!(
+                "federation {} went live during recovery; refusing to replace the live client",
+                id.to_hex()
+            );
+        }
+        // Publish the registry row, record durable user ownership, and terminalize this recovery's
+        // intent atomically (D4.6). Otherwise a crash after registration but before the driver's
+        // ordinary Done write would reopen this client on startup and re-drive the still-Executing
+        // action into the refuse-if-registered path, falsely reporting a completed recovery as
+        // failed.
         self.journal
-            .complete_recovery(&id, &info, recovery_key)
+            .complete_recovery(&id, &info, &invite, recovery_key)
             .await
             .map_err(|e| anyhow::anyhow!("committing recovered federation: {e:?}"))?;
         self.clients
@@ -358,13 +387,19 @@ impl MultiClient {
         Ok(id)
     }
 
-    fn ensure_recovery_not_in_progress(&self, id: &FederationId) -> anyhow::Result<()> {
-        if self
-            .active_recoveries
+    /// Whether `id` currently holds a process-local recovery reservation. Read by both
+    /// [`Self::ensure_recovery_not_in_progress`] (the join path) and [`Self::open_one`] (the
+    /// scheduler open path), so no open path can materialize a second client on the fresh partition
+    /// an in-flight recovery owns (D4 concurrency).
+    fn recovery_in_progress(&self, id: &FederationId) -> bool {
+        self.active_recoveries
             .read()
             .expect("active recovery set lock poisoned")
             .contains(id)
-        {
+    }
+
+    fn ensure_recovery_not_in_progress(&self, id: &FederationId) -> anyhow::Result<()> {
+        if self.recovery_in_progress(id) {
             anyhow::bail!(
                 "federation {} recovery is already in progress; wait for it to finish before \
                  joining",
@@ -493,11 +528,46 @@ impl MultiClient {
             .contains_key(id)
     }
 
+    /// Whether `id` has a durable registry row — open OR registered-but-unopened. Recovery refuses
+    /// any registered fed (D3): a surviving journal may hold non-terminal intents a fresh recovery
+    /// oplog would double-pay. (Open implies registered, so this subsumes the `has_client` check.)
+    async fn is_registered(&self, id: &FederationId) -> anyhow::Result<bool> {
+        Ok(self
+            .journal
+            .get_federation(id)
+            .await
+            .map_err(|e| anyhow::anyhow!("reading federation registry: {e:?}"))?
+            .is_some())
+    }
+
     /// Open one already-joined federation's client from its registry row and insert it
     /// into the map. `open` reads the federation config already stored in the client's
     /// own db partition, so `info.invite` is not needed here (it exists for
     /// display/backup, per [`FederationInfo`]'s docs).
     async fn open_one(&self, info: &FederationInfo) -> anyhow::Result<FederationId> {
+        // Honor the recovery reservation on THIS path too, not just `join_inner` (D4 concurrency):
+        // the watch scheduler calls `open_all` → `open_one` for every registered-but-unopened fed
+        // each cycle, and a fed whose recovery is in flight owns its fresh partition until `recover`
+        // inserts the live client. Opening it here — in the window between `complete_recovery`'s
+        // registry write and that insert — would run a SECOND handle over the same partition. Derive
+        // the id from the registry row's canonical invite so we can skip BEFORE opening; a
+        // malformed/unparseable invite is never the just-registered recovery target, so fall through.
+        if let Ok(invite) = InviteCode::from_str(&info.invite) {
+            let id = bridge_federation_id(invite.federation_id());
+            if self.recovery_in_progress(&id) {
+                anyhow::bail!(
+                    "federation {} recovery is in progress; skipping open until it registers",
+                    id.to_hex()
+                );
+            }
+            // `open_all` may have snapshotted this registry row while recovery was publishing it,
+            // then reached it only after recovery inserted the client and released its reservation.
+            // Treat that stale work item as already complete instead of opening a second handle on
+            // the recovered partition.
+            if self.has_client(&id) {
+                return Ok(id);
+            }
+        }
         let client: ClientHandleArc = self
             .client_builder()
             .await?
@@ -995,16 +1065,21 @@ async fn join_deadline<T>(
         .map_err(|_elapsed| JoinDeadlineElapsed)
 }
 
-/// Refuse a recovery of a federation that is already open/live (D3): a second client on the same
-/// seed would run two executors over one wallet store. Recovery targets a federation whose stores
-/// were lost — registered-but-unopened, or not present here at all — and that path proceeds into a
-/// FRESH prefix. Pure over the liveness bit so the refusal decision is unit-testable without a
-/// live client.
-fn ensure_recover_not_live(is_live: bool, id: &FederationId) -> anyhow::Result<()> {
-    if is_live {
+/// Refuse a recovery of a federation that still has a durable registry row — open OR
+/// registered-but-unopened (D3). Refusing over *registered*, not merely *open*, is the money-safety
+/// boundary: a registered-but-unopened fed's surviving journal still holds non-terminal `Pay`/`Move`
+/// intents that reconcile re-drives, and recovery hands back a fresh EMPTY oplog — the cross-restart
+/// send-dedup authority — so a re-driven `Pay` would fund a SECOND outgoing contract the gateway
+/// already settled and holds the preimage for → automatic double-pay. Refusing every registered fed
+/// removes this by construction: recovery only ever runs where no journal (and thus no surviving
+/// intent) exists. Pure over the registration bit so the refusal is unit-testable without a live
+/// journal.
+fn ensure_recover_not_registered(is_registered: bool, id: &FederationId) -> anyhow::Result<()> {
+    if is_registered {
         anyhow::bail!(
-            "federation {} is already open; recovering would run a second client on the same \
-             seed — remove it deliberately first",
+            "federation {} is still registered; if open, recovery would run a second client on \
+             one seed; if its partition won't open, that is an incident — do not recover over a \
+             surviving journal",
             id.to_hex()
         );
     }
@@ -1993,20 +2068,110 @@ mod tests {
     }
 
     #[test]
-    fn recover_refuses_an_already_live_federation() {
+    fn recover_refuses_a_registered_federation() {
         let id = FederationId([7u8; 32]);
-        // A federation whose live client is already open cannot be recovered — a second client on
-        // the same seed would run two executors over one wallet store (D3).
-        let refused = ensure_recover_not_live(true, &id);
+        // A federation that still has a durable registry row cannot be recovered — whether it is
+        // open OR merely registered-but-unopened, its surviving journal may hold re-drivable intents
+        // a fresh recovery oplog would double-pay (D3). An open fed is a strict subset: open implies
+        // registered, so this same guard refuses it.
+        let refused = ensure_recover_not_registered(true, &id);
         assert!(refused.is_err());
         let message = refused.unwrap_err().to_string();
         assert!(
-            message.contains("already open"),
-            "the refusal must be the actionable 'already open' message, was: {message}"
+            message.contains("still registered"),
+            "the refusal must be the actionable 'still registered' message, was: {message}"
         );
-        // A federation that is NOT live (its stores were lost — the recovery case) proceeds into a
-        // fresh prefix.
-        assert!(ensure_recover_not_live(false, &id).is_ok());
+        // A federation with NO registry row (a fresh host, or a lost journal — the recovery case)
+        // proceeds into a fresh prefix.
+        assert!(ensure_recover_not_registered(false, &id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn recover_refuses_a_registered_but_unopened_federation() {
+        let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
+        let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
+        let multi_client = MultiClient::new(db, journal_db, mnemonic).await;
+
+        // Registered-but-unopened: a journal registry row survives but no client is open. This is
+        // exactly the dangerous state — the surviving journal still holds re-drivable `Pay`/`Move`
+        // intents, so recovery's fresh empty oplog would double-pay. Recovery must refuse it, not
+        // just an already-open fed.
+        let fed_id = fedimint_core::config::FederationId::dummy();
+        let id = bridge_federation_id(fed_id);
+        let invite = InviteCode::new(
+            SafeUrl::parse("https://registered.example").expect("valid url"),
+            PeerId::from(0),
+            fed_id,
+            None,
+        );
+        let info = FederationInfo {
+            invite: invite.to_string(),
+            db_prefix: 0,
+            joined_at: 0,
+        };
+        multi_client
+            .journal
+            .put_federation(&id, &info)
+            .await
+            .expect("register the federation without opening a client");
+
+        // No client is open for this fed ...
+        assert!(!multi_client.has_client(&id));
+        // ... yet recovery refuses at the pre-lock registration check, before any network preview
+        // or partition write.
+        let refused = multi_client
+            .recover(invite, &IdempotencyKey("recover:registered".to_string()))
+            .await;
+        assert!(refused.is_err());
+        let message = refused.unwrap_err().to_string();
+        assert!(
+            message.contains("still registered"),
+            "registered-but-unopened recovery must refuse with the 'still registered' message, \
+             was: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_one_skips_a_federation_reserved_for_recovery() {
+        let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
+        let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
+        let multi_client = MultiClient::new(db, journal_db, mnemonic).await;
+
+        // A real invite so `open_one` can derive the fed id from the registry row before touching
+        // the partition.
+        let fed_id = fedimint_core::config::FederationId::dummy();
+        let id = bridge_federation_id(fed_id);
+        let invite = InviteCode::new(
+            SafeUrl::parse("https://reserved.example").expect("valid url"),
+            PeerId::from(0),
+            fed_id,
+            None,
+        );
+        let info = FederationInfo {
+            invite: invite.to_string(),
+            db_prefix: 0,
+            joined_at: 0,
+        };
+
+        let _reservation = multi_client
+            .reserve_recovery(id)
+            .expect("reserve the fed for an in-flight recovery");
+
+        // The scheduler's `open_all` → `open_one` must NOT open a second handle on the partition the
+        // in-flight recovery owns: it identifies the fed from the registry row's invite and refuses
+        // BEFORE the open, so `recover` stays the sole writer of that partition's live client.
+        let refused = multi_client.open_one(&info).await;
+        assert!(refused.is_err());
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("recovery is in progress"),
+            "open_one must skip a reserved fed via the recovery reservation, not attempt the open"
+        );
+        assert!(!multi_client.has_client(&id));
     }
 
     #[tokio::test]
