@@ -15,11 +15,31 @@ snapshot, or not at all. A mismatched pair — one store from one moment, the ot
 another — is **out of contract**, and the wallet does not defend against it. When a store
 is lost, the supported path is Recovery from the seed and federation IDs, not a store copy.
 
-**2. Recovery always targets a fresh client partition; it never wipes or reuses one.**
-If the federation is already open, recovery **refuses** rather than running a second client
-on the same seed. Otherwise it allocates a new partition, recovers into it, and registers
-the federation only after recovery completes. Any pre-existing partition is left untouched
-and inert.
+**2. Recovery always targets a fresh client partition; it never wipes or reuses one, and it
+refuses any federation that is still registered.**
+If the federation still has a durable registry row — open, OR registered-but-unopened —
+recovery **refuses**. Otherwise (unregistered: a fresh host, or a lost bookkeeping store) it
+allocates a new partition, recovers into it, and registers the federation only after recovery
+completes. Any pre-existing partition is left untouched and inert.
+
+The refusal is over *registered*, not merely *open*, for a money-safety reason found in
+adversarial review. All three legitimate recovery scenarios have the federation unregistered
+at recovery time (fresh host and lost-bookkeeping-store have no registry row; a disk-move
+carries both stores and simply reopens — no recovery). The one registered-but-unopened state
+(bookkeeping store survived, client store lost) is where the danger lives: the surviving
+bookkeeping store still holds non-terminal send/move intents, which reconcile auto-re-drives.
+Recovery hands back a fresh, EMPTY operation log — but that log is the cross-restart
+send-dedup authority, so a re-driven send misses the dedup and funds a second outgoing
+contract for an invoice the gateway already settled, producing an automatic double-pay with
+no operator action. Refusing every registered federation removes this by construction:
+recovery runs only where no surviving intent can exist. The corrupt-partition-with-surviving-
+bookkeeping case becomes an operator incident (stop, back up, deliberately clear the
+bookkeeping store, then recover), never auto-recovered.
+
+Recovery also confers **user ownership**: it records the same durable user-approval a manual
+join does, so the recovered federation is eligible for automated allocation. Otherwise the
+funds return but the allocator, treating the federation as merely agent-discovered, would
+never spend from it.
 
 The forcing fact for (2): `ClientPreview::recover` rejects an already-initialized database.
 So reusing a federation's existing partition necessarily means **wiping it before

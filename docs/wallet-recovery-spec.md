@@ -65,14 +65,29 @@ import path. Add `walletd restore-mnemonic`, the exact mirror of the existing `w
   mints a random seed and the import then correctly refuses — the documented fix is a clean data
   dir. The runbook must state this ordering explicitly.
 
-### D3 — Always recover into a FRESH prefix; never wipe (decision 2)
+### D3 — Refuse if the federation is REGISTERED; else recover into a FRESH prefix (decision 2)
 V1 performs **no supersede-in-place**. Resolve the target prefix as:
-- If the federation is **already open/live** → **refuse** with an actionable error ("already open;
-  recovering would run a second client on the same seed — remove it deliberately first"). This
-  matches the runbook's *one seed, one live `client.db`, one daemon*.
-- Otherwise → allocate `next_db_prefix()` (`multi_client.rs:386`) and recover into it.
+- If the federation is **REGISTERED** (`journal.get_federation(id)` is `Some` — it has a durable
+  registry row, whether or not its client is currently open) → **REFUSE** with an actionable error
+  ("federation is still registered; if it is open, recovery would run a second client on one seed;
+  if its partition won't open, that is an incident — do not recover over a surviving journal").
+- Otherwise (UNregistered: fresh host, or a lost `journal.db`) → allocate `next_db_prefix()`
+  (`multi_client.rs:386`) and recover into it.
 
-Any pre-existing partition for that federation is left **untouched and inert**: `open_all` only
+**Why refuse the registered case, not just the open one (money-safety — adversarial review):** all
+three legitimate recovery scenarios have the fed UNregistered at recovery time (fresh host and
+lost-`journal.db` have no registry row; a disk-move has both stores and just reopens — no recovery).
+The dangerous state is *registered-but-unopened* (`journal.db` survived, `client.db` lost): the
+surviving journal still holds non-terminal `Pay`/`Move` intents, and reconcile auto-re-drives them.
+Recovery gives a FRESH, EMPTY oplog — but the oplog IS the cross-restart send-dedup authority, so a
+re-driven `Pay` misses the dedup and funds a SECOND outgoing contract for an invoice the gateway
+already settled and holds the preimage for → **automatic double-pay, no operator action.** Refusing
+any registered fed removes this by construction: recovery only ever runs where no journal (and thus
+no surviving intent) exists. The corrupt-partition-with-surviving-journal case is handled as an
+incident in the runbook (stop, back up, deliberately clear the journal, then recover), never
+auto-recovered in V1.
+
+Any pre-existing partition for an UNregistered fed is left **untouched and inert**: `open_all` only
 opens *registry* rows, and `next_db_prefix` already scans raw partitions purely to take `max+1` so
 it can never be reused for a different federation. Reclaiming orphans is a separate, deliberate GC
 command — never automatic, and out of scope here.
@@ -90,11 +105,31 @@ Sibling of `join`/`join_inner` (`multi_client.rs:151-255`):
    `subscribe_to_recovery_progress()` on a side task.
 5. **Completion is stronger than that call returning**: the handle omits recovered modules from its
    live registry, so **reopen the partition and drain its state machines before registering**.
-6. Only then `put_federation(id, FederationInfo { invite, db_prefix, joined_at })`
-   (`journal.rs:548`) and insert into the in-memory registry.
+6. Only then commit: `put_federation(...)` AND **atomically record durable user ownership** — a
+   `CandidateState::UserApproved` candidate row, exactly as a successful user `join` does
+   (preserving an existing `UserApproved`). **Why (adversarial review):** without it, the recovered
+   fed has no `UserApproved` row, so `auto_joined_candidates` treats it as probe-gated and discovery
+   later seeds it as `AutoJoined`; under default policy no such fed is eligible as a spending source,
+   so **automated allocation stays disabled for every recovered federation**. Recovery is a
+   deliberate user action, so it confers user ownership just like `join`. This write is part of the
+   same atomic `complete_recovery` dbtx as the registry row + intent terminalization.
 7. On failure: the operation terminalizes as failed with the SDK's error; the fresh unregistered
    partition is abandoned inert (free, per D3). The operator may simply retry — each attempt gets a
    clean prefix.
+
+**Concurrency — the open path must respect the recovery reservation (adversarial review):** the
+in-memory `active_recoveries` reservation must be honored by EVERY open path, not just `join_inner`.
+The watch scheduler independently calls `open_all` → `open_one` (`scheduler.rs`) for every
+registered-but-unopened fed each cycle, and `open_one` takes neither `join_lock` nor checks
+`active_recoveries`. `open_one`/`open_all` MUST skip a fed in `active_recoveries`. The reservation
+MUST be held from before prefix allocation through the in-memory `clients.insert` (covering the
+window between `complete_recovery`'s registry write and the insert, where a scheduler cycle could
+otherwise `open_one` the just-registered partition → two handles on one partition). Re-verify
+`has_client` under `join_lock` immediately around the commit + insert so the final registration
+cannot silently replace a client that went live meanwhile. (Note: D3's refuse-if-registered already
+prevents the *old-partition-goes-live-during-replay* race for the pre-completion window, since a fed
+under recovery has no registry row until `complete_recovery`; this reservation guard closes the
+post-completion window.)
 
 ### D5 — Execution model: async, per ADR-0024
 ADR-0024 is absolute: every operation's IO "runs in its own concurrent driver task, unbounded in
@@ -122,8 +157,10 @@ Not seed-at-rest encryption (Phase 7). Not automatic recovery on startup. Not ba
 ## Verification
 - **Unit**: recovery registers the federation only after completion; recovery into a fresh prefix
   never reuses or deletes an existing partition (extend
-  `next_db_prefix_accounts_for_orphaned_client_partitions`, `multi_client.rs:1751`); recovery of an
-  already-live federation is refused; `decide()` never emits `Action::Recover`;
+  `next_db_prefix_accounts_for_orphaned_client_partitions`, `multi_client.rs:1751`); recovery of a
+  **registered** federation is refused (open OR registered-but-unopened — the D3 boundary);
+  `complete_recovery` records a `UserApproved` candidate so the recovered fed is allocator-eligible;
+  `open_one`/`open_all` skip a fed in `active_recoveries`; `decide()` never emits `Action::Recover`;
   `restore-mnemonic` refuses when a seed exists and rejects a bad checksum.
 - **Live devimint (the gate — must pass):** fund a federation, drop `journal.db`, then
   `restore-mnemonic` + `recover <invite>` on a clean store and assert the balance is restored after
