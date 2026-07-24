@@ -174,6 +174,15 @@ pub enum Action {
         /// persisted the federation registry but before it terminalized its ledger row.
         membership_preexisting: bool,
     },
+    /// Rebuild a federation's funded balance from the seed via `ClientPreview::recover`
+    /// (`docs/wallet-recovery-spec.md`). A DELIBERATE, user-initiated last resort — the auto-join
+    /// and driver-retry paths keep calling [`Action::Join`], and `decide()` must NEVER emit this
+    /// (recovery recovers into a FRESH client partition, invisible to the allocator until it
+    /// completes). It is executable but carries no money source/destination and no fee budget.
+    Recover {
+        federation: FederationId,
+        invite: String,
+    },
     /// Advisory: do not route the next inflow to `fed` / do not cap allocation here.
     /// Never becomes an executor `Intent` (see `Action::is_executable`); the ledger's
     /// `Refusal` kind records the concept. `diagnostics` carries the balance/threshold
@@ -297,6 +306,7 @@ impl Action {
                 | Action::Pay { .. }
                 | Action::Receive { .. }
                 | Action::Join { .. }
+                | Action::Recover { .. }
         )
     }
 
@@ -312,7 +322,7 @@ impl Action {
             | Action::DirectInflow { fee_cap, .. }
             | Action::Pay { fee_cap, .. }
             | Action::Receive { fee_cap, .. } => Some(*fee_cap),
-            Action::Join { .. } | Action::RefuseInflow { .. } => None,
+            Action::Join { .. } | Action::Recover { .. } | Action::RefuseInflow { .. } => None,
         }
     }
 }

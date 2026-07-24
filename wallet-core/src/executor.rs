@@ -164,7 +164,10 @@ pub fn project_reservations(
                 add_outbound(&mut out, *from, Msat(amount.0.saturating_add(fee_cap.0)))
             }
             Action::Receive { to, amount, .. } => add_inbound(&mut out, *to, *amount),
-            Action::Pay { .. } | Action::Join { .. } | Action::RefuseInflow { .. } => {}
+            Action::Pay { .. }
+            | Action::Join { .. }
+            | Action::Recover { .. }
+            | Action::RefuseInflow { .. } => {}
         }
     }
     out
@@ -727,7 +730,22 @@ fn validate_attach(intent: &Intent, decision: &AllocatorDecision) -> Result<(), 
                 federation, invite, ..
             },
         ) => (old_federation, old_invite) == (federation, invite),
-        (Action::Pay { .. } | Action::Receive { .. } | Action::Join { .. }, _) => false,
+        (
+            Action::Recover {
+                federation: old_federation,
+                invite: old_invite,
+            },
+            Action::Recover {
+                federation, invite, ..
+            },
+        ) => (old_federation, old_invite) == (federation, invite),
+        (
+            Action::Pay { .. }
+            | Action::Receive { .. }
+            | Action::Join { .. }
+            | Action::Recover { .. },
+            _,
+        ) => false,
         _ => true,
     };
     if !matches_sizing {
@@ -768,6 +786,7 @@ pub fn admit_intent(
         | Action::DirectInflow { .. }
         | Action::Receive { .. }
         | Action::Join { .. }
+        | Action::Recover { .. }
         | Action::RefuseInflow { .. } => None,
     };
     if let Some((fed, required)) = source {
@@ -790,7 +809,10 @@ pub fn admit_intent(
         | Action::Evacuate { to, amount, .. }
         | Action::DirectInflow { to, amount, .. }
         | Action::Receive { to, amount, .. } => Some((*to, *amount)),
-        Action::Pay { .. } | Action::Join { .. } | Action::RefuseInflow { .. } => None,
+        Action::Pay { .. }
+        | Action::Join { .. }
+        | Action::Recover { .. }
+        | Action::RefuseInflow { .. } => None,
     };
     if let (Some(cap), Some((fed, amount))) = (per_fed_cap, destination) {
         let committed = balances

@@ -70,9 +70,9 @@ pub use multi_client::{
 pub use probe::{assemble_facts, assemble_status, FedimintProbeRunner, ProbeResult};
 pub use runtime::{
     direct_inflow_nonce_key, join_intent_key, move_key, raw_pay_key, raw_receive_key,
-    DirectInflowOutcome, FinalizeOutcome, MoveOutcome, ProbeOutcome, ProbeReport, ReconcileSummary,
-    Runtime, WatchCycleReport, WatchDiscoverOutcome, WatchProbeOutcome, WatchProbeReport,
-    WatchReconcileOutcome, WatchTickOutcome,
+    recover_intent_key, DirectInflowOutcome, FinalizeOutcome, MoveOutcome, ProbeOutcome,
+    ProbeReport, ReconcileSummary, Runtime, WatchCycleReport, WatchDiscoverOutcome,
+    WatchProbeOutcome, WatchProbeReport, WatchReconcileOutcome, WatchTickOutcome,
 };
 pub use service::{
     AwaitOutcome, Command, DecidedOp, JournalTransition, OpRequest, ProbeCandidate, ProbeDecision,
