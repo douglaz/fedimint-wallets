@@ -58,7 +58,21 @@ Block Store (E2E-encrypted to the user's Google account, keyed to the device
 lockscreen), with no seed-phrase ceremony at onboarding. On a new device the seed
 restores during setup and balances are rebuilt from it via Fedimint recovery. See
 [ADR-0003](./docs/adr/0003-recovery-silent-backup.md).
-_Avoid_: making "seed phrase backup" the default flow (it is an opt-in export)
+**The backup unit is the seed plus the joined federation IDs — never the wallet's
+local stores.** Recovery rebuilds balances from the seed; it does not reinstate a
+point in time. Because the money is recoverable this way, losing the bookkeeping
+store loses records, not settled funds.
+_Avoid_: making "seed phrase backup" the default flow (it is an opt-in export);
+calling a copy of the local stores "the backup"
+
+**Restore** (distinct from **Recovery**):
+Copying the wallet's local stores back onto a host — an operator action, not the
+product's backup path. The stores are one live unit and carry **no cross-store
+point-in-time guarantee**, so they are restored **together from a single snapshot,
+or not at all**; a mismatched pair is out of contract. When a store is lost, the
+supported path is Recovery from the seed and federation IDs, not a store copy.
+_Avoid_: using "restore" for seed-based Recovery; implying the stores can be
+restored from different moments
 
 **Shutdown notice**:
 A federation's machine-readable announcement that it will cease operating (via
