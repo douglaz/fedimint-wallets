@@ -63,6 +63,12 @@ pub struct MultiClient {
     /// Serializes db-prefix allocation and initial client creation so two concurrent joins
     /// cannot initialize different federations into the same per-fed partition.
     join_lock: Mutex<()>,
+    /// Process-local reservation held from recovery admission through final registration. A join
+    /// for the same federation checks this under `join_lock`, so it cannot initialize a second
+    /// client while the long recovery replay runs. This is deliberately NOT durable recovery
+    /// lifecycle state: a failed/cancelled recovery drops the reservation and leaves its fresh
+    /// partition inert, exactly as D3/D4 require.
+    active_recoveries: RwLock<BTreeSet<FederationId>>,
     /// Pooled HTTP client for DIRECT gateway reads (`routing_info`). The SDK's
     /// `GatewayApi` route is deliberately bypassed for these: its per-URL
     /// `ConnectionPool` treats every http(s) connection as disconnected
@@ -133,6 +139,7 @@ impl MultiClient {
             root_secret,
             clients: RwLock::new(BTreeMap::new()),
             join_lock: Mutex::new(()),
+            active_recoveries: RwLock::new(BTreeSet::new()),
             // Bounded: a quote is pre-fund and advisory (no money has moved), so timing out
             // against an unresponsive gateway is safe — the driver surfaces Retryable and the
             // intent stays Pending. The SDK path had NO deadline here, which left a driver
@@ -185,6 +192,7 @@ impl MultiClient {
         if self.has_client(&id) {
             return Ok(JoinDeadlineOutcome::Joined(JoinOutcome::opened(id)));
         }
+        self.ensure_recovery_not_in_progress(&id)?;
         if let Some(info) = self
             .journal
             .get_federation(&id)
@@ -252,6 +260,136 @@ impl MultiClient {
             id: joined_id,
             newly_joined: true,
         }))
+    }
+
+    /// Rebuild `invite`'s federation from the seed via [`ClientPreview::recover`]
+    /// (`docs/wallet-recovery-spec.md`, D3/D4). A DELIBERATE, user-initiated last resort: the
+    /// auto-join and driver-retry paths keep calling [`Self::join`], and the allocator's
+    /// `decide()` never emits it.
+    ///
+    /// - If the federation is already **open/live** → REFUSE (recovering would run a second client
+    ///   on the same seed). Otherwise recover into a **FRESH** [`Self::next_db_prefix`]; V1 never
+    ///   wipes or reuses a partition, so any pre-existing partition for the federation is left
+    ///   untouched and inert (the registry row is simply repointed at the recovered partition).
+    /// - Await completion via [`Client::wait_for_all_recoveries`] — the pinned SDK returns `Err` on
+    ///   a failed module recovery instead of parking forever, so recovery is complete-or-fail —
+    ///   while a side task logs progress from [`Client::subscribe_to_recovery_progress`].
+    /// - **Completion is stronger than that call returning:** the recovery-phase handle omits every
+    ///   recovered module from its live registry and sits mid-init, so we stop it, REOPEN the
+    ///   now-`done` partition (the normal init path, which registers every module), and drain its
+    ///   state machines before registering — only then is `balance` readable (D4/D5).
+    /// - `put_federation` + the in-memory insert happen ONLY after the reopened client is usable.
+    ///   On any failure the fresh partition is abandoned inert; a retry gets a clean prefix (D4.7).
+    pub async fn recover(
+        &self,
+        invite: InviteCode,
+        recovery_key: &IdempotencyKey,
+    ) -> anyhow::Result<FederationId> {
+        let id = bridge_federation_id(invite.federation_id());
+
+        // Fast refuse before contending for the lock; re-checked authoritatively under it.
+        ensure_recover_not_live(self.has_client(&id), &id)?;
+
+        // Serialize FRESH-prefix allocation + partition materialization with `join` (both take
+        // `next_db_prefix`). Held only across the bounded preview fetch + `recover` init — NOT the
+        // long module replay, which runs after the lock is released.
+        let join_guard = self.join_lock.lock().await;
+        ensure_recover_not_live(self.has_client(&id), &id)?;
+        // Keep this per-fed reservation through registry insertion. The global join lock can then
+        // be released after the fresh partition is materialized, allowing unrelated federation
+        // joins to proceed without allowing a second client for THIS federation.
+        let _recovery_reservation = self.reserve_recovery(id)?;
+        let preview = self
+            .client_builder()
+            .await?
+            .preview(self.connectors.clone(), &invite)
+            .await?;
+        let db_prefix = self.next_db_prefix().await?;
+        // `recover` initializes the fresh partition (its config row makes the prefix visible to a
+        // concurrent `next_db_prefix`) and spawns the module-recovery task; the replay is awaited
+        // below. Failure here leaves the fresh partition inert — a retry gets a clean prefix.
+        let recovery_client = preview
+            .recover(self.client_db(db_prefix), self.root_secret.clone(), None)
+            .await?;
+        drop(join_guard);
+
+        // Block on the sole completion gate; a side task logs progress (never a completion signal).
+        wait_for_recoveries_with_progress(&recovery_client).await?;
+
+        let recovered_id = bridge_federation_id(recovery_client.federation_id());
+        if recovered_id != id {
+            anyhow::bail!(
+                "recovered federation id {} did not match invite id {}",
+                recovered_id.to_hex(),
+                id.to_hex()
+            );
+        }
+
+        // The recovery-phase handle is NOT usable and must NOT be registered as-is: fedimint omits
+        // every recovered module from THIS handle's live registry and leaves it mid-init, so
+        // `balance`/send would fail "Primary module not available" while `federations()` reported
+        // the fed open (so `open_all` would never self-heal it). Stop it, then reopen the partition
+        // — now that the module recovery state is persisted `done`, `open` registers every module
+        // and yields a client that can read balance and send.
+        recovery_client.shutdown().await;
+        let client = self.open_recovered_partition(db_prefix).await?;
+        // Reopening starts the state machines that materialize recovered notes into spendable
+        // balance (the gateway's own recovery path waits on this same gate before reading balance).
+        // Register only after it completes, so `balance` never reads a transient zero.
+        client.wait_for_all_active_state_machines().await?;
+
+        let info = FederationInfo {
+            invite: invite.to_string(),
+            db_prefix,
+            joined_at: unix_now(),
+        };
+        // Publish the registry row and terminalize this recovery's intent atomically. Otherwise a
+        // crash after registration but before the driver's ordinary Done write would reopen this
+        // client on startup and re-drive the still-Executing action into the "already open"
+        // refusal, falsely reporting a completed recovery as failed.
+        self.journal
+            .complete_recovery(&id, &info, recovery_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("committing recovered federation: {e:?}"))?;
+        self.clients
+            .write()
+            .expect("client map lock poisoned")
+            .insert(id, client);
+        Ok(id)
+    }
+
+    fn ensure_recovery_not_in_progress(&self, id: &FederationId) -> anyhow::Result<()> {
+        if self
+            .active_recoveries
+            .read()
+            .expect("active recovery set lock poisoned")
+            .contains(id)
+        {
+            anyhow::bail!(
+                "federation {} recovery is already in progress; wait for it to finish before \
+                 joining",
+                id.to_hex()
+            );
+        }
+        Ok(())
+    }
+
+    fn reserve_recovery(&self, id: FederationId) -> anyhow::Result<RecoveryReservation<'_>> {
+        if !self
+            .active_recoveries
+            .write()
+            .expect("active recovery set lock poisoned")
+            .insert(id)
+        {
+            anyhow::bail!(
+                "federation {} recovery is already in progress; wait for it to finish",
+                id.to_hex()
+            );
+        }
+        Ok(RecoveryReservation {
+            active: &self.active_recoveries,
+            id,
+        })
     }
 
     /// Open every already-joined federation, BEST-EFFORT: a federation whose client fails
@@ -376,6 +514,24 @@ impl MultiClient {
             .expect("client map lock poisoned")
             .insert(id, client);
         Ok(id)
+    }
+
+    /// Open a partition whose module recovery has COMPLETED into a fully-materialized client.
+    /// Unlike the recovery-phase handle returned by [`ClientPreview::recover`], this `open` takes
+    /// the normal init path (the persisted module recovery state is `done`), so it registers every
+    /// recovered module and yields a client that can read balance and send. The caller MUST have
+    /// stopped the recovery-phase client first — two live handles on one partition would run two
+    /// executors over the same db.
+    async fn open_recovered_partition(&self, db_prefix: u32) -> anyhow::Result<ClientHandleArc> {
+        self.client_builder()
+            .await?
+            .open(
+                self.connectors.clone(),
+                self.client_db(db_prefix),
+                self.root_secret.clone(),
+            )
+            .await
+            .map(Arc::new)
     }
 
     /// The next unused `db_prefix`: one past the highest already recorded in the
@@ -805,6 +961,25 @@ impl MultiClient {
     }
 }
 
+struct RecoveryReservation<'a> {
+    active: &'a RwLock<BTreeSet<FederationId>>,
+    id: FederationId,
+}
+
+impl Drop for RecoveryReservation<'_> {
+    fn drop(&mut self) {
+        let removed = self
+            .active
+            .write()
+            .expect("active recovery set lock poisoned")
+            .remove(&self.id);
+        debug_assert!(
+            removed,
+            "active recovery reservation must remain held until its guard drops"
+        );
+    }
+}
+
 async fn join_deadline<T>(
     deadline: Option<JoinDeadline>,
     future: impl Future<Output = T>,
@@ -818,6 +993,43 @@ async fn join_deadline<T>(
     runtime::timeout(remaining, future)
         .await
         .map_err(|_elapsed| JoinDeadlineElapsed)
+}
+
+/// Refuse a recovery of a federation that is already open/live (D3): a second client on the same
+/// seed would run two executors over one wallet store. Recovery targets a federation whose stores
+/// were lost — registered-but-unopened, or not present here at all — and that path proceeds into a
+/// FRESH prefix. Pure over the liveness bit so the refusal decision is unit-testable without a
+/// live client.
+fn ensure_recover_not_live(is_live: bool, id: &FederationId) -> anyhow::Result<()> {
+    if is_live {
+        anyhow::bail!(
+            "federation {} is already open; recovering would run a second client on the same \
+             seed — remove it deliberately first",
+            id.to_hex()
+        );
+    }
+    Ok(())
+}
+
+/// Block until every module recovery completes, logging progress on a detached side task for
+/// operator visibility. The progress stream is NEVER a completion authority (the SDK may duplicate
+/// updates and its recovery task is not cancellation-aware); the pinned
+/// [`Client::wait_for_all_recoveries`] — which returns `Err` on a failed module recovery instead of
+/// parking forever — is the sole success/failure gate (D4/D5).
+async fn wait_for_recoveries_with_progress(client: &Client) -> anyhow::Result<()> {
+    let mut progress_stream = Box::pin(client.subscribe_to_recovery_progress());
+    let progress_task = runtime::spawn("wallet-recovery-progress", async move {
+        while let Some((module_instance_id, progress)) = progress_stream.next().await {
+            tracing::info!(
+                module_instance_id,
+                progress = %progress,
+                "multi_client: recovery progress"
+            );
+        }
+    });
+    let result = client.wait_for_all_recoveries().await;
+    progress_task.abort();
+    result
 }
 
 /// Invoice expiry (seconds) passed to lnv2 `receive`. Spec §4 fixes this at one hour; the
@@ -1764,7 +1976,75 @@ mod tests {
             .expect("mem db insert succeeds");
         dbtx.commit_tx().await;
 
+        // `recover` recovers into exactly this FRESH prefix (D3): one past the orphaned partition.
         assert_eq!(multi_client.next_db_prefix().await.unwrap(), 42);
+
+        // ...and choosing it is purely READ-ONLY — the orphaned partition (which may still hold a
+        // funded federation) is left byte-for-byte untouched, never wiped or reused. This is what
+        // makes recovery-into-a-fresh-prefix non-destructive.
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(
+            dbtx.raw_get_bytes(&orphaned_client_key)
+                .await
+                .expect("orphan read succeeds")
+                .as_deref(),
+            Some(&b"initialized client row"[..])
+        );
+    }
+
+    #[test]
+    fn recover_refuses_an_already_live_federation() {
+        let id = FederationId([7u8; 32]);
+        // A federation whose live client is already open cannot be recovered — a second client on
+        // the same seed would run two executors over one wallet store (D3).
+        let refused = ensure_recover_not_live(true, &id);
+        assert!(refused.is_err());
+        let message = refused.unwrap_err().to_string();
+        assert!(
+            message.contains("already open"),
+            "the refusal must be the actionable 'already open' message, was: {message}"
+        );
+        // A federation that is NOT live (its stores were lost — the recovery case) proceeds into a
+        // fresh prefix.
+        assert!(ensure_recover_not_live(false, &id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn recovery_reservation_blocks_same_federation_until_registration_scope_ends() {
+        let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
+        let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
+        let multi_client = MultiClient::new(db, journal_db, mnemonic).await;
+        let recovering = FederationId([7u8; 32]);
+        let unrelated = FederationId([8u8; 32]);
+
+        let reservation = multi_client
+            .reserve_recovery(recovering)
+            .expect("first recovery reserves its federation");
+        assert!(
+            multi_client
+                .ensure_recovery_not_in_progress(&recovering)
+                .is_err(),
+            "a concurrent join must not initialize a second client for the recovering federation"
+        );
+        assert!(
+            multi_client.reserve_recovery(recovering).is_err(),
+            "a concurrent recovery must not initialize a second client for the same federation"
+        );
+        assert!(
+            multi_client
+                .ensure_recovery_not_in_progress(&unrelated)
+                .is_ok(),
+            "the per-fed reservation must not block unrelated federation work"
+        );
+
+        drop(reservation);
+        assert!(
+            multi_client
+                .ensure_recovery_not_in_progress(&recovering)
+                .is_ok(),
+            "completion or failure releases the process-local reservation"
+        );
     }
 
     #[tokio::test]

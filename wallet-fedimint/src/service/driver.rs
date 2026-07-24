@@ -321,11 +321,12 @@ pub(super) fn spawn_intent(
             &intent,
             &mut summary,
         );
-        let perform_timeout = if matches!(&intent.action, Action::Join { .. }) {
-            None
-        } else {
-            perform_timeout
-        };
+        let perform_timeout =
+            if matches!(&intent.action, Action::Join { .. } | Action::Recover { .. }) {
+                None
+            } else {
+                perform_timeout
+            };
         match perform_timeout {
             Some(deadline) => {
                 let _ = tokio::time::timeout(deadline, drive).await;

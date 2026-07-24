@@ -93,6 +93,12 @@ pub enum OperationKind {
     Join {
         fed: FederationId,
     },
+    /// A seed-based recovery of `fed` (`docs/wallet-recovery-spec.md`). Distinct from `Join`
+    /// because this ledger row is the ONLY durable record that a partition was rebuilt from the
+    /// seed rather than freshly joined — the registry row it writes is byte-identical to a join's.
+    Recover {
+        fed: FederationId,
+    },
     // GROSS invoiced amount — the user's input, known BEFORE any resolution, so the pre-call
     // Started row is complete; the NET credit is amount_invoiced − fees.receive_fee (lnv2 raw
     // receive deducts fees from the invoiced amount, unlike the exact-net DirectInflow).
@@ -289,6 +295,7 @@ pub fn kind_from_action(action: &Action) -> OperationKind {
             gateway: gateway.clone(),
         },
         Action::Join { federation, .. } => OperationKind::Join { fed: *federation },
+        Action::Recover { federation, .. } => OperationKind::Recover { fed: *federation },
         Action::RefuseInflow {
             fed, diagnostics, ..
         } => OperationKind::Refusal {
@@ -394,6 +401,7 @@ pub fn advance(
 fn enrich_kind(kind: &mut OperationKind, upd: &RawOpUpdate) {
     match kind {
         OperationKind::Join { .. }
+        | OperationKind::Recover { .. }
         | OperationKind::Refusal { .. }
         | OperationKind::Tick { .. }
         | OperationKind::Probe { .. }

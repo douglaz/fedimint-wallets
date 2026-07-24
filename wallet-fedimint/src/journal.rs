@@ -559,6 +559,64 @@ impl FedimintJournal {
         Ok(())
     }
 
+    /// Publish a recovered client partition and terminalize its owning intent in one journal
+    /// transaction. This closes the final crash window: startup can never observe a registered,
+    /// live recovered client while the recovery intent still looks executable and re-drive it
+    /// into [`crate::MultiClient`]'s required "already open" refusal.
+    ///
+    /// This is only the success commit. Recovery still has no durable in-progress marker or resume
+    /// state: failures leave the fresh, unregistered partition inert as specified by D3/D4.
+    pub async fn complete_recovery(
+        &self,
+        id: &FederationId,
+        info: &FederationInfo,
+        key: &IdempotencyKey,
+    ) -> Result<(), ExecError> {
+        let ikey = intent_key(key);
+        let mut dbtx = self.db.begin_transaction().await;
+        let Some(bytes) = dbtx.raw_get_bytes(&ikey).await.map_err(db_err)? else {
+            return Err(ExecError::Permanent(
+                "journal: recovery intent not found".to_owned(),
+            ));
+        };
+        let mut intent = decode_row_result::<Intent>("intent", &ikey, &bytes)?;
+        let matches_recovery = matches!(
+            &intent.action,
+            Action::Recover {
+                federation,
+                invite,
+            } if federation == id && invite == &info.invite
+        );
+        if !matches_recovery {
+            return Err(ExecError::Permanent(
+                "journal: recovery completion does not match its intent".to_owned(),
+            ));
+        }
+        if intent.status != IntentStatus::Executing {
+            return Err(ExecError::Permanent(format!(
+                "journal: recovery completion requires Executing intent, found {:?}",
+                intent.status
+            )));
+        }
+
+        intent.status = IntentStatus::Done;
+        dbtx.raw_insert_bytes(&federation_key(id), &encode_row(info)?)
+            .await
+            .map_err(db_err)?;
+        write_intent_and_index(
+            &mut dbtx,
+            &ikey,
+            key,
+            IntentStatus::Executing,
+            &intent,
+            self.now_ms(),
+            None,
+        )
+        .await?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(())
+    }
+
     /// Read a single federation's registry row.
     ///
     /// Surfaces failures via `Result` (see [`Self::get_move`]) so the resume loop (§9.1) can
@@ -1050,7 +1108,7 @@ impl FedimintJournal {
             Action::DirectInflow { to, .. } | Action::Receive { to, .. } => to,
             Action::Pay { from, .. } => from,
             Action::RefuseInflow { fed, .. } => fed,
-            Action::Join { federation, .. } => federation,
+            Action::Join { federation, .. } | Action::Recover { federation, .. } => federation,
         };
         let key = IdempotencyKey(format!(
             "tick-drop:{}:{}",

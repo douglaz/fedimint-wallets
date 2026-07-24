@@ -1081,6 +1081,22 @@ impl FedimintExecutor {
                     .await?;
                 return Ok(PerformOutcome::Done);
             }
+            Action::Recover { invite, .. } => {
+                let invite = InviteCode::from_str(invite).map_err(|error| {
+                    ExecError::Permanent(format!("parsing federation invite: {error}"))
+                })?;
+                // Recovery is complete-or-fail (D5): EVERY failure — an already-live federation, a
+                // failed module recovery, a transport fault — terminalizes this intent `Failed`
+                // with the SDK's diagnostic (`Permanent`, not `Retryable`). The operator retries
+                // deliberately (the Failed+User manual-retry path re-drives into a clean FRESH
+                // prefix); nothing auto-re-drives it, so a deterministic refusal — recovering an
+                // already-open fed — can never wedge Pending forever.
+                self.mc
+                    .recover(invite, &intent.idempotency_key)
+                    .await
+                    .map_err(|error| ExecError::Permanent(error.to_string()))?;
+                return Ok(PerformOutcome::Done);
+            }
             Action::DirectInflow { .. }
             | Action::Move { .. }
             | Action::Evacuate { .. }
@@ -1412,7 +1428,10 @@ fn pre_fund_endpoints(action: &Action) -> Option<(Option<FederationId>, Option<F
         Action::Move { from, to, .. } => Some((Some(*from), Some(*to))),
         Action::DirectInflow { to, .. } | Action::Receive { to, .. } => Some((None, Some(*to))),
         Action::Pay { from, .. } => Some((Some(*from), None)),
-        Action::Evacuate { .. } | Action::Join { .. } | Action::RefuseInflow { .. } => None,
+        Action::Evacuate { .. }
+        | Action::Join { .. }
+        | Action::Recover { .. }
+        | Action::RefuseInflow { .. } => None,
     }
 }
 

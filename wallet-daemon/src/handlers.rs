@@ -18,7 +18,7 @@ use wallet_api::{
     ApproveRequest, AwaitTarget, BalanceResponse, CandidateView, DirectInflowRequest,
     FederationView, HealthView, HistoryResponse, JoinRequest, MoveRequest, OperationAccepted,
     OperationStatusDto, OperationView, PayRequest, Policy, ReceiveAccepted, ReceiveRequest,
-    RefuseReason, WatchStatusView,
+    RecoverRequest, RefuseReason, WatchStatusView,
 };
 use wallet_core::{
     Action, Actor, AllocatorDecision, FederationId, IdempotencyKey, Msat, Occurrence,
@@ -26,8 +26,8 @@ use wallet_core::{
 };
 use wallet_fedimint::{
     direct_inflow_nonce_key, join_intent_key, move_key, parse_invoice, raw_pay_key,
-    raw_receive_key, AwaitOutcome, Invoice, OpRequest, OperationRef, Snapshot, SnapshotScope,
-    TickPolicy,
+    raw_receive_key, recover_intent_key, AwaitOutcome, Invoice, OpRequest, OperationRef, Snapshot,
+    SnapshotScope, TickPolicy,
 };
 
 /// Wall-clock unix millis for the actor's decide-time clock. Display/ordering material only —
@@ -438,6 +438,31 @@ pub async fn join(
     submit_operation(&state, action, key, BTreeMap::new()).await
 }
 
+/// `POST /v1/recover`: rebuild a federation's balance from the seed (`docs/wallet-recovery-spec.md`,
+/// D1). Mirrors [`join`] — admit and return the operation key; the long recovery drives in a
+/// detached task (D5), so the operator polls `GET /v1/operations/{key}` for the terminal state.
+/// Recovering an already-open federation, or a failed module recovery, terminalizes that operation
+/// `Failed` (the refusal lives in [`wallet_fedimint::MultiClient::recover`], not here).
+pub async fn recover(
+    State(state): State<AppState>,
+    request: Result<Json<RecoverRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, HttpError> {
+    let Json(request) = request?;
+    use fedimint_core::invite_code::InviteCode;
+    use std::str::FromStr as _;
+    let parsed = InviteCode::from_str(&request.invite)
+        .map_err(|error| HttpError::invalid_request(format!("invalid invite code: {error}")))?;
+    let federation = {
+        use fedimint_core::BitcoinHash as _;
+        FederationId(parsed.federation_id().0.to_byte_array())
+    };
+    // Canonicalize the invite so the derived key is stable regardless of input formatting.
+    let invite = parsed.to_string();
+    let key = recover_intent_key(federation, &invite);
+    let action = Action::Recover { federation, invite };
+    submit_operation(&state, action, key, BTreeMap::new()).await
+}
+
 pub async fn approve(
     State(state): State<AppState>,
     request: Result<Json<ApproveRequest>, JsonRejection>,
@@ -819,6 +844,7 @@ fn operation_status_dto(status: OperationStatus) -> OperationStatusDto {
 fn kind_and_amount(kind: &OperationKind) -> (&'static str, Option<Msat>) {
     match kind {
         OperationKind::Join { .. } => ("join", None),
+        OperationKind::Recover { .. } => ("recover", None),
         OperationKind::Receive {
             amount_invoiced, ..
         } => ("receive", Some(*amount_invoiced)),

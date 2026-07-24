@@ -153,6 +153,7 @@ impl MovePlan {
             Action::Pay { .. }
             | Action::Receive { .. }
             | Action::Join { .. }
+            | Action::Recover { .. }
             | Action::RefuseInflow { .. } => None,
         }
     }

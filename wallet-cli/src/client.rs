@@ -17,6 +17,7 @@ use wallet_api::{
     ApiError, ApiErrorKind, ApproveRequest, BalanceResponse, CandidateView, DirectInflowRequest,
     FederationView, HealthView, HistoryResponse, JoinRequest, MoveRequest, OperationAccepted,
     OperationStatusDto, OperationView, PayRequest, Policy, ReceiveAccepted, ReceiveRequest,
+    RecoverRequest,
 };
 use wallet_core::{FederationId, Msat};
 
@@ -362,6 +363,16 @@ impl WalletdClient {
         let accepted: OperationAccepted = self.post("/v1/join", &request).await?;
         // Join is async now (full Intent lifecycle, §6a.6): the phase-1 result is the operation
         // key; settlement is awaited via `await-move <key>` like every other admitted op.
+        render::print_phase1("started", &accepted.operation_key);
+        Ok(())
+    }
+
+    pub async fn recover(&self, invite: String) -> Result<(), CliExit> {
+        let request = RecoverRequest { invite };
+        let accepted: OperationAccepted = self.post("/v1/recover", &request).await?;
+        // Recovery is async (the long epoch-history replay drives in a detached task, §D5): the
+        // phase-1 result is the operation key; terminal status is awaited via `await-move <key>`
+        // like every other admitted op.
         render::print_phase1("started", &accepted.operation_key);
         Ok(())
     }

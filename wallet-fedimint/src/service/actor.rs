@@ -1853,6 +1853,7 @@ fn spending_federation(action: &Action) -> Option<FederationId> {
         Action::DirectInflow { .. }
         | Action::Receive { .. }
         | Action::Join { .. }
+        | Action::Recover { .. }
         | Action::RefuseInflow { .. } => None,
     }
 }
@@ -1969,6 +1970,15 @@ fn validate_live_attach(existing: &Action, requested: &Action) -> ServiceResult<
                 ..
             },
             Action::Join {
+                federation, invite, ..
+            },
+        ) => (old_fed, old_invite) == (federation, invite),
+        (
+            Action::Recover {
+                federation: old_fed,
+                invite: old_invite,
+            },
+            Action::Recover {
                 federation, invite, ..
             },
         ) => (old_fed, old_invite) == (federation, invite),

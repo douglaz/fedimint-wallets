@@ -2,7 +2,8 @@
 //! `--standalone` render byte-identically. Ported mechanically from the current `main.rs` print
 //! sites (the smoke gates parse these shapes):
 //!
-//! - phase-1 (pay/move/join): a `<word> <operation key>` line on STDOUT + `key: <operation key>`
+//! - phase-1 (pay/move/join/recover): a `<word> <operation key>` line on STDOUT +
+//!   `key: <operation key>`
 //!   on STDERR. `word` is `started` on a fresh admission; `--standalone` (which sees the full
 //!   `DecidedOp`) additionally renders `already-in-flight` / `already-paid`. Client mode's `202`
 //!   carries only the key, so it always renders `started` — the daemon discards the decide's
@@ -15,8 +16,8 @@
 //! CONTRACT CHANGES forced by the async daemon model (deliberate; step-7 ports the smokes to them):
 //! the operation KEY replaces the fedimint operation-id everywhere (the id does not exist at
 //! `202`/admit time); await-* are keyed by that operation key (no `--fed`); `await-send` prints
-//! `success` WITHOUT a preimage (the wire `OperationView` carries none); `move`/`join` are async
-//! (a phase-1 line, then `await-*`) where the old standalone was synchronous.
+//! `success` WITHOUT a preimage (the wire `OperationView` carries none); `move`/`join`/`recover`
+//! are async (a phase-1 line, then `await-*`) where the old standalone was synchronous.
 
 use crate::exit::CliExit;
 use wallet_api::OperationStatusDto;
@@ -46,10 +47,12 @@ impl AwaitVerb {
         match self {
             AwaitVerb::Receive => kind == "receive",
             AwaitVerb::Send => kind == "pay",
-            // `await-move` covers move/direct-inflow/join (an agent evacuation is a move row;
-            // join is async with the same phase-1-then-await contract — smoke_devimint awaits
-            // its join key here).
-            AwaitVerb::Move => matches!(kind, "move" | "evacuation" | "direct-inflow" | "join"),
+            // `await-move` covers move/direct-inflow/join/recover (an agent evacuation is a move
+            // row; join and recover are async with the same phase-1-then-await contract).
+            AwaitVerb::Move => matches!(
+                kind,
+                "move" | "evacuation" | "direct-inflow" | "join" | "recover"
+            ),
         }
     }
 
@@ -64,8 +67,9 @@ impl AwaitVerb {
 }
 
 /// Print a phase-1 result line (`<word> <key>` to stdout) plus the `key:` handle to stderr.
-/// Used by pay/move/join. `word` is chosen by [`phase1_word`] (standalone) or fixed to `started`
-/// (client mode). Diagnostics stay on stderr so `X=$(wallet-cli pay …)` captures only the line.
+/// Used by pay/move/join/recover. `word` is chosen by [`phase1_word`] (standalone) or fixed to
+/// `started` (client mode). Diagnostics stay on stderr so `X=$(wallet-cli pay …)` captures only
+/// the line.
 pub fn print_phase1(word: &str, key: &str) {
     println!("{word} {key}");
     eprintln!("key: {key}");
@@ -127,5 +131,22 @@ pub fn await_terminal(
         OperationStatusDto::Started | OperationStatusDto::Awaiting => Err(CliExit::Usage(
             anyhow::anyhow!("operation {key} is not terminal yet (status {status:?})"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AwaitVerb;
+
+    #[test]
+    fn await_move_accepts_every_async_move_shaped_operation() {
+        for kind in ["move", "evacuation", "direct-inflow", "join", "recover"] {
+            assert!(
+                AwaitVerb::Move.accepts_kind(kind),
+                "await-move must accept terminal `{kind}` operations"
+            );
+        }
+        assert!(!AwaitVerb::Move.accepts_kind("receive"));
+        assert!(!AwaitVerb::Move.accepts_kind("pay"));
     }
 }

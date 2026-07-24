@@ -677,6 +677,70 @@ async fn federation_registry_roundtrip() {
     );
 }
 
+/// Recovery publication and intent completion share one journal transaction. If the process
+/// stops immediately after this commit, startup must see BOTH the registered partition and a
+/// terminal recovery intent rather than re-driving recovery against the now-live client.
+#[tokio::test]
+async fn recovery_registration_terminalizes_the_intent_atomically() {
+    let journal = mem_journal();
+    let id = fed(0xCC);
+    let key = IdempotencyKey("recover:atomic".to_string());
+    let recovery = Intent {
+        idempotency_key: key.clone(),
+        attempt: 0,
+        action: Action::Recover {
+            federation: id,
+            invite: "fed1recover".to_string(),
+        },
+        max_fee: None,
+        status: IntentStatus::Executing,
+        reason: ReasonCode::UserInitiated,
+        actor: Actor::User,
+        created_at_ms: fixed_clock(),
+        operation_id: None,
+        invoice: None,
+    };
+    let info = FederationInfo {
+        invite: "fed1recover".to_string(),
+        db_prefix: 42,
+        joined_at: fixed_clock() / 1000,
+    };
+    journal.upsert(&recovery).await.expect("upsert recovery");
+
+    journal
+        .complete_recovery(&id, &info, &key)
+        .await
+        .expect("publish recovered federation");
+
+    assert_eq!(
+        journal
+            .get(&key)
+            .await
+            .expect("read recovery intent")
+            .expect("recovery intent exists")
+            .status,
+        IntentStatus::Done
+    );
+    assert!(
+        !has_key(&journal.pending().await.expect("pending"), &key.0),
+        "a committed recovery must not be re-driven after restart"
+    );
+    assert_eq!(
+        journal
+            .get_federation(&id)
+            .await
+            .expect("read recovered federation"),
+        Some(info)
+    );
+    let operation = journal
+        .operation(&OperationRef::Key(key))
+        .await
+        .expect("read recovery ledger row")
+        .expect("recovery ledger row exists");
+    assert_eq!(operation.status, OperationStatus::Succeeded);
+    assert_eq!(operation.kind, OperationKind::Recover { fed: id });
+}
+
 #[tokio::test]
 async fn candidate_registry_round_trips_every_state_and_upserts() {
     let journal = mem_journal();

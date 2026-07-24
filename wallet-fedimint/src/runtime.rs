@@ -385,7 +385,10 @@ impl<E> TimeoutExecutor<E> {
 #[async_trait]
 impl<E: Executor> Executor for TimeoutExecutor<E> {
     async fn perform(&self, intent: &Intent) -> Result<PerformOutcome, ExecError> {
-        if matches!(intent.action, Action::Join { .. }) {
+        // Join (slow DKG config download) and Recover (long epoch-history replay) are legitimately
+        // long-running; the per-perform deadline never applies to them, or a healthy recovery
+        // would be killed mid-replay.
+        if matches!(intent.action, Action::Join { .. } | Action::Recover { .. }) {
             return self.inner.perform(intent).await;
         }
         match self.timeout {
@@ -3751,6 +3754,19 @@ pub fn join_intent_key(federation: FederationId, invite: &str) -> IdempotencyKey
     let invite_hash = sha256::Hash::hash(invite.as_bytes()).to_byte_array();
     IdempotencyKey(format!(
         "join:{}:{}",
+        federation.to_hex(),
+        bytes_hex(&invite_hash)
+    ))
+}
+
+/// The idempotency key for a seed `recover` (`docs/wallet-recovery-spec.md`). Distinct `recover:`
+/// prefix from [`join_intent_key`] so recovery rows never classify as `KeyClass::Join` and so a
+/// re-submitted recover of the same `(federation, invite)` dedups to the live/terminal intent
+/// instead of forking a second recovery.
+pub fn recover_intent_key(federation: FederationId, invite: &str) -> IdempotencyKey {
+    let invite_hash = sha256::Hash::hash(invite.as_bytes()).to_byte_array();
+    IdempotencyKey(format!(
+        "recover:{}:{}",
         federation.to_hex(),
         bytes_hex(&invite_hash)
     ))
