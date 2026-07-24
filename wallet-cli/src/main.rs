@@ -31,10 +31,11 @@ use wallet_core::{
 };
 use wallet_fedimint::{
     direct_inflow_nonce_key, join_intent_key, move_key, parse_invoice, raw_pay_key,
-    raw_receive_key, AutoJoinReport, AwaitOutcome, CandidateSource, CandidateState, DiscoverReport,
-    DiscoverSourceReport, FederationInfo, FedimintJournal, GatewayUrl, Invoice, ManualSource,
-    MultiClient, ObserverSource, OpRequest, OperationId, OperationRef, ProbeOutcome, Runtime,
-    ScoredFed, ServiceError, Snapshot, SnapshotScope, TickPolicy, WalletClient, WalletService,
+    raw_receive_key, recover_intent_key, AutoJoinReport, AwaitOutcome, CandidateSource,
+    CandidateState, DiscoverReport, DiscoverSourceReport, FederationInfo, FedimintJournal,
+    GatewayUrl, Invoice, ManualSource, MultiClient, ObserverSource, OpRequest, OperationId,
+    OperationRef, ProbeOutcome, Runtime, ScoredFed, ServiceError, Snapshot, SnapshotScope,
+    TickPolicy, WalletClient, WalletService,
 };
 
 #[derive(Parser)]
@@ -84,6 +85,12 @@ enum Command {
     /// Join a federation by its invite code (idempotent: re-joining an already-joined
     /// federation just opens it).
     Join { invite: String },
+    /// Rebuild a federation's balance from the seed (`docs/wallet-recovery-spec.md`): a deliberate
+    /// last resort for a wallet whose local stores were lost. Recovers into a FRESH partition and
+    /// never wipes one; refuses if the federation is still registered (open OR
+    /// registered-but-unopened — a surviving journal could double-pay). The seed must already be
+    /// present (from a prior run or `walletd restore-mnemonic`).
+    Recover { invite: String },
     /// Discover candidate federations from configured sources, structurally vet them, and
     /// optionally auto-join within the discovery caps.
     Discover {
@@ -602,6 +609,7 @@ async fn run_client(cli: Cli) -> Result<(), CliExit> {
         Command::Show { reference, json } => client.show(&reference, json).await,
         Command::Candidates { state, json } => client.candidates(state, json).await,
         Command::Join { invite } => client.join(invite).await,
+        Command::Recover { invite } => client.recover(invite).await,
         Command::Approve { fed } => client.approve(parse_fed_id(&fed)?).await,
         Command::Receive {
             amount,
@@ -772,9 +780,27 @@ async fn run_standalone(cli: Cli) -> Result<(), CliExit> {
         other => other,
     };
 
-    let mnemonic = load_or_generate_mnemonic(&db)
-        .await
-        .map_err(CliExit::from)?;
+    // Recovery rebuilds a funded client from an EXISTING seed and must NEVER mint one: unlike every
+    // other verb, `recover` on a seedless store must refuse (exit 2, nothing journaled) rather than
+    // silently generate a random seed — that would recover the wrong (empty) wallet AND occupy the
+    // secret row, so a later `walletd restore-mnemonic` would refuse the operator's real seed on the
+    // one command they reach for when they believe their funds are lost.
+    let mnemonic = match &command {
+        Command::Recover { .. } => load_existing_mnemonic(&db)
+            .await
+            .map_err(CliExit::from)?
+            .ok_or_else(|| {
+                CliExit::Refused(
+                    "no wallet seed present — import your 12 words first (`walletd \
+                     restore-mnemonic`), then retry `recover`; recovery rebuilds from the seed and \
+                     never mints a new one"
+                        .to_owned(),
+                )
+            })?,
+        _ => load_or_generate_mnemonic(&db)
+            .await
+            .map_err(CliExit::from)?,
+    };
     let multi_client = Arc::new(MultiClient::new(db, journal_db, mnemonic).await);
 
     let joined = journal
@@ -1236,6 +1262,7 @@ fn is_actor_verb(command: &Command) -> bool {
     matches!(
         command,
         Command::Join { .. }
+            | Command::Recover { .. }
             | Command::Receive { .. }
             | Command::Pay { .. }
             | Command::AwaitReceive { .. }
@@ -1351,6 +1378,39 @@ async fn actor_command(
                     decided.status == IntentStatus::Done,
                     decided.deduplicated,
                     "already-joined",
+                ),
+                &key.0,
+            );
+            Ok(())
+        }
+        Command::Recover { invite } => {
+            let parsed = InviteCode::from_str(&invite)
+                .map_err(|e| CliExit::Refused(format!("invalid invite code: {e}")))?;
+            let federation = {
+                use fedimint_core::BitcoinHash as _;
+                FederationId(parsed.federation_id().0.to_byte_array())
+            };
+            let invite = parsed.to_string();
+            let key = recover_intent_key(federation, &invite);
+            let action = Action::Recover { federation, invite };
+            // Admit and return the operation key; the long recovery drives in a detached task (D5).
+            // Standalone aborts drivers on shutdown, so — exactly like a FRESH standalone `join` —
+            // the phase-1 word is "started" and the operator awaits terminal status via the daemon
+            // path (the live devimint gate runs recovery under the daemon, which stays up).
+            let decided = client
+                .decide_op(op_request(
+                    action,
+                    key.clone(),
+                    Occurrence(0),
+                    BTreeMap::new(),
+                ))
+                .await
+                .map_err(service_err_to_exit)?;
+            render::print_phase1(
+                render::phase1_word(
+                    decided.status == IntentStatus::Done,
+                    decided.deduplicated,
+                    "already-recovered",
                 ),
                 &key.0,
             );
@@ -2355,6 +2415,7 @@ fn describe_decision(decision: &AllocatorDecision) -> String {
             format!("receive {} msat into {}", amount.0, to.to_hex())
         }
         Action::Join { federation, .. } => format!("join {}", federation.to_hex()),
+        Action::Recover { federation, .. } => format!("recover {}", federation.to_hex()),
     }
 }
 
@@ -2689,6 +2750,22 @@ async fn load_or_generate_mnemonic(db: &Database) -> anyhow::Result<Mnemonic> {
     }
 }
 
+/// Load the wallet's mnemonic from `db` WITHOUT ever minting one: `Ok(Some)` = present,
+/// `Ok(None)` = absent, `Err` = present-but-corrupt. The `recover` verb uses this instead of
+/// [`load_or_generate_mnemonic`] because recovery rebuilds a FUNDED client from an existing seed:
+/// lazily minting a fresh random seed here would recover the wrong (empty) wallet under a bogus
+/// root AND occupy the secret row, so a later `walletd restore-mnemonic` would refuse the operator's
+/// real seed. A seedless store must therefore REFUSE (caller maps `None` to that), never generate.
+async fn load_existing_mnemonic(db: &Database) -> anyhow::Result<Option<Mnemonic>> {
+    match Client::load_decodable_client_secret_opt::<Vec<u8>>(db).await {
+        Ok(Some(entropy)) => Ok(Some(Mnemonic::from_entropy(&entropy)?)),
+        Ok(None) => Ok(None),
+        Err(e) => {
+            Err(e.context("wallet client secret is present in the database but failed to decode"))
+        }
+    }
+}
+
 // --- operation-ledger recording + display helpers (spec §9-§11) -----------------------------
 
 /// Map a ledger-write [`wallet_core::ExecError`] into `anyhow` for a `?` that must fail the
@@ -2783,7 +2860,9 @@ impl CandidateStateArg {
 /// Whether a record involves `fed` (for `history --fed`): a `Move` matches either endpoint.
 fn record_involves_fed(record: &OperationRecord, fed: FederationId) -> bool {
     match &record.kind {
-        OperationKind::Join { fed: f } | OperationKind::Refusal { fed: f, .. } => *f == fed,
+        OperationKind::Join { fed: f }
+        | OperationKind::Recover { fed: f }
+        | OperationKind::Refusal { fed: f, .. } => *f == fed,
         OperationKind::Receive { fed: f, .. } | OperationKind::Pay { fed: f, .. } => *f == fed,
         OperationKind::DirectInflow { to, .. } => *to == fed,
         OperationKind::Move { from, to, .. } => *from == fed || *to == fed,
@@ -2876,6 +2955,9 @@ pub(crate) fn print_refusal_diagnostics(diagnostics: &RefusalDiagnostics) {
 fn print_kind_details(kind: &OperationKind) {
     match kind {
         OperationKind::Join { fed } => {
+            println!("fed: {}", fed.to_hex())
+        }
+        OperationKind::Recover { fed } => {
             println!("fed: {}", fed.to_hex())
         }
         OperationKind::Refusal { fed, diagnostics } => {
@@ -2982,6 +3064,7 @@ fn print_kind_details(kind: &OperationKind) {
 fn kind_and_amount(kind: &OperationKind) -> (&'static str, Option<Msat>) {
     match kind {
         OperationKind::Join { .. } => ("join", None),
+        OperationKind::Recover { .. } => ("recover", None),
         OperationKind::Receive {
             amount_invoiced, ..
         } => ("receive", Some(*amount_invoiced)),
@@ -3417,6 +3500,43 @@ mod tests {
             .await
             .expect("the generated secret is reused on the next load");
         assert_eq!(first.to_entropy(), second.to_entropy());
+    }
+
+    /// `recover`'s load-only seed path (finding: seedless standalone recovery must not mint a random
+    /// seed). On an empty store it returns `Ok(None)` — the caller maps that to a REFUSAL — and
+    /// crucially leaves the secret row UNWRITTEN, so a subsequent `restore-mnemonic` can still
+    /// install the real seed. Once a seed exists it returns exactly that seed.
+    #[tokio::test]
+    async fn recover_seed_path_never_mints_and_refuses_a_seedless_store() {
+        use fedimint_core::db::mem_impl::MemDatabase;
+        use fedimint_core::db::IRawDatabaseExt as _;
+
+        let db = MemDatabase::new().into_database();
+        // Absent seed → `None` (refusal at the caller), and NO seed was minted as a side effect.
+        assert!(
+            load_existing_mnemonic(&db)
+                .await
+                .expect("an absent seed is not an error, just None")
+                .is_none(),
+            "recovery must never mint a seed for a seedless store"
+        );
+        assert!(
+            Client::load_decodable_client_secret_opt::<Vec<u8>>(&db)
+                .await
+                .expect("reading the secret row")
+                .is_none(),
+            "the load-only path must leave the secret row unwritten so `restore-mnemonic` still works"
+        );
+
+        // With a seed present it returns that exact seed (never a fresh one).
+        let expected = load_or_generate_mnemonic(&db)
+            .await
+            .expect("seed a store to recover into");
+        let loaded = load_existing_mnemonic(&db)
+            .await
+            .expect("a present seed loads")
+            .expect("a present seed is Some");
+        assert_eq!(loaded.to_entropy(), expected.to_entropy());
     }
 
     #[test]

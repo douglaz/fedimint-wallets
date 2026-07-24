@@ -677,6 +677,170 @@ async fn federation_registry_roundtrip() {
     );
 }
 
+/// Recovery publication and intent completion share one journal transaction. If the process
+/// stops immediately after this commit, startup must see BOTH the registered partition and a
+/// terminal recovery intent rather than re-driving recovery against the now-live client.
+#[tokio::test]
+async fn recovery_registration_terminalizes_the_intent_atomically() {
+    let journal = mem_journal();
+    let id = fed(0xCC);
+    let key = IdempotencyKey("recover:atomic".to_string());
+    let recovery = Intent {
+        idempotency_key: key.clone(),
+        attempt: 0,
+        action: Action::Recover {
+            federation: id,
+            invite: "fed1recover".to_string(),
+        },
+        max_fee: None,
+        status: IntentStatus::Executing,
+        reason: ReasonCode::UserInitiated,
+        actor: Actor::User,
+        created_at_ms: fixed_clock(),
+        operation_id: None,
+        invoice: None,
+    };
+    let info = FederationInfo {
+        invite: "fed1recover".to_string(),
+        db_prefix: 42,
+        joined_at: fixed_clock() / 1000,
+    };
+    journal.upsert(&recovery).await.expect("upsert recovery");
+
+    journal
+        .complete_recovery(&id, &info, &invite(), &key)
+        .await
+        .expect("publish recovered federation");
+
+    assert_eq!(
+        journal
+            .get(&key)
+            .await
+            .expect("read recovery intent")
+            .expect("recovery intent exists")
+            .status,
+        IntentStatus::Done
+    );
+    assert!(
+        !has_key(&journal.pending().await.expect("pending"), &key.0),
+        "a committed recovery must not be re-driven after restart"
+    );
+    assert_eq!(
+        journal
+            .get_federation(&id)
+            .await
+            .expect("read recovered federation"),
+        Some(info)
+    );
+    let operation = journal
+        .operation(&OperationRef::Key(key))
+        .await
+        .expect("read recovery ledger row")
+        .expect("recovery ledger row exists");
+    assert_eq!(operation.status, OperationStatus::Succeeded);
+    assert_eq!(operation.kind, OperationKind::Recover { fed: id });
+    // The SAME transaction records durable user ownership (D4.6), so the recovered fed is
+    // allocator-eligible (`probe_gated_members` subtracts `UserApproved` members) rather than
+    // stranded as a probe-gated, agent-discovered member.
+    assert_eq!(
+        journal
+            .get_candidate(&id)
+            .await
+            .expect("read recovery candidate row")
+            .expect("recovery wrote a candidate row")
+            .state,
+        CandidateState::UserApproved
+    );
+}
+
+fn recover_intent(key: &IdempotencyKey, id: FederationId, invite_str: &str) -> Intent {
+    Intent {
+        idempotency_key: key.clone(),
+        attempt: 0,
+        action: Action::Recover {
+            federation: id,
+            invite: invite_str.to_string(),
+        },
+        max_fee: None,
+        status: IntentStatus::Executing,
+        reason: ReasonCode::UserInitiated,
+        actor: Actor::User,
+        created_at_ms: fixed_clock(),
+        operation_id: None,
+        invoice: None,
+    }
+}
+
+/// D4.6: a completed recovery records the same durable USER ownership a manual join does, so the
+/// recovered fed is allocator-eligible. A pre-existing `Discovered` candidate is promoted to
+/// `UserApproved`; the write shares the recovery's atomic transaction.
+#[tokio::test]
+async fn complete_recovery_records_user_owned_candidate() {
+    // Case A: no prior candidate → a fresh `UserApproved` row is written.
+    {
+        let journal = mem_journal();
+        let id = fed(0xC1);
+        let key = IdempotencyKey("recover:owns-a".to_string());
+        let info = FederationInfo {
+            invite: "fed1recover-a".to_string(),
+            db_prefix: 7,
+            joined_at: 0,
+        };
+        journal
+            .upsert(&recover_intent(&key, id, "fed1recover-a"))
+            .await
+            .expect("upsert recovery");
+        journal
+            .complete_recovery(&id, &info, &invite(), &key)
+            .await
+            .expect("complete recovery");
+        assert_eq!(
+            journal
+                .get_candidate(&id)
+                .await
+                .expect("read candidate")
+                .expect("recovery wrote a candidate row")
+                .state,
+            CandidateState::UserApproved,
+            "a recovered fed with no prior candidate becomes UserApproved (allocator-eligible)"
+        );
+    }
+
+    // Case B: a prior `Discovered` candidate → promoted to `UserApproved`.
+    {
+        let journal = mem_journal();
+        let id = fed(0xC2);
+        journal
+            .put_candidate(&candidate(id, CandidateState::Discovered))
+            .await
+            .expect("seed discovered candidate");
+        let key = IdempotencyKey("recover:owns-b".to_string());
+        let info = FederationInfo {
+            invite: "fed1recover-b".to_string(),
+            db_prefix: 8,
+            joined_at: 0,
+        };
+        journal
+            .upsert(&recover_intent(&key, id, "fed1recover-b"))
+            .await
+            .expect("upsert recovery");
+        journal
+            .complete_recovery(&id, &info, &invite(), &key)
+            .await
+            .expect("complete recovery");
+        assert_eq!(
+            journal
+                .get_candidate(&id)
+                .await
+                .expect("read candidate")
+                .expect("candidate row exists")
+                .state,
+            CandidateState::UserApproved,
+            "recovery promotes a Discovered candidate to durable user ownership"
+        );
+    }
+}
+
 #[tokio::test]
 async fn candidate_registry_round_trips_every_state_and_upserts() {
     let journal = mem_journal();

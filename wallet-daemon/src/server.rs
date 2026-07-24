@@ -50,6 +50,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/receive", post(handlers::receive))
         .route("/v1/direct-inflow", post(handlers::direct_inflow))
         .route("/v1/join", post(handlers::join))
+        .route("/v1/recover", post(handlers::recover))
         .route("/v1/approve", post(handlers::approve))
         .route("/v1/candidates", get(handlers::candidates))
         .route("/v1/reconcile", post(handlers::reconcile))

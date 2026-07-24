@@ -78,6 +78,28 @@ fn move_tops_up_spending_below_target() {
 }
 
 #[test]
+fn decide_never_emits_recover() {
+    // D1 invariant: `decide()` is allocator PLANNING — it emits only DirectInflow/Move/Evacuate/
+    // RefuseInflow. `Action::Recover` is a DELIBERATE user verb (`docs/wallet-recovery-spec.md`);
+    // recovery must never be auto-planned (a recovering fed is unregistered and invisible to the
+    // allocator until it completes). Cover the top-up, standby-fund, and evacuation branches — all
+    // known to emit an action — and assert none is a Recover.
+    let snapshots = [
+        snap!([fed!(1, 20_000, true, false, true), fed!(2, 80_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 60_000, 0, 1000),
+        snap!([fed!(1, 80_000, true, false, true), fed!(2, 5_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 50_000, 20_000, 2000),
+        snap!([fed!(1, 50_000, true, true, true), fed!(2, 30_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 100_000, 0, 3000),
+    ];
+    let mut emitted = 0;
+    for snapshot in &snapshots {
+        for decision in decide(snapshot, occ(1)) {
+            emitted += 1;
+            assert!(!matches!(decision.action, Action::Recover { .. }), "decide() must never emit Action::Recover, got {:?}", decision.action);
+        }
+    }
+    assert!(emitted >= 3, "expected the covered branches to emit actions; the invariant test would be vacuous otherwise");
+}
+
+#[test]
 fn move_funds_distinct_warm_standby() {
     let snapshot = snap!([fed!(1, 80_000, true, false, true), fed!(2, 5_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 50_000, 20_000, 2000);
     assert_eq!(decide(&snapshot, occ(1)), decision!(move_action!(1, 2, 15_000), ReasonCode::StandbyBelowTarget, occ(1), move_key(1, 2, 1)));

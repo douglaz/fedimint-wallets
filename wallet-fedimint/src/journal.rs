@@ -559,6 +559,72 @@ impl FedimintJournal {
         Ok(())
     }
 
+    /// Publish a recovered client partition and terminalize its owning intent in one journal
+    /// transaction. This closes the final crash window: startup can never observe a registered,
+    /// live recovered client while the recovery intent still looks executable and re-drive it
+    /// into [`crate::MultiClient`]'s required refuse-if-registered guard.
+    ///
+    /// This is only the success commit. Recovery still has no durable in-progress marker or resume
+    /// state: failures leave the fresh, unregistered partition inert as specified by D3/D4.
+    pub async fn complete_recovery(
+        &self,
+        id: &FederationId,
+        info: &FederationInfo,
+        invite: &InviteCode,
+        key: &IdempotencyKey,
+    ) -> Result<(), ExecError> {
+        let ikey = intent_key(key);
+        let now_ms = self.now_ms();
+        let mut dbtx = self.db.begin_transaction().await;
+        let Some(bytes) = dbtx.raw_get_bytes(&ikey).await.map_err(db_err)? else {
+            return Err(ExecError::Permanent(
+                "journal: recovery intent not found".to_owned(),
+            ));
+        };
+        let mut intent = decode_row_result::<Intent>("intent", &ikey, &bytes)?;
+        let matches_recovery = matches!(
+            &intent.action,
+            Action::Recover {
+                federation,
+                invite: intent_invite,
+            } if federation == id && intent_invite == &info.invite
+        );
+        if !matches_recovery {
+            return Err(ExecError::Permanent(
+                "journal: recovery completion does not match its intent".to_owned(),
+            ));
+        }
+        if intent.status != IntentStatus::Executing {
+            return Err(ExecError::Permanent(format!(
+                "journal: recovery completion requires Executing intent, found {:?}",
+                intent.status
+            )));
+        }
+
+        intent.status = IntentStatus::Done;
+        dbtx.raw_insert_bytes(&federation_key(id), &encode_row(info)?)
+            .await
+            .map_err(db_err)?;
+        // Record durable USER ownership in the SAME transaction (D4.6). Without a `UserApproved`
+        // candidate row the recovered fed reads as an agent-discovered member, so
+        // `probe_gated_members` keeps it probe-gated and the allocator never spends from it. A
+        // deliberate recovery confers user ownership exactly like `join`; preserve an existing
+        // `UserApproved` (idempotent).
+        write_recovered_user_ownership(&mut dbtx, id, invite, now_ms).await?;
+        write_intent_and_index(
+            &mut dbtx,
+            &ikey,
+            key,
+            IntentStatus::Executing,
+            &intent,
+            now_ms,
+            None,
+        )
+        .await?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(())
+    }
+
     /// Read a single federation's registry row.
     ///
     /// Surfaces failures via `Result` (see [`Self::get_move`]) so the resume loop (§9.1) can
@@ -1050,7 +1116,7 @@ impl FedimintJournal {
             Action::DirectInflow { to, .. } | Action::Receive { to, .. } => to,
             Action::Pay { from, .. } => from,
             Action::RefuseInflow { fed, .. } => fed,
-            Action::Join { federation, .. } => federation,
+            Action::Join { federation, .. } | Action::Recover { federation, .. } => federation,
         };
         let key = IdempotencyKey(format!(
             "tick-drop:{}:{}",
@@ -2636,6 +2702,62 @@ impl Journal for FedimintJournal {
     fn store_id(&self) -> usize {
         self.store_id
     }
+}
+
+/// Record durable USER ownership for a recovered federation inside an existing dbtx — the same
+/// `UserApproved` candidate write a manual `join` performs (§5.1.4a, see
+/// [`FedimintJournal::mark_candidate_user_approved`]), but ATOMIC with the recovery commit (D4.6).
+/// [`crate::runtime::probe_gated_members`] gates every joined member that is NOT `UserApproved`, so
+/// without this the recovered fed's funds return but the allocator never spends from it. Preserves
+/// an existing `UserApproved` (idempotent, no demote/re-timestamp); every other state —
+/// `Discovered`/`Rejected`/`AutoJoined`/absent — is promoted, and an unreadable row is replaced
+/// (recovery carries an authenticated id+invite). Promoting `AutoJoined` is deliberate and diverges
+/// from the join path's [`FedimintJournal::mark_candidate_user_approved`], which leaves an
+/// `AutoJoined` row agent-owned: a seed recovery is an explicit user claim of ownership. (The
+/// non-`absent` branches are unreachable in the real lost-`journal.db`/fresh-host scenarios — the
+/// candidate row is lost together with the registry row, so the `absent` branch runs — but every
+/// branch resolves toward user ownership if reached.)
+async fn write_recovered_user_ownership(
+    dbtx: &mut impl IDatabaseTransactionOpsCore,
+    id: &FederationId,
+    invite: &InviteCode,
+    now_ms: u64,
+) -> Result<(), ExecError> {
+    let raw_key = candidate_key(id);
+    let fresh = CandidateRecord {
+        id: *id,
+        invite: invite.clone(),
+        source: DiscoverySource::Manual,
+        discovered_at_ms: now_ms,
+        structural: StructuralOutcome::Passed,
+        structural_checked_at_ms: now_ms,
+        state: CandidateState::UserApproved,
+        updated_at_ms: now_ms,
+    };
+    let next = match dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? {
+        Some(bytes) => match decode_candidate_row(*id, &raw_key, &bytes) {
+            // Already user-owned: leave it untouched (idempotent).
+            Ok(current) if current.state == CandidateState::UserApproved => return Ok(()),
+            Ok(mut current) => {
+                current.state = CandidateState::UserApproved;
+                current.updated_at_ms = now_ms;
+                current
+            }
+            Err(error) => {
+                tracing::warn!(
+                    federation = %id.to_hex(),
+                    ?error,
+                    "journal: replacing unreadable candidate as UserApproved on recovery"
+                );
+                fresh
+            }
+        },
+        None => fresh,
+    };
+    dbtx.raw_insert_bytes(&raw_key, &encode_row(&next)?)
+        .await
+        .map_err(db_err)?;
+    Ok(())
 }
 
 /// Rewrite the Intent row and move its `PendingIndexKey` entry from `old_status` to

@@ -27,8 +27,8 @@ NOT put them in cloud storage or a password manager synced to one.
 
 ### 2. Back up the federation set (whenever it changes)
 
-The seed recovers ecash *within* a federation; to get there you must rejoin each
-federation by invite code first. Record them alongside (not with) the seed words:
+The seed recovers ecash *within* a federation; recovery needs each federation's invite
+code. Record them alongside (not with) the seed words:
 
 ```bash
 wallet-cli list-feds      # one line per fed: <id> invite=<fed1...> joined_at=<ts>
@@ -43,9 +43,10 @@ federation's guardians), but without it recovery means hunting guardians down by
 - **`journal.db`** (operation history, policy, move records) is bookkeeping — losing it
   loses your records and in-flight-operation bookkeeping, not settled funds.
 - **Recovery from seed is a LAST resort, not a routine restore.** Fedimint recovery
-  restores ecash but wipes the operation log — the client-side send dedup with it. A
-  restore performed while a send was in flight can double-pay (the one real hazard,
-  `docs/fedimint-mechanics.md` §4). Prefer keeping the disk alive over re-seeding.
+  rebuilds ecash into a fresh client partition but does not reinstate the operation log —
+  or its client-side send dedup. Recovery performed while a send was in flight can
+  double-pay (the one real hazard, `docs/fedimint-mechanics.md` §4). Prefer keeping the
+  disk alive over re-seeding.
 - **Never run two wallets from one seed.** Two clients on the same seed are two
   processes spending the same notes; the federation will let exactly one win and the
   bookkeeping of both is garbage. One seed, one live `client.db`, one daemon.
@@ -107,10 +108,27 @@ systemctl --user show walletd -p NRestarts
 - **A federation signals shutdown.** The scheduler evacuates on its own (the 6a chain
   gate proves the path). Verify with `wallet-cli history | grep evacuation`, and check
   the destination fed's balance grew accordingly.
-- **Disk dies.** New host: `walletd init`, restore is NOT copying words into a config —
-  rejoin each federation from your recorded invites, then run fedimint recovery with the
-  seed. Accept that any operation in flight at the moment of death may need manual
-  reconciliation against the federations' view.
+- **Disk dies.** On the new host, keep the daemon stopped and restore in this exact order:
+
+  ```bash
+  walletd init
+  walletd restore-mnemonic < seed.txt
+  systemctl --user start walletd
+
+  STARTED=$(wallet-cli recover "$FEDERATION_INVITE")
+  RECOVERY_KEY=${STARTED#started }
+  wallet-cli await-move "$RECOVERY_KEY" --timeout 86400
+  ```
+
+  Repeat `recover` + `await-move` for each recorded invite. **Do not run `wallet-cli join`
+  first**: join opens a fresh, empty client for that federation, and recovery correctly
+  refuses an already-open federation rather than run two clients on the same seed.
+  `walletd init` does not mint a seed; only daemon startup does. Starting before
+  `restore-mnemonic` therefore mints a new random seed, after which import refuses to
+  overwrite it. If that happens, stop the daemon and start again with a clean data
+  directory. Recovery always allocates a fresh prefix and never deletes or reuses an old
+  partition. Accept that any operation in flight at the moment of disk loss may need
+  manual reconciliation against the federations' view.
 
 ## Upgrades — a release that changes the stored-policy schema
 
@@ -120,11 +138,12 @@ normally. Just deploy and restart; re-run `policy set` afterward only if you wan
 field to a non-default value.
 
 **Do NOT try to "reset" a stuck policy by wiping `journal.db`.** The federation registry
-(federation id → client db-prefix) lives in `journal.db`, and the wallet has no seed-recovery
-path wired: after a wipe, `wallet-cli join` allocates a fresh EMPTY client partition instead of
-reopening the funded one, so `balance` reads 0 and the ecash is stranded in an orphaned
-partition. Restoring the backup brings back the same undecodable row. If a policy row ever fails
-to decode on a real deployment, stop and treat it as an incident — do not wipe (see Never).
+(federation id → client db-prefix) lives in `journal.db`; wiping it deliberately discards
+bookkeeping and leaves the funded client partition inert. `wallet-cli join` then allocates a fresh
+EMPTY partition, while `wallet-cli recover` is a last-resort seed-recovery path for actual store
+loss, not a policy-reset mechanism. Restoring the backup brings back the same undecodable row. If a
+policy row ever fails to decode on a real deployment, stop and treat it as an incident — do not
+wipe (see Never).
 
 ## Never
 

@@ -2,9 +2,8 @@
 //! exclusive lock, runs the watch scheduler, and fronts the in-process `WalletService` with a
 //! local, bearer-authed axum HTTP surface. The CLI (step 6) becomes a thin client over it.
 //!
-//! Two subcommands: `walletd` (serve until SIGTERM) and `walletd init` (scaffold host config,
-//! rotate the 0600 bearer token, write the `~/.config/walletd/` client pointer, seed the
-//! default `Policy` row insert-if-absent). All money/decision logic lives in
+//! Subcommands cover host initialization, read-only mnemonic export, and seed restoration;
+//! no subcommand serves until SIGTERM. All money/decision logic lives in
 //! wallet-fedimint/wallet-core; this crate only translates HTTP ⇄ `WalletClient`.
 
 mod config;
@@ -52,6 +51,13 @@ enum Command {
     /// store has none. Blocks on the exclusive store lock, so it only reveals the secret
     /// while the daemon is stopped — same while-stopped semantics as `init`'s token rotation.
     Mnemonic,
+    /// Import a 12-word seed into a store that has NONE, so a lost wallet can be rebuilt with
+    /// `recover` (`docs/wallet-recovery-spec.md`). The mirror of `mnemonic`: reads the words from
+    /// STDIN (never argv — argv leaks into shell history and `ps`), validates the BIP-39 checksum,
+    /// and REFUSES if a seed already exists (no `--force`; overwriting silently strands whatever it
+    /// funded). Ordering: `init` → `restore-mnemonic` → then start (`init` mints no seed; only the
+    /// daemon start path does, so starting first mints a random seed and this import then refuses).
+    RestoreMnemonic,
 }
 
 #[tokio::main]
@@ -64,6 +70,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Init) => run_init(&config_path).await,
         Some(Command::Mnemonic) => run_mnemonic(&config_path).await,
+        Some(Command::RestoreMnemonic) => run_restore_mnemonic(&config_path).await,
         None => run_serve(&config_path).await,
     }
 }
@@ -91,6 +98,77 @@ async fn run_mnemonic(config_path: &std::path::Path) -> Result<()> {
     eprintln!("write these 12 words down and store them offline; anyone holding them");
     eprintln!("controls the funds. This is the ONLY copy outside client.db.");
     println!("{mnemonic}");
+    Ok(())
+}
+
+/// `walletd restore-mnemonic`: import a 12-word seed into a store that has NONE (the mirror of
+/// `walletd mnemonic`). Reads the words from stdin, validates the BIP-39 checksum, and persists
+/// them — refusing if a seed already exists. Opening the RocksDB takes the exclusive store lock, so
+/// this is a while-stopped operation like `mnemonic`/`init`.
+async fn run_restore_mnemonic(config_path: &std::path::Path) -> Result<()> {
+    let config = config::load(config_path)?;
+    // The next write installs full spend authority. Apply the same 0700 data-directory invariant
+    // as `init` and daemon startup before RocksDB creates or opens any seed-bearing files.
+    config::ensure_private_data_dir(&config.data_dir)?;
+    let db = open_db(&config).await?;
+    let phrase = read_mnemonic_phrase(std::io::stdin().lock())?;
+    restore_mnemonic_into(&db, &phrase, &config.db_path()).await?;
+    eprintln!(
+        "restored the wallet seed; start the daemon, then `recover <invite>` each federation \
+         whose balance you need rebuilt"
+    );
+    Ok(())
+}
+
+/// Read the mnemonic phrase from `reader` (stdin in production — never argv, which leaks into
+/// shell history and `ps`). Collapses surrounding/internal whitespace so a phrase pasted with a
+/// trailing newline or odd spacing still parses. Split out so the stdin contract is unit-testable.
+fn read_mnemonic_phrase(mut reader: impl std::io::Read) -> Result<String> {
+    let mut raw = String::new();
+    reader
+        .read_to_string(&mut raw)
+        .context("reading the mnemonic from stdin")?;
+    let phrase = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if phrase.is_empty() {
+        anyhow::bail!(
+            "no mnemonic on stdin — pipe the 12 words in, e.g. `walletd restore-mnemonic < seed.txt`"
+        );
+    }
+    Ok(phrase)
+}
+
+/// Validate and persist `phrase` as the wallet seed into `db`. Refuses if a seed already exists
+/// (overwriting silently strands whatever it funded — the one irreversible action here), and
+/// rejects an invalid BIP-39 checksum BEFORE any write. Split from [`run_restore_mnemonic`] so it
+/// is testable over an in-memory db without stdin/RocksDB. The SDK's secret store ALSO refuses
+/// overwrite; the explicit check here yields the actionable message and skips checksum work.
+async fn restore_mnemonic_into(
+    db: &Database,
+    phrase: &str,
+    db_path: &std::path::Path,
+) -> Result<()> {
+    if Client::load_decodable_client_secret_opt::<Vec<u8>>(db)
+        .await
+        .context("checking for an existing wallet seed")?
+        .is_some()
+    {
+        anyhow::bail!(
+            "a wallet seed already exists in {} — restore refuses to overwrite it (that would \
+             strand whatever it funded); to restore a different seed, start from a clean data dir",
+            db_path.display()
+        );
+    }
+    let mnemonic = Mnemonic::parse_normalized(phrase).map_err(|error| {
+        anyhow::anyhow!("the supplied words are not a valid BIP-39 mnemonic: {error}")
+    })?;
+    anyhow::ensure!(
+        mnemonic.word_count() == 12,
+        "the supplied mnemonic must contain exactly 12 words (got {})",
+        mnemonic.word_count()
+    );
+    Client::store_encodable_client_secret(db, mnemonic.to_entropy())
+        .await
+        .context("persisting the restored wallet seed")?;
     Ok(())
 }
 
@@ -320,5 +398,115 @@ mod perform_timeout_tests {
             Some(Duration::from_secs(180))
         );
         assert_eq!(parse_perform_timeout(Some("0")), None);
+    }
+}
+
+#[cfg(test)]
+mod restore_mnemonic_tests {
+    use super::{read_mnemonic_phrase, restore_mnemonic_into};
+    use fedimint_bip39::Mnemonic;
+    use fedimint_client::Client;
+    use fedimint_core::db::mem_impl::MemDatabase;
+    use fedimint_core::db::{Database, IRawDatabaseExt as _};
+    use std::path::Path;
+
+    fn mem_db() -> Database {
+        MemDatabase::new().into_database()
+    }
+
+    /// A valid 12-word BIP-39 phrase (the all-zero entropy mnemonic, checksum correct).
+    fn valid_phrase() -> String {
+        Mnemonic::from_entropy(&[0u8; 16])
+            .expect("valid 12-word entropy")
+            .to_string()
+    }
+
+    #[test]
+    fn reads_the_phrase_from_stdin_and_collapses_whitespace() {
+        // A phrase piped with a trailing newline and padded spacing still parses to the canonical
+        // single-space form — proving the words come from the reader (stdin), not argv.
+        let phrase = read_mnemonic_phrase("  abandon   abandon\nabandon\t\n".as_bytes())
+            .expect("non-empty input parses");
+        assert_eq!(phrase, "abandon abandon abandon");
+    }
+
+    #[test]
+    fn empty_stdin_is_a_clean_error() {
+        assert!(read_mnemonic_phrase("   \n\t ".as_bytes()).is_err());
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_when_a_seed_already_exists() {
+        let db = mem_db();
+        // Seed the store as the daemon's first start would.
+        let existing = Mnemonic::from_entropy(&[1u8; 16]).expect("valid entropy");
+        Client::store_encodable_client_secret(&db, existing.to_entropy())
+            .await
+            .expect("first seed stores");
+
+        // Importing over it is refused — a DIFFERENT valid phrase must not overwrite.
+        let result = restore_mnemonic_into(&db, &valid_phrase(), Path::new("/tmp/client.db")).await;
+        assert!(result.is_err(), "restore must refuse to overwrite a seed");
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+
+        // The original seed is untouched.
+        let stored = Client::load_decodable_client_secret_opt::<Vec<u8>>(&db)
+            .await
+            .expect("seed reads")
+            .expect("seed present");
+        assert_eq!(stored, existing.to_entropy());
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_a_bad_bip39_checksum_and_writes_nothing() {
+        let db = mem_db();
+        // 12 valid words but a wrong checksum (the last word must be "about", not "abandon").
+        let bad = "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+                   abandon abandon abandon";
+        let result = restore_mnemonic_into(&db, bad, Path::new("/tmp/client.db")).await;
+        assert!(result.is_err(), "an invalid checksum must be rejected");
+
+        // Nothing was persisted, so the store is still seedless (a later valid import can proceed).
+        assert!(Client::load_decodable_client_secret_opt::<Vec<u8>>(&db)
+            .await
+            .expect("seed reads")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_a_valid_mnemonic_that_is_not_twelve_words() {
+        let db = mem_db();
+        let twenty_four_words = Mnemonic::from_entropy(&[2u8; 32])
+            .expect("32 bytes produce a valid 24-word mnemonic")
+            .to_string();
+
+        let result =
+            restore_mnemonic_into(&db, &twenty_four_words, Path::new("/tmp/client.db")).await;
+        assert!(result
+            .expect_err("restore accepts exactly the wallet's 12-word seed format")
+            .to_string()
+            .contains("12 words"));
+        assert!(Client::load_decodable_client_secret_opt::<Vec<u8>>(&db)
+            .await
+            .expect("seed reads")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn restore_persists_a_valid_mnemonic_into_an_empty_store() {
+        let db = mem_db();
+        let phrase = valid_phrase();
+        restore_mnemonic_into(&db, &phrase, Path::new("/tmp/client.db"))
+            .await
+            .expect("a valid phrase into an empty store succeeds");
+
+        let stored = Client::load_decodable_client_secret_opt::<Vec<u8>>(&db)
+            .await
+            .expect("seed reads")
+            .expect("seed present");
+        assert_eq!(
+            stored,
+            Mnemonic::from_entropy(&[0u8; 16]).unwrap().to_entropy()
+        );
     }
 }
