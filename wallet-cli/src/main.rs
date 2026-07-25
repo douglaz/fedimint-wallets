@@ -1395,8 +1395,8 @@ async fn actor_command(
             let action = Action::Recover { federation, invite };
             // Admit and return the operation key; the long recovery drives in a detached task (D5).
             // Standalone aborts drivers on shutdown, so — exactly like a FRESH standalone `join` —
-            // the phase-1 word is "started" and the operator awaits terminal status via the daemon
-            // path (the live devimint gate runs recovery under the daemon, which stays up).
+            // the phase-1 word is "started". A later standalone await re-drives the pending intent
+            // before waiting; daemon mode can await while its original detached driver stays live.
             let decided = client
                 .decide_op(op_request(
                     action,

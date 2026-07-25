@@ -162,9 +162,22 @@ Not seed-at-rest encryption (Phase 7). Not automatic recovery on startup. Not ba
   `complete_recovery` records a `UserApproved` candidate so the recovered fed is allocator-eligible;
   `open_one`/`open_all` skip a fed in `active_recoveries`; `decide()` never emits `Action::Recover`;
   `restore-mnemonic` refuses when a seed exists and rejects a bad checksum.
-- **Live devimint (the gate — must pass):** fund a federation, drop `journal.db`, then
-  `restore-mnemonic` + `recover <invite>` on a clean store and assert the balance is restored after
-  recovery completes.
+- **Live devimint (the gate — must pass):** `wallet-cli/tests/smoke_recover_devimint.sh`, covering
+  BOTH admitted loss shapes and BOTH front ends, each asserting the balance is restored EXACTLY
+  (integer equality, zero slack — recovery replays held ecash and charges no fee):
+  - *Phase A, whole-store loss under `walletd`* — fund a federation, lose `client.db` AND
+    `journal.db` (the seed-only/fresh-host path), then the runbook's disk-dies recipe verbatim:
+    `init` → `restore-mnemonic` → start the daemon → `recover <invite>` → `await-move`, into a
+    store the daemon itself reports empty first. This is the path an operator uses for real sats,
+    and the only one where the detached D5 driver survives to finish the replay in one process.
+  - *Phase B, lost `journal.db` only, standalone* — delete just the journal, leaving `client.db`
+    (the seed plus phase A's now-ORPHANED partition), then `recover` + `await-move` again: proves
+    live that a recovery over a real store still holding an orphaned partition completes and
+    restores the same number, and that standalone's re-drive-on-await path finishes a recovery at
+    all. (The fresh-prefix arithmetic itself stays unit-covered.)
+
+  Both phases also assert the recovered fed is `UserApproved` (D4.6); phase B then spends from it
+  over lnv2.
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace` — **run inside `nix develop`** (bare cargo fails on a missing `cmake`).
 
