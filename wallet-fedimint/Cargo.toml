@@ -17,23 +17,26 @@ license = "AGPL-3.0-or-later"
 wallet-core = { path = "../wallet-core" }
 wallet-api = { path = "../wallet-api" }
 # All fedimint crates share ONE git source + rev. Pinned to douglaz/fedimint
-# `wallet-pin/iroh-plus-recovery` (5bd145c) = the iroh long-poll branch (63ab515)
-# plus one cherry-picked commit making a failed module recovery reportable instead
-# of parking forever (upstreaming as fix/recovery-failure-is-determinate). Seed
-# recovery (br-m9m) needs that fix so a failed recovery fails instead of hanging.
-fedimint-core = { git = "https://github.com/douglaz/fedimint.git", rev = "5bd145cd6decc2daea92ed0d0f48476a52a79b17" }
-fedimint-api-client = { git = "https://github.com/douglaz/fedimint.git", rev = "5bd145cd6decc2daea92ed0d0f48476a52a79b17" }
-fedimint-client = { git = "https://github.com/douglaz/fedimint.git", rev = "5bd145cd6decc2daea92ed0d0f48476a52a79b17" }
-fedimint-bip39 = { git = "https://github.com/douglaz/fedimint.git", rev = "5bd145cd6decc2daea92ed0d0f48476a52a79b17" }
-fedimint-rocksdb = { git = "https://github.com/douglaz/fedimint.git", rev = "5bd145cd6decc2daea92ed0d0f48476a52a79b17" }
+# `wallet-pin/iroh-recovery-tpe8838` (72b1e5b) = the iroh long-poll branch (63ab515)
+# + a cherry-pick making a failed module recovery reportable instead of parking
+# forever (upstreaming as fix/recovery-failure-is-determinate; seed recovery br-m9m
+# needs complete-or-fail) + a cherry-pick of the #8838 single-share TPE fix (e350cd7):
+# without it, lnv2 decryption on a SINGLE-GUARDIAN federation panics in
+# lagrange_multipliers (the #8837 sm-executor freeze) — devimint's 4-guardian setup
+# never exercises it, single-guardian PILOT feds do (br-fix-pin-tpe-8838).
+fedimint-core = { git = "https://github.com/douglaz/fedimint.git", rev = "72b1e5beadc5a31a33ebc751764cb2f840a63b5e" }
+fedimint-api-client = { git = "https://github.com/douglaz/fedimint.git", rev = "72b1e5beadc5a31a33ebc751764cb2f840a63b5e" }
+fedimint-client = { git = "https://github.com/douglaz/fedimint.git", rev = "72b1e5beadc5a31a33ebc751764cb2f840a63b5e" }
+fedimint-bip39 = { git = "https://github.com/douglaz/fedimint.git", rev = "72b1e5beadc5a31a33ebc751764cb2f840a63b5e" }
+fedimint-rocksdb = { git = "https://github.com/douglaz/fedimint.git", rev = "72b1e5beadc5a31a33ebc751764cb2f840a63b5e" }
 # `ConnectorRegistry` (join/open need it) is already resolved transitively via
 # fedimint-client, so pinning it directly adds no new version to the lockfile.
-fedimint-connectors = { git = "https://github.com/douglaz/fedimint.git", rev = "5bd145cd6decc2daea92ed0d0f48476a52a79b17" }
-fedimint-mint-client = { git = "https://github.com/douglaz/fedimint.git", rev = "5bd145cd6decc2daea92ed0d0f48476a52a79b17" }
-fedimint-wallet-client = { git = "https://github.com/douglaz/fedimint.git", rev = "5bd145cd6decc2daea92ed0d0f48476a52a79b17" }
-fedimint-ln-client = { git = "https://github.com/douglaz/fedimint.git", rev = "5bd145cd6decc2daea92ed0d0f48476a52a79b17" }
-fedimint-lnv2-client = { git = "https://github.com/douglaz/fedimint.git", rev = "5bd145cd6decc2daea92ed0d0f48476a52a79b17" }
-fedimint-lnv2-common = { git = "https://github.com/douglaz/fedimint.git", rev = "5bd145cd6decc2daea92ed0d0f48476a52a79b17" }
+fedimint-connectors = { git = "https://github.com/douglaz/fedimint.git", rev = "72b1e5beadc5a31a33ebc751764cb2f840a63b5e" }
+fedimint-mint-client = { git = "https://github.com/douglaz/fedimint.git", rev = "72b1e5beadc5a31a33ebc751764cb2f840a63b5e" }
+fedimint-wallet-client = { git = "https://github.com/douglaz/fedimint.git", rev = "72b1e5beadc5a31a33ebc751764cb2f840a63b5e" }
+fedimint-ln-client = { git = "https://github.com/douglaz/fedimint.git", rev = "72b1e5beadc5a31a33ebc751764cb2f840a63b5e" }
+fedimint-lnv2-client = { git = "https://github.com/douglaz/fedimint.git", rev = "72b1e5beadc5a31a33ebc751764cb2f840a63b5e" }
+fedimint-lnv2-common = { git = "https://github.com/douglaz/fedimint.git", rev = "72b1e5beadc5a31a33ebc751764cb2f840a63b5e" }
 # `Bolt11Invoice` (the type lnv2 `send`/`receive` speak) — pinned to the SAME version
 # fedimint's workspace uses (0.33), so it resolves to the one copy already in the lockfile;
 # depending on it directly adds no new version and guarantees the exact same type.
