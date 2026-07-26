@@ -92,10 +92,6 @@ fn evacuation_cost_fits(cost: FreshMoveCost, fee_cap: Msat, spendable: Msat) -> 
     cost.total_fee() <= fee_cap && cost.source_debit() <= spendable
 }
 
-fn raw_pay_fee_fits(gateway_quote: Msat, federation_quote: Msat, fee_cap: Msat) -> bool {
-    gateway_quote.0.saturating_add(federation_quote.0) <= fee_cap.0
-}
-
 fn raw_fee_cap_error(operation: &str, quote: u64, fee_cap: Msat) -> ExecError {
     ExecError::Permanent(format!(
         "{operation} fee quote {quote} msat exceeds fee cap {} msat",
@@ -134,10 +130,6 @@ fn pre_fund_reservation_error(error: ExecError) -> ExecError {
     ExecError::Retryable(format!(
         "reservation scan failed before funding; leaving the intent pending: {reason}"
     ))
-}
-
-fn raw_receive_fee_fits(gateway_quote: Msat, federation_quote: Msat, fee_cap: Msat) -> bool {
-    gateway_quote.0.saturating_add(federation_quote.0) <= fee_cap.0
 }
 
 fn keep_cheapest_fitting<T>(
@@ -1033,7 +1025,11 @@ impl FedimintExecutor {
                     Some(gateway) => vec![gateway],
                     None => self.mc.gateways(from).await.map_err(retryable)?,
                 };
-                let mut selected_gateway = None;
+                // Scan ALL candidates and keep the CHEAPEST that fits the cap, not the first fitter.
+                // `lowest_quote` already tracked the minimum for the over-cap diagnostic; it now also
+                // decides selection so a user pay takes the cheapest route, matching the move path's
+                // cheapest-serving-both-ends selection (the fee cap remains the money backstop).
+                let mut cheapest_fitting: Option<(Msat, GatewayUrl)> = None;
                 let mut lowest_quote = None;
                 for candidate in candidates {
                     let gateway_fee =
@@ -1051,13 +1047,11 @@ impl FedimintExecutor {
                     let total = gateway_quote.0.saturating_add(federation_quote.0);
                     lowest_quote =
                         Some(lowest_quote.map_or(total, |lowest: u64| lowest.min(total)));
-                    if raw_pay_fee_fits(gateway_quote, federation_quote, *fee_cap) {
-                        selected_gateway = Some(candidate);
-                        break;
-                    }
+                    cheapest_fitting =
+                        keep_cheapest_fitting(cheapest_fitting, (Msat(total), candidate), *fee_cap);
                 }
-                let gateway = match selected_gateway {
-                    Some(gateway) => gateway,
+                let gateway = match cheapest_fitting {
+                    Some((_, gateway)) => gateway,
                     None => {
                         return Err(raw_pay_quote_error(lowest_quote, *fee_cap, *from));
                     }
@@ -1172,13 +1166,12 @@ impl FedimintExecutor {
                     let total = gateway_quote.0.saturating_add(federation_quote.0);
                     lowest_quote =
                         Some(lowest_quote.map_or(total, |lowest: u64| lowest.min(total)));
-                    if raw_receive_fee_fits(gateway_quote, federation_quote, *fee_cap) {
-                        selected_gateway = Some(candidate);
-                        break;
-                    }
+                    // Keep the CHEAPEST fitting candidate, not the first (matching the raw pay arm).
+                    selected_gateway =
+                        keep_cheapest_fitting(selected_gateway, (Msat(total), candidate), *fee_cap);
                 }
                 let gateway = match selected_gateway {
-                    Some(gateway) => gateway,
+                    Some((_, gateway)) => gateway,
                     None if lowest_quote.is_some() && !quote_unavailable => {
                         return Err(raw_fee_cap_error(
                             "raw receive",
@@ -2305,20 +2298,31 @@ mod tests {
     }
 
     #[test]
-    fn raw_pay_fee_cap_bounds_gateway_plus_federation_cost() {
-        assert!(raw_pay_fee_fits(Msat(400), Msat(600), Msat(1_000)));
-        assert!(!raw_pay_fee_fits(Msat(401), Msat(600), Msat(1_000)));
-        assert!(!raw_pay_fee_fits(
-            Msat(u64::MAX),
-            Msat(1),
-            Msat(u64::MAX - 1)
-        ));
-    }
-
-    #[test]
-    fn raw_receive_fee_cap_bounds_gateway_plus_federation_cost() {
-        assert!(raw_receive_fee_fits(Msat(400), Msat(600), Msat(1_000)));
-        assert!(!raw_receive_fee_fits(Msat(401), Msat(600), Msat(1_000)));
+    fn keep_cheapest_fitting_selects_the_cheapest_within_cap() {
+        // Over-cap candidates are skipped — the fee cap stays the money backstop for pay/receive.
+        assert_eq!(
+            keep_cheapest_fitting(None, (Msat(1_001), "a"), Msat(1_000)),
+            None
+        );
+        // The boundary (cost == cap) fits.
+        assert_eq!(
+            keep_cheapest_fitting(None, (Msat(1_000), "a"), Msat(1_000)),
+            Some((Msat(1_000), "a"))
+        );
+        // A cheaper fitting candidate replaces a dearer incumbent...
+        assert_eq!(
+            keep_cheapest_fitting(Some((Msat(900), "a")), (Msat(700), "b"), Msat(1_000)),
+            Some((Msat(700), "b"))
+        );
+        // ...but an equal or dearer one does not, so the first cheapest is stable.
+        assert_eq!(
+            keep_cheapest_fitting(Some((Msat(700), "b")), (Msat(700), "c"), Msat(1_000)),
+            Some((Msat(700), "b"))
+        );
+        assert_eq!(
+            keep_cheapest_fitting(Some((Msat(700), "b")), (Msat(900), "d"), Msat(1_000)),
+            Some((Msat(700), "b"))
+        );
     }
 
     #[test]
