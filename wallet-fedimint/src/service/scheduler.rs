@@ -1,6 +1,6 @@
 use super::{PolicyExt, ProbeCandidate, ProbeFacts, ReconcileReport, ServiceError, WalletClient};
 use crate::discovery::{CandidateSource, ObserverSource};
-use crate::runtime::{ledger_nonce, now_ms, MoveRouteProblem, Runtime};
+use crate::runtime::{ledger_nonce, now_ms, Runtime};
 use fedimint_core::runtime as fedimint_runtime;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -177,10 +177,17 @@ async fn spending_after_failed_tick(
     runtime: &Runtime,
     tick_policy: &crate::tick::TickPolicy,
 ) -> Option<wallet_core::FederationId> {
+    // This failure-only fallback needs designation for scheduling, not a second tick plan.
+    // Calling `status()` here would create a fresh route budget and price every pair again,
+    // including on a reconcile cycle whose plan was deliberately built with `price_routes=false`.
+    let probes = runtime.probe_all().await;
     runtime
-        .status(tick_policy)
+        .designated_spending_from_probes(
+            tick_policy,
+            &wallet_core::ScorerPolicy::default(),
+            &probes,
+        )
         .await
-        .map(|status| status.spending_fed)
         .unwrap_or(tick_policy.spending_fed)
 }
 
@@ -454,6 +461,12 @@ async fn run_cycle(
         probes: probes.clone(),
         occurrence,
         now_ms: sensed_at_ms,
+        // Route economics costs live fee quotes + gateway round trips, so only a cycle that can
+        // actually COMMIT pays for them: when reconcile re-drove work the round below is planned
+        // and thrown away. ONE budget for the whole cycle — the loop can re-plan once per
+        // unroutable destination, and a shared deadline is what stops a stalled federation from
+        // multiplying its timeout by the revision count.
+        price_routes: tick_may_commit(&reconcile),
     };
     let mut decision_count = 0;
     let mut commit = super::CommitTickReport::default();
@@ -461,28 +474,11 @@ async fn run_cycle(
     let spending = match &reconcile {
         None => policy.spending_fed,
         Some(_) => {
-            let mut failures: Vec<MoveRouteProblem> = Vec::new();
-            let round: anyhow::Result<super::TickRound> = async {
-                loop {
-                    facts.now_ms = now_ms();
-                    let round = client
-                        .decide_tick_round(facts.clone(), failures.clone())
-                        .await
-                        .map_err(anyhow::Error::new)?;
-                    if !tick_may_commit(&reconcile) {
-                        break Ok(round);
-                    }
-                    let Some(problem) = runtime.first_move_route_problem(&round.decisions).await
-                    else {
-                        break Ok(round);
-                    };
-                    failures.push(problem);
-                    if failures.len() > probes.len() {
-                        break Ok(round);
-                    }
-                }
-            }
-            .await;
+            facts.now_ms = now_ms();
+            let round = client
+                .decide_tick_round(facts)
+                .await
+                .map_err(anyhow::Error::new);
             match round {
                 Ok(round) => {
                     let mut spending = round.spending_fed;

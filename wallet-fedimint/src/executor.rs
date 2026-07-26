@@ -60,6 +60,17 @@ pub const MINIMUM_INCOMING_CONTRACT_MSAT: u64 =
 /// short async fixed point; a couple of passes converge for any real fee (ppm slope < 1).
 const FED_FEE_REQUOTE_PASSES: u32 = 3;
 
+/// The money-path move fallback prices registered gateways within this wall-clock budget. Without a
+/// bound a federation advertising a large or unresponsive gateway set makes a single perform issue
+/// one fee round-trip per gateway before it can pick a route, capped only by `perform_timeout`. A
+/// TIME budget rather than a candidate-count cap bounds the work WITHOUT a deterministic blind
+/// spot: when gateways answer quickly — the normal case — every registered gateway is still priced,
+/// so a fitting route in ANY position is found, and only a genuinely slow/large registry is
+/// truncated. A truncated scan then falls through to plain both-ends validation rather than falsely
+/// reporting "no route fits the cap" over an unexamined suffix. `perform_timeout` remains the
+/// backstop for a single slow round-trip.
+const FALLBACK_MOVE_ROUTE_BUDGET_MS: u64 = 10_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FreshMoveCost {
     invoice_amount: Msat,
@@ -129,6 +140,20 @@ fn raw_receive_fee_fits(gateway_quote: Msat, federation_quote: Msat, fee_cap: Ms
     gateway_quote.0.saturating_add(federation_quote.0) <= fee_cap.0
 }
 
+fn keep_cheapest_fitting<T>(
+    best: Option<(Msat, T)>,
+    candidate: (Msat, T),
+    fee_cap: Msat,
+) -> Option<(Msat, T)> {
+    if candidate.0 > fee_cap {
+        return best;
+    }
+    match best {
+        Some((cheapest, _)) if cheapest <= candidate.0 => best,
+        _ => Some(candidate),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FreshSendRequiredGatewayFees {
     receive: fee::GatewayFee,
@@ -141,10 +166,10 @@ pub struct FedimintExecutor {
     mc: Arc<MultiClient>,
     journal: Arc<FedimintJournal>,
     /// An explicitly pinned lnv2 gateway (Phase 1 pins the gateway, ⟦D4⟧). When set,
-    /// [`Self::resolve_gateway`] uses it for a FRESH move instead of the federation's
-    /// registered list — devimint does NOT auto-register its LDK gateway into that list, so
-    /// `mc.gateways` is empty there (runbook §4) and the CLI must supply the URL directly. A
-    /// RESUMED move ignores this and reuses the gateway already pinned in its `MoveRecord`.
+    /// fresh operations use it instead of the federation's registered list — devimint does NOT
+    /// auto-register its LDK gateway into that list, so `mc.gateways` is empty there (runbook §4)
+    /// and the CLI must supply the URL directly. A RESUMED move ignores this and reuses the
+    /// gateway already pinned in its `MoveRecord`.
     pinned_gateway: Option<GatewayUrl>,
     /// The hard per-fed balance cap (ADR-0018) enforced at PERFORM time (§15.2): a non-evacuation
     /// inflow that would push its destination over the cap is refused pre-mint, and a fresh
@@ -226,9 +251,22 @@ impl FedimintExecutor {
             &artifacts,
         ) {
             Some(gateway) => gateway,
-            // Scan for a gateway serving BOTH ends of a send-required move (§15.6); a
+            // Prefer the route `decide()` already priced this move against (still validated), then
+            // scan for the cheapest gateway serving BOTH ends of a send-required move (§15.6); a
             // receive-only inflow (`plan.from == None`) validates only the destination.
-            None => self.resolve_gateway(&plan.to, plan.from).await?,
+            //
+            // An `Evacuate` arrives here with a NON-final amount: `size_fresh_evacuation` runs
+            // after this and downsizes the ask to what the dying federation can actually afford
+            // under `fee_cap`. Pricing routes against the pre-sizing ask would judge them on an
+            // amount no one will ever move, so an evacuation resolves by VALIDATION only.
+            None => {
+                self.resolve_move_gateway(
+                    plan,
+                    action_gateway(&intent.action),
+                    move_amount_is_final(&intent.action),
+                )
+                .await?
+            }
         };
 
         let params = MoveParams {
@@ -244,19 +282,65 @@ impl FedimintExecutor {
         Ok(assemble_move_record(params, &artifacts, cached))
     }
 
-    /// Resolve a gateway for a FRESH move into `to` (spec §7, §15.6): the explicitly pinned
-    /// gateway wins (⟦D4⟧; devimint's LDK gateway is not auto-registered, so the CLI passes it
-    /// directly — runbook §4). Otherwise SCAN the federation's registered lnv2 gateway list for
-    /// the first that VALIDATES — for a send-required move (`from == Some`) against BOTH `to` and
-    /// `from` (the shared-gateway internal swap needs both ends), for a receive-only inflow
-    /// (`from == None`) against `to` alone. A stale first-registered gateway must not make a
-    /// healthy fed unroutable (the SDK's own `select_gateway` scans until responsive).
+    /// The gateway a move should actually use (spec §7, §15.6), in precedence order:
+    ///
+    /// 1. the explicitly PINNED gateway (⟦D4⟧; devimint's LDK gateway is not auto-registered, so
+    ///    the CLI passes it directly — runbook §4). An operator pin overrides route selection
+    ///    entirely, planning included;
+    /// 2. the route `decide()` preselected on the action — but only while it still SERVES both
+    ///    ends. It is a HINT, not a constraint: `perform` can run long after planning (retries,
+    ///    restarts), and failing terminally on a gateway that has since gone away would strand
+    ///    the move — the worst outcome. Money safety is the UNCHANGED `fee_cap` re-checked at the
+    ///    Pay step, not gateway identity: a substitute that costs more simply fails the cap;
+    /// 3. otherwise price the registered routes at the action amount and choose the cheapest one
+    ///    whose full fee fits the unchanged cap — but only when `amount_is_final`. A fresh
+    ///    `Evacuate` is resolved by plain both-ends VALIDATION instead, because its `plan.amount`
+    ///    is the un-downsized full ask that `size_fresh_evacuation` has not yet reduced: judging
+    ///    routes against `fee_cap` at that amount would refuse the drain (`Retryable`, every
+    ///    tick) BEFORE the downsizing search that exists to make it affordable ever ran, and
+    ///    route economics must never gate an evacuation.
+    ///
+    /// The gateway actually used lands on the durable `MoveRecord` and from there on the ledger
+    /// row's `OperationKind::Move.gateway`, so any substitution is auditable after the fact.
+    async fn resolve_move_gateway(
+        &self,
+        plan: &MovePlan,
+        preselected: Option<&GatewayUrl>,
+        amount_is_final: bool,
+    ) -> Result<GatewayUrl, ExecError> {
+        if let Some(gateway) = &self.pinned_gateway {
+            return Ok(gateway.clone());
+        }
+        if let Some(preselected) = preselected {
+            if self
+                .gateway_serves_route(&plan.to, plan.from.as_ref(), preselected)
+                .await
+            {
+                return Ok(preselected.clone());
+            }
+            tracing::warn!(
+                to = %plan.to.to_hex(),
+                gateway = %preselected.0,
+                "executor: the planned gateway no longer serves this move; re-resolving under the \
+                 same fee cap"
+            );
+        }
+        if !amount_is_final {
+            return self.resolve_gateway(&plan.to, plan.from).await;
+        }
+        self.resolve_fallback_move_gateway(plan).await
+    }
+
+    /// Resolve the first registered gateway that VALIDATES (`to`, plus `from` when the move has a
+    /// send leg) — the pre-route-economics behavior, kept for every shape whose amount cannot be
+    /// priced: a receive-only inflow, a sizing probe, and a fresh evacuation (whose `plan.amount`
+    /// is still the un-downsized full balance). Funding moves use
+    /// [`Self::resolve_fallback_move_gateway`] first, because their action carries an amount and
+    /// cap against which routes can be compared economically.
     ///
     /// "None validates" is `Retryable`, NOT `Permanent`: a resume verb (`reconcile`/`await-move`)
     /// carries no pinned gateway, so re-driving an intent that has none cached must leave it
-    /// `Pending` (re-drivable once the operator re-runs `direct-inflow --gateway` to supply one),
-    /// never terminally `Failed`. The fresh `direct-inflow` path never hits this — its
-    /// `pick_receive_gateway` guarantees a gateway before the runtime is built.
+    /// `Pending` (re-drivable once the operator supplies one), never terminally `Failed`.
     async fn resolve_gateway(
         &self,
         to: &FederationId,
@@ -280,9 +364,106 @@ impl FedimintExecutor {
         )))
     }
 
-    /// Whether `gateway` can route this move (§15.6): it must serve the RECEIVE end `to`, and for
-    /// a send-required move ALSO the SEND end `from` (`routing_info` serves both). A `routing_info`
-    /// fetch failure for either end reads as "does not serve", so the scan passes over it.
+    /// Re-resolve a missing/dead move hint at the move's actual amount. Only routes whose complete
+    /// receive+send quote fits the action's unchanged cap enter the argmin; this prevents a
+    /// reference-amount winner from failing pre-mint while another serving route would fit.
+    ///
+    /// Two shapes cannot be priced at all and fall back to plain both-ends VALIDATION
+    /// ([`Self::resolve_gateway`], i.e. exactly what this path did before route economics):
+    ///
+    /// - a RECEIVE-ONLY inflow (`plan.from == None`, every `DirectInflow`) has no send leg to
+    ///   price, and no source federation to price it from;
+    /// - a scan where NO candidate could be quoted at `plan.amount` (every send dry-run hit
+    ///   `InsufficientBalanceError`, reported as `Ok(None)` — see
+    ///   `quote_fresh_send_required_cost`), which says the amount itself is unfundable rather
+    ///   than that the routes are dear.
+    ///
+    /// A fresh `Evacuate` never reaches this function at all ([`Self::resolve_move_gateway`]
+    /// routes it by validation): its `plan.amount` is the pre-sizing ask, so ANY verdict taken
+    /// here — cap-refusal included — would pre-empt the `size_fresh_evacuation` search that makes
+    /// the drain affordable, and strand a dying federation's funds.
+    ///
+    /// Only "some route priced, none fits the cap" keeps the cap-shaped `Retryable`: there the cap
+    /// — not liveness — is the reason, and reporting it is what makes the refusal legible.
+    async fn resolve_fallback_move_gateway(
+        &self,
+        plan: &MovePlan,
+    ) -> Result<GatewayUrl, ExecError> {
+        let Some(from) = plan.from else {
+            return self.resolve_gateway(&plan.to, None).await;
+        };
+        let gateways = self.mc.gateways(&plan.to).await.map_err(retryable)?;
+        let scan_deadline_ms =
+            crate::runtime::now_ms().saturating_add(FALLBACK_MOVE_ROUTE_BUDGET_MS);
+        let mut cheapest = None;
+        let mut priced_any = false;
+        let mut fully_scanned = true;
+        for gateway in &gateways {
+            if crate::runtime::now_ms() >= scan_deadline_ms {
+                fully_scanned = false;
+                tracing::debug!(
+                    to = %plan.to.to_hex(),
+                    registered = gateways.len(),
+                    "executor: move fallback gateway scan hit its time budget; \
+                     leaving final routing to plain validation"
+                );
+                break;
+            }
+            let gateway_fees = match self
+                .fresh_send_required_gateway_fees(&from, &plan.to, gateway)
+                .await
+            {
+                Ok(fees) => fees,
+                Err(error) => {
+                    tracing::debug!(
+                        gateway = %gateway.0,
+                        ?error,
+                        "executor: move fallback gateway quote failed"
+                    );
+                    continue;
+                }
+            };
+            let cost = match self
+                .quote_fresh_send_required_cost(&from, &plan.to, plan.amount, gateway_fees)
+                .await
+            {
+                Ok(Some(cost)) => {
+                    priced_any = true;
+                    cost.total_fee()
+                }
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::debug!(
+                        gateway = %gateway.0,
+                        ?error,
+                        "executor: move fallback federation quote failed"
+                    );
+                    continue;
+                }
+            };
+            cheapest = keep_cheapest_fitting(cheapest, (cost, gateway), plan.fee_cap);
+        }
+        if let Some((_, gateway)) = cheapest {
+            return Ok(gateway.clone());
+        }
+        // Only conclude "no gateway fits the cap" when the WHOLE registered set was examined. A scan
+        // truncated by the time budget has an unexamined suffix that may contain a fitting route, so
+        // it must not report a hard cap refusal — fall through to plain both-ends validation, which
+        // can still pick a serving gateway from the suffix (the cap is re-enforced at perform).
+        if priced_any && fully_scanned {
+            return Err(ExecError::Retryable(format!(
+                "no lnv2 gateway can route move {} -> {} within fee cap {} msat \
+                 (scanned all {} registered gateway(s))",
+                from.to_hex(),
+                plan.to.to_hex(),
+                plan.fee_cap.0,
+                gateways.len(),
+            )));
+        }
+        self.resolve_gateway(&plan.to, Some(from)).await
+    }
+
+    /// Whether `gateway` serves both required ends of this move (§15.6).
     async fn gateway_serves_route(
         &self,
         to: &FederationId,
@@ -1427,6 +1608,30 @@ impl FedimintExecutor {
     }
 }
 
+/// The route `decide()` preselected for a move-shaped action, if any. Deliberately read off the
+/// `Action` rather than carried on [`MovePlan`]: the plan is the pure, gateway-FREE projection of
+/// what to move, and the gateway is a routing hint the executor may override.
+fn action_gateway(action: &Action) -> Option<&GatewayUrl> {
+    match action {
+        Action::Move { gateway, .. } | Action::Evacuate { gateway, .. } => gateway.as_ref(),
+        _ => None,
+    }
+}
+
+/// Whether the plan's `amount` is FINAL when the gateway is resolved — i.e. whether candidate
+/// routes may be judged against `fee_cap` at that amount.
+///
+/// False for an `Evacuate` alone: `assemble_record` (and so gateway resolution) runs BEFORE
+/// `size_fresh_evacuation`, which downsizes the drain until the quoted cost fits the absolute
+/// `max_fee` cap. A cap verdict taken at the pre-sizing ask would refuse the evacuation
+/// (`Retryable`, every tick) without the downsizing search ever running — stranding a dying
+/// federation's balance, which is exactly what that search exists to prevent. Route economics
+/// never gates an evacuation (`wallet-core`'s `evacuate_decision`), and this is where that
+/// promise is kept on the perform side.
+fn move_amount_is_final(action: &Action) -> bool {
+    !matches!(action, Action::Evacuate { .. })
+}
+
 fn pre_fund_endpoints(action: &Action) -> Option<(Option<FederationId>, Option<FederationId>)> {
     match action {
         Action::Move { from, to, .. } => Some((Some(*from), Some(*to))),
@@ -1973,6 +2178,7 @@ mod tests {
             to: FED_B,
             amount: Msat(50_000),
             fee_cap: Msat(1_000),
+            gateway: None,
         };
         assert_eq!(pre_fund_endpoints(&action), None);
     }
@@ -2029,6 +2235,7 @@ mod tests {
             to: FED_B,
             amount: Msat(50_000),
             fee_cap: Msat(10_000),
+            gateway: None,
         };
         let err = executor
             .perform(&intent(action))
@@ -2051,6 +2258,7 @@ mod tests {
             to: FED_B,
             amount: Msat(50_000),
             fee_cap: Msat(10_000),
+            gateway: None,
         };
         let plan = MovePlan::from_action(&action).expect("Evacuate must map to a plan");
         assert_eq!(plan.from, Some(FED_A));
@@ -2295,6 +2503,22 @@ mod tests {
     }
 
     #[test]
+    fn fallback_selection_uses_actual_cost_and_keeps_the_same_cap() {
+        let cap = Msat(1_000);
+        let high_base = GatewayUrl("https://high-base.example".into());
+        let low_base = GatewayUrl("https://low-base.example".into());
+        let over_cap = GatewayUrl("https://over-cap.example".into());
+
+        let mut best = None;
+        best = keep_cheapest_fitting(best, (Msat(900), &high_base), cap);
+        best = keep_cheapest_fitting(best, (Msat(300), &low_base), cap);
+        best = keep_cheapest_fitting(best, (Msat(1_001), &over_cap), cap);
+
+        assert_eq!(best, Some((Msat(300), &low_base)));
+        assert_eq!(cap, Msat(1_000), "fallback must not widen the action's cap");
+    }
+
+    #[test]
     fn deterministic_send_rejection_fails_the_move_permanently() {
         // §15.4. A deterministic rejection from the send leg (expired / wrong-currency /
         // unsupported / fee-limit) maps to a terminal Permanent with an actionable message — the
@@ -2350,6 +2574,152 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn the_preselected_route_is_read_off_the_move_shaped_actions_only() {
+        let planned = GatewayUrl("https://planned.example".into());
+        assert_eq!(
+            action_gateway(&Action::Move {
+                from: FED_A,
+                to: FED_B,
+                amount: Msat(50_000),
+                fee_cap: Msat(1_000),
+                gateway: Some(planned.clone()),
+            }),
+            Some(&planned)
+        );
+        assert_eq!(
+            action_gateway(&Action::Evacuate {
+                from: FED_A,
+                to: FED_B,
+                amount: Msat(50_000),
+                fee_cap: Msat(1_000),
+                gateway: Some(planned.clone()),
+            }),
+            Some(&planned)
+        );
+        // A legacy row (or an unpriced pair) simply carries none, which is the pre-route-economics
+        // behavior: resolve at perform time.
+        assert_eq!(
+            action_gateway(&Action::Move {
+                from: FED_A,
+                to: FED_B,
+                amount: Msat(50_000),
+                fee_cap: Msat(1_000),
+                gateway: None,
+            }),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pin_beats_the_preselected_route_and_a_dead_hint_re_resolves() {
+        let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
+        let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
+        let mc = Arc::new(MultiClient::new(db, journal_db.clone(), mnemonic).await);
+        let journal = Arc::new(FedimintJournal::new(journal_db.clone()));
+        let plan = MovePlan {
+            from: Some(FED_A),
+            to: FED_B,
+            amount: Msat(50_000),
+            fee_cap: Msat(1_000),
+            send_required: true,
+        };
+        let planned = GatewayUrl("https://planned.example".into());
+
+        // §Q4: an operator pin is the HIGHEST precedence — it wins over `decide()`'s preselection
+        // without validating it, exactly as it already wins over the registered-set scan.
+        let pin = GatewayUrl("https://pinned.example".into());
+        let pinned = FedimintExecutor::new(mc.clone(), journal.clone(), Some(pin.clone()), None);
+        assert_eq!(
+            pinned
+                .resolve_move_gateway(&plan, Some(&planned), true)
+                .await
+                .expect("a pin never needs to resolve"),
+            pin
+        );
+
+        // §Q2: with no pin, a preselected gateway that no longer serves the route (no federation
+        // is open here, so nothing validates) must NOT strand the move terminally — it falls
+        // through to re-resolution and, when that finds nothing either, stays RETRYABLE so a
+        // later tick can complete it. The move's `fee_cap` is untouched throughout: the cap, not
+        // gateway identity, is what bounds what a substitute may spend.
+        let unpinned = FedimintExecutor::new(mc, journal, None, None);
+        let error = unpinned
+            .resolve_move_gateway(&plan, Some(&planned), true)
+            .await
+            .expect_err("no gateway can serve an unopened federation");
+        assert!(
+            matches!(error, ExecError::Retryable(_)),
+            "a dead preselected gateway must leave the move re-drivable, not failed: {error:?}"
+        );
+        assert_eq!(plan.fee_cap, Msat(1_000));
+    }
+
+    #[test]
+    fn a_fresh_evacuation_is_routed_before_its_amount_is_final() {
+        // The evacuation ordering trap: `assemble_record` resolves the gateway, and only THEN
+        // does `size_fresh_evacuation` downsize the drain to what fits the absolute `max_fee`.
+        // A dying fed holding 10_000_000 msat whose destination has 8_000_000 of cap room emits
+        // `Evacuate { amount: 8_000_000, fee_cap: max_fee }` — an amount the source CAN afford,
+        // so the send dry-run prices it fine and the quote simply lands over the cap. Judging
+        // routes on that cap here would fail the evacuation `Retryable` every tick and the
+        // downsizing bisection would never run, stranding the balance.
+        assert!(!move_amount_is_final(&Action::Evacuate {
+            from: FED_A,
+            to: FED_B,
+            amount: Msat(8_000_000),
+            fee_cap: Msat(1_000),
+            gateway: None,
+        }));
+        // Every other move shape carries the amount it will actually move, so its routes ARE
+        // comparable against the cap.
+        assert!(move_amount_is_final(&Action::Move {
+            from: FED_A,
+            to: FED_B,
+            amount: Msat(50_000),
+            fee_cap: Msat(1_000),
+            gateway: None,
+        }));
+        assert!(move_amount_is_final(&Action::DirectInflow {
+            to: FED_B,
+            amount: Msat(50_000),
+            fee_cap: Msat(1_000),
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_receive_only_inflow_resolves_without_a_source_federation() {
+        // A `DirectInflow` maps to `from: None` (`MovePlan::from_action`), so with no pinned
+        // gateway and no preselected route it reaches the fallback resolver — which has no send
+        // leg to price. It must VALIDATE the destination alone (the pre-route-economics
+        // behavior). Treating the missing source as a Permanent error there terminally fails
+        // EVERY direct inflow on a daemon that pins no gateway (the pin is optional host config).
+        let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
+        let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
+        let mc = Arc::new(MultiClient::new(db, journal_db.clone(), mnemonic).await);
+        let journal = Arc::new(FedimintJournal::new(journal_db));
+        let executor = FedimintExecutor::new(mc, journal, None, None);
+
+        let plan = MovePlan::from_action(&Action::DirectInflow {
+            to: FED_B,
+            amount: Msat(50_000),
+            fee_cap: Msat(1_000),
+        })
+        .expect("DirectInflow maps to a plan");
+        assert_eq!(plan.from, None, "a direct inflow is receive-only");
+
+        let error = executor
+            .resolve_move_gateway(&plan, None, true)
+            .await
+            .expect_err("no federation is open in this fixture");
+        assert!(
+            matches!(error, ExecError::Retryable(_)),
+            "a receive-only inflow must stay re-drivable, not fail terminally: {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn poison_reservation_row_does_not_terminalize_a_healthy_move() {
         let db = MemDatabase::new().into_database();
@@ -2377,6 +2747,7 @@ mod tests {
                 to: FED_B,
                 amount: Msat(50_000),
                 fee_cap: Msat(10_000),
+                gateway: None,
             }))
             .await
             .expect_err("fail closed before any network I/O");

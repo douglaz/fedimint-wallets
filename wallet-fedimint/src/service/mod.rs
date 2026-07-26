@@ -4,9 +4,11 @@ mod actor;
 mod driver;
 mod scheduler;
 
+pub(crate) use actor::{active_probe_verdicts, plan_tick_round};
+
 use crate::journal::{FedimintJournal, ProbeRecord, ProbeSession};
 use crate::probe::ProbeResult;
-use crate::runtime::{MoveRouteProblem, Runtime};
+use crate::runtime::Runtime;
 use crate::tick::TickPolicy;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -203,6 +205,11 @@ pub struct ProbeFacts {
     pub probes: Vec<(FederationId, ProbeResult)>,
     pub occurrence: wallet_core::Occurrence,
     pub now_ms: u64,
+    /// Whether this cycle may do route-pricing and preflight I/O.
+    ///
+    /// Only the caller knows whether the cycle can commit. The actor mints one non-cloneable
+    /// allowance when this is true and reuses it across every route-revision round.
+    pub price_routes: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -244,6 +251,9 @@ pub enum SnapshotScope {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+// `Intent` deliberately carries the complete persisted Action. Boxing this internal reply enum
+// would add allocation and touch every snapshot consumer only to satisfy a layout heuristic.
+#[allow(clippy::large_enum_variant)]
 pub enum Snapshot {
     Intent(Option<Intent>),
     Reservations(Reservations),
@@ -312,7 +322,6 @@ pub enum Command {
     },
     DecideTickRound {
         facts: ProbeFacts,
-        route_failures: Vec<MoveRouteProblem>,
         reply: oneshot::Sender<ServiceResult<TickRound>>,
     },
     CommitTick {
@@ -446,17 +455,9 @@ impl WalletClient {
             .await
     }
 
-    pub async fn decide_tick_round(
-        &self,
-        facts: ProbeFacts,
-        route_failures: Vec<MoveRouteProblem>,
-    ) -> ServiceResult<TickRound> {
-        self.request(|reply| Command::DecideTickRound {
-            facts,
-            route_failures,
-            reply,
-        })
-        .await
+    pub async fn decide_tick_round(&self, facts: ProbeFacts) -> ServiceResult<TickRound> {
+        self.request(|reply| Command::DecideTickRound { facts, reply })
+            .await
     }
 
     pub async fn commit_tick(

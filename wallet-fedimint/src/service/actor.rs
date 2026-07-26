@@ -5,12 +5,13 @@ use crate::runtime::{
     probe_out_fee_cap, probe_umbrella_key, PROBE_BUDGET_WINDOW_MS,
 };
 use crate::tick::{build_snapshot, decisions_to_apply, pinned_input_problems};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::Ordering;
 use tokio::task::JoinHandle;
 use wallet_core::{
-    admit_intent, probe_verdict, Action, Actor, DecideAndJournal, IntentStatus, Journal,
-    OperationKind, OperationStatus, ProbePolicy, ScorerPolicy,
+    admit_intent, probe_verdict, Action, ActiveProbeVerdict, Actor, AllocatorDecision,
+    AllocatorSnapshot, DecideAndJournal, IntentStatus, Journal, OperationKind, OperationStatus,
+    ProbePolicy, ReasonCode, Reservations, RouteEconomics, RouteStatus, ScorerPolicy,
 };
 
 struct PendingWaiter {
@@ -182,6 +183,356 @@ async fn wait_for_deadline(deadline: Option<Instant>) {
     }
 }
 
+/// The actor-owned tick plan. Standalone tick/status call this same function directly; the daemon
+/// reaches it through `DecideTickRound`, so route pricing and `decide()` cannot drift.
+#[derive(Clone, Debug)]
+pub(crate) struct PlannedTickRound {
+    pub(crate) decisions: Vec<AllocatorDecision>,
+    pub(crate) probes: Vec<(FederationId, crate::probe::ProbeResult)>,
+    pub(crate) active_probes: BTreeMap<FederationId, ActiveProbeVerdict>,
+    pub(crate) snapshot: AllocatorSnapshot,
+}
+
+pub(crate) async fn plan_tick_round(
+    journal: &FedimintJournal,
+    runtime: Option<&Runtime>,
+    probes: Vec<(FederationId, crate::probe::ProbeResult)>,
+    policy: &TickPolicy,
+    sensed_at_ms: u64,
+    mut route_budget: Option<crate::route_econ::RouteQuoteBudget>,
+) -> Result<PlannedTickRound, ExecError> {
+    let candidates = journal.list_candidates_report().await?;
+    let joined = journal.list_federations().await?;
+    let auto_joined = probe_gated_members(
+        joined.into_iter().map(|(id, _)| id),
+        candidates
+            .candidates
+            .iter()
+            .map(|(id, record)| (*id, record.state)),
+    );
+    let reservations = project_reservations(journal).await?;
+    let mut probes = probes;
+    let mut priced = BTreeMap::<(FederationId, FederationId), RouteEconomics>::new();
+    let mut invalidated = BTreeSet::new();
+    let mut evacuation_fallback: Option<(FederationId, PlannedTickRound)> = None;
+    // The round whose refusal first named an unroutable designated pair. A re-designation that ends
+    // up funding nothing reverts to it so that refusal (§Q5) is not lost.
+    let mut route_blocked_fallback: Option<PlannedTickRound> = None;
+    let mut route_revisions = 0usize;
+
+    loop {
+        let round = build_tick_round(
+            journal,
+            runtime,
+            &probes,
+            policy,
+            sensed_at_ms,
+            &auto_joined,
+            &reservations,
+            route_budget.as_mut(),
+            &mut priced,
+            &invalidated,
+        )
+        .await?;
+        if let Some((source, fallback)) = &evacuation_fallback {
+            let still_evacuating = round.decisions.iter().any(|decision| {
+                matches!(decision.action, Action::Evacuate { from, .. } if from == *source)
+            });
+            if !still_evacuating {
+                return Ok(fallback.clone());
+            }
+        }
+        // A discarded reconcile cycle supplies no budget. It pays for neither route economics nor
+        // the pre-existing concrete route preflight.
+        let (Some(runtime), Some(budget)) = (runtime, route_budget.as_ref()) else {
+            return Ok(round);
+        };
+        let Some(problem) = budget
+            .run_before_deadline(runtime.first_move_route_problem(&round.decisions))
+            .await
+        else {
+            tracing::warn!(
+                "tick: route-work deadline expired before concrete preflight completed; \
+                 leaving final validation to perform"
+            );
+            return Ok(round);
+        };
+        let Some(problem) = problem else {
+            // No EMITTED move failed preflight — but `decide()` may have route-BLOCKED the designated
+            // pair (`Unroutable`/`UneconomicAtAnySize` → a refusal, no move). On origin/main that pair
+            // was always an emitted move whose preflight failure marked the destination unavailable and
+            // re-drove allocation onto another routable pairing; pre-classifying the skip loses that
+            // re-designation and wedges a ≥3-federation wallet on the unroutable top-scored pairing.
+            // Restore it: drop the blocked destination and re-drive so allocation re-designates onto
+            // another eligible pairing, keeping the FIRST such round as the fallback.
+            if let Some((_, to)) = first_route_blocked_designation(&round) {
+                if crate::runtime::mark_gateway_unavailable(&mut probes, to) {
+                    tracing::warn!(
+                        to = %to.to_hex(),
+                        "tick: the designated funding pair is unroutable this cycle; re-driving \
+                         allocation onto another eligible pairing"
+                    );
+                    route_blocked_fallback.get_or_insert_with(|| round.clone());
+                    route_revisions += 1;
+                    if route_revisions > probes.len() {
+                        return Ok(route_blocked_fallback.take().unwrap_or(round));
+                    }
+                    continue;
+                }
+            }
+            // No further route-blocked pair to re-drive. If a re-designation was in progress and this
+            // final round funds nothing, no routable alternative exists, so revert to the round whose
+            // refusal names the original block (§Q5 keeps that diagnostic visible). Otherwise this
+            // round — the re-designated routable pairing, or the original when none was needed — is
+            // the result.
+            if let Some(fallback) = route_blocked_fallback.take() {
+                let funds_a_move = round
+                    .decisions
+                    .iter()
+                    .any(|decision| matches!(decision.action, Action::Move { .. }));
+                if !funds_a_move {
+                    return Ok(fallback);
+                }
+            }
+            return Ok(round);
+        };
+        if problem.evacuation_source_route
+            && round.decisions.iter().any(|decision| {
+                matches!(decision.action, Action::Evacuate { from, .. } if from == problem.from)
+            })
+        {
+            evacuation_fallback = Some((problem.from, round.clone()));
+        }
+
+        // A concrete preflight failure invalidates the exact pair's earlier `Routable` evidence.
+        // Keep it in the accumulator only to prevent another quote pass; `build_tick_round`
+        // excludes invalidated entries from every later snapshot.
+        invalidated.insert((problem.from, problem.to));
+        let changed =
+            crate::runtime::mark_gateway_unavailable(&mut probes, problem.mark_unavailable);
+        tracing::warn!(
+            from = %problem.from.to_hex(),
+            to = %problem.to.to_hex(),
+            marked_unavailable = %problem.mark_unavailable.to_hex(),
+            gateway = %problem
+                .gateway
+                .as_ref()
+                .map_or("<none>", |gateway| gateway.0.as_str()),
+            error = %problem.error,
+            "tick: planned send-required route failed gateway validation; revising the fundable set"
+        );
+        if !changed {
+            return Ok(round);
+        }
+        route_revisions += 1;
+        if route_revisions > probes.len() {
+            return Ok(round);
+        }
+    }
+}
+
+/// The off-actor half of a tick decision: the network-heavy route pricing + concrete route
+/// preflight (via [`plan_tick_round`]) plus the pure pinned-input check. It runs in a task spawned
+/// off the actor's `select!` loop so pricing a stalled federation cannot block the single-owner
+/// actor. `planned_generation` is the generation captured on the actor turn by
+/// [`ActorState::prepare_tick_round`]; the commit-time check validates it is still current, so a
+/// `PutPolicy` landing during this off-actor window refuses the stale batch rather than admitting it.
+async fn plan_tick_off_actor(
+    journal: Arc<FedimintJournal>,
+    runtime: Option<Arc<Runtime>>,
+    facts: ProbeFacts,
+    policy: TickPolicy,
+    planned_generation: u64,
+) -> ServiceResult<TickRound> {
+    let route_budget = facts
+        .price_routes
+        .then(|| crate::route_econ::RouteQuoteBudget::starting_at(facts.now_ms));
+    let round = plan_tick_round(
+        journal.as_ref(),
+        runtime.as_deref(),
+        facts.probes,
+        &policy,
+        facts.now_ms,
+        route_budget,
+    )
+    .await
+    .map_err(storage)?;
+    let problems = pinned_input_problems(&policy, &round.snapshot, &round.probes, &round.decisions);
+    if !problems.is_empty() {
+        return Err(ServiceError::Storage(format!(
+            "tick: {}",
+            problems.join("; ")
+        )));
+    }
+    Ok(TickRound {
+        decisions: round.decisions,
+        spending_fed: round.snapshot.spending_fed,
+        standby_fed: round.snapshot.standby_fed,
+        planned_generation,
+    })
+}
+
+/// The designated funding pair (either direction) that `decide()` route-BLOCKED this round: a pair
+/// whose `route_economics_by_pair` status is `Unroutable`/`UneconomicAtAnySize` and into whose
+/// destination no move was emitted. This is the pre-classified analogue of a concrete preflight
+/// failure — [`plan_tick_round`] drops the destination and re-drives so allocation re-designates onto
+/// a routable pairing instead of wedging. Returns the `(from, to)` of the block; `to` is the
+/// destination to drop.
+fn first_route_blocked_designation(
+    round: &PlannedTickRound,
+) -> Option<(FederationId, FederationId)> {
+    let (Some(spending), Some(standby)) = (round.snapshot.spending_fed, round.snapshot.standby_fed)
+    else {
+        return None;
+    };
+    if spending == standby {
+        return None;
+    }
+    // The single designated pair, both directions — the only pairs `decide()` funds.
+    for (from, to) in [(standby, spending), (spending, standby)] {
+        let blocked = matches!(
+            round
+                .snapshot
+                .route_economics_by_pair
+                .get(&(from, to))
+                .map(|economics| economics.status),
+            Some(RouteStatus::Unroutable | RouteStatus::UneconomicAtAnySize)
+        );
+        // Only re-designate when `decide()` actually WANTED a non-dust funding of `to` that the
+        // ROUTE blocked — a refusal naming `to` that is (a) route/shortfall-caused, not `OverCap`
+        // (a cap-full destination is not helped by re-designating away from it), and (b) over a
+        // real, at-or-above-floor gap. A sub-floor DUST shortfall must not trigger an unrequested
+        // full-target rebalance onto some other fed: an `Unroutable` pair returns silently there
+        // (no refusal), but an `UneconomicAtAnySize` pair still emits its §Q5 `UneconomicRoute`
+        // refusal even at dust (`allocator::fund_into`, the `!uneconomic` skip), so the reason alone
+        // cannot distinguish dust — gate on the gap itself via the refusal's diagnostics.
+        let route_refused = round.decisions.iter().any(|decision| {
+            let Action::RefuseInflow {
+                fed,
+                reason,
+                diagnostics,
+            } = &decision.action
+            else {
+                return false;
+            };
+            *fed == to
+                && *reason != ReasonCode::OverCap
+                && diagnostics
+                    .want
+                    .zip(diagnostics.min_move)
+                    .is_some_and(|(want, min_move)| want.0 >= min_move.0)
+        });
+        let funded = round
+            .decisions
+            .iter()
+            .any(|decision| matches!(decision.action, Action::Move { to: dest, .. } if dest == to));
+        if blocked && route_refused && !funded {
+            return Some((from, to));
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_tick_round(
+    journal: &FedimintJournal,
+    runtime: Option<&Runtime>,
+    probes: &[(FederationId, crate::probe::ProbeResult)],
+    policy: &TickPolicy,
+    sensed_at_ms: u64,
+    auto_joined: &BTreeSet<FederationId>,
+    reservations: &Reservations,
+    route_budget: Option<&mut crate::route_econ::RouteQuoteBudget>,
+    priced: &mut BTreeMap<(FederationId, FederationId), RouteEconomics>,
+    invalidated: &BTreeSet<(FederationId, FederationId)>,
+) -> Result<PlannedTickRound, ExecError> {
+    let scorer_policy = ScorerPolicy::default();
+    let preliminary = build_snapshot(
+        probes,
+        policy,
+        &scorer_policy,
+        auto_joined,
+        &BTreeMap::new(),
+    );
+    let active_probes = active_probe_verdicts(
+        journal,
+        probes,
+        preliminary.spending_fed,
+        &policy.probe_gate_policy,
+        sensed_at_ms,
+    )
+    .await;
+    let mut snapshot = build_snapshot(probes, policy, &scorer_policy, auto_joined, &active_probes);
+    snapshot.reservations = reservations.clone();
+    if let (Some(runtime), Some(budget)) = (runtime, route_budget) {
+        runtime
+            .price_missing_routes(&snapshot, budget, priced)
+            .await;
+    }
+    snapshot.route_economics_by_pair = priced
+        .iter()
+        .filter(|(pair, _)| !invalidated.contains(pair))
+        .map(|(pair, economics)| (*pair, economics.clone()))
+        .collect();
+    let decisions = wallet_core::decide(&snapshot, policy.occurrence);
+    Ok(PlannedTickRound {
+        decisions,
+        probes: probes.to_vec(),
+        active_probes,
+        snapshot,
+    })
+}
+
+pub(crate) async fn active_probe_verdicts(
+    journal: &FedimintJournal,
+    probes: &[(FederationId, crate::probe::ProbeResult)],
+    spending: Option<FederationId>,
+    gate_policy: &ProbePolicy,
+    sensed_at_ms: u64,
+) -> BTreeMap<FederationId, ActiveProbeVerdict> {
+    let Some(source) = spending else {
+        return BTreeMap::new();
+    };
+    let mut active = BTreeMap::new();
+    for (id, _) in probes {
+        if *id == source {
+            continue;
+        }
+        match journal.probe_record(id).await {
+            Ok(record) => {
+                active.insert(
+                    *id,
+                    probe_verdict(
+                        &record.map(|record| record.attempts).unwrap_or_default(),
+                        source,
+                        sensed_at_ms,
+                        gate_policy,
+                    ),
+                );
+            }
+            Err(error) => tracing::warn!(
+                federation = %id.to_hex(),
+                ?error,
+                "tick: unreadable probe record; omitting active-probe verdict"
+            ),
+        }
+    }
+    active
+}
+
+async fn project_reservations(journal: &FedimintJournal) -> Result<Reservations, ExecError> {
+    let intents = journal.reservation_intents().await?;
+    let mut records = BTreeMap::new();
+    for intent in &intents {
+        if let Some(record) = journal.get_move(&intent.idempotency_key).await? {
+            records.insert(intent.idempotency_key.clone(), record);
+        }
+    }
+    Ok(wallet_core::project_reservations(&intents, |key| {
+        records.get(key).cloned()
+    }))
+}
+
 impl ActorState {
     async fn handle(&mut self, command: Command, client: Option<&WalletClient>, intake: bool) {
         match command {
@@ -271,17 +622,28 @@ impl ActorState {
                 };
                 let _ = reply.send(result);
             }
-            Command::DecideTickRound {
-                facts,
-                route_failures,
-                reply,
-            } => {
-                let result = if intake {
-                    self.decide_tick_round(facts, &route_failures).await
+            Command::DecideTickRound { facts, reply } => {
+                if intake {
+                    // Do the ms-scale bookkeeping on the actor turn, then price routes OFF the
+                    // actor loop and reply from the spawned task, so the actor keeps serving
+                    // admissions, driver transitions, waiter deadlines, and shutdown while the tick
+                    // plans (ADR-0024). The scheduler still awaits this reply before it commits.
+                    let (journal, runtime, facts, policy, planned_generation) =
+                        self.prepare_tick_round(facts);
+                    tokio::spawn(async move {
+                        let result = plan_tick_off_actor(
+                            journal,
+                            runtime,
+                            facts,
+                            policy,
+                            planned_generation,
+                        )
+                        .await;
+                        let _ = reply.send(result);
+                    });
                 } else {
-                    Err(ServiceError::ShuttingDown)
-                };
-                let _ = reply.send(result);
+                    let _ = reply.send(Err(ServiceError::ShuttingDown));
+                }
             }
             Command::CommitTick {
                 decisions,
@@ -347,133 +709,37 @@ impl ActorState {
         }
     }
 
-    async fn decide_tick_round(
+    /// The ms-scale, actor-serialized half of a tick decision: record the sensed balances and
+    /// capture the planning inputs (journal, runtime, tick policy, and the generation the plan will
+    /// be tagged with) atomically under the actor turn. The network-heavy planning itself runs OFF
+    /// the actor loop — see [`plan_tick_off_actor`] — so route pricing (gateway + federation RPCs,
+    /// up to the route-work budget) cannot stall admissions, driver transitions, waiter deadlines,
+    /// or shutdown (ADR-0024). Capturing `policy_generation` HERE, before planning, is what keeps
+    /// the commit-time drift guard intact: a `PutPolicy` that lands during the off-actor plan bumps
+    /// the live generation, so the commit check refuses the now-stale batch — exactly as before,
+    /// when planning ran on the actor turn and no `PutPolicy` could interleave at all.
+    fn prepare_tick_round(
         &mut self,
         facts: ProbeFacts,
-        route_failures: &[crate::runtime::MoveRouteProblem],
-    ) -> ServiceResult<TickRound> {
+    ) -> (
+        Arc<FedimintJournal>,
+        Option<Arc<Runtime>>,
+        ProbeFacts,
+        TickPolicy,
+        u64,
+    ) {
+        let balances = facts_from_probes(&facts.probes);
+        self.remember_tick_balances(facts.occurrence, &balances);
         let mut policy = TickPolicy::from(&self.policy);
         policy.occurrence = facts.occurrence;
         policy.now = facts.now_ms;
-        let reservations = self.project_reservations().await?;
-        let candidates = self
-            .journal
-            .list_candidates_report()
-            .await
-            .map_err(storage)?;
-        let joined = self.journal.list_federations().await.map_err(storage)?;
-        let auto_joined = probe_gated_members(
-            joined.into_iter().map(|(id, _)| id),
-            candidates
-                .candidates
-                .iter()
-                .map(|(id, record)| (*id, record.state)),
-        );
-        let balances = facts_from_probes(&facts.probes);
-        let mut probes = facts.probes;
-        let mut evacuation_fallback: Option<(FederationId, TickRound)> = None;
-        for failure in route_failures {
-            let round = self
-                .build_tick_round(&probes, &policy, &auto_joined, &reservations)
-                .await?;
-            if let Some((fallback_source, fallback)) = &evacuation_fallback {
-                let still_evacuating = round.decisions.iter().any(|decision| {
-                    matches!(decision.action, Action::Evacuate { from, .. } if from == *fallback_source)
-                });
-                if !still_evacuating {
-                    self.remember_tick_balances(facts.occurrence, &balances);
-                    return Ok(fallback.clone());
-                }
-            }
-            if failure.evacuation_source_route
-                && round.decisions.iter().any(|decision| {
-                    matches!(decision.action, Action::Evacuate { from, .. } if from == failure.from)
-                })
-            {
-                evacuation_fallback = Some((failure.from, round));
-            }
-            if !crate::runtime::mark_gateway_unavailable(&mut probes, failure.mark_unavailable) {
-                break;
-            }
-        }
-        let round = self
-            .build_tick_round(&probes, &policy, &auto_joined, &reservations)
-            .await?;
-        if let Some((fallback_source, fallback)) = evacuation_fallback {
-            let still_evacuating = round.decisions.iter().any(|decision| {
-                matches!(decision.action, Action::Evacuate { from, .. } if from == fallback_source)
-            });
-            if !still_evacuating {
-                self.remember_tick_balances(facts.occurrence, &balances);
-                return Ok(fallback);
-            }
-        }
-        self.remember_tick_balances(facts.occurrence, &balances);
-        Ok(round)
-    }
-
-    async fn build_tick_round(
-        &self,
-        probes: &[(FederationId, crate::probe::ProbeResult)],
-        policy: &TickPolicy,
-        auto_joined: &std::collections::BTreeSet<FederationId>,
-        reservations: &Reservations,
-    ) -> ServiceResult<TickRound> {
-        let preliminary = build_snapshot(
-            probes,
+        (
+            Arc::clone(&self.journal),
+            self.runtime.clone(),
+            facts,
             policy,
-            &ScorerPolicy::default(),
-            auto_joined,
-            &BTreeMap::new(),
-        );
-        let mut active_probes = BTreeMap::new();
-        if let Some(source) = preliminary.spending_fed {
-            for (id, _) in probes {
-                if *id == source {
-                    continue;
-                }
-                match self.journal.probe_record(id).await {
-                    Ok(record) => {
-                        active_probes.insert(
-                            *id,
-                            probe_verdict(
-                                &record.map(|record| record.attempts).unwrap_or_default(),
-                                source,
-                                policy.now,
-                                &policy.probe_gate_policy,
-                            ),
-                        );
-                    }
-                    Err(error) => tracing::warn!(
-                        federation = %id.to_hex(),
-                        ?error,
-                        "DecideTickRound: unreadable probe record; omitting verdict"
-                    ),
-                }
-            }
-        }
-        let mut snapshot = build_snapshot(
-            probes,
-            policy,
-            &ScorerPolicy::default(),
-            auto_joined,
-            &active_probes,
-        );
-        snapshot.reservations = reservations.clone();
-        let decisions = wallet_core::decide(&snapshot, policy.occurrence);
-        let problems = pinned_input_problems(policy, &snapshot, probes, &decisions);
-        if !problems.is_empty() {
-            return Err(ServiceError::Storage(format!(
-                "tick: {}",
-                problems.join("; ")
-            )));
-        }
-        Ok(TickRound {
-            decisions,
-            spending_fed: snapshot.spending_fed,
-            standby_fed: snapshot.standby_fed,
-            planned_generation: self.policy_generation,
-        })
+            self.policy_generation,
+        )
     }
 
     fn remember_tick_balances(
@@ -958,10 +1224,9 @@ impl ActorState {
         intent: &Intent,
         balances: &BTreeMap<FederationId, Msat>,
     ) -> ServiceResult<()> {
-        let reservations = self
-            .project_reservations()
+        let reservations = project_reservations(&self.journal)
             .await
-            .map_err(as_storage_refusal)?;
+            .map_err(storage_refusal)?;
         admit_intent(
             intent,
             Some(balances),
@@ -1385,10 +1650,10 @@ impl ActorState {
                 .await
                 .map(Snapshot::Intent)
                 .map_err(storage),
-            SnapshotScope::Reservations => self
-                .project_reservations()
+            SnapshotScope::Reservations => project_reservations(&self.journal)
                 .await
-                .map(Snapshot::Reservations),
+                .map(Snapshot::Reservations)
+                .map_err(storage),
             SnapshotScope::Registry => Ok(Snapshot::Registry {
                 drivers: driver::len(&self.registry),
             }),
@@ -1399,24 +1664,6 @@ impl ActorState {
                 .map(Snapshot::Probe)
                 .map_err(storage),
         }
-    }
-
-    async fn project_reservations(&self) -> ServiceResult<Reservations> {
-        let intents = self.journal.reservation_intents().await.map_err(storage)?;
-        let mut records = BTreeMap::new();
-        for intent in &intents {
-            if let Some(record) = self
-                .journal
-                .move_record(&intent.idempotency_key)
-                .await
-                .map_err(storage)?
-            {
-                records.insert(intent.idempotency_key.clone(), record);
-            }
-        }
-        Ok(wallet_core::project_reservations(&intents, |key| {
-            records.get(key).cloned()
-        }))
     }
 
     async fn reconcile(&mut self, client: &WalletClient) -> ServiceResult<ReconcileReport> {
@@ -1504,6 +1751,7 @@ impl ActorState {
             to,
             amount,
             fee_cap,
+            ..
         } = &intent.action
         else {
             return Ok(None);
@@ -1923,18 +2171,24 @@ fn validate_live_attach(existing: &Action, requested: &Action) -> ServiceResult<
                 ..
             },
         ) => (old_to, old_amount, old_fee, old_nonce) == (to, amount, fee_cap, nonce),
+        // The preselected `gateway` is excluded on purpose (as `..` already excludes it for the
+        // Pay/Receive arms above): it is a routing HINT the executor may substitute, not part of
+        // the money identity, so a re-plan that picks a cheaper gateway must still attach to the
+        // live intent for the same from/to/amount/fee_cap.
         (
             Action::Move {
                 from: old_from,
                 to: old_to,
                 amount: old_amount,
                 fee_cap: old_fee,
+                ..
             },
             Action::Move {
                 from,
                 to,
                 amount,
                 fee_cap,
+                ..
             },
         )
         | (
@@ -1943,12 +2197,14 @@ fn validate_live_attach(existing: &Action, requested: &Action) -> ServiceResult<
                 to: old_to,
                 amount: old_amount,
                 fee_cap: old_fee,
+                ..
             },
             Action::Evacuate {
                 from,
                 to,
                 amount,
                 fee_cap,
+                ..
             },
         ) => (old_from, old_to, old_amount, old_fee) == (from, to, amount, fee_cap),
         (
@@ -2141,4 +2397,152 @@ pub(super) fn refusal_from_exec(error: ExecError) -> ServiceError {
 
 fn refused(reason: RefuseReason, message: String) -> ServiceError {
     ServiceError::Refused { reason, message }
+}
+
+#[cfg(test)]
+mod route_blocked_designation_tests {
+    use super::*;
+    use wallet_core::{Occurrence, RefusalDiagnostics};
+
+    // A(spending, deficit), B(standby, surplus): the designated funding direction is (B, A).
+    const A: FederationId = FederationId([0xAA; 32]);
+    const B: FederationId = FederationId([0xBB; 32]);
+    const MIN_MOVE: u64 = 5_000;
+
+    fn snapshot(
+        route: BTreeMap<(FederationId, FederationId), RouteEconomics>,
+    ) -> AllocatorSnapshot {
+        AllocatorSnapshot {
+            federations: vec![],
+            spending_fed: Some(A),
+            standby_fed: Some(B),
+            per_fed_cap: Msat(0),
+            target_spending_balance: Msat(0),
+            standby_target: Msat(0),
+            max_fee: Msat(0),
+            max_fee_bps_of_move: 100,
+            min_move: Msat(MIN_MOVE),
+            route_economics_by_pair: route,
+            reservations: Reservations::default(),
+            now: 0,
+        }
+    }
+
+    fn blocked(status: RouteStatus) -> BTreeMap<(FederationId, FederationId), RouteEconomics> {
+        BTreeMap::from([(
+            (B, A),
+            RouteEconomics {
+                resolved_gateway: None,
+                min_viable_amount: Msat(0),
+                status,
+            },
+        )])
+    }
+
+    fn refuse(fed: FederationId, reason: ReasonCode, want: u64) -> AllocatorDecision {
+        AllocatorDecision {
+            action: Action::RefuseInflow {
+                fed,
+                reason,
+                diagnostics: RefusalDiagnostics {
+                    want: Some(Msat(want)),
+                    min_move: Some(Msat(MIN_MOVE)),
+                    ..Default::default()
+                },
+            },
+            reason,
+            occurrence: Occurrence(0),
+            idempotency_key: IdempotencyKey(String::new()),
+        }
+    }
+
+    fn round(snapshot: AllocatorSnapshot, decisions: Vec<AllocatorDecision>) -> PlannedTickRound {
+        PlannedTickRound {
+            decisions,
+            probes: vec![],
+            active_probes: BTreeMap::new(),
+            snapshot,
+        }
+    }
+
+    #[test]
+    fn non_dust_route_block_redesignates() {
+        // An Unroutable pair with a real (at-or-above-floor) shortfall re-designates.
+        let r = round(
+            snapshot(blocked(RouteStatus::Unroutable)),
+            vec![refuse(A, ReasonCode::SpendingBelowTarget, MIN_MOVE + 1_000)],
+        );
+        assert_eq!(first_route_blocked_designation(&r), Some((B, A)));
+    }
+
+    #[test]
+    fn dust_uneconomic_does_not_redesignate() {
+        // §Q5 emits an UneconomicRoute refusal even at a sub-floor DUST gap; the gap guard
+        // (`want >= min_move`) must keep this from triggering an unrequested full-target rebalance.
+        let r = round(
+            snapshot(blocked(RouteStatus::UneconomicAtAnySize)),
+            vec![refuse(A, ReasonCode::UneconomicRoute, 1)],
+        );
+        assert_eq!(first_route_blocked_designation(&r), None);
+    }
+
+    #[test]
+    fn non_dust_uneconomic_redesignates() {
+        let r = round(
+            snapshot(blocked(RouteStatus::UneconomicAtAnySize)),
+            vec![refuse(A, ReasonCode::UneconomicRoute, MIN_MOVE + 1)],
+        );
+        assert_eq!(first_route_blocked_designation(&r), Some((B, A)));
+    }
+
+    #[test]
+    fn overcap_only_refusal_does_not_redesignate() {
+        // Cap-caused, not route-caused: re-designating away does not help a cap-full destination.
+        let r = round(
+            snapshot(blocked(RouteStatus::Unroutable)),
+            vec![refuse(A, ReasonCode::OverCap, MIN_MOVE + 1_000)],
+        );
+        assert_eq!(first_route_blocked_designation(&r), None);
+    }
+
+    #[test]
+    fn funded_destination_does_not_redesignate() {
+        let mv = AllocatorDecision {
+            action: Action::Move {
+                from: B,
+                to: A,
+                amount: Msat(MIN_MOVE + 1_000),
+                fee_cap: Msat(60),
+                gateway: None,
+            },
+            reason: ReasonCode::SpendingBelowTarget,
+            occurrence: Occurrence(0),
+            idempotency_key: IdempotencyKey(String::new()),
+        };
+        let r = round(
+            snapshot(blocked(RouteStatus::Unroutable)),
+            vec![
+                mv,
+                refuse(A, ReasonCode::SpendingBelowTarget, MIN_MOVE + 1_000),
+            ],
+        );
+        assert_eq!(first_route_blocked_designation(&r), None);
+    }
+
+    #[test]
+    fn routable_pair_does_not_redesignate() {
+        // A Routable status is never a wedge regardless of any refusal.
+        let r = round(
+            snapshot(blocked(RouteStatus::Routable)),
+            vec![refuse(A, ReasonCode::SpendingBelowTarget, MIN_MOVE + 1_000)],
+        );
+        assert_eq!(first_route_blocked_designation(&r), None);
+    }
+
+    #[test]
+    fn no_designation_returns_none() {
+        let mut s = snapshot(BTreeMap::new());
+        s.spending_fed = None;
+        assert_eq!(first_route_blocked_designation(&round(s, vec![])), None);
+    }
 }

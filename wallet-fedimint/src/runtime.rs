@@ -36,6 +36,7 @@ use crate::multi_client::{
     parse_invoice, JoinDeadlineOutcome, MultiClient, ReceiveState, SendState,
 };
 use crate::probe::{assemble_facts, assemble_status, FedimintProbeRunner, ProbeResult};
+use crate::route_econ::RouteQuoteBudget;
 use crate::tick::{
     build_snapshot, decisions_to_apply, pinned_input_problems, ScoredFed, StatusReport, TickPolicy,
     TickReport,
@@ -62,7 +63,7 @@ use wallet_core::{
     ExecutionSummary, Executor, FederationFacts, FederationId, IdempotencyKey, Intent,
     IntentStatus, Journal, Module, Msat, Occurrence, OperationId, OperationKind, OperationRecord,
     OperationStatus, PerformOutcome, ProbeAttempt, ProbeBudgetUsage, ProbePolicy, ReasonCode,
-    Reservations, ScorerPolicy, WatchPolicy,
+    ScorerPolicy, WatchPolicy,
 };
 
 /// Wall-clock in unix millis for the ledger's `created_at_ms` (§8/§9.4). `seq` is the
@@ -330,17 +331,11 @@ struct TickPlan {
 }
 
 #[derive(Clone, Debug)]
-struct EvacuationFallback {
-    from: FederationId,
-    plan: TickPlan,
-}
-
-#[derive(Clone, Debug)]
 pub struct MoveRouteProblem {
     pub(crate) from: FederationId,
     pub(crate) to: FederationId,
-    /// The federation whose gateway is marked unavailable in the planning probe copy so
-    /// `plan_tick` re-runs allocation onto a different route. This is ALWAYS the selected
+    /// The federation whose gateway is marked unavailable in the planning probe copy so the
+    /// tick planner re-runs allocation onto a different route. This is ALWAYS the selected
     /// destination `to`: a destination that cannot receive is skipped directly, and a source
     /// leg that the destination-selected gateway cannot serve is retried against another
     /// eligible destination (an evacuation additionally captures a fallback plan first). There
@@ -609,19 +604,6 @@ impl Runtime {
         TimeoutExecutor::new(self.executor(), self.perform_timeout)
     }
 
-    async fn projected_reservations(&self) -> Result<Reservations, ExecError> {
-        let intents = self.journal.reservation_intents().await?;
-        let mut records = BTreeMap::new();
-        for intent in &intents {
-            if let Some(record) = self.journal.get_move(&intent.idempotency_key).await? {
-                records.insert(intent.idempotency_key.clone(), record);
-            }
-        }
-        Ok(wallet_core::project_reservations(&intents, |key| {
-            records.get(key).cloned()
-        }))
-    }
-
     async fn decide_and_drive(
         &self,
         decision: &AllocatorDecision,
@@ -814,6 +796,7 @@ impl Runtime {
                 to,
                 amount,
                 fee_cap,
+                gateway: None,
             },
             reason,
             occurrence,
@@ -1342,6 +1325,7 @@ impl Runtime {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn service_watch_deadlines(
         &self,
         tick_policy: &TickPolicy,
@@ -1409,12 +1393,12 @@ impl Runtime {
         add_expiry_deadlines(&mut deadlines, &raw_probes, now_ms);
 
         let spending = match self
-            .plan_tick_from_probes(tick_policy, &ScorerPolicy::default(), raw_probes)
+            .designated_spending_from_probes(tick_policy, &ScorerPolicy::default(), &raw_probes)
             .await
         {
-            Ok(plan) => plan.snapshot.spending_fed,
+            Ok(spending) => spending,
             Err(e) => {
-                tracing::warn!(error = ?e, "watch: planning failed while computing probe deadlines");
+                tracing::warn!(error = ?e, "watch: designation failed while computing probe deadlines");
                 tick_policy.spending_fed
             }
         };
@@ -2245,6 +2229,7 @@ impl Runtime {
                 to,
                 amount,
                 fee_cap,
+                gateway: None,
             },
             reason: ReasonCode::ActiveProbe,
             occurrence,
@@ -2690,7 +2675,7 @@ impl Runtime {
         // exists, so a storage fault there can error out AFTER the `Started` row was written.
         // Terminalize the tick `Failed` on that path too, or `history/show` leaves it in-flight
         // until reconcile repairs it an hour later (§10.4), same as the bail paths below.
-        let plan = match self.plan_tick(policy, &ScorerPolicy::default()).await {
+        let plan = match self.plan_tick(policy).await {
             Ok(plan) => plan,
             Err(e) => {
                 self.record_tick_failed(&tick_key, &e.to_string()).await;
@@ -2795,7 +2780,7 @@ impl Runtime {
     /// decisions. The route check reflects the pinned gateway when one was supplied, same as `tick`.
     pub async fn status(&self, policy: &TickPolicy) -> anyhow::Result<StatusReport> {
         let scorer_policy = ScorerPolicy::default();
-        let plan = self.plan_tick(policy, &scorer_policy).await?;
+        let plan = self.plan_tick(policy).await?;
         // Surface (do NOT bail on) any pinned-input problem the equivalent `tick` would fail on, so
         // the operator sees BOTH the warning and the full scored view that explains it.
         for problem in pinned_input_problems(policy, &plan.snapshot, &plan.probes, &plan.decisions)
@@ -2836,7 +2821,7 @@ impl Runtime {
             let mut facts = assemble_facts(probe, *id);
             facts.active_probe = active_probe;
             // The POST-GATE fundability the tick actually applies (§5.1.3), read from the exact
-            // snapshot `plan_tick` decided on — NOT re-derived from `score()`, which ignores the
+            // snapshot the planner decided on — NOT re-derived from `score()`, which ignores the
             // active probe. `build_snapshot` maps 1:1 over the probes, so the fed is always
             // present; the `is_some_and` default is a defensive fail-closed, not a real branch.
             let gated_eligible = plan
@@ -2861,116 +2846,78 @@ impl Runtime {
         })
     }
 
-    /// Probe, build, decide, and fold executor-route facts back into the probe view before the
-    /// caller either reports a dry run or applies money moves.
+    /// Probe, then use the actor-owned planner — the same implementation the daemon runs through
+    /// `DecideTickRound`.
     ///
-    /// Without an explicit `--gateway`, the executor routes each fresh `Move`/`Evacuate` through
-    /// the destination federation's FIRST registered gateway, then requires that same gateway to
-    /// serve the send leg. The raw probe only knows whether each federation has some usable
-    /// gateway. This loop validates the exact executor route for each FRESH decided send-required
-    /// action; when a destination's concrete route cannot support the move, that destination is
-    /// marked unavailable in the planning copy and the pure `build_snapshot`/`decide` path runs
-    /// again. Same-key replays are left to `apply`, which resumes the stored intent and its cached
-    /// `MoveRecord` gateway. The preflight uses the same `decisions_to_apply` projection as
-    /// `apply`.
-    /// `status` still reports the RAW scored probe view so a route-revision does not relabel a
-    /// healthy federation as generally unprobed just because this tick's concrete move route failed.
-    async fn plan_tick(
-        &self,
-        policy: &TickPolicy,
-        scorer_policy: &ScorerPolicy,
-    ) -> anyhow::Result<TickPlan> {
+    /// Pinned-input problems are NOT raised here: `tick` bails on them and `status` reports them,
+    /// so the decision belongs to the caller.
+    async fn plan_tick(&self, policy: &TickPolicy) -> anyhow::Result<TickPlan> {
         let raw_probes = self.probe_all().await;
-        self.plan_tick_from_probes(policy, scorer_policy, raw_probes)
-            .await
+        let round = crate::service::plan_tick_round(
+            self.journal.as_ref(),
+            Some(self),
+            raw_probes.clone(),
+            policy,
+            now_ms(),
+            Some(RouteQuoteBudget::starting_at(now_ms())),
+        )
+        .await
+        .map_err(exec_err)?;
+        Ok(TickPlan {
+            raw_probes,
+            probes: round.probes,
+            active_probes: round.active_probes,
+            snapshot: round.snapshot,
+            decisions: round.decisions,
+        })
     }
 
-    async fn plan_tick_from_probes(
+    /// Price the funding pairs of `snapshot` that `priced` does not already cover, in place
+    /// (`route_econ::price_missing_pairs`). `None` budget = no route I/O at all, which the
+    /// allocator reads as the permissive `min_move` fallback. The pinned gateway is threaded
+    /// through so an operator pin OVERRIDES route selection (§Q4).
+    pub(crate) async fn price_missing_routes(
+        &self,
+        snapshot: &AllocatorSnapshot,
+        budget: &mut RouteQuoteBudget,
+        priced: &mut BTreeMap<(FederationId, FederationId), wallet_core::RouteEconomics>,
+    ) {
+        crate::route_econ::price_missing_pairs(
+            self.mc.as_ref(),
+            self.pinned_gateway.as_ref(),
+            snapshot,
+            budget,
+            priced,
+        )
+        .await
+    }
+
+    pub(crate) async fn designated_spending_from_probes(
         &self,
         policy: &TickPolicy,
         scorer_policy: &ScorerPolicy,
-        raw_probes: Vec<(FederationId, ProbeResult)>,
-    ) -> anyhow::Result<TickPlan> {
-        let mut probes = raw_probes.clone();
+        probes: &[(FederationId, ProbeResult)],
+    ) -> anyhow::Result<Option<FederationId>> {
         let auto_joined = self.auto_joined_candidates().await?;
-        let reservations = self.projected_reservations().await.map_err(exec_err)?;
-        let mut route_revisions = 0usize;
-        let mut evacuation_fallback: Option<EvacuationFallback> = None;
-        loop {
-            let mut preliminary = build_snapshot(
-                &probes,
-                policy,
-                scorer_policy,
-                &auto_joined,
-                &BTreeMap::new(),
-            );
-            preliminary.reservations = reservations.clone();
-            let active_probes = self
-                .active_probe_verdicts(&probes, preliminary.spending_fed, &policy.probe_gate_policy)
-                .await;
-            let mut snapshot =
-                build_snapshot(&probes, policy, scorer_policy, &auto_joined, &active_probes);
-            snapshot.reservations = reservations.clone();
-            let decisions = wallet_core::decide(&snapshot, policy.occurrence);
-            if let Some(fallback) = &evacuation_fallback {
-                let still_trying_evacuation = decisions.iter().any(|d| {
-                    matches!(&d.action, Action::Evacuate { from, .. } if *from == fallback.from)
-                });
-                if !still_trying_evacuation {
-                    return Ok(fallback.plan.clone());
-                }
-            }
-            let Some(problem) = self.first_move_route_problem(&decisions).await else {
-                return Ok(TickPlan {
-                    raw_probes,
-                    probes,
-                    active_probes,
-                    snapshot,
-                    decisions,
-                });
-            };
-
-            if problem.evacuation_source_route {
-                evacuation_fallback = Some(EvacuationFallback {
-                    from: problem.from,
-                    plan: TickPlan {
-                        raw_probes: raw_probes.clone(),
-                        probes: probes.clone(),
-                        active_probes: active_probes.clone(),
-                        snapshot: snapshot.clone(),
-                        decisions: decisions.clone(),
-                    },
-                });
-            }
-            let changed = mark_gateway_unavailable(&mut probes, problem.mark_unavailable);
-            tracing::warn!(
-                from = %problem.from.to_hex(),
-                to = %problem.to.to_hex(),
-                marked_unavailable = %problem.mark_unavailable.to_hex(),
-                gateway = %problem.gateway.as_ref().map(|g| g.0.as_str()).unwrap_or("<none>"),
-                error = %problem.error,
-                "tick: planned send-required route failed executor gateway validation; revising this tick's fundable set"
-            );
-            if !changed {
-                return Ok(TickPlan {
-                    raw_probes,
-                    probes,
-                    active_probes,
-                    snapshot,
-                    decisions,
-                });
-            }
-            route_revisions += 1;
-            if route_revisions > probes.len() {
-                return Ok(TickPlan {
-                    raw_probes,
-                    probes,
-                    active_probes,
-                    snapshot,
-                    decisions,
-                });
-            }
-        }
+        let preliminary = build_snapshot(
+            probes,
+            policy,
+            scorer_policy,
+            &auto_joined,
+            &BTreeMap::new(),
+        );
+        let active_probes = crate::service::active_probe_verdicts(
+            self.journal.as_ref(),
+            probes,
+            preliminary.spending_fed,
+            &policy.probe_gate_policy,
+            now_ms(),
+        )
+        .await;
+        Ok(
+            build_snapshot(probes, policy, scorer_policy, &auto_joined, &active_probes)
+                .spending_fed,
+        )
     }
 
     /// The funding gate's PROBE-GATED set: every JOINED (`0x03`) federation that is NOT
@@ -2996,42 +2943,6 @@ impl Runtime {
             joined.into_iter().map(|(id, _)| id),
             report.candidates.iter().map(|(id, rec)| (*id, rec.state)),
         ))
-    }
-
-    async fn active_probe_verdicts(
-        &self,
-        probes: &[(FederationId, ProbeResult)],
-        spending: Option<FederationId>,
-        gate_policy: &ProbePolicy,
-    ) -> BTreeMap<FederationId, ActiveProbeVerdict> {
-        let Some(source) = spending else {
-            return BTreeMap::new();
-        };
-        let mut active = BTreeMap::new();
-        for (id, _) in probes {
-            if *id == source {
-                continue;
-            }
-            match self.journal.probe_record(id).await {
-                Ok(record) => {
-                    let verdict = probe_verdict(
-                        &record.map(|r| r.attempts).unwrap_or_default(),
-                        source,
-                        now_ms(),
-                        gate_policy,
-                    );
-                    active.insert(*id, verdict);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        federation = %id.to_hex(),
-                        error = ?e,
-                        "tick: unreadable probe record; omitting the active-probe verdict"
-                    );
-                }
-            }
-        }
-        active
     }
 
     async fn ensure_fresh_tick_decisions(
@@ -3093,11 +3004,10 @@ impl Runtime {
 
     /// The first route problem in this tick's fresh, apply-bound send-required decisions.
     /// Destination failures and send-gateway source failures both mark the selected
-    /// destination unavailable, letting `plan_tick` rerun allocation and fall through to a
+    /// destination unavailable, letting the tick planner rerun allocation and fall through to a
     /// later eligible federation when one can actually serve the route. If every destination
-    /// fails an evacuation source-route preflight, `plan_tick` falls back to the last
-    /// evacuation plan and lets `apply` surface the real execution failure loudly instead of
-    /// silently reporting that nothing needed to run.
+    /// fails an evacuation source-route preflight, the planner falls back to the last evacuation
+    /// round and lets execution surface the real failure loudly.
     pub(crate) async fn first_move_route_problem(
         &self,
         decisions: &[AllocatorDecision],
@@ -3149,7 +3059,7 @@ impl Runtime {
     /// Preflight the executor's concrete gateway route for a fresh send-required action.
     ///
     /// Destination failures mean this tick's chosen target cannot receive through the same
-    /// gateway the executor will use, so `plan_tick` marks that destination unavailable and
+    /// gateway the executor will use, so the planner marks that destination unavailable and
     /// reruns allocation. Source-side failures are also tied to the destination-selected
     /// gateway: if that gateway cannot serve the source, another eligible destination may
     /// still work and should be tried before the executor commits any receive-side artifact.
@@ -3159,9 +3069,10 @@ impl Runtime {
         from: FederationId,
         to: FederationId,
     ) -> Result<(), MoveRouteProblem> {
-        // Mirror the executor's `resolve_gateway` SCAN (§15.6): the route is usable iff SOME
-        // gateway in the destination's registered set (or the single pinned gateway) serves the
-        // destination AND — for a send — the source.
+        // Mirror the executor's serving-both-ends predicate (§15.6): the route is usable iff SOME
+        // registered gateway (or the pin) serves the destination and the source. The executor's
+        // economic argmin need not be repeated here because this preflight is only a routability
+        // verdict.
         let candidates = match self.route_gateway_candidates(&to).await {
             Ok(candidates) => candidates,
             Err(error) => {
@@ -4482,6 +4393,7 @@ mod tests {
                 to,
                 amount: Msat(100_000),
                 fee_cap: Msat(1_000),
+                gateway: None,
             },
             reason: ReasonCode::StandbyBelowTarget,
             occurrence: Occurrence(0),
@@ -4500,6 +4412,7 @@ mod tests {
                 to,
                 amount: Msat(100_000),
                 fee_cap: Msat(1_000),
+                gateway: None,
             },
             reason: ReasonCode::ShutdownNotice,
             occurrence: Occurrence(0),
@@ -4658,6 +4571,7 @@ mod tests {
                     to: candidate,
                     amount: Msat(policy.amount_msat),
                     fee_cap: Msat(policy.leg_fee_cap_msat),
+                    gateway: None,
                 },
                 max_fee: Some(Msat(policy.leg_fee_cap_msat)),
                 status: IntentStatus::Done,

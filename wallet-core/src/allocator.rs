@@ -139,7 +139,13 @@ fn reserved(map: &BTreeMap<FederationId, u64>, fed: FederationId) -> u64 {
 /// `0..=40000` x bps `1..=10000`: this form is both overdraw-safe (never breaks the invariant)
 /// AND maximal (`result + 1` always overdraws). `u128` intermediate so `(budget+1)*10000`
 /// cannot overflow even at `u64::MAX`.
-fn max_fundable(budget: u64, bps: u16) -> u64 {
+///
+/// PUBLIC because the route-economics pricing pass must bound the amounts `fund_into` can emit
+/// (`wallet-fedimint`'s `route_econ::maximum_funding_amount`): a published floor is only a valid
+/// UPPER bound while the fee quotes behind it were taken at or above every amount the allocator
+/// can actually move. A second copy of this expression that drifted would silently break that
+/// bound in the under-blocking direction, so there is exactly one.
+pub fn max_fundable(budget: u64, bps: u16) -> u64 {
     let denom = 10_000u128 + bps as u128;
     (((budget as u128 + 1) * 10_000 - 1) / denom) as u64
 }
@@ -147,7 +153,7 @@ fn max_fundable(budget: u64, bps: u16) -> u64 {
 /// The proportional fee cap stamped on a funding `Move`: `amount * bps / 10000`. Paired with
 /// [`max_fundable`] so `amount + move_fee_cap(amount) <= budget` holds under integer floors,
 /// keeping the executor's `amount + fee_cap` spend within the source balance.
-fn move_fee_cap(amount: Msat, bps: u16) -> Msat {
+pub fn move_fee_cap(amount: Msat, bps: u16) -> Msat {
     Msat((amount.0 as u128 * bps as u128 / 10_000) as u64)
 }
 
@@ -218,12 +224,39 @@ fn fund_into(
         return;
     }
 
-    // A shortfall below the protocol move floor is DUST: the destination is effectively at
-    // target, and a sub-floor move could only fail lnv2's minimum-incoming-contract check at
-    // perform time — every tick, forever (the 24h soak logged 91 such doomed moves). Silent
-    // like the self-fund no-op: a refusal row every cycle for a sub-5-sat gap would itself
-    // be the noise this floor removes.
-    if want < snapshot.min_move.0 {
+    // ROUTE ECONOMICS (`docs/route-economics-decisions.md` §Q5). The I/O layer prices each
+    // ordered pair; `decide()` only READS the entry, staying pure:
+    //  - ABSENT — permissive: the bare protocol `min_move` floor, i.e. exactly the behavior
+    //    before route economics existed. Absence is transient (first tick, a failed quote RPC,
+    //    an exhausted per-tick quote budget); blocking on it would stall every rebalance on any
+    //    quote hiccup, and the proportional `fee_cap` is still the money backstop.
+    //  - `Routable` — the floor rises to the pair's `min_viable_amount`.
+    //  - `Unroutable` / `UneconomicAtAnySize` — emit NO move for this pair (see `route_blocked`).
+    let route = source.and_then(|src| snapshot.route_economics_by_pair.get(&(src.id, dest.id)));
+    // Never BELOW the protocol floor: `min_viable_amount` is IO-supplied, while lnv2's minimum
+    // incoming contract is a protocol fact the allocator keeps enforcing itself either way.
+    let floor = match route {
+        Some(route) if route.status == RouteStatus::Routable => {
+            route.min_viable_amount.0.max(snapshot.min_move.0)
+        }
+        _ => snapshot.min_move.0,
+    };
+    let route_blocked = matches!(
+        route.map(|route| route.status),
+        Some(RouteStatus::Unroutable | RouteStatus::UneconomicAtAnySize)
+    );
+    let uneconomic = route.map(|route| route.status) == Some(RouteStatus::UneconomicAtAnySize);
+
+    // A shortfall below the move floor is DUST: the destination is effectively at target, and a
+    // sub-floor move could only fail (lnv2's minimum-incoming-contract check, or the fee cap)
+    // at perform time — every tick, forever (the 24h soak logged 91 such doomed moves). Silent
+    // like the self-fund no-op: a refusal row every cycle for a gap that is not worth moving
+    // would itself be the noise this floor removes. A `Routable` pair's economic floor is the
+    // same kind of statement about the same gap, so it is silent for the same reason.
+    //
+    // `UneconomicAtAnySize` is the deliberate exception: §Q5 requires its standing
+    // misconfiguration to remain visible rather than disappear behind the dust rule.
+    if want < floor && !uneconomic {
         return;
     }
 
@@ -232,9 +265,10 @@ fn fund_into(
     // exceed the cap.
     let cap_room = cap_room_with(snapshot, dest, credited);
     let amount = want.min(cap_room).min(available);
-    // Cap/available CRUMBS below the floor are equally unperformable: emit no move — the
-    // shortfall refusals below still record WHY the destination stays underfunded.
-    let amount = if amount < snapshot.min_move.0 {
+    // Cap/available CRUMBS below the floor are equally unperformable, and a pair nothing can
+    // route (or that no size can make economic) is unperformable at ANY amount: emit no move —
+    // the shortfall refusals below still record WHY the destination stays underfunded.
+    let amount = if route_blocked || amount < floor {
         0
     } else {
         amount
@@ -242,14 +276,23 @@ fn fund_into(
     if let Some(src) = source.filter(|_| amount > 0) {
         push_and_reserve(
             out,
-            move_decision(kind, src.id, dest.id, Msat(amount), snapshot, occurrence),
+            move_decision(
+                kind,
+                src.id,
+                dest.id,
+                Msat(amount),
+                snapshot,
+                occurrence,
+                route.and_then(|route| route.resolved_gateway.clone()),
+            ),
             credited,
             debited,
         );
     }
     // Both refusals below share the full arithmetic: `amount` (the emitted move, possibly 0)
-    // was clamped by whichever of `want` / `cap_room` / `available` was smallest, and a reader
-    // recovers WHICH from these figures alone. `available` is `None` iff there was no source.
+    // was clamped by `want` / `cap_room` / `available`, then suppressed when it did not clear the
+    // finite route floor. A reader recovers both stages from these figures alone. `available` is
+    // `None` iff there was no source.
     let diagnostics = RefusalDiagnostics {
         source: source_id,
         want: Some(Msat(want)),
@@ -265,8 +308,34 @@ fn fund_into(
         max_fee_bps: Some(snapshot.max_fee_bps_of_move),
         cap_room: Some(Msat(cap_room)),
         amount: Some(Msat(amount)),
+        // This public diagnostic retains its established meaning: the protocol minimum. A
+        // route-economics deferral is deliberately silent; an indefinitely uneconomic route is
+        // explained by its specific reason below.
         min_move: Some(snapshot.min_move),
     };
+    // Surface the standing misconfiguration INSTEAD of the ordinary shortfall refusal (the
+    // shortfall is fully explained by the route being uneconomic), including while the current
+    // gap is protocol dust. The over-cap refusal is still pushed first when it applies: it is the
+    // POPULATED twin of the figure-less row `decide()` already emitted for an externally over-cap
+    // fed, and `push_decision`'s in-place replace only works if it is pushed.
+    if uneconomic {
+        if want > cap_room {
+            push_decision(
+                out,
+                refuse_decision(dest.id, ReasonCode::OverCap, occurrence, diagnostics),
+            );
+        }
+        push_decision(
+            out,
+            refuse_decision(
+                dest.id,
+                ReasonCode::UneconomicRoute,
+                occurrence,
+                diagnostics,
+            ),
+        );
+        return;
+    }
     if want > cap_room {
         push_decision(
             out,
@@ -333,12 +402,14 @@ fn push_and_reserve(
             to,
             amount,
             fee_cap,
+            ..
         }
         | Action::Evacuate {
             from,
             to,
             amount,
             fee_cap,
+            ..
         } => Some((*from, *to, amount.0, fee_cap.0)),
         _ => None,
     };
@@ -471,6 +542,7 @@ fn reason_tag(reason: ReasonCode) -> &'static str {
         ReasonCode::OverCap => "over_cap",
         ReasonCode::NotProbed => "not_probed",
         ReasonCode::LowReputation => "low_reputation",
+        ReasonCode::UneconomicRoute => "uneconomic_route",
         ReasonCode::UserInitiated => "user_initiated",
         ReasonCode::StandingInstruction => "standing_instruction",
         ReasonCode::ActiveProbe => "active_probe",
@@ -542,6 +614,15 @@ fn evacuate_decision(
                     to: to.id,
                     amount,
                     fee_cap: snapshot.max_fee,
+                    // Route economics NEVER gates an evacuation — a dying federation must be
+                    // drained even when the route prices badly, so `status` is not consulted
+                    // here and there is no floor. The pair's gateway is carried when it happens
+                    // to have been priced (the funding pairs are), purely so `perform` can skip
+                    // a re-scan; otherwise `None` and the executor resolves as it always has.
+                    gateway: snapshot
+                        .route_economics_by_pair
+                        .get(&(from.id, to.id))
+                        .and_then(|route| route.resolved_gateway.clone()),
                 },
                 reason,
                 occurrence,
@@ -581,6 +662,7 @@ fn move_decision(
     amount: Msat,
     snapshot: &AllocatorSnapshot,
     occurrence: Occurrence,
+    gateway: Option<GatewayUrl>,
 ) -> AllocatorDecision {
     AllocatorDecision {
         action: Action::Move {
@@ -590,6 +672,9 @@ fn move_decision(
             // Proportional cap (br-ljj.2): scales with the move, unlike `Evacuate`'s absolute
             // `snapshot.max_fee`. Sized to fit the source budget by `max_fundable` above.
             fee_cap: move_fee_cap(amount, snapshot.max_fee_bps_of_move),
+            // The pair's cheapest both-ends gateway, i.e. the exact route the `min_viable_amount`
+            // floor above was computed against — so planning and perform agree on the economics.
+            gateway,
         },
         reason: kind.reason(),
         occurrence,

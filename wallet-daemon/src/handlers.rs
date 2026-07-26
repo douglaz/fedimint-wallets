@@ -341,6 +341,7 @@ pub async fn move_op(
         to: request.to,
         amount: request.amount,
         fee_cap,
+        gateway: None,
     };
     let balances = sample_balances(&state, &[request.from, request.to]).await?;
     // Dest-side fail-fast: a FRESH move to a joined-but-unopened `to` returns 503 at admission
@@ -882,6 +883,7 @@ fn reason_tag(reason: ReasonCode) -> &'static str {
         ReasonCode::OverCap => "over_cap",
         ReasonCode::NotProbed => "not_probed",
         ReasonCode::LowReputation => "low_reputation",
+        ReasonCode::UneconomicRoute => "uneconomic_route",
         ReasonCode::UserInitiated => "user_initiated",
         ReasonCode::StandingInstruction => "standing_instruction",
         ReasonCode::ActiveProbe => "active_probe",
