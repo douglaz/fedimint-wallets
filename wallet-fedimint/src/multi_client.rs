@@ -45,6 +45,14 @@ use wallet_core::{ExecError, FederationId, FeeBreakdown, IdempotencyKey, Msat};
 /// load-bearing: a variable-length prefix could alias (`[0x01,0x00]` vs `[0x01],[0x00,..]`).
 const CLIENT_PREFIX_TAG: u8 = 0x01;
 
+/// The join lock is held across the federation-config preview fetch. Cap that fetch so a slow or
+/// unreachable federation cannot hold `join_lock` — and thereby queue every other join/recovery
+/// (NOT money ops; pay/receive/move never take the lock) — indefinitely. Generous enough for a
+/// healthy multi-guardian preview (each guardian call is itself request-bounded), short enough to
+/// bound the worst case. On timeout the join/recovery fails cleanly: its recovery reservation (if
+/// any) drops on the early return and no fresh db partition was allocated yet.
+const PREVIEW_UNDER_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// One fedimint client per joined federation. `db` is the CLIENT store — each client `i`
 /// at `[0x01] ++ u32_le(db_prefix)`, plus fedimint's own client secret — while the app
 /// journal lives in its OWN separate `Database` (see [`Self::new`] for why co-locating
@@ -208,10 +216,23 @@ impl MultiClient {
         }
 
         let preview = match join_deadline(deadline, async {
-            self.client_builder()
-                .await?
-                .preview(self.connectors.clone(), &invite)
+            // Bound the preview even when the caller sets NO deadline (a user-initiated join), so an
+            // unreachable fed cannot hold `join_lock` — and queue every other join — indefinitely.
+            // When a caller deadline is also present, whichever bound is tighter fires first.
+            let build_and_preview = async {
+                self.client_builder()
+                    .await?
+                    .preview(self.connectors.clone(), &invite)
+                    .await
+            };
+            runtime::timeout(PREVIEW_UNDER_LOCK_TIMEOUT, build_and_preview)
                 .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "federation preview timed out after {}s while holding the join lock",
+                        PREVIEW_UNDER_LOCK_TIMEOUT.as_secs()
+                    )
+                })?
         })
         .await
         {
@@ -302,8 +323,8 @@ impl MultiClient {
         ensure_recover_not_registered(self.is_registered(&id).await?, &id)?;
 
         // Serialize FRESH-prefix allocation + partition materialization with `join` (both take
-        // `next_db_prefix`). Held only across the bounded preview fetch + `recover` init — NOT the
-        // long module replay, which runs after the lock is released.
+        // `next_db_prefix`). Held only across the preview fetch (bounded by `PREVIEW_UNDER_LOCK_TIMEOUT`
+        // below) + `recover` init — NOT the long module replay, which runs after the lock is released.
         let join_guard = self.join_lock.lock().await;
         ensure_recover_not_registered(self.is_registered(&id).await?, &id)?;
         // Keep this per-fed reservation from BEFORE prefix allocation through the in-memory insert.
@@ -311,11 +332,22 @@ impl MultiClient {
         // letting unrelated federation joins proceed, while `join`/`open_one` still cannot open a
         // second client for THIS federation until the reservation drops (D4 concurrency).
         let _recovery_reservation = self.reserve_recovery(id)?;
-        let preview = self
-            .client_builder()
-            .await?
-            .preview(self.connectors.clone(), &invite)
-            .await?;
+        // Bound the preview so an unreachable/slow fed cannot hold `join_lock` (and queue every other
+        // join/recovery) indefinitely. On timeout `_recovery_reservation` drops on the early return
+        // and no fresh partition was allocated yet (`next_db_prefix` runs below), so a retry is clean.
+        let builder = self.client_builder().await?;
+        let preview = runtime::timeout(
+            PREVIEW_UNDER_LOCK_TIMEOUT,
+            builder.preview(self.connectors.clone(), &invite),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "federation {} preview timed out after {}s while holding the join lock; recovery abandoned",
+                id.to_hex(),
+                PREVIEW_UNDER_LOCK_TIMEOUT.as_secs(),
+            )
+        })??;
         let db_prefix = self.next_db_prefix().await?;
         // `recover` initializes the fresh partition (its config row makes the prefix visible to a
         // concurrent `next_db_prefix`) and spawns the module-recovery task; the replay is awaited
@@ -398,6 +430,15 @@ impl MultiClient {
             .read()
             .expect("active recovery set lock poisoned")
             .contains(id)
+    }
+
+    /// Whether a recovery of `id` is in flight — the reservation is held from before the fresh
+    /// partition is allocated until AFTER `recover` inserts the live client. The daemon reads this
+    /// so a terminal recovery status is not reported while `/v1/balance` still omits the fed: in the
+    /// window between `complete_recovery`'s commit (which terminalizes the intent) and the in-memory
+    /// client insert, the op would otherwise read succeeded with the fed not yet open.
+    pub fn is_recovering(&self, id: &FederationId) -> bool {
+        self.recovery_in_progress(id)
     }
 
     fn ensure_recovery_not_in_progress(&self, id: &FederationId) -> anyhow::Result<()> {
