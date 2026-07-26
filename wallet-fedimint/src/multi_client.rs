@@ -1201,8 +1201,10 @@ async fn wait_for_recoveries_with_progress(client: &Client) -> anyhow::Result<()
 }
 
 /// Invoice expiry (seconds) passed to lnv2 `receive`. Spec §4 fixes this at one hour; the
-/// executor may size it per-move in step 4b.
-const RECEIVE_EXPIRY_SECS: u32 = 3600;
+/// executor may size it per-move in step 4b. `pub(crate)` so the settlement-stall watchdog can
+/// exclude receives still within their invoice validity (a legitimately-unpaid open invoice is not
+/// a stall) using the SAME expiry the invoice was actually minted with.
+pub(crate) const RECEIVE_EXPIRY_SECS: u32 = 3600;
 
 /// Op-log page size for [`MultiClient::backfill_ops`]. Backfill pages to EXHAUSTION (spec
 /// §9.2), so this only trades round-trips against per-page memory; it is not a coverage cap.
