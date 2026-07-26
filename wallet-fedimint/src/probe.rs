@@ -963,6 +963,7 @@ mod tests {
             min_move: Msat(5_000),
             reservations: wallet_core::Reservations::default(),
             now: 0,
+            route_economics_by_pair: Default::default(),
         };
 
         let decisions = decide(&snapshot, Occurrence(1));

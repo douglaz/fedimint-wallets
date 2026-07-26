@@ -89,6 +89,7 @@ fn move_intent(k: &str, status: IntentStatus) -> Intent {
             to: fed(2),
             amount: Msat(100_000),
             fee_cap: Msat(2_000),
+            gateway: None,
         },
         max_fee: Some(Msat(2_000)),
         status,
@@ -547,8 +548,7 @@ async fn record_refusals_persist_diagnostics_across_serialization() {
 fn refusal_diagnostics_missing_max_fee_bps_decodes_to_none() {
     // A refusal row persisted before `max_fee_bps` existed (br-ljj.1/.2 wrote such rows to the
     // live pilot journal) has no such key. Refusal rows are re-decoded on every `history` read,
-    // so document the persisted-row behavior directly: an object without the key adopts `None`
-    // while the other figures still decode as written.
+    // so document the persisted-row behavior directly.
     let mut json = serde_json::to_value(RefusalDiagnostics {
         source_spendable: Some(Msat(10_000)),
         max_fee_bps: Some(100),

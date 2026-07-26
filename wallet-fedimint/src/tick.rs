@@ -207,6 +207,11 @@ pub fn build_snapshot(
         // lnv2's minimum incoming contract: a fund/top-up sized below this could only fail
         // at perform time, so the allocator treats a sub-floor shortfall as dust.
         min_move: Msat(crate::executor::MINIMUM_INCOMING_CONTRACT_MSAT),
+        // Left EMPTY here, and filled by the caller's I/O step: pricing a pair needs live fee
+        // quotes, and this function is pure. Empty reads as "not priced this tick", the
+        // permissive `min_move` fallback — which is also exactly what the pure golden tests and
+        // any probe-only assembler want.
+        route_economics_by_pair: BTreeMap::new(),
         reservations: wallet_core::Reservations::default(),
         now: policy.now,
     }
@@ -1196,6 +1201,7 @@ mod tests {
                 to: fed_id(2),
                 amount: Msat(1),
                 fee_cap: Msat(50_000),
+                gateway: None,
             },
             reason: ReasonCode::ShutdownNotice,
             occurrence: Occurrence(0),

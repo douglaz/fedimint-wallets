@@ -1,5 +1,6 @@
 #[rustfmt::skip]
 mod golden {
+use std::collections::BTreeMap;
 use wallet_core::*;
 
 macro_rules! id { ($id:expr) => { FederationId([$id; 32]) }; }
@@ -19,18 +20,32 @@ macro_rules! fed {
 // move's `fee_cap` is `amount / 100` and the source `available` is `budget * 10000/10100`.
 const GOLDEN_MOVE_BPS: u16 = 100;
 macro_rules! snap {
-    ([$($fed:expr),*], $spending:expr, $standby:expr, $cap:expr, $target:expr, $standby_target:expr, $now:expr) => { AllocatorSnapshot { federations: vec![$($fed),*], spending_fed: $spending, standby_fed: $standby, per_fed_cap: msat!($cap), target_spending_balance: msat!($target), standby_target: msat!($standby_target), max_fee: msat!(500), max_fee_bps_of_move: GOLDEN_MOVE_BPS, min_move: Msat(0), reservations: Reservations::default(), now: $now } };
+    // `route_economics_by_pair` starts EMPTY — no pair priced — which is the permissive
+    // `min_move`-only fallback, i.e. the pre-route-economics behavior every golden below asserts.
+    // The `route_*` tests populate it explicitly.
+    ([$($fed:expr),*], $spending:expr, $standby:expr, $cap:expr, $target:expr, $standby_target:expr, $now:expr) => { AllocatorSnapshot { federations: vec![$($fed),*], spending_fed: $spending, standby_fed: $standby, per_fed_cap: msat!($cap), target_spending_balance: msat!($target), standby_target: msat!($standby_target), max_fee: msat!(500), max_fee_bps_of_move: GOLDEN_MOVE_BPS, min_move: Msat(0), route_economics_by_pair: BTreeMap::new(), reservations: Reservations::default(), now: $now } };
 }
 macro_rules! decision {
     ($action:expr, $reason:expr, $occurrence:expr, $key:expr) => { vec![AllocatorDecision { action: $action, reason: $reason, occurrence: $occurrence, idempotency_key: $key }] };
 }
 macro_rules! move_action {
     // A funding move's `fee_cap` is PROPORTIONAL (br-ljj.2): it follows from the amount rather
-    // than being the absolute `snapshot.max_fee`, which only `evacuate!` still carries.
-    ($from:expr, $to:expr, $amount:expr) => { Action::Move { from: id!($from), to: id!($to), amount: msat!($amount), fee_cap: msat!($amount * GOLDEN_MOVE_BPS as u64 / 10_000) } };
+    // than being the absolute `snapshot.max_fee`, which only `evacuate!` still carries. The
+    // 4-arg form asserts the preselected route stamped from the pair's `resolved_gateway`.
+    ($from:expr, $to:expr, $amount:expr) => { move_action!($from, $to, $amount, None) };
+    ($from:expr, $to:expr, $amount:expr, $gateway:expr) => { Action::Move { from: id!($from), to: id!($to), amount: msat!($amount), fee_cap: msat!($amount * GOLDEN_MOVE_BPS as u64 / 10_000), gateway: $gateway } };
 }
 macro_rules! evacuate {
-    ($from:expr, $to:expr, $amount:expr) => { Action::Evacuate { from: id!($from), to: id!($to), amount: msat!($amount), fee_cap: msat!(500) } };
+    ($from:expr, $to:expr, $amount:expr) => { evacuate!($from, $to, $amount, None) };
+    ($from:expr, $to:expr, $amount:expr, $gateway:expr) => { Action::Evacuate { from: id!($from), to: id!($to), amount: msat!($amount), fee_cap: msat!(500), gateway: $gateway } };
+}
+macro_rules! gateway { ($url:expr) => { Some(GatewayUrl($url.to_owned())) }; }
+macro_rules! route {
+    // One `route_economics_by_pair` entry: the ordered pair, its cheapest both-ends gateway, its
+    // economic floor, and its status.
+    ($from:expr, $to:expr, $gateway:expr, $floor:expr, $status:expr) => {
+        ((id!($from), id!($to)), RouteEconomics { resolved_gateway: $gateway, min_viable_amount: msat!($floor), status: $status })
+    };
 }
 macro_rules! refuse {
     // `diagnostics` is intentionally omitted from the expected value: `RefusalDiagnostics`
@@ -62,6 +77,7 @@ fn reason_tag(reason: ReasonCode) -> &'static str {
         ReasonCode::OverCap => "over_cap",
         ReasonCode::NotProbed => "not_probed",
         ReasonCode::LowReputation => "low_reputation",
+        ReasonCode::UneconomicRoute => "uneconomic_route",
         ReasonCode::UserInitiated => "user_initiated",
         ReasonCode::StandingInstruction => "standing_instruction",
         ReasonCode::ActiveProbe => "active_probe",
@@ -129,6 +145,164 @@ fn floor_does_not_block_a_real_shortfall() {
     let mut snapshot = snap!([fed!(1, 200_000, true, false, true), fed!(2, 94_000, true, false, true)], Some(id!(1)), Some(id!(2)), 500_000, 50_000, 100_000, 2700);
     snapshot.min_move = Msat(5_000);
     assert_eq!(decide(&snapshot, occ(1)), decision!(move_action!(1, 2, 6_000), ReasonCode::StandbyBelowTarget, occ(1), move_key(1, 2, 1)));
+}
+
+// --- route economics (docs/route-economics-decisions.md) ---
+//
+// One golden per `route_economics_by_pair` branch. Every case uses the SAME shape — spending fed
+// 1 holding 200_000 with a 50_000 target, standby fed 2 holding 94_000 against a 100_000 target,
+// so the pair (1 -> 2) has a real 6_000 shortfall — and varies only the pair's entry, so the
+// branch under test is the only thing that moves.
+
+fn standby_shortfall_snapshot() -> AllocatorSnapshot {
+    let mut snapshot = snap!([fed!(1, 200_000, true, false, true), fed!(2, 94_000, true, false, true)], Some(id!(1)), Some(id!(2)), 500_000, 50_000, 100_000, 6000);
+    snapshot.min_move = Msat(5_000);
+    snapshot
+}
+
+#[test]
+fn a_missing_route_entry_falls_back_to_the_permissive_protocol_floor() {
+    // §Q5 MISSING: the I/O layer could not price the pair this tick (first tick, a failed quote,
+    // an exhausted budget). That is TRANSIENT, so the allocator must NOT block on it — the bare
+    // `min_move` floor applies and the 6_000 shortfall moves, exactly as before route economics.
+    // No preselected gateway either: `perform` resolves one itself, as it always did.
+    let snapshot = standby_shortfall_snapshot();
+    assert!(snapshot.route_economics_by_pair.is_empty());
+    assert_eq!(decide(&snapshot, occ(1)), decision!(move_action!(1, 2, 6_000), ReasonCode::StandbyBelowTarget, occ(1), move_key(1, 2, 1)));
+}
+
+#[test]
+fn a_routable_pair_raises_the_floor_to_its_min_viable_amount_and_stamps_the_route() {
+    // §Q5 Routable. The pair prices at a 33_000 msat economic floor — far above the 5_000 protocol
+    // floor — so the 6_000 shortfall is DEFERRED (silently, like sub-dust: it self-heals as the
+    // shortfall grows). Below-floor deferral is the whole point of the floor.
+    let mut snapshot = standby_shortfall_snapshot();
+    snapshot.route_economics_by_pair = BTreeMap::from([route!(1, 2, gateway!("https://cheap.example"), 33_000, RouteStatus::Routable)]);
+    assert!(decide(&snapshot, occ(1)).is_empty(), "a shortfall below the pair's economic floor must defer, not churn");
+
+    // Once the shortfall CLEARS that floor (standby drained to 60_000, a 40_000 gap), the move is
+    // emitted — stamped with the exact gateway the floor was priced against, so planning and
+    // perform agree on the economics.
+    let mut cleared = snap!([fed!(1, 200_000, true, false, true), fed!(2, 60_000, true, false, true)], Some(id!(1)), Some(id!(2)), 500_000, 50_000, 100_000, 6100);
+    cleared.min_move = Msat(5_000);
+    cleared.route_economics_by_pair = BTreeMap::from([route!(1, 2, gateway!("https://cheap.example"), 33_000, RouteStatus::Routable)]);
+    assert_eq!(decide(&cleared, occ(1)), decision!(move_action!(1, 2, 40_000, gateway!("https://cheap.example")), ReasonCode::StandbyBelowTarget, occ(1), move_key(1, 2, 1)));
+}
+
+#[test]
+fn a_routable_floor_below_the_protocol_minimum_never_undercuts_it() {
+    // `min_viable_amount` is IO-supplied; lnv2's minimum incoming contract is a protocol fact the
+    // allocator keeps enforcing itself. A pair that prices "free" must not reopen the dust hole.
+    let mut snapshot = snap!([fed!(1, 200_000, true, false, true), fed!(2, 96_000, true, false, true)], Some(id!(1)), Some(id!(2)), 500_000, 50_000, 100_000, 6200);
+    snapshot.min_move = Msat(5_000);
+    snapshot.route_economics_by_pair = BTreeMap::from([route!(1, 2, gateway!("https://free.example"), 1, RouteStatus::Routable)]);
+    assert!(decide(&snapshot, occ(1)).is_empty(), "the 4_000 sub-dust shortfall stays dust however cheap the route prices");
+}
+
+#[test]
+fn an_unroutable_pair_skips_the_move_but_keeps_the_shortfall_refusal() {
+    // §Q5 Unroutable: no gateway serves both ends, so NO size routes — emit no move. The generic
+    // shortfall refusal still records that the standby stayed underfunded; the condition is
+    // transient (a gateway may return), so it gets no refusal reason of its own.
+    let mut snapshot = standby_shortfall_snapshot();
+    snapshot.route_economics_by_pair = BTreeMap::from([route!(1, 2, None, 0, RouteStatus::Unroutable)]);
+    assert_eq!(decide(&snapshot, occ(1)), decision!(refuse!(2, ReasonCode::StandbyBelowTarget), ReasonCode::StandbyBelowTarget, occ(1), refuse_key(2, ReasonCode::StandbyBelowTarget, 1)));
+}
+
+#[test]
+fn an_uneconomic_pair_skips_the_move_and_surfaces_a_visible_refusal() {
+    // §Q5 UneconomicAtAnySize: the gateways' proportional share meets or exceeds the cap, so no
+    // shortfall growth can ever make the pair fundable. Unlike the deliberately-silent sub-dust
+    // skip, this disables the pair's rebalancing INDEFINITELY and is a misconfiguration, so it
+    // gets its OWN persistent refusal row instead of a generic shortfall row.
+    let mut snapshot = standby_shortfall_snapshot();
+    snapshot.route_economics_by_pair = BTreeMap::from([route!(1, 2, gateway!("https://dear.example"), 0, RouteStatus::UneconomicAtAnySize)]);
+    let decisions = decide(&snapshot, occ(1));
+    assert!(!decisions.iter().any(|d| matches!(d.action, Action::Move { .. })), "no move can ever fit the cap on this pair: {decisions:?}");
+    assert_eq!(decisions.len(), 1, "one specific refusal is enough to surface the permanent condition: {decisions:?}");
+    assert!(decisions.iter().any(|d| d.idempotency_key == refuse_key(2, ReasonCode::UneconomicRoute, 1)
+        && matches!(&d.action, Action::RefuseInflow { fed, reason: ReasonCode::UneconomicRoute, .. } if *fed == id!(2))),
+        "the uneconomic route must be surfaced visibly, not swallowed: {decisions:?}");
+    // The refusal names the SOURCE too, so an operator can see which pair is misconfigured.
+    let surfaced = decisions.iter().find(|d| d.reason == ReasonCode::UneconomicRoute).expect("checked above");
+    let Action::RefuseInflow { diagnostics, .. } = &surfaced.action else { panic!("expected a refusal") };
+    assert_eq!(diagnostics.source, Some(id!(1)));
+}
+
+#[test]
+fn an_uneconomic_pair_stays_visible_while_the_shortfall_is_protocol_dust() {
+    // §Q5 explicitly distinguishes this permanent misconfiguration from the deliberately-silent
+    // protocol-dust skip: the refusal remains visible until the cap or route changes, even when
+    // the current gap is below `min_move`.
+    let mut snapshot = snap!([fed!(1, 200_000, true, false, true), fed!(2, 96_000, true, false, true)], Some(id!(1)), Some(id!(2)), 500_000, 50_000, 100_000, 6250);
+    snapshot.min_move = Msat(5_000);
+    snapshot.route_economics_by_pair = BTreeMap::from([route!(1, 2, gateway!("https://dear.example"), 0, RouteStatus::UneconomicAtAnySize)]);
+    let decisions = decide(&snapshot, occ(1));
+    assert_eq!(decisions.len(), 1, "the permanent route diagnostic is the one row: {decisions:?}");
+    assert!(matches!(
+        decisions[0].action,
+        Action::RefuseInflow {
+            fed,
+            reason: ReasonCode::UneconomicRoute,
+            ..
+        } if fed == id!(2)
+    ));
+}
+
+#[test]
+fn an_uneconomic_pair_still_populates_a_co_emitted_over_cap_refusal() {
+    // A destination can be over the per-fed cap AND below target AND on an uneconomic pair. The
+    // top-level over-cap check pushes a FIGURE-LESS refusal for the first fact; `push_decision`'s
+    // in-place replace only upgrades it if the populated twin is pushed, so the route refusal must
+    // not return before it. Otherwise the operator's over-cap row loses every figure.
+    let mut snapshot = snap!([fed!(1, 200_000, true, false, true), fed!(2, 96_000, true, false, true)], Some(id!(1)), Some(id!(2)), 90_000, 50_000, 150_000, 6350);
+    snapshot.min_move = Msat(5_000);
+    snapshot.route_economics_by_pair = BTreeMap::from([route!(1, 2, gateway!("https://dear.example"), 0, RouteStatus::UneconomicAtAnySize)]);
+
+    let decisions = decide(&snapshot, occ(1));
+    assert!(!decisions.iter().any(|d| matches!(d.action, Action::Move { .. })), "an uneconomic pair emits no move: {decisions:?}");
+    let over_cap = decisions.iter().find(|d| d.idempotency_key == refuse_key(2, ReasonCode::OverCap, 1)).expect("the over-cap refusal survives");
+    let Action::RefuseInflow { diagnostics, .. } = &over_cap.action else { panic!("expected a refusal") };
+    assert!(diagnostics.is_populated(), "the populated over-cap refusal must replace the figure-less one: {diagnostics:?}");
+    assert!(decisions.iter().any(|d| d.idempotency_key == refuse_key(2, ReasonCode::UneconomicRoute, 1)), "the route condition is still surfaced: {decisions:?}");
+}
+
+#[test]
+fn route_economics_are_keyed_by_ordered_pair() {
+    // The floor is directional: `1 -> 2` being uneconomic says nothing about `2 -> 1`. Here only
+    // the REVERSE direction is priced, so the pair actually being funded is MISSING → permissive.
+    let mut snapshot = standby_shortfall_snapshot();
+    snapshot.route_economics_by_pair = BTreeMap::from([route!(2, 1, gateway!("https://other.example"), 0, RouteStatus::UneconomicAtAnySize)]);
+    assert_eq!(decide(&snapshot, occ(1)), decision!(move_action!(1, 2, 6_000), ReasonCode::StandbyBelowTarget, occ(1), move_key(1, 2, 1)));
+}
+
+#[test]
+fn an_evacuation_is_never_blocked_by_route_economics() {
+    // Draining a dying federation must not be gated on a fee model — an uneconomic route is a
+    // reason to pay more, not to abandon the balance. The evacuation is emitted with the pair's
+    // gateway (a cheaper starting point for `perform`) and its ABSOLUTE `max_fee` cap unchanged.
+    let mut snapshot = snap!([fed!(1, 50_000, true, true, true), fed!(2, 30_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 100_000, 0, 6300);
+    snapshot.min_move = Msat(5_000);
+    snapshot.route_economics_by_pair = BTreeMap::from([route!(1, 2, gateway!("https://dear.example"), 900_000, RouteStatus::UneconomicAtAnySize)]);
+    assert_eq!(decide(&snapshot, occ(1)), decision!(evacuate!(1, 2, 50_000, gateway!("https://dear.example")), ReasonCode::ShutdownNotice, occ(1), evac_key(1, 2, 1)));
+}
+
+#[test]
+fn decide_stays_pure_over_route_economics() {
+    // The whole reason route economics is IO-SUPPLIED: `decide` reads the priced pairs as plain
+    // data, so it takes the snapshot by shared reference, cannot quote anything itself, and two
+    // calls on one snapshot are identical. (Sharing the snapshot across the two calls is what
+    // makes this a compile-time statement too: a `decide` that quoted would need `&mut`/async.)
+    let mut snapshot = standby_shortfall_snapshot();
+    snapshot.route_economics_by_pair = BTreeMap::from([
+        route!(1, 2, gateway!("https://a.example"), 33_000, RouteStatus::Routable),
+        route!(2, 1, gateway!("https://b.example"), 12_000, RouteStatus::Routable),
+    ]);
+    let before = snapshot.clone();
+    let first = decide(&snapshot, occ(1));
+    let second = decide(&snapshot, occ(1));
+    assert_eq!(first, second);
+    assert_eq!(snapshot, before, "decide must not mutate its snapshot");
 }
 
 #[test]

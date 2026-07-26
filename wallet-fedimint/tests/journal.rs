@@ -45,6 +45,7 @@ fn intent(key: &str, status: IntentStatus) -> Intent {
             to: fed(2),
             amount: Msat(100_000),
             fee_cap: Msat(2_000),
+            gateway: None,
         },
         max_fee: Some(Msat(2_000)),
         status,
@@ -560,6 +561,7 @@ async fn recomposed_sync_path_writes_identical_intent_and_ledger_bytes() {
                 to: fed(2),
                 amount: Msat(100_000),
                 fee_cap: Msat(2_000),
+                gateway: None,
             },
             false,
         ),
@@ -1848,6 +1850,51 @@ async fn atomic_intent_and_index() {
         &journal.pending().await.expect("pending"),
         "atomic"
     ));
+}
+
+/// An intent row written BEFORE `Action::Move`/`Evacuate` gained the preselected `gateway` still
+/// decodes (as `None`) instead of hard-failing. `Action` is part of the durable `Intent` format
+/// and rows are re-decoded on every read, so the field's `#[serde(default)]` is load-bearing: an
+/// in-flight money op journaled by the previous build must still be resumable after an upgrade.
+/// Same forward-compat rule as `Policy`'s and `RefusalDiagnostics::max_fee_bps`.
+#[tokio::test]
+async fn a_legacy_intent_row_without_the_preselected_gateway_still_decodes() {
+    let db = MemDatabase::new().into_database();
+    let journal = FedimintJournal::new(db.clone());
+    let mut planned = intent("legacy-gateway", IntentStatus::Pending);
+    let Action::Move { gateway, .. } = &mut planned.action else {
+        panic!("the fixture intent is a Move");
+    };
+    *gateway = Some(GatewayUrl("https://planned.example".to_string()));
+
+    // Serialize the CURRENT shape, then delete the key an older build would never have written.
+    let mut row: serde_json::Value =
+        serde_json::from_slice(&encoded_test_row(&planned)).expect("encode then parse");
+    let removed = row["data"]["action"]["Move"]
+        .as_object_mut()
+        .expect("Move is a struct variant")
+        .remove("gateway");
+    assert!(removed.is_some(), "the legacy shape must actually differ");
+
+    let app_db = db.with_prefix(vec![0x00]);
+    let mut dbtx = app_db.begin_transaction().await;
+    dbtx.raw_insert_bytes(
+        &tagged_key(0x01, planned.idempotency_key.0.as_bytes()),
+        &serde_json::to_vec(&row).expect("re-encode legacy row"),
+    )
+    .await
+    .expect("insert legacy intent row");
+    dbtx.commit_tx_result().await.expect("commit legacy row");
+
+    let decoded = journal
+        .get(&planned.idempotency_key)
+        .await
+        .expect("a legacy row must decode, not hard-fail")
+        .expect("row present");
+    assert_eq!(
+        decoded.action,
+        intent("legacy-gateway", IntentStatus::Pending).action
+    );
 }
 
 #[tokio::test]

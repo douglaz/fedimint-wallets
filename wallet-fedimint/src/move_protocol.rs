@@ -119,17 +119,21 @@ impl MovePlan {
             // A `Move` and an `Evacuate` are the same executable send-required move (drain
             // `from` into `to`); they differ only in the reason/idempotency scheme the pure
             // allocator stamps, which lives on the `Action`/`Intent`, not the plan.
+            // The preselected `gateway` is deliberately NOT projected onto the plan: this stays
+            // the pure, gateway-FREE mapping, and the executor reads the hint off the action.
             Action::Move {
                 from,
                 to,
                 amount,
                 fee_cap,
+                ..
             }
             | Action::Evacuate {
                 from,
                 to,
                 amount,
                 fee_cap,
+                ..
             } => Some(MovePlan {
                 from: Some(*from),
                 to: *to,
