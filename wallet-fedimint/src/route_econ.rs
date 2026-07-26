@@ -343,16 +343,37 @@ async fn pair_economics(
         return no_serving_route(candidate_count);
     }
 
-    // Any move emitted this tick has `amount + fee_cap <= source budget`. Both federation fee
-    // functions are non-decreasing step functions of their contract amount, and neither contract
-    // can exceed that total source budget for a move that fits. Sampling there therefore upper
-    // bounds every federation fee the current snapshot can actually perform.
+    // Both federation fee functions are non-decreasing (affine `base + ppm·contract`), so sampling
+    // at the largest contract any performable move can reach — `maximum + fee_cap`, the grossed-up
+    // outgoing contract that delivers `maximum` net — upper bounds every fee the snapshot can
+    // perform. `recv_fed`/`send_fed` enter the model as the fixed cost `k`/`c`.
+    //
+    // The RECEIVE quote is a pure fee computation, so sample it at that whole ceiling directly. The
+    // SEND quote is NOT: `send_fee_quote_for_amount` note-selects real inventory to fund the
+    // outgoing contract (SDK `fee_quote` → `create_final_inputs_and_outputs`). For a pair NOT bound
+    // by source budget the ceiling is comfortably fundable and the quote succeeds — the strict upper
+    // bound. Only a source-CONSTRAINED pair (`maximum` ≈ the whole budget, with no fed-fee headroom
+    // above the move plus its proportional reserve) fails that dry-run with `InsufficientBalance`;
+    // the pre-fix code then dropped the pair to the permissive `min_move` fallback (NO floor) for
+    // exactly the tight standby it most needs to gate. There, fall back to sampling at the fundable
+    // `maximum`: a strict upper bound for every send contract `<= maximum`, under-shooting the affine
+    // fee over the reserve tail `(maximum, maximum + fee_cap]` by at most `fee_cap · ppm/1e6` — a
+    // second-order term whose only effect is that a marginally-admitted move may fail the
+    // perform-time fee-cap recheck (`keep_cheapest_fitting`) and retry: churn for one tick, never an
+    // over-cap spend or over-credit. This preserves the strict bound wherever it can be quoted and
+    // still gates the source-constrained pairs the pre-fix permissive drop left ungated.
     let sample = federation_quote_sample(maximum, snapshot.max_fee_bps_of_move);
     let recv_fed = budget.run(mc.receive_fee_quote(&to, sample)).await?.ok()?;
-    let send_fed = budget
+    let send_fed = match budget
         .run(mc.send_fee_quote_for_amount(&from, sample))
         .await?
-        .ok()?;
+    {
+        Ok(fee) => fee,
+        Err(_) => budget
+            .run(mc.send_fee_quote_for_amount(&from, maximum))
+            .await?
+            .ok()?,
+    };
     select_gateway(
         serving,
         recv_fed,

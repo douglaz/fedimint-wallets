@@ -60,6 +60,17 @@ pub const MINIMUM_INCOMING_CONTRACT_MSAT: u64 =
 /// short async fixed point; a couple of passes converge for any real fee (ppm slope < 1).
 const FED_FEE_REQUOTE_PASSES: u32 = 3;
 
+/// The money-path move fallback prices registered gateways within this wall-clock budget. Without a
+/// bound a federation advertising a large or unresponsive gateway set makes a single perform issue
+/// one fee round-trip per gateway before it can pick a route, capped only by `perform_timeout`. A
+/// TIME budget rather than a candidate-count cap bounds the work WITHOUT a deterministic blind
+/// spot: when gateways answer quickly — the normal case — every registered gateway is still priced,
+/// so a fitting route in ANY position is found, and only a genuinely slow/large registry is
+/// truncated. A truncated scan then falls through to plain both-ends validation rather than falsely
+/// reporting "no route fits the cap" over an unexamined suffix. `perform_timeout` remains the
+/// backstop for a single slow round-trip.
+const FALLBACK_MOVE_ROUTE_BUDGET_MS: u64 = 10_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FreshMoveCost {
     invoice_amount: Msat,
@@ -382,9 +393,22 @@ impl FedimintExecutor {
             return self.resolve_gateway(&plan.to, None).await;
         };
         let gateways = self.mc.gateways(&plan.to).await.map_err(retryable)?;
+        let scan_deadline_ms =
+            crate::runtime::now_ms().saturating_add(FALLBACK_MOVE_ROUTE_BUDGET_MS);
         let mut cheapest = None;
         let mut priced_any = false;
+        let mut fully_scanned = true;
         for gateway in &gateways {
+            if crate::runtime::now_ms() >= scan_deadline_ms {
+                fully_scanned = false;
+                tracing::debug!(
+                    to = %plan.to.to_hex(),
+                    registered = gateways.len(),
+                    "executor: move fallback gateway scan hit its time budget; \
+                     leaving final routing to plain validation"
+                );
+                break;
+            }
             let gateway_fees = match self
                 .fresh_send_required_gateway_fees(&from, &plan.to, gateway)
                 .await
@@ -422,10 +446,14 @@ impl FedimintExecutor {
         if let Some((_, gateway)) = cheapest {
             return Ok(gateway.clone());
         }
-        if priced_any {
+        // Only conclude "no gateway fits the cap" when the WHOLE registered set was examined. A scan
+        // truncated by the time budget has an unexamined suffix that may contain a fitting route, so
+        // it must not report a hard cap refusal — fall through to plain both-ends validation, which
+        // can still pick a serving gateway from the suffix (the cap is re-enforced at perform).
+        if priced_any && fully_scanned {
             return Err(ExecError::Retryable(format!(
                 "no lnv2 gateway can route move {} -> {} within fee cap {} msat \
-                 (scanned {} registered gateway(s))",
+                 (scanned all {} registered gateway(s))",
                 from.to_hex(),
                 plan.to.to_hex(),
                 plan.fee_cap.0,
