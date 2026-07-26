@@ -413,11 +413,15 @@ fn repair_enrichment_adopting_op_id_stays_non_terminal_unrepaired() {
 fn kind_from_action_mapping() {
     let fee_cap = Msat(500);
     assert_eq!(
+        // The action's PRESELECTED gateway is deliberately NOT copied onto the row: the ledger's
+        // `gateway` reports the route actually used, filled from the `MoveRecord` once the
+        // executor has committed to one (which may be a substitute for a hint that went away).
         kind_from_action(&Action::Move {
             from: FED,
             to: OTHER,
             amount: Msat(40_000),
             fee_cap,
+            gateway: Some(GatewayUrl("https://planned.example".into())),
         }),
         OperationKind::Move {
             from: FED,
@@ -435,6 +439,7 @@ fn kind_from_action_mapping() {
             to: OTHER,
             amount: Msat(40_000),
             fee_cap,
+            gateway: None,
         }),
         OperationKind::Move {
             from: FED,

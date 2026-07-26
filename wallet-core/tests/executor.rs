@@ -24,6 +24,7 @@ fn move_decision(key: &str, amount: u64) -> AllocatorDecision {
             to: FederationId([2; 32]),
             amount: Msat(amount),
             fee_cap: Msat(7),
+            gateway: None,
         },
         ReasonCode::SpendingBelowTarget,
     )
@@ -97,12 +98,14 @@ fn move_record(intent: &Intent, phase: MovePhase) -> MoveRecord {
             to,
             amount,
             fee_cap,
+            ..
         }
         | Action::Evacuate {
             from,
             to,
             amount,
             fee_cap,
+            ..
         } => (Some(from), to, amount, fee_cap, true),
         Action::DirectInflow {
             to,
@@ -139,6 +142,7 @@ fn reservation_projection_covers_every_phase6a_table_row() {
         to,
         amount: Msat(100),
         fee_cap: Msat(7),
+        gateway: None,
     };
 
     for status in [IntentStatus::Pending, IntentStatus::Executing] {
@@ -197,6 +201,7 @@ fn reservation_projection_covers_every_phase6a_table_row() {
             to,
             amount: Msat(40),
             fee_cap: Msat(9),
+            gateway: None,
         },
         IntentStatus::Pending,
     );
@@ -428,6 +433,7 @@ async fn cross_operation_reservations_gate_source_and_destination_admission() {
             to,
             amount: Msat(20),
             fee_cap: Msat(1),
+            gateway: None,
         },
         ReasonCode::UserInitiated,
     );
@@ -452,6 +458,7 @@ async fn cross_operation_reservations_gate_source_and_destination_admission() {
             to,
             amount: Msat(40),
             fee_cap: Msat(50),
+            gateway: None,
         },
         ReasonCode::ShutdownNotice,
     );
@@ -708,6 +715,7 @@ async fn recomposed_apply_matches_explicit_decide_then_drive() {
                 to: FederationId([2; 32]),
                 amount: Msat(42),
                 fee_cap: Msat(7),
+                gateway: None,
             },
             false,
         ),
@@ -1139,6 +1147,7 @@ async fn apply_redrives_stored_pending_intent_without_refreshing_fields() {
             to: FederationId([2; 32]),
             amount: Msat(42),
             fee_cap: Msat(1),
+            gateway: None,
         },
         ReasonCode::SpendingBelowTarget,
     );
@@ -1151,6 +1160,7 @@ async fn apply_redrives_stored_pending_intent_without_refreshing_fields() {
             to: FederationId([2; 32]),
             amount: Msat(99),
             fee_cap: Msat(99),
+            gateway: None,
         },
         ReasonCode::SpendingBelowTarget,
     );
@@ -1330,6 +1340,7 @@ async fn apply_does_not_resurrect_failed_intent() {
             to: FederationId([2; 32]),
             amount: Msat(42),
             fee_cap: Msat(1),
+            gateway: None,
         },
         ReasonCode::SpendingBelowTarget,
     );
@@ -1343,6 +1354,7 @@ async fn apply_does_not_resurrect_failed_intent() {
             to: FederationId([2; 32]),
             amount: Msat(42),
             fee_cap: Msat(99),
+            gateway: None,
         },
         ReasonCode::SpendingBelowTarget,
     );
@@ -1607,6 +1619,7 @@ async fn apply_stamps_actor_reason_and_created_at() {
             to: FederationId([2; 32]),
             amount: Msat(42),
             fee_cap: Msat(7),
+            gateway: None,
         },
         ReasonCode::StandbyBelowTarget,
     );

@@ -42,6 +42,7 @@ pub mod journal;
 pub mod move_protocol;
 pub mod multi_client;
 pub mod probe;
+mod route_econ;
 pub mod runtime;
 pub mod service;
 pub mod tick;

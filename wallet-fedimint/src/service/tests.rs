@@ -352,6 +352,7 @@ async fn pay_is_held_probe_refused_own_leg_passes_and_evacuation_preempts_withou
                 to: source,
                 amount: Msat(10),
                 fee_cap: Msat(1),
+                gateway: None,
             },
             BTreeMap::from([(candidate, Msat(100)), (source, Msat(0))]),
             Some(probe.session.nonce.clone()),
@@ -397,6 +398,7 @@ async fn pay_is_held_probe_refused_own_leg_passes_and_evacuation_preempts_withou
                 to: source,
                 amount: Msat(20),
                 fee_cap: Msat(1),
+                gateway: None,
             },
             BTreeMap::from([(candidate, Msat(100)), (source, Msat(0))]),
             None,
@@ -431,6 +433,7 @@ async fn pay_is_held_probe_refused_own_leg_passes_and_evacuation_preempts_withou
             to: source,
             amount: Msat(1),
             fee_cap: Msat(0),
+            gateway: None,
         },
         BTreeMap::from([(candidate, Msat(100)), (source, Msat(0))]),
         Some(probe.session.nonce),
@@ -507,6 +510,7 @@ async fn evacuation_preemption_keeps_real_probe_cost_in_the_live_budget() {
                 to: source,
                 amount: Msat(20),
                 fee_cap: Msat(1),
+                gateway: None,
             },
             BTreeMap::from([(candidate, Msat(100)), (source, Msat(0))]),
             None,
@@ -623,6 +627,7 @@ async fn evacuation_preemption_credits_a_settled_probe_return_leg() {
                 to: source,
                 amount: Msat(20),
                 fee_cap: Msat(1),
+                gateway: None,
             },
             BTreeMap::from([(candidate, Msat(100)), (source, Msat(0))]),
             None,
@@ -673,6 +678,7 @@ async fn reconcile_preempts_a_crash_orphaned_evacuation_before_driving_any_probe
             to: candidate,
             amount: Msat(probe.session.amount_msat),
             fee_cap: Msat(probe.session.leg_fee_cap_msat),
+            gateway: None,
         },
         reason: ReasonCode::ActiveProbe,
         occurrence,
@@ -700,6 +706,7 @@ async fn reconcile_preempts_a_crash_orphaned_evacuation_before_driving_any_probe
             to: source,
             amount: Msat(20),
             fee_cap: Msat(1),
+            gateway: None,
         },
         BTreeMap::from([(candidate, Msat(100)), (source, Msat(0))]),
         None,
@@ -1933,6 +1940,7 @@ async fn reconcile_redrives_a_retryable_probe_leg_while_its_umbrella_driver_wait
             to: candidate,
             amount: Msat(probe.session.amount_msat),
             fee_cap: Msat(probe.session.leg_fee_cap_msat),
+            gateway: None,
         },
         reason: ReasonCode::ActiveProbe,
         occurrence,
@@ -1982,6 +1990,7 @@ async fn reconcile_redrives_a_retryable_probe_leg_while_its_umbrella_driver_wait
                 to: source,
                 amount: Msat(10),
                 fee_cap: Msat(1),
+                gateway: None,
             },
             BTreeMap::from([(candidate, Msat(100)), (source, Msat(0))]),
             None,
@@ -2104,6 +2113,7 @@ async fn evacuation_bypasses_a_full_external_driver_cap_for_fresh_and_retry_requ
             to: fed(3),
             amount: Msat(1),
             fee_cap: Msat(0),
+            gateway: None,
         },
         BTreeMap::from([(fed(2), Msat(10)), (fed(3), Msat(0))]),
         None,
@@ -2141,6 +2151,7 @@ async fn evacuation_bypasses_a_full_external_driver_cap_for_fresh_and_retry_requ
                 to: fed(3),
                 amount: Msat(1),
                 fee_cap: Msat(0),
+                gateway: None,
             },
             BTreeMap::from([(fed(2), Msat(10)), (fed(3), Msat(0))]),
             None,
@@ -2229,14 +2240,12 @@ async fn commit_tick_bypasses_and_does_not_consume_the_external_driver_cap() {
 
     let occurrence = Occurrence(36);
     client
-        .decide_tick_round(
-            ProbeFacts {
-                probes: vec![(fed(1), healthy_probe(100)), (fed(2), healthy_probe(0))],
-                occurrence,
-                now_ms: 104,
-            },
-            Vec::new(),
-        )
+        .decide_tick_round(ProbeFacts {
+            probes: vec![(fed(1), healthy_probe(100)), (fed(2), healthy_probe(0))],
+            occurrence,
+            now_ms: 104,
+            price_routes: false,
+        })
         .await
         .expect("seed tick facts");
     let decision = AllocatorDecision {
@@ -2245,6 +2254,7 @@ async fn commit_tick_bypasses_and_does_not_consume_the_external_driver_cap() {
             to: fed(2),
             amount: Msat(10),
             fee_cap: Msat(0),
+            gateway: None,
         },
         reason: ReasonCode::SpendingBelowTarget,
         occurrence,
@@ -2472,6 +2482,7 @@ async fn lowered_policy_cap_applies_to_the_next_decide() {
                 to: fed(2),
                 amount: Msat(20),
                 fee_cap: Msat(0),
+                gateway: None,
             },
             BTreeMap::from([(fed(1), Msat(100)), (fed(2), Msat(40))]),
             None,
@@ -2554,14 +2565,12 @@ async fn decide_tick_round_matches_the_pure_allocator_fixture() {
     let probes = vec![(fed(1), healthy_probe(250)), (fed(2), healthy_probe(0))];
     let occurrence = Occurrence(31);
     let round = client
-        .decide_tick_round(
-            ProbeFacts {
-                probes: probes.clone(),
-                occurrence,
-                now_ms: 99,
-            },
-            Vec::new(),
-        )
+        .decide_tick_round(ProbeFacts {
+            probes: probes.clone(),
+            occurrence,
+            now_ms: 99,
+            price_routes: false,
+        })
         .await
         .expect("decide tick round");
 
@@ -2588,14 +2597,12 @@ async fn commit_tick_rechecks_reservations_and_records_a_dropped_decision() {
     let client = service.client();
     let occurrence = Occurrence(32);
     client
-        .decide_tick_round(
-            ProbeFacts {
-                probes: vec![(fed(1), healthy_probe(100)), (fed(2), healthy_probe(0))],
-                occurrence,
-                now_ms: 100,
-            },
-            Vec::new(),
-        )
+        .decide_tick_round(ProbeFacts {
+            probes: vec![(fed(1), healthy_probe(100)), (fed(2), healthy_probe(0))],
+            occurrence,
+            now_ms: 100,
+            price_routes: false,
+        })
         .await
         .expect("seed tick facts");
     client
@@ -2608,6 +2615,7 @@ async fn commit_tick_rechecks_reservations_and_records_a_dropped_decision() {
             to: fed(2),
             amount: Msat(30),
             fee_cap: Msat(0),
+            gateway: None,
         },
         reason: ReasonCode::StandbyBelowTarget,
         occurrence,
@@ -2642,14 +2650,12 @@ async fn commit_tick_refuses_a_batch_planned_under_a_superseded_policy() {
     // Plan the round under the current policy generation. The scheduler validates routes
     // over the network before committing; a PutPolicy can land in that window.
     let round = client
-        .decide_tick_round(
-            ProbeFacts {
-                probes: vec![(fed(1), healthy_probe(100)), (fed(2), healthy_probe(0))],
-                occurrence,
-                now_ms: 108,
-            },
-            Vec::new(),
-        )
+        .decide_tick_round(ProbeFacts {
+            probes: vec![(fed(1), healthy_probe(100)), (fed(2), healthy_probe(0))],
+            occurrence,
+            now_ms: 108,
+            price_routes: false,
+        })
         .await
         .expect("seed tick facts");
     // The operator changes policy mid-validation — the round's sizing is now stale.
@@ -2662,6 +2668,7 @@ async fn commit_tick_refuses_a_batch_planned_under_a_superseded_policy() {
             to: fed(2),
             amount: Msat(30),
             fee_cap: Msat(0),
+            gateway: None,
         },
         reason: ReasonCode::StandbyBelowTarget,
         occurrence,
@@ -2695,14 +2702,12 @@ async fn commit_tick_rechecks_fresh_balances_after_a_user_op_settles() {
     let client = service.client();
     let occurrence = Occurrence(37);
     client
-        .decide_tick_round(
-            ProbeFacts {
-                probes: vec![(fed(1), healthy_probe(100)), (fed(2), healthy_probe(0))],
-                occurrence,
-                now_ms: 105,
-            },
-            Vec::new(),
-        )
+        .decide_tick_round(ProbeFacts {
+            probes: vec![(fed(1), healthy_probe(100)), (fed(2), healthy_probe(0))],
+            occurrence,
+            now_ms: 105,
+            price_routes: false,
+        })
         .await
         .expect("seed balance facts before route validation");
     client
@@ -2726,6 +2731,7 @@ async fn commit_tick_rechecks_fresh_balances_after_a_user_op_settles() {
             to: fed(2),
             amount: Msat(30),
             fee_cap: Msat(0),
+            gateway: None,
         },
         reason: ReasonCode::StandbyBelowTarget,
         occurrence,
@@ -2756,14 +2762,12 @@ async fn tick_row_waits_for_the_admitted_driver_outcome() {
     let client = service.client();
     let occurrence = Occurrence(38);
     client
-        .decide_tick_round(
-            ProbeFacts {
-                probes: vec![(fed(1), healthy_probe(100)), (fed(2), healthy_probe(0))],
-                occurrence,
-                now_ms: 106,
-            },
-            Vec::new(),
-        )
+        .decide_tick_round(ProbeFacts {
+            probes: vec![(fed(1), healthy_probe(100)), (fed(2), healthy_probe(0))],
+            occurrence,
+            now_ms: 106,
+            price_routes: false,
+        })
         .await
         .expect("seed tick facts");
     let decision = AllocatorDecision {
@@ -2772,6 +2776,7 @@ async fn tick_row_waits_for_the_admitted_driver_outcome() {
             to: fed(2),
             amount: Msat(10),
             fee_cap: Msat(0),
+            gateway: None,
         },
         reason: ReasonCode::StandbyBelowTarget,
         occurrence,
@@ -2844,14 +2849,12 @@ async fn commit_tick_records_advisory_refusal_once_without_executable_admission(
     let client = service.client();
     let occurrence = Occurrence(35);
     let round = client
-        .decide_tick_round(
-            ProbeFacts {
-                probes: vec![(fed(1), healthy_probe(1_200)), (fed(2), healthy_probe(100))],
-                occurrence,
-                now_ms: 103,
-            },
-            Vec::new(),
-        )
+        .decide_tick_round(ProbeFacts {
+            probes: vec![(fed(1), healthy_probe(1_200)), (fed(2), healthy_probe(100))],
+            occurrence,
+            now_ms: 103,
+            price_routes: false,
+        })
         .await
         .expect("plan over-cap advisory");
     let advisory = round
@@ -2897,18 +2900,16 @@ async fn commit_tick_spawns_every_fitting_decision_without_an_agent_lane() {
     let client = service.client();
     let occurrence = Occurrence(33);
     client
-        .decide_tick_round(
-            ProbeFacts {
-                probes: vec![
-                    (fed(1), healthy_probe(100)),
-                    (fed(2), healthy_probe(0)),
-                    (fed(3), healthy_probe(0)),
-                ],
-                occurrence,
-                now_ms: 101,
-            },
-            Vec::new(),
-        )
+        .decide_tick_round(ProbeFacts {
+            probes: vec![
+                (fed(1), healthy_probe(100)),
+                (fed(2), healthy_probe(0)),
+                (fed(3), healthy_probe(0)),
+            ],
+            occurrence,
+            now_ms: 101,
+            price_routes: false,
+        })
         .await
         .expect("seed tick facts");
     let decisions = [fed(2), fed(3)]
@@ -2920,6 +2921,7 @@ async fn commit_tick_spawns_every_fitting_decision_without_an_agent_lane() {
                 to,
                 amount: Msat(10),
                 fee_cap: Msat(0),
+                gateway: None,
             },
             reason: ReasonCode::StandbyBelowTarget,
             occurrence,
@@ -2995,19 +2997,17 @@ async fn commit_tick_continues_after_one_decision_hits_a_storage_fault() {
     let client = service.client();
     let occurrence = Occurrence(36);
     client
-        .decide_tick_round(
-            ProbeFacts {
-                probes: vec![
-                    (held, healthy_probe(100)),
-                    (held_destination, healthy_probe(0)),
-                    (fed(3), healthy_probe(100)),
-                    (fed(4), healthy_probe(0)),
-                ],
-                occurrence,
-                now_ms: 104,
-            },
-            Vec::new(),
-        )
+        .decide_tick_round(ProbeFacts {
+            probes: vec![
+                (held, healthy_probe(100)),
+                (held_destination, healthy_probe(0)),
+                (fed(3), healthy_probe(100)),
+                (fed(4), healthy_probe(0)),
+            ],
+            occurrence,
+            now_ms: 104,
+            price_routes: false,
+        })
         .await
         .expect("seed tick facts");
     let first_key = IdempotencyKey("evacuate:faulted-preemption".to_owned());
@@ -3019,6 +3019,7 @@ async fn commit_tick_continues_after_one_decision_hits_a_storage_fault() {
                 to: held_destination,
                 amount: Msat(10),
                 fee_cap: Msat(0),
+                gateway: None,
             },
             reason: ReasonCode::ShutdownNotice,
             occurrence,
@@ -3030,6 +3031,7 @@ async fn commit_tick_continues_after_one_decision_hits_a_storage_fault() {
                 to: fed(4),
                 amount: Msat(10),
                 fee_cap: Msat(0),
+                gateway: None,
             },
             reason: ReasonCode::ShutdownNotice,
             occurrence,
@@ -3086,9 +3088,10 @@ async fn commit_tick_rejects_same_occurrence_terminal_replay_loudly() {
         probes: vec![(fed(1), healthy_probe(100)), (fed(2), healthy_probe(0))],
         occurrence,
         now_ms: 102,
+        price_routes: false,
     };
     client
-        .decide_tick_round(facts.clone(), Vec::new())
+        .decide_tick_round(facts.clone())
         .await
         .expect("first round");
     let decision = AllocatorDecision {
@@ -3097,6 +3100,7 @@ async fn commit_tick_rejects_same_occurrence_terminal_replay_loudly() {
             to: fed(2),
             amount: Msat(10),
             fee_cap: Msat(0),
+            gateway: None,
         },
         reason: ReasonCode::StandbyBelowTarget,
         occurrence,
@@ -3108,7 +3112,7 @@ async fn commit_tick_rejects_same_occurrence_terminal_replay_loudly() {
         .expect("first commit");
     wait_for_registry(&client, 0).await;
     client
-        .decide_tick_round(facts, Vec::new())
+        .decide_tick_round(facts)
         .await
         .expect("replayed round");
     let error = client
@@ -3207,6 +3211,7 @@ async fn fresh_admission_with_unopened_destination_fails_fast() {
             to: fed(2),
             amount: Msat(10),
             fee_cap: Msat(1),
+            gateway: None,
         },
         BTreeMap::from([(fed(1), Msat(100))]),
         None,
@@ -3240,6 +3245,7 @@ async fn admitted_while_open_then_closed_still_attaches_on_replay() {
         to: fed(2),
         amount: Msat(10),
         fee_cap: Msat(1),
+        gateway: None,
     };
     let balances = BTreeMap::from([(fed(1), Msat(100))]);
     let admitted = client

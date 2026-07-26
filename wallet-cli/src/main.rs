@@ -1499,6 +1499,7 @@ async fn actor_command(
                 to,
                 amount: Msat(amount),
                 fee_cap,
+                gateway: None,
             };
             let balances = sample_balances_standalone(multi_client, &[from, to]).await?;
             let decided = client
@@ -2373,6 +2374,7 @@ fn describe_decision(decision: &AllocatorDecision) -> String {
             to,
             amount,
             fee_cap,
+            ..
         } => format!(
             "move {} msat {} -> {} (fee_cap {} msat, reason {:?})",
             amount.0,
@@ -2397,6 +2399,7 @@ fn describe_decision(decision: &AllocatorDecision) -> String {
             to,
             amount,
             fee_cap,
+            ..
         } => format!(
             "evacuate {} msat {} -> {} (fee_cap {} msat, reason {:?})",
             amount.0,
@@ -3157,6 +3160,7 @@ fn reason_tag(reason: ReasonCode) -> &'static str {
         ReasonCode::OverCap => "over_cap",
         ReasonCode::NotProbed => "not_probed",
         ReasonCode::LowReputation => "low_reputation",
+        ReasonCode::UneconomicRoute => "uneconomic_route",
         ReasonCode::UserInitiated => "user_initiated",
         ReasonCode::StandingInstruction => "standing_instruction",
         ReasonCode::ActiveProbe => "active_probe",

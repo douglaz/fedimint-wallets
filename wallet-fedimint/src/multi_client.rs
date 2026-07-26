@@ -830,6 +830,20 @@ impl MultiClient {
         Ok(payment_fee_to_gateway_fee(routing_info.receive_fee))
     }
 
+    /// The receive fee when `gateway` explicitly serves `id`. `Ok(None)` is the gateway's
+    /// successful "unsupported federation" response; transport/HTTP/decode failures remain
+    /// `Err` so route sensing can leave the pair unknown instead of misclassifying it unroutable.
+    pub(crate) async fn maybe_receive_gateway_fee(
+        &self,
+        id: &FederationId,
+        gateway: &GatewayUrl,
+    ) -> anyhow::Result<Option<GatewayFee>> {
+        Ok(self
+            .maybe_routing_info_for(id, gateway)
+            .await?
+            .map(|info| payment_fee_to_gateway_fee(info.receive_fee)))
+    }
+
     /// The pinned gateway's SEND fee for paying `invoice` from `id` (spec §6.2), read from
     /// its `routing_info` via `send_parameters` (which picks the direct-swap vs lightning-swap
     /// fee by whether the invoice's payee is the gateway). Feeds the send-leg cap re-quote.
@@ -857,6 +871,19 @@ impl MultiClient {
     ) -> anyhow::Result<GatewayFee> {
         let routing_info = self.routing_info_for(id, gateway).await?;
         Ok(payment_fee_to_gateway_fee(routing_info.send_fee_minimum))
+    }
+
+    /// The direct-swap send fee with the same unsupported-vs-failed distinction as
+    /// [`Self::maybe_receive_gateway_fee`].
+    pub(crate) async fn maybe_direct_swap_send_gateway_fee(
+        &self,
+        id: &FederationId,
+        gateway: &GatewayUrl,
+    ) -> anyhow::Result<Option<GatewayFee>> {
+        Ok(self
+            .maybe_routing_info_for(id, gateway)
+            .await?
+            .map(|info| payment_fee_to_gateway_fee(info.send_fee_minimum)))
     }
 
     /// Validate that `gateway` serves `id` by asking the gateway for this federation's lnv2

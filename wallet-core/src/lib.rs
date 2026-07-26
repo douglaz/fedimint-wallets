@@ -11,7 +11,7 @@ pub mod scorer;
 pub mod types;
 pub mod watch;
 
-pub use allocator::decide;
+pub use allocator::{decide, max_fundable, move_fee_cap};
 pub use discovery::{
     auto_join_budget, BudgetVerdict, DiscoveryPolicy, DiscoverySource, SourceStatus,
     STRUCTURAL_RECHECK_BACKOFF_MS,

@@ -64,8 +64,11 @@ the two fee caps are deliberately different shapes:
   positive surplus is never refused for being smaller than a flat cap.
 
 A `--max-fee-bps-of-move` of `0` (every funding move would get a zero cap and fail) or above
-`10000` is rejected by policy validation. Setting it very low can still under-cap small moves
-so they fail at perform time — a per-route economic floor is planned separately.
+`10000` is rejected by policy validation. Before each committable tick, the allocator prices the
+designated funding pair through the cheapest gateway serving both federations. Small moves wait
+until their shortfall clears that route's economic floor; a cap below every serving route's
+proportional fee blocks that pair and records an `uneconomic_route` refusal in
+`wallet-cli history`. The perform-time cap remains the final money backstop if quotes change.
 
 See [docs/real-sats-pilot-runbook.md](./docs/real-sats-pilot-runbook.md) for suggested
 pilot values.

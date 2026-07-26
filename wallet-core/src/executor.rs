@@ -106,12 +106,14 @@ pub fn project_reservations(
                 to,
                 amount,
                 fee_cap,
+                ..
             }
             | Action::Evacuate {
                 from,
                 to,
                 amount,
                 fee_cap,
+                ..
             } => {
                 let record = records(&intent.idempotency_key);
                 let reservation_amount = record.as_ref().map_or(*amount, |record| record.amount);

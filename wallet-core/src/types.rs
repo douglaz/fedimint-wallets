@@ -108,10 +108,58 @@ pub struct AllocatorSnapshot {
     /// target, and the move could only fail at perform time, every tick, forever (the 24h
     /// soak logged 91 such doomed sub-minimum moves). Zero disables the floor.
     pub min_move: Msat,
+    /// Per-ORDERED-PAIR `(from, to)` route economics, supplied by the I/O layer so `decide()`
+    /// stays PURE (`docs/route-economics-decisions.md`). Where `min_move` is one protocol
+    /// constant for every pair, this is what it actually costs to route a funding move through
+    /// the cheapest gateway serving BOTH ends of THAT pair — so a pair whose fees can never fit
+    /// the proportional cap is not funded at all, and a pair that needs a bigger move to amortise
+    /// its fees gets a bigger floor.
+    ///
+    /// A pair is ABSENT when the I/O layer could not price it this tick (first tick, a quote RPC
+    /// failed, the per-tick quote budget ran out). Absence is TRANSIENT and therefore PERMISSIVE:
+    /// `decide()` falls back to the bare `min_move` floor (§Q5). It is never cached across
+    /// ticks — a stale-low floor would under-block, and under-blocking churns forever.
+    pub route_economics_by_pair:
+        std::collections::BTreeMap<(FederationId, FederationId), RouteEconomics>,
     /// Durable cross-operation reservations projected from the journal. The allocator's
     /// local `credited`/`debited` maps remain the intra-batch layer.
     pub reservations: Reservations,
     pub now: u64,
+}
+
+/// What it costs to route a funding move across ONE ordered federation pair this tick, and
+/// whether it can be routed at all. Computed by the I/O layer from live fee quotes and read by
+/// `allocator::decide` (see [`AllocatorSnapshot::route_economics_by_pair`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteEconomics {
+    /// The CHEAPEST gateway serving BOTH ends of the pair (the pinned gateway when the operator
+    /// set one — a pin overrides route selection entirely). `None` when nothing serves the pair.
+    /// Stamped onto the emitted `Action::Move`/`Evacuate` as the perform-time route HINT.
+    pub resolved_gateway: Option<GatewayUrl>,
+    /// The smallest NET amount whose modelled move cost still fits the PROPORTIONAL per-move fee
+    /// cap. An explicit UPPER bound (every fee component is rounded UP), so it over-blocks rather
+    /// than under-blocks: a deferred top-up's shortfall keeps growing until it clears the floor,
+    /// whereas under-blocking would emit a move that fails the cap at perform time every tick,
+    /// forever. Meaningful only for [`RouteStatus::Routable`].
+    pub min_viable_amount: Msat,
+    pub status: RouteStatus,
+}
+
+/// Whether an ordered pair can carry a funding move, and if not, why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteStatus {
+    /// Some gateway serves both ends and the modelled cost fits the cap at or above
+    /// `min_viable_amount`.
+    Routable,
+    /// No gateway serves BOTH ends of the pair this tick — nothing can be routed at any size.
+    /// Transient by nature (a gateway may come back), so it is not surfaced as its own refusal;
+    /// the shortfall refusal already records that the destination stayed underfunded.
+    Unroutable,
+    /// A gateway serves both ends, but a conservative lower-bound proof shows that no positive
+    /// move size can fit `max_fee_bps_of_move`. Ambiguous adverse-slope cases remain missing
+    /// rather than receiving this permanent classification. This status is surfaced as its own
+    /// [`ReasonCode::UneconomicRoute`] refusal.
+    UneconomicAtAnySize,
 }
 
 /// A move A→B is a protocol (ADR-0022): B creates an invoice, A pays it via a shared
@@ -135,6 +183,17 @@ pub enum Action {
         to: FederationId,
         amount: Msat,
         fee_cap: Msat,
+        /// The route `decide()` priced this move against — the pair's
+        /// [`RouteEconomics::resolved_gateway`]. A HINT, not a constraint: `perform` uses it
+        /// only while it still serves both ends, and otherwise re-resolves under the SAME
+        /// `fee_cap` (the cap, not gateway identity, is the money backstop). `None` when the
+        /// pair was not priced this tick, which is exactly the pre-route-economics behavior
+        /// (resolve at perform time).
+        ///
+        /// `Action` is serde-persisted inside the durable `Intent`, so this MUST stay
+        /// `#[serde(default)]`: rows written before the field existed carry no key.
+        #[serde(default)]
+        gateway: Option<GatewayUrl>,
     },
     /// Move a federation's balance out ahead of a shutdown/health problem. Executed
     /// since Phase 3.A as a send-required move (the same validated two-leg path as
@@ -144,6 +203,12 @@ pub enum Action {
         to: FederationId,
         amount: Msat,
         fee_cap: Msat,
+        /// The preselected route, exactly as on `Move` (and `#[serde(default)]` for the same
+        /// durable-format reason). An evacuation is never BLOCKED by route economics — draining
+        /// a dying federation must not be gated on a fee model — so this is only ever a cheaper
+        /// starting point, `None` whenever the pair was not priced.
+        #[serde(default)]
+        gateway: Option<GatewayUrl>,
     },
     /// Pay a user-supplied BOLT11 directly from one federation. The payment hash is the
     /// natural user-API idempotency anchor; all sizing fields remain in the intent so an
@@ -336,6 +401,11 @@ pub enum ReasonCode {
     OverCap,
     NotProbed,
     LowReputation,
+    /// The route between the funding source and this federation is
+    /// [`RouteStatus::UneconomicAtAnySize`]: live quotes proved that no move size can clear the
+    /// cap. Emitted VISIBLY (rather than skipped silently like sub-dust) because it disables
+    /// rebalancing for the pair indefinitely and is fixed by raising the cap or changing gateway.
+    UneconomicRoute,
     /// A plain user verb (`direct-inflow`/`move`): the operator initiated it directly, so
     /// there is no allocator reason. Mandatory-but-honest (§8) — the ledger's `reason` is
     /// always present.

@@ -190,6 +190,7 @@ async fn move_returns_202_operation_key_fast() {
             to: fed(2),
             amount: Msat(10),
             fee_cap,
+            gateway: None,
         },
         reason: ReasonCode::UserInitiated,
         occurrence: Occurrence(0),

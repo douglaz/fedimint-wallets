@@ -129,6 +129,7 @@ fn leg_intent_with_fee_cap(
             to,
             amount: Msat(amount),
             fee_cap: Msat(fee_cap),
+            gateway: None,
         },
         max_fee: Some(Msat(fee_cap)),
         status: IntentStatus::Pending,
