@@ -12,6 +12,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use wallet_api::{
@@ -26,8 +27,8 @@ use wallet_core::{
 };
 use wallet_fedimint::{
     direct_inflow_nonce_key, join_intent_key, move_key, parse_invoice, raw_pay_key,
-    raw_receive_key, recover_intent_key, AwaitOutcome, Invoice, OpRequest, OperationRef, Snapshot,
-    SnapshotScope, TickPolicy,
+    raw_receive_key, recover_intent_key, AwaitOutcome, Invoice, MultiClient, OpRequest,
+    OperationRef, Snapshot, SnapshotScope, TickPolicy,
 };
 
 /// Wall-clock unix millis for the actor's decide-time clock. Display/ordering material only —
@@ -110,7 +111,10 @@ pub async fn history(
     let next_before_seq = (rows.len() == limit && limit > 0)
         .then(|| rows.last().map(|row| row.seq))
         .flatten();
-    let operations = rows.iter().map(operation_view).collect();
+    let operations = rows
+        .iter()
+        .map(|row| operation_view_masked(row, &state.mc))
+        .collect();
     Ok(Json(HistoryResponse {
         operations,
         next_before_seq,
@@ -157,7 +161,7 @@ pub async fn show_operation(
         .await
         .map_err(storage)?
     {
-        Some(record) => Ok(Json(operation_view(&record))),
+        Some(record) => Ok(Json(operation_view_masked(&record, &state.mc))),
         None => Err(HttpError::not_found(format!(
             "no operation found for key {}",
             key.0
@@ -832,6 +836,25 @@ fn operation_view(record: &OperationRecord) -> OperationView {
             _ => None,
         },
     }
+}
+
+/// `operation_view`, then mask the narrow recovery commit→insert window. `MultiClient::recover`
+/// terminalizes the recovery intent (→ `Succeeded`) and only THEN inserts the live client, so for a
+/// few microseconds an operation-status read sees `Succeeded` while `/v1/balance` still omits the
+/// fed (absent from `federations()` until the insert). The recovery reservation is held across that
+/// window, so while `is_recovering(fed)` holds, keep reporting the same in-progress `Started` the op
+/// showed throughout the replay — status and balance then agree, and it advances to `Succeeded` on
+/// the next poll once the client is installed. Money-safe and self-correcting either way.
+fn operation_view_masked(record: &OperationRecord, mc: &Option<Arc<MultiClient>>) -> OperationView {
+    let mut view = operation_view(record);
+    if view.status == OperationStatusDto::Succeeded {
+        if let OperationKind::Recover { fed } = &record.kind {
+            if mc.as_ref().is_some_and(|mc| mc.is_recovering(fed)) {
+                view.status = OperationStatusDto::Started;
+            }
+        }
+    }
+    view
 }
 
 fn operation_status_dto(status: OperationStatus) -> OperationStatusDto {
