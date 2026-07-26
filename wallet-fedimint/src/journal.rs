@@ -573,56 +573,73 @@ impl FedimintJournal {
         invite: &InviteCode,
         key: &IdempotencyKey,
     ) -> Result<(), ExecError> {
-        let ikey = intent_key(key);
         let now_ms = self.now_ms();
-        let mut dbtx = self.db.begin_transaction().await;
-        let Some(bytes) = dbtx.raw_get_bytes(&ikey).await.map_err(db_err)? else {
-            return Err(ExecError::Permanent(
-                "journal: recovery intent not found".to_owned(),
-            ));
-        };
-        let mut intent = decode_row_result::<Intent>("intent", &ikey, &bytes)?;
-        let matches_recovery = matches!(
-            &intent.action,
-            Action::Recover {
-                federation,
-                invite: intent_invite,
-            } if federation == id && intent_invite == &info.invite
-        );
-        if !matches_recovery {
-            return Err(ExecError::Permanent(
-                "journal: recovery completion does not match its intent".to_owned(),
-            ));
-        }
-        if intent.status != IntentStatus::Executing {
-            return Err(ExecError::Permanent(format!(
-                "journal: recovery completion requires Executing intent, found {:?}",
-                intent.status
-            )));
-        }
+        // Autocommit-retry (like `set_status_if`), NOT a bare `begin_transaction`/`commit_tx`: this
+        // is the terminal commit of an hours-long module-recovery replay, so a write-conflict with a
+        // concurrent watch-cycle write to the same candidate/registry key must be RE-TRIED rather
+        // than surfaced as an error that discards the whole replay (safe — the retry recovers into a
+        // fresh prefix — but wasteful). The entire check-and-write runs inside one retried closure so
+        // a loser re-reads state before re-applying. Snapshot the clock once so retries reuse it.
+        self.db
+            .autocommit(
+                |dbtx, _| {
+                    Box::pin(async move {
+                        let ikey = intent_key(key);
+                        let Some(bytes) = dbtx.raw_get_bytes(&ikey).await.map_err(db_err)? else {
+                            return Err(ExecError::Permanent(
+                                "journal: recovery intent not found".to_owned(),
+                            ));
+                        };
+                        let mut intent = decode_row_result::<Intent>("intent", &ikey, &bytes)?;
+                        let matches_recovery = matches!(
+                            &intent.action,
+                            Action::Recover {
+                                federation,
+                                invite: intent_invite,
+                            } if federation == id && intent_invite == &info.invite
+                        );
+                        if !matches_recovery {
+                            return Err(ExecError::Permanent(
+                                "journal: recovery completion does not match its intent".to_owned(),
+                            ));
+                        }
+                        if intent.status != IntentStatus::Executing {
+                            return Err(ExecError::Permanent(format!(
+                                "journal: recovery completion requires Executing intent, found {:?}",
+                                intent.status
+                            )));
+                        }
 
-        intent.status = IntentStatus::Done;
-        dbtx.raw_insert_bytes(&federation_key(id), &encode_row(info)?)
+                        intent.status = IntentStatus::Done;
+                        dbtx.raw_insert_bytes(&federation_key(id), &encode_row(info)?)
+                            .await
+                            .map_err(db_err)?;
+                        // Record durable USER ownership in the SAME transaction (D4.6). Without a
+                        // `UserApproved` candidate row the recovered fed reads as an agent-discovered
+                        // member, so `probe_gated_members` keeps it probe-gated and the allocator
+                        // never spends from it. A deliberate recovery confers user ownership exactly
+                        // like `join`; preserve an existing `UserApproved` (idempotent).
+                        write_recovered_user_ownership(dbtx, id, invite, now_ms).await?;
+                        write_intent_and_index(
+                            dbtx,
+                            &ikey,
+                            key,
+                            IntentStatus::Executing,
+                            &intent,
+                            now_ms,
+                            None,
+                        )
+                        .await?;
+                        Ok(())
+                    })
+                },
+                None,
+            )
             .await
-            .map_err(db_err)?;
-        // Record durable USER ownership in the SAME transaction (D4.6). Without a `UserApproved`
-        // candidate row the recovered fed reads as an agent-discovered member, so
-        // `probe_gated_members` keeps it probe-gated and the allocator never spends from it. A
-        // deliberate recovery confers user ownership exactly like `join`; preserve an existing
-        // `UserApproved` (idempotent).
-        write_recovered_user_ownership(&mut dbtx, id, invite, now_ms).await?;
-        write_intent_and_index(
-            &mut dbtx,
-            &ikey,
-            key,
-            IntentStatus::Executing,
-            &intent,
-            now_ms,
-            None,
-        )
-        .await?;
-        dbtx.commit_tx_result().await.map_err(db_err)?;
-        Ok(())
+            .map_err(|e| match e {
+                AutocommitError::CommitFailed { last_error, .. } => db_err(last_error),
+                AutocommitError::ClosureError { error, .. } => error,
+            })
     }
 
     /// Read a single federation's registry row.
