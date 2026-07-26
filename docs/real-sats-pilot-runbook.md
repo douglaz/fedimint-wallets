@@ -51,6 +51,16 @@ federation's guardians), but without it recovery means hunting guardians down by
   processes spending the same notes; the federation will let exactly one win and the
   bookkeeping of both is garbage. One seed, one live `client.db`, one daemon.
 
+### 3a. Prefer WSS-transport federations
+
+Choose federations whose guardians speak the **WebSocket (WSS)** API transport. The iroh
+transport's long-poll can STALL on sustained waits — a cross-fed Move's receive-claim await
+over an iroh federation hung indefinitely in the 2026-07-19/20 incident, recovered only by
+the daemon's `perform` timeout re-driving it with a fresh await. WSS federations avoid that
+failure mode entirely. (The daemon still bounds each `perform` via
+`WALLETD_PERFORM_TIMEOUT_SECS` — 120s in the shipped k8s config — so even an iroh stall
+self-recovers in ~2 min, but prefer WSS so the stall does not happen in the first place.)
+
 ### 4. Cap the exposure
 
 Pilot policy: keep the total at an amount you are genuinely willing to lose. Suggested
@@ -82,12 +92,26 @@ them only after a clean first week.)
 wallet-cli history --limit 200 | grep -iE "stranded|refunded" || echo clean
 
 # 2. Self-heal accounting: watchdog firings mean settlement silently died and the daemon
-#    restarted itself. One is survivable news; recurring ones are an investigation.
+#    restarted itself. Since the invoice-expiry fix, an open UNPAID invoice on a quiet
+#    pilot no longer false-fires this (a receive counts only once its invoice has actually
+#    EXPIRED), so a firing is now a reliable signal — one is survivable news, recurring
+#    ones are an investigation.
 journalctl --user -u walletd --since yesterday | grep -c "settlement stall" || true
 
 # 3. Restart count (systemd's view):
 systemctl --user show walletd -p NRestarts
+
+# 4. Liveness: /v1/health ALWAYS returns HTTP 200 (even with a dead scheduler) — the truth
+#    is in the BODY, not the status code. Parse `scheduler_alive`; never trust a 200 alone.
+curl -s -H "Authorization: Bearer $(cat "$WALLETD_TOKEN_PATH")" \
+  http://127.0.0.1:9736/v1/health \
+  | jq -e '.scheduler_alive == true' >/dev/null && echo alive || echo "SCHEDULER DOWN"
 ```
+
+The `/v1/health` status-code-is-always-200 shape is deliberate (the API requires the bearer
+token even for health), so any uptime monitor or k8s probe pointed at it MUST assert
+`scheduler_alive` in the JSON body — a check that only looks at the HTTP status will read a
+scheduler-dead daemon as healthy.
 
 ## Incidents
 

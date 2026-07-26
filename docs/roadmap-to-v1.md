@@ -29,6 +29,9 @@ either outcome (the ledger, hardening, UI, and recovery serve a single-fed walle
   redeemability probe passed its live devimint gate and now records durable verdict history
   for discovery-driven funding decisions ([phase5-plan.md](./phase5-plan.md)).
 - **Phase 5.1 — discovery: COMPLETE (2026-07-09)** — source-agnostic candidate pipeline (Observer HTTP + Manual; Nostr deferred), the `0x09` candidate registry, and the probe GATE wiring: an agent-discovered/auto-joined federation is fundable only after a sustained active-probe PASS (operator-tunable), never on discovery alone. Live devimint exit gate passed ([phase5-plan.md](./phase5-plan.md)).
+- **Phase 6a — `walletd` daemon + local API: COMPLETE (2026-07).** The 24/7 single-owner daemon (axum on 127.0.0.1 + bearer-token file) owns the DB and runs the watch scheduler; `wallet-cli` is a thin client (client mode default, `--standalone` explicit; the `watch` verb is gone — the daemon IS the watch). The fully-async intent model holds: route pricing and all network IO run OFF the actor, so a mid-flight (hours-long LN hold) payment never blocks another operation's start (ADR-0024). The responsiveness gate (`POST /v1/pay` reaches its first external call <250 ms under load) and the 24h+ soak passed; deployed as `walletd` (systemd + k8s) for the real-sats pilot ([phase6a-plan.md](./phase6a-plan.md), [real-sats-pilot-runbook.md](./real-sats-pilot-runbook.md)).
+- **Seed recovery (Phase 7 partial): COMPLETE.** A wallet restores each federation's ecash balance from the 12-word seed alone (fedimint recovery), with complete-or-fail semantics (a failed module recovery terminalizes rather than hanging forever), live-validated on devimint ([ADR-0025](./adr/0025-recovery-fresh-partition-seed-is-the-backup-unit.md)). The seed is the backup unit; the encrypted app-state/history backup and seed encryption-at-rest remain deferred — see Phase 7 and [ADR-0026](./adr/0026-seed-at-rest-encryption-headless.md).
+- **Route economics: COMPLETE.** Before each committable tick the allocator prices the designated funding pair through the cheapest gateway serving both ends and floors moves at that route's economic break-even, ending the uneconomic sub-viable churn a flat/proportional cap could not. Current pin: `douglaz/fedimint` `72b1e5b` (`wallet-pin/iroh-recovery-tpe8838`: iroh long-poll + recovery-complete-or-fail + #8838 single-share TPE).
 
 ## Sequence
 
@@ -56,7 +59,7 @@ into the gate, discovered federations are surface/manual-join only.
 **Gate:** discover → structural floor → ACTIVE probe → score → rebalance runs unattended
 against devimint, fully recorded; a candidate failing only the active probe is never funded.
 
-### Phase 6a — `walletd`: the 24/7 daemon + local API (Android postponed; re-sequenced 2026-07-10)
+### Phase 6a — `walletd`: the 24/7 daemon + local API — COMPLETE (Android postponed; re-sequenced 2026-07-10)
 The working-wallet milestone while device issues block the Android build. One process owns
 the DB permanently (`db.lock` forbids a 24/7 watch loop + operational commands as separate
 processes): new `wallet-daemon` crate (axum on 127.0.0.1 + bearer-token file; a Runtime-
@@ -97,7 +100,13 @@ copy per ADR-0006); discrete events on `mpsc`/`broadcast` (never `watch`, it coa
 budget 5-6 real JNI/platform modules; auth-to-send holds agent intents pending biometric
 approval (the deleted `requires_auth` concept returns HERE, not earlier).
 
-### Phase 7 — durability + recovery
+### Phase 7 — durability + recovery — PARTIAL (seed recovery landed; encryption + app-state backup deferred)
+Seed recovery of ecash is DONE (see "Where we are"): a seed-only restore rebuilds each
+federation's balance with complete-or-fail semantics, live-gated on devimint (ADR-0025).
+What remains, deferred: seed encryption AT REST — for the headless daemon a
+passphrase-derived or KMS/HSM key, NOT the mobile Android Keystore path
+([ADR-0026](./adr/0026-seed-at-rest-encryption-headless.md)) — and the encrypted
+app-state/history backup below.
 What all four surveyed wallets got wrong: seed encrypted at rest (Android Keystore +
 BiometricPrompt), silent backup of the federation set + standing instruction (ADR-0003).
 Carried from the retired TODOS.md: detect "no lockscreen" at onboarding and force a backup
