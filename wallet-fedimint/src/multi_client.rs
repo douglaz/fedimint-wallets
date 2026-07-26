@@ -199,9 +199,11 @@ impl MultiClient {
             .await
             .map_err(|e| anyhow::anyhow!("reading federation registry: {e:?}"))?
         {
-            // Registered on a previous run (or by a concurrent process): open, don't re-join.
+            // Registered on a previous run (or by a concurrent process): open, don't re-join. We
+            // already hold `join_lock` here, so call the locked body directly (the lock is not
+            // re-entrant).
             return Ok(JoinDeadlineOutcome::Joined(JoinOutcome::opened(
-                self.open_one(&info).await?,
+                self.open_one_locked(&info).await?,
             )));
         }
 
@@ -540,11 +542,22 @@ impl MultiClient {
             .is_some())
     }
 
-    /// Open one already-joined federation's client from its registry row and insert it
-    /// into the map. `open` reads the federation config already stored in the client's
-    /// own db partition, so `info.invite` is not needed here (it exists for
-    /// display/backup, per [`FederationInfo`]'s docs).
+    /// Open one already-joined federation's client from its registry row and insert it into the
+    /// map, serializing on `join_lock` so a registered fed is never double-opened. The watch
+    /// scheduler's `open_all` races a user `join`'s open for the same fed; without the lock both
+    /// could pass the `has_client` check and build two `ClientHandle`s over one db partition — two
+    /// executors on one partition, the product-forbidden state (this module's core invariant).
+    /// Callers that ALREADY hold `join_lock` (e.g. `join_inner`) must call
+    /// [`Self::open_one_locked`] directly, because the lock is not re-entrant.
     async fn open_one(&self, info: &FederationInfo) -> anyhow::Result<FederationId> {
+        let _join_guard = self.join_lock.lock().await;
+        self.open_one_locked(info).await
+    }
+
+    /// The body of [`Self::open_one`], assuming `join_lock` is ALREADY held by the caller so that
+    /// the `has_client` checks and the open+insert are serialized against every other join/open of
+    /// the same federation.
+    async fn open_one_locked(&self, info: &FederationInfo) -> anyhow::Result<FederationId> {
         // Honor the recovery reservation on THIS path too, not just `join_inner` (D4 concurrency):
         // the watch scheduler calls `open_all` → `open_one` for every registered-but-unopened fed
         // each cycle, and a fed whose recovery is in flight owns its fresh partition until `recover`
@@ -579,6 +592,18 @@ impl MultiClient {
             .await
             .map(Arc::new)?;
         let id = bridge_federation_id(client.federation_id());
+        // Under `join_lock`: for a normal (parseable-invite) row the `has_client` check above
+        // already returned early, so this is reached only when that pre-open check was skipped (a
+        // corrupt/unparseable registry invite, whose id is knowable only after `open`). Never
+        // REPLACE a live client with a second handle — drop our fresh one, as `join_inner`'s
+        // commit-time guard does. We hold the only `Arc`, so `try_unwrap` yields the handle for a
+        // clean shutdown (a failed unwrap falls through to `Drop`).
+        if self.has_client(&id) {
+            if let Ok(handle) = Arc::try_unwrap(client) {
+                handle.shutdown().await;
+            }
+            return Ok(id);
+        }
         self.clients
             .write()
             .expect("client map lock poisoned")
