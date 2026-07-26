@@ -4,12 +4,13 @@ A Rust Fedimint wallet project for a private, no-KYC, spending-focused ecash wal
 Wallet-of-Satoshi-simple on the surface, with an on-device multi-federation
 Allocator underneath.
 
-This repo is currently the headless engine and CLI. The Android Slint app is still
-planned, not built.
+This repo is currently the headless engine, the 24/7 `walletd` daemon, and the CLI.
+The Android Slint app is still planned, not built.
 
 ## Current status
 
-As of 2026-07-07, the core engine is past the original analysis/report stage:
+As of 2026-07-26, the engine, the `walletd` daemon, discovery, and seed recovery are
+live and devimint-validated:
 
 - **Phase 1 money engine: complete.** Join, receive, pay, exact-net direct inflow,
   cross-federation move, crash/reconcile recovery, and idempotent replay were
@@ -24,10 +25,30 @@ As of 2026-07-07, the core engine is past the original analysis/report stage:
   operation ledger is exposed through `wallet-cli history` / `wallet-cli show`.
 - **Phase 5.0 active probe: complete.** The wallet can spend a small amount through
   a candidate federation and redeem it back, producing a sustained-window
-  redeemability verdict for future discovery-driven funding decisions.
+  redeemability verdict for discovery-driven funding decisions.
+- **Phase 5.1 discovery + triggers: complete.** Source-agnostic candidate discovery
+  (Observer HTTP + manual), the candidate registry, and probe-gated funding: a
+  discovered/auto-joined federation is fundable only after a sustained active-probe
+  pass, never on discovery alone.
+- **Phase 6a `walletd` daemon + local API: complete.** A 24/7 single-owner daemon
+  (axum on 127.0.0.1 + bearer token) owns the DB and runs the watch scheduler;
+  `wallet-cli` is a thin client (client mode default, `--standalone` explicit). Route
+  pricing and all network IO run OFF the actor so a mid-flight (hours-long LN) payment
+  never blocks another operation (ADR-0024); the responsiveness gate holds
+  `POST /v1/pay` to its first external call in <250 ms.
+- **Seed recovery: complete.** A wallet restores each federation's ecash balance from
+  the 12-word seed alone (fedimint recovery), with complete-or-fail semantics (a failed
+  module recovery terminalizes rather than hanging forever) — live-validated on devimint.
+- **Route economics: complete.** Before each committable tick the allocator prices the
+  designated funding pair through the cheapest gateway serving both ends and floors
+  moves at that route's economic break-even, so it stops churning uneconomic
+  sub-viable moves every tick.
 
-Next work: Phase 5.1 discovery and triggers, then the Android frontend, recovery,
-and release hardening. See [docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md).
+Recovery of ECASH from the seed is done; the remaining durability work — encryption of
+the seed at rest (kicked off in [ADR-0026](./docs/adr/0026-seed-at-rest-encryption-headless.md),
+build deferred) and an encrypted app-state/history backup — is Phase 7. The Android
+frontend (Phase 6b) and release hardening (Phase 8) are next. See
+[docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md).
 
 ## What is in this repo
 
@@ -36,10 +57,16 @@ and release hardening. See [docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md).
 - [wallet-fedimint](./wallet-fedimint/) - Fedimint SDK integration: multi-federation
   clients, durable journal, executor, runtime, probe runner, move protocol, and
   operation ledger storage.
-- [wallet-cli](./wallet-cli/) - the first-class headless frontend. It supports
-  joining federations, balance/listing, receiving, paying, direct inflows,
-  cross-federation moves, evacuations through `tick`, active probes, reconciliation,
-  and ledger inspection.
+- [wallet-cli](./wallet-cli/) - the first-class frontend, a thin client of `walletd`
+  by default (`--standalone` for a direct-DB one-shot). Joins federations,
+  balance/listing, receive/pay/direct-inflow, cross-federation moves, evacuations
+  through `tick`, active probes, seed recovery (`recover` / `restore-mnemonic`),
+  reconciliation, and ledger inspection (`history` / `show`).
+- [wallet-daemon](./wallet-daemon/) - `walletd`, the 24/7 daemon: an axum local API
+  (127.0.0.1 + bearer token) over a single Runtime-owning actor, with the watch
+  scheduler, per-operation IO driver tasks, and the settlement-stall self-heal watchdog.
+- [wallet-api](./wallet-api/) - the wire DTOs and the runtime-mutable `Policy` struct
+  shared between the daemon and its clients.
 - [docs/](./docs/) - the build plans, runbooks, ADRs, review notes, and specs.
 - [SIMPLE-FEDIMINT-WALLET-REPORT.md](./SIMPLE-FEDIMINT-WALLET-REPORT.md) - the
   original wallet survey and product design report. It is useful background, but the
@@ -76,8 +103,10 @@ pilot values.
 ## Local development
 
 The workspace is pinned to `douglaz/fedimint` at commit
-`b108ec66ab21b70e1eea35d8663d9941a665ad58`. The Fedimint native dependencies are
-expected from the sibling Fedimint checkout's Nix environment:
+`72b1e5beadc5a31a33ebc751764cb2f840a63b5e` (branch `wallet-pin/iroh-recovery-tpe8838`:
+the iroh long-poll transport, a recovery-complete-or-fail cherry-pick, and the #8838
+single-share TPE fix — see `wallet-fedimint/Cargo.toml`). The Fedimint native
+dependencies are expected from the sibling Fedimint checkout's Nix environment:
 
 ```bash
 nix develop /home/master/p/fedimint -c cargo build --workspace
