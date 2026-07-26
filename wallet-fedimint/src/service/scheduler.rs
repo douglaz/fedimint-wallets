@@ -2,7 +2,9 @@ use super::{PolicyExt, ProbeCandidate, ProbeFacts, ReconcileReport, ServiceError
 use crate::discovery::{CandidateSource, ObserverSource};
 use crate::runtime::{ledger_nonce, now_ms, Runtime};
 use fedimint_core::runtime as fedimint_runtime;
+use lightning_invoice::Bolt11Invoice;
 use std::collections::{BTreeMap, BTreeSet};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -34,28 +36,64 @@ fn settlement_stall_deadline() -> Duration {
 /// operations to their TRUE terminal — claiming a funded contract, expiring an unpaid one — so
 /// no payment is ever marked failed while its contract is still claimable.
 ///
-/// The signal is deliberately SELF-CLEARING to avoid a restart loop on legitimately-unpaid
-/// invoices: it fires only when several receives are stuck past the deadline AND zero receives
-/// have CLAIMED within that same window. A live client keeps claiming other receives (nonzero
-/// recent successes ⇒ the stuck ones are merely unpaid, no restart); a dead task claims nothing
-/// (zero successes ⇒ restart), and after the restart the fresh task's successes clear it.
+/// Two layers keep this from restart-looping on legitimately-unpaid invoices. FIRST, a receive is
+/// only counted once it has outlived its own invoice validity (`is_settlement_stalled`): within its
+/// expiry an unpaid invoice is normal, so a quiet pilot holding a few open invoices never counts —
+/// this is what a low-traffic federation needs, since the second layer alone could not tell an
+/// unpaid invoice from a dead task without other traffic. SECOND, even among expired-and-stuck
+/// receives the signal is SELF-CLEARING: it fires only when zero receives have CLAIMED within the
+/// deadline window. A live client keeps claiming other receives (nonzero recent successes ⇒ no
+/// restart); a dead task claims nothing (zero successes ⇒ restart), and the fresh task's successes
+/// clear it after the restart.
 /// Returning `Some` makes [`run`] exit; its `CriticalTaskGuard` fires, walletd exits non-zero,
 /// and the supervisor (systemd `Restart=on-failure`, shipped) brings it back.
 async fn detect_settlement_stall(journal: &crate::journal::FedimintJournal) -> Option<String> {
     let deadline_ms = settlement_stall_deadline().as_millis() as u64;
     let now = now_ms();
 
-    // Cheap every-cycle scan: how many receives are stuck Awaiting past the deadline?
+    // Every-cycle scan: how many receives are stuck Awaiting past the settlement deadline AND past
+    // their invoice's own validity? A receive still within its invoice expiry is legitimately
+    // awaiting an external payer (an unpaid, UNEXPIRED invoice), NOT a settlement stall — see
+    // `is_settlement_stalled`. Excluding those stops a quiet pilot that merely holds a few open
+    // invoices from restart-looping (the false-fire this watchdog previously had).
     let awaiting = journal.awaiting().await.ok()?;
-    let stalled = awaiting
-        .iter()
-        .filter(|intent| {
-            matches!(
-                intent.action,
-                wallet_core::Action::Receive { .. } | wallet_core::Action::DirectInflow { .. }
-            ) && now.saturating_sub(intent.created_at_ms) > deadline_ms
-        })
-        .count();
+    let mut stalled = 0usize;
+    for intent in &awaiting {
+        // Cheap pre-checks before any per-intent journal read: only a receive-shaped op past the
+        // settlement deadline can be a stall.
+        let is_receive = matches!(
+            intent.action,
+            wallet_core::Action::Receive { .. } | wallet_core::Action::DirectInflow { .. }
+        );
+        if !is_receive || now.saturating_sub(intent.created_at_ms) <= deadline_ms {
+            continue;
+        }
+        // Resolve the invoice to read its real expiry: a raw `Receive` carries it on the intent; a
+        // `DirectInflow` runs the move path and persists it on the derived `MoveRecord` instead
+        // (its `intent.invoice` is always `None`), so it must be fetched from there. A move-record
+        // READ error is NOT a missing invoice: treating it as one would take the created-at fallback
+        // and could restart on a fresh-but-old-intent inflow during a transient storage hiccup, so
+        // abort the whole watchdog cycle instead — a decision this consequential must not run on an
+        // unreliable journal read. The `min_move` fallback is reserved for a genuine `Ok(None)`.
+        let invoice = match &intent.action {
+            wallet_core::Action::DirectInflow { .. } => {
+                match journal.get_move(&intent.idempotency_key).await {
+                    Ok(record) => record.and_then(|rec| rec.invoice),
+                    Err(_) => return None,
+                }
+            }
+            _ => intent.invoice.clone(),
+        };
+        if is_settlement_stalled(
+            &intent.action,
+            invoice.as_ref(),
+            intent.created_at_ms,
+            now,
+            deadline_ms,
+        ) {
+            stalled += 1;
+        }
+    }
     if stalled < SETTLEMENT_STALL_THRESHOLD {
         return None;
     }
@@ -70,6 +108,57 @@ async fn detect_settlement_stall(journal: &crate::journal::FedimintJournal) -> O
     });
 
     settlement_stall_verdict(stalled, claimed_recently, deadline_ms / 1000)
+}
+
+/// Whether one Awaiting intent counts toward the settlement-stall signal: a receive-shaped op
+/// (`Receive`/`DirectInflow`, both paid by an EXTERNAL party) that is past the settlement deadline
+/// AND whose invoice has actually EXPIRED. Within its validity an unpaid invoice is legitimately
+/// awaiting a payer, not a stall — this is the fix for the quiet-pilot false-fire. Expiry is read
+/// from the persisted BOLT11 itself (its own mint timestamp + expiry), so a receive that minted its
+/// invoice long AFTER the intent was created — e.g. after a long run of failed `perform` attempts —
+/// is judged by the invoice's REAL validity, not `created_at_ms` (which predates the mint). Only a
+/// receive still Awaiting past its invoice's expiry (it should have terminalized: expired-unpaid →
+/// Failed, funded → Succeeded) is evidence the shared receive task has died. A missing/unparseable
+/// invoice on an Awaiting receive is anomalous; fall back to the conservative created-at anchor.
+/// Pure, so the decision is unit-tested without a journal fixture.
+fn is_settlement_stalled(
+    action: &wallet_core::Action,
+    invoice: Option<&wallet_core::Invoice>,
+    created_at_ms: u64,
+    now: u64,
+    deadline_ms: u64,
+) -> bool {
+    let is_receive = matches!(
+        action,
+        wallet_core::Action::Receive { .. } | wallet_core::Action::DirectInflow { .. }
+    );
+    // Cheap pre-filter: nothing younger than the settlement deadline is a stall, and it avoids
+    // parsing an invoice for the common recent-op case.
+    if !is_receive || now.saturating_sub(created_at_ms) <= deadline_ms {
+        return false;
+    }
+    // Post-expiry GRACE: count only once the invoice has been expired for MORE than the settlement
+    // deadline, evaluated at `now - deadline_ms`. An invoice's expiry -> terminal transition is
+    // asynchronous: at the boundary a HEALTHY awaiter has not yet written the expired/Failed status,
+    // so counting the instant an invoice expires would restart a normal wallet whenever several
+    // invoices expire together with no recent claim. The grace gives that transition time to land.
+    //
+    // The BOLT11 timestamp is authored by the gateway/LN node, whereas lnv2's incoming contract
+    // expiry is derived from a separate clock; this same grace also absorbs any gateway-vs-wallet
+    // clock skew up to `deadline_ms` (300s), which covers every realistic (NTP-synced) deployment.
+    // A skew beyond that is a broken node — the consequence here is only a money-safe self-heal
+    // restart, and the truly authoritative source (the persisted receive-contract expiration) is
+    // not reachable from the journal without a per-receive live-client query.
+    let grace_point_ms = now.saturating_sub(deadline_ms);
+    match invoice.and_then(|inv| Bolt11Invoice::from_str(&inv.0).ok()) {
+        Some(bolt11) => bolt11.would_expire(Duration::from_millis(grace_point_ms)),
+        None => {
+            now.saturating_sub(created_at_ms)
+                > (crate::multi_client::RECEIVE_EXPIRY_SECS as u64)
+                    .saturating_mul(1000)
+                    .saturating_add(deadline_ms)
+        }
+    }
 }
 
 /// The pure decision behind [`detect_settlement_stall`], split out so the self-clearing logic is
@@ -93,7 +182,170 @@ fn settlement_stall_verdict(
 
 #[cfg(test)]
 mod stall_tests {
-    use super::{settlement_stall_verdict, SETTLEMENT_STALL_THRESHOLD};
+    use super::{is_settlement_stalled, settlement_stall_verdict, SETTLEMENT_STALL_THRESHOLD};
+    use lightning_invoice::Bolt11Invoice;
+    use std::str::FromStr;
+    use wallet_core::{Action, FederationId, Invoice, Msat};
+
+    const DEADLINE_MS: u64 = 300_000; // 300s
+    const EXPIRY_MS: u64 = 3_600_000; // fixed 1h fallback anchor (RECEIVE_EXPIRY_SECS)
+    const NOW: u64 = 100_000_000;
+
+    // A valid BOLT11 (the spec example) — a fixed mint timestamp and the default 3600s expiry, so
+    // its real validity window is derivable and independent of `created_at_ms`.
+    const REAL_INVOICE: &str = "lnbc25m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5vdhkven9v5sxyetpdeessp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs9q5sqqqqqqqqqqqqqqqqsgq2a25dxl5hrntdtn6zvydt7d66hyzsyhqs4wdynavys42xgl6sgx9c4g7me86a27t07mdtfry458rtjr0v92cnmswpsjscgt2vcse3sgpz3uapa";
+
+    fn receive() -> Action {
+        Action::Receive {
+            to: FederationId([0x11; 32]),
+            amount: Msat(1_000),
+            fee_cap: Msat(10),
+            nonce: String::new(),
+            gateway: None,
+        }
+    }
+
+    fn invoice_expiry_ms() -> u64 {
+        let b = Bolt11Invoice::from_str(REAL_INVOICE).expect("valid test invoice");
+        (b.duration_since_epoch() + b.expiry_time()).as_millis() as u64
+    }
+
+    #[test]
+    fn unexpired_invoice_is_not_stalled() {
+        // Past the settlement deadline, but the invoice itself is still within its validity — the
+        // legitimately-open unpaid invoice a quiet pilot holds. Must NOT count.
+        let now = invoice_expiry_ms() - 1_000; // 1s before the invoice expires
+        let inv = Invoice(REAL_INVOICE.to_string());
+        assert!(!is_settlement_stalled(
+            &receive(),
+            Some(&inv),
+            now - 600_000,
+            now,
+            DEADLINE_MS
+        ));
+    }
+
+    #[test]
+    fn expired_invoice_past_grace_is_stalled() {
+        // Expired for MORE than the settlement deadline yet still Awaiting → the async expiry ->
+        // terminal transition should have landed by now → genuine stall.
+        let now = invoice_expiry_ms() + DEADLINE_MS + 1_000;
+        let inv = Invoice(REAL_INVOICE.to_string());
+        assert!(is_settlement_stalled(
+            &receive(),
+            Some(&inv),
+            now - 5_000_000,
+            now,
+            DEADLINE_MS
+        ));
+    }
+
+    #[test]
+    fn just_expired_within_grace_is_not_stalled() {
+        // Expired only moments ago — inside the post-expiry grace, a healthy awaiter's terminal
+        // write may still be in flight, so this must NOT count (would otherwise restart a normal
+        // wallet whenever several invoices expire together).
+        let now = invoice_expiry_ms() + 1_000; // 1s past expiry, well within the 300s grace
+        let inv = Invoice(REAL_INVOICE.to_string());
+        assert!(!is_settlement_stalled(
+            &receive(),
+            Some(&inv),
+            now - 5_000_000,
+            now,
+            DEADLINE_MS
+        ));
+    }
+
+    #[test]
+    fn delayed_mint_is_judged_by_invoice_not_created_at() {
+        // The regression codex caught: the intent was created LONG before the invoice was minted
+        // (a run of failed perform attempts). Judged by the invoice's own fresh validity it is NOT
+        // a stall, even though `created_at_ms` is 2h old — the old created-at anchor would have
+        // wrongly counted it and re-introduced the restart loop.
+        let now = invoice_expiry_ms() - 1_000;
+        let created = now - 7_200_000; // intent created 2h before now
+        let inv = Invoice(REAL_INVOICE.to_string());
+        assert!(!is_settlement_stalled(
+            &receive(),
+            Some(&inv),
+            created,
+            now,
+            DEADLINE_MS
+        ));
+    }
+
+    #[test]
+    fn within_deadline_is_never_stalled() {
+        // Younger than the settlement deadline → the cheap pre-filter excludes it even with an
+        // already-expired invoice.
+        let now = invoice_expiry_ms() + 10_000_000;
+        let inv = Invoice(REAL_INVOICE.to_string());
+        assert!(!is_settlement_stalled(
+            &receive(),
+            Some(&inv),
+            now - 100_000, // 100s < 300s deadline
+            now,
+            DEADLINE_MS
+        ));
+    }
+
+    #[test]
+    fn no_invoice_falls_back_to_created_at() {
+        // Anomalous: an Awaiting receive with no parseable invoice falls back to the created-at +
+        // fixed-expiry anchor. Within the anchor → not a stall; past it → a stall.
+        assert!(!is_settlement_stalled(
+            &receive(),
+            None,
+            NOW - 600_000, // 10 min, < 1h
+            NOW,
+            DEADLINE_MS
+        ));
+        assert!(is_settlement_stalled(
+            &receive(),
+            None,
+            NOW - (EXPIRY_MS + DEADLINE_MS + 60_000), // past the 1h anchor + the post-expiry grace
+            NOW,
+            DEADLINE_MS
+        ));
+    }
+
+    #[test]
+    fn direct_inflow_uses_the_same_rule() {
+        // In production `detect_settlement_stall` resolves a DirectInflow's invoice from its
+        // `MoveRecord` (its `intent.invoice` is always `None`) and passes it in exactly like this.
+        let inflow = Action::DirectInflow {
+            to: FederationId([0x22; 32]),
+            amount: Msat(1_000),
+            fee_cap: Msat(10),
+        };
+        let now = invoice_expiry_ms() - 1_000;
+        let inv = Invoice(REAL_INVOICE.to_string());
+        assert!(!is_settlement_stalled(
+            &inflow,
+            Some(&inv),
+            now - 600_000,
+            now,
+            DEADLINE_MS
+        ));
+    }
+
+    #[test]
+    fn non_receive_is_never_stalled() {
+        let mv = Action::Move {
+            from: FederationId([0x01; 32]),
+            to: FederationId([0x02; 32]),
+            amount: Msat(1),
+            fee_cap: Msat(1),
+            gateway: None,
+        };
+        assert!(!is_settlement_stalled(
+            &mv,
+            None,
+            NOW - (EXPIRY_MS + 60_000),
+            NOW,
+            DEADLINE_MS
+        ));
+    }
 
     #[test]
     fn below_threshold_never_restarts() {
