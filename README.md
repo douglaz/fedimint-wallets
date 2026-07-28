@@ -37,8 +37,12 @@ live and devimint-validated:
   never blocks another operation (ADR-0024); the responsiveness gate holds
   `POST /v1/pay` to its first external call in <250 ms.
 - **Seed recovery: complete.** A wallet restores each federation's ecash balance from
-  the 12-word seed alone (fedimint recovery), with complete-or-fail semantics (a failed
-  module recovery terminalizes rather than hanging forever) — live-validated on devimint.
+  the 12-word seed alone (fedimint recovery) — the SUCCESS path is live-validated on
+  devimint (both the daemon and standalone front ends, including journal-only loss over an
+  orphan partition). Complete-or-fail semantics (a failed module recovery terminalizes
+  rather than hanging forever) are covered by unit tests, NOT by a live gate: faithfully
+  injecting a module-recovery failure needs a fault hook in the fedimint fork, so the live
+  failure gate is deferred (`docs/recovery-failure-gate-analysis.md`).
 - **Route economics: complete.** Before each committable tick the allocator prices the
   designated funding pair through the cheapest gateway serving both ends and floors
   moves at that route's economic break-even, so it stops churning uneconomic
