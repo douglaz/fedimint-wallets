@@ -63,23 +63,33 @@ self-recovers in ~2 min, but prefer WSS so the stall does not happen in the firs
 
 ### 4. Cap the exposure
 
-Pilot policy: keep the total at an amount you are genuinely willing to lose. Suggested
-starting point (~150k sats total ceiling across feds):
+Pilot policy: keep the total at an amount you are genuinely willing to lose.
+
+**There is no aggregate ceiling in code — `Policy` enforces `per_fed_cap` only.** The total
+exposure a policy permits is therefore `per_fed_cap × (number of joined federations)`, so the
+per-fed number is what you must size to reach a total you can accept. For the two-federation
+pilot, 75k sats per fed is what makes the enforced caps imply a ~150k sat total:
 
 ```bash
-# 100k sats concentration ceiling per federation
+# 75k sats concentration ceiling per federation
+#   -> with the pilot's TWO feds this is the ~150k sat total ceiling.
+#   Joining a third fed raises the permitted total to 225k: re-run `policy set` with a
+#   lower per-fed cap BEFORE joining, or the ceiling silently moves.
 # 50k sats float in the spending fed
 # 20k sats in standby
 # 50 sats absolute cap: evacuations + manual --fee-cap default
 # 3% proportional cap on funding moves (top-up/standby)
 wallet-cli policy set \
-  --per-fed-cap 100000000 \
+  --per-fed-cap 75000000 \
   --spending-target 50000000 \
   --standby-target 20000000 \
   --max-fee 50000 \
   --max-fee-bps-of-move 300
 wallet-cli policy get              # verify what is actually stored
 ```
+
+Keep `auto_join` off (the default) for the pilot: automatic federation discovery would raise
+the permitted total without an operator deciding to.
 
 (Values are msat, except `--max-fee-bps-of-move`, which is basis points, 1-10000. Raise
 them only after a clean first week.)
@@ -121,11 +131,15 @@ scheduler-dead daemon as healthy.
   and treat it as a bug (the known upstream trigger is fixed at our pin; a new firing has
   a new cause).
 - **A `stranded` row in history.** The move's send leg settled but the receive was not
-  credited. Reconcile re-drives it on every pass and on every restart; give it time and a
-  restart before touching anything. If it persists across a restart + an hour, preserve
-  `journalctl` + `wallet-cli history` output and debug with the recv op-id from the move
-  record — do not re-submit the move by hand (the executor's dedup is what is protecting
-  you from a double-spend).
+  credited. **`Stranded` is TERMINAL — waiting and restarting will NOT repair it.**
+  `reconcile` re-drives `pending()` only (`Pending`/`Executing`); `Failed`/`Permanent` stay
+  terminal and `Awaiting` is subscription-owned, so nothing re-drives a stranded move. Do not
+  burn an hour waiting for a self-heal that cannot come. Instead, act immediately: preserve
+  `journalctl` + `wallet-cli history` output, and recover using the durable artifact the move
+  record saved for exactly this case — **the payment preimage** — together with the recv op-id.
+  The preimage is proof the send settled and is what a gateway/federation operator needs to
+  reconcile the un-credited leg. Do NOT re-submit the move by hand (the executor's dedup is
+  what is protecting you from a double-spend).
 - **A pay came back `refunded`/failed after submission.** lnv2 permits ONE payment
   attempt per invoice: the wallet refuses a retry of that same invoice by design
   ("already consumed its single payment attempt"). Get a fresh invoice from the payee.
