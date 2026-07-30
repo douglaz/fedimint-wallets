@@ -90,6 +90,9 @@ Per ADR-0028:
   five-failure boundary. Argon2 runs on a **bounded blocking pool** and no lock is held across
   hashing or backoff, so login attempts cannot starve authenticated requests. Exponential backoff
   after 5 consecutive failures, capped at 30s, reset on success.
+- **Failed logins and rate-limit engagement are logged at `warn`**, carrying no password material.
+  The password is the only control in front of `/v1/recover`, so an operator must be able to see a
+  brute-force attempt; silent absorption by the limiter means an attack leaves no trace at all.
 - **Logout is `POST`** with CSRF, and clears the server-side entry.
 - Restarting the sidecar clears all sessions — the documented "revoke everything".
 
