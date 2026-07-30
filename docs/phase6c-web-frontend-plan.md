@@ -253,8 +253,9 @@ past-tense language with reasons.
 ## 6c.6 Config, provisioning, lifecycle
 
 - **Config file** (`wallet-web.toml`), written `0600` with the mode re-asserted after write,
-  mirroring `wallet-daemon/src/config.rs`. Holds: bind address/port, daemon URL, token path,
-  Argon2id password hash (PHC string), session timeouts, public origin.
+  mirroring `wallet-daemon/src/config.rs`. Holds: **port only** (the bind address is hard-coded to
+  loopback per 6c.1 and is deliberately NOT configurable), daemon URL, token path, Argon2id
+  password hash (PHC string), session timeouts, public origin.
 - **`wallet-web init`** provisions the password (prompt, confirm, hash, write). **The server refuses
   to start without a password hash** — fail closed, no default credential, no first-load setup page
   (ADR-0028).
@@ -280,7 +281,8 @@ past-tense language with reasons.
    errors, the login page, and `/healthz` — not only on authenticated pages.
 3. A loopback peer address does **not** authenticate: an unauthenticated request from `127.0.0.1`
    is still rejected.
-4. Startup rejects a non-loopback bind address and a non-loopback daemon URL.
+4. Startup rejects a non-loopback daemon URL. (There is no bind-address test: the address is a
+   hard-coded constant, not configuration — 6c.1/6c.6.)
 5. Session expiry: idle beyond 4h rejected; absolute beyond 24h rejected even under continuous
    use; **and continuous 3s polling still expires at 4h** (polling must not slide `last_seen`).
 6. Session and CSRF values are regenerated on login; the hidden CSRF field never equals the cookie.
@@ -302,6 +304,11 @@ past-tense language with reasons.
     every one of them is listed.
 12. Money idempotency **with JavaScript disabled**: submitting the same rendered receive/move form
     twice produces exactly ONE operation, and the same receive key re-yields the same invoice.
+    **The move case must edit `max_fee` between the two submissions and still yield one
+    operation** — without that, the test passes even when the form omits the fee cap and lets the
+    daemon re-derive it, which is exactly the defect the snapshot requirement exists to prevent
+    (a re-derived cap changes `move_key`). Likewise assert Receive keeps its snapshotted federation
+    and cap across a policy edit.
 13. Policy round-trip preserves a field the form does not know about (read-modify-write, not
     reconstruct).
 14. Receive/DirectInflow result pages carry the invoice and QR from the POST response.
