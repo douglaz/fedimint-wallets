@@ -215,6 +215,15 @@ Disabling a button in JavaScript is not a defence — the spec requires the UI t
 
 - Every money form **generates its idempotency value at render time** into a hidden field, so a
   resubmit of the same rendered form carries the same key and dedupes at the daemon.
+- **The idempotency input alone is not sufficient — snapshot every policy-derived field the key or
+  the action depends on.** When a form leaves the federation or fee cap unset, the daemon resolves
+  them from *current policy* on each POST (`handlers.rs`: `let fee_cap =
+  request.fee_cap.unwrap_or(policy.max_fee)`), and for a move that resolved cap is an **input to
+  the operation key**. A policy edit between the first POST and a retry therefore produces a
+  different key from the same `occurrence`, and the move is admitted as a SECOND operation; for
+  receive it can silently target a different federation or fail as a sizing conflict. So each
+  rendered form must resolve and submit **explicit** values for the federation and fee cap (and any
+  future policy-derived field affecting the key), not rely on daemon-side defaults.
 - **Pay and Move use Post/Redirect/Get**, so a refresh re-issues a GET, never the POST.
 - **Receive and DirectInflow do NOT redirect** — they render their result directly from the POST
   response. Their payable invoice exists *only* in that response body (`ReceiveAccepted`), and
