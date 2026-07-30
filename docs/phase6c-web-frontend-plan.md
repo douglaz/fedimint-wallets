@@ -285,39 +285,42 @@ past-tense language with reasons.
    `POST /login`, `GET /healthz`). A newly added route fails this test by default.
 2. Required security headers are present on **every** response — authenticated pages, redirects,
    errors, the login page, and `/healthz` — not only on authenticated pages.
-3. A loopback peer address does **not** authenticate: an unauthenticated request from `127.0.0.1`
+3. **The baseline that everything else assumes: the correct password authenticates and establishes
+   a session; a wrong password does not, and returns an indistinguishable failure.** Every other
+   auth test here presumes login works; none of them actually assert it.
+4. A loopback peer address does **not** authenticate: an unauthenticated request from `127.0.0.1`
    is still rejected.
-4. Startup rejects a non-loopback daemon URL. (There is no bind-address test: the address is a
+5. Startup rejects a non-loopback daemon URL. (There is no bind-address test: the address is a
    hard-coded constant, not configuration — 6c.1/6c.6.)
-5. Session expiry: idle beyond 4h rejected; absolute beyond 24h rejected even under continuous
+6. Session expiry: idle beyond 4h rejected; absolute beyond 24h rejected even under continuous
    use; **and continuous 3s polling still expires at 4h** (polling must not slide `last_seen`).
-6. Session and CSRF values are regenerated on login; the hidden CSRF field never equals the cookie.
-7. CSRF: mutating request without a valid token rejected; mismatched `Origin` rejected; **neither
+7. Session and CSRF values are regenerated on login; the hidden CSRF field never equals the cookie.
+8. CSRF: mutating request without a valid token rejected; mismatched `Origin` rejected; **neither
    `Origin` nor `Referer` present** rejected; `POST /login` exempt from the token but not the
    origin check.
-8. Rate limiting engages after 5 failures and resets on success, **including under concurrent
+9. Rate limiting engages after 5 failures and resets on success, **including under concurrent
    attempts** (the boundary must hold), and authenticated requests stay responsive while logins
    are being throttled.
-9. `init` writes `0600`; startup fails with no hash, with a malformed PHC string, and with
+10. `init` writes `0600`; startup fails with no hash, with a malformed PHC string, and with
    Argon2id parameters below the pinned minimums; passwords under 12 chars are rejected;
    oversized input is rejected before hashing.
-10. `?status=open` (daemon): returns exactly `Started`+`Awaiting`; omitting `status` is
+11. `?status=open` (daemon): returns exactly `Started`+`Awaiting`; omitting `status` is
     byte-identical to today's response; **an open row older than more than one full page of
     terminal rows is still returned** (proves filtering happens before `take(limit)` — a
     handler-side filter must fail this); cursor paging works with the filter on; an unknown status
     value returns 422 `refused`.
-11. Outstanding follows `next_before_seq` to exhaustion — with more open operations than one page,
+12. Outstanding follows `next_before_seq` to exhaustion — with more open operations than one page,
     every one of them is listed.
-12. Money idempotency **with JavaScript disabled**: submitting the same rendered receive/move form
+13. Money idempotency **with JavaScript disabled**: submitting the same rendered receive/move form
     twice produces exactly ONE operation, and the same receive key re-yields the same invoice.
     **The move case must edit `max_fee` between the two submissions and still yield one
     operation** — without that, the test passes even when the form omits the fee cap and lets the
     daemon re-derive it, which is exactly the defect the snapshot requirement exists to prevent
     (a re-derived cap changes `move_key`). Likewise assert Receive keeps its snapshotted federation
     and cap across a policy edit.
-13. Policy round-trip preserves a field the form does not know about (read-modify-write, not
+14. Policy round-trip preserves a field the form does not know about (read-modify-write, not
     reconstruct).
-14. Receive/DirectInflow result pages carry the invoice and QR from the POST response.
+15. Receive/DirectInflow result pages carry the invoice and QR from the POST response.
 
 **Live gate (devimint, driven like the existing CLI gates):**
 Start `walletd` + `wallet-web` against a two-fed devimint. Log in over HTTP. Receive: create an
@@ -352,8 +355,8 @@ over-specification, and should be declined with a reference to this section:
 1. Crate skeleton, config + `init`, fail-closed startup, `0600` handling. *(test 9)*
 2. Auth: Argon2id, sessions, expiry, rate limiting, CSRF, headers, login/logout. *(tests 2-8)*
 3. Daemon `?status=open` filter + its tests, landed as its own PR. *(test 10)*
-4. Read surface: dashboard, balance, federations, activity, operation detail, Outstanding.
-5. Polling JS + degraded-daemon banner and `/healthz`.
-6. Money surface: send, receive (server-side QR), move, direct-inflow.
-7. Federation + admin + policy surfaces with confirmation pages.
-8. The devimint live gate.
+5. Read surface: dashboard, balance, federations, activity, operation detail, Outstanding.
+6. Polling JS + degraded-daemon banner and `/healthz`.
+7. Money surface: send, receive (server-side QR), move, direct-inflow.
+8. Federation + admin + policy surfaces with confirmation pages.
+9. The devimint live gate.
