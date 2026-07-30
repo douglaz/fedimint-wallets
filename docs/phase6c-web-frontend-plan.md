@@ -78,6 +78,9 @@ Per ADR-0028:
 - **Both values are regenerated on every successful login**, regardless of any cookie presented
   (session fixation).
 - **Lifetime**: sliding **4h idle**, absolute **24h** cap, enforced server-side on every request.
+  These are the security contract, so configuration may only ever **tighten** them: values above the
+  4h/24h ceilings, or unparseable values, fail startup closed rather than silently widening the
+  window that ADR-0028 relies on as its sole mitigation.
 - **Polling and `/healthz` are PASSIVE**: they validate the session but must NOT update
   `last_seen`. Otherwise 3-second polling (6c.4) refreshes the idle timer forever and an unattended
   visible tab stays fully authorized for the full 24h — defeating the idle timeout entirely.
@@ -98,20 +101,32 @@ Per ADR-0028:
   field, compared in constant time. `POST /login` is the one exception — no session exists yet —
   and it is still subject to the origin check below.
 - Every mutating request is rejected unless `Origin` (or `Referer` when `Origin` is absent) matches
-  the configured `public_origin` **exactly** (scheme + host + effective port). A request carrying
-  **neither** header is rejected. `public_origin` is explicit configuration, not derived from
+  the configured `public_origin` **exactly** (scheme + host + effective port). A `Referer` is a full
+  URL (`https://host/form`), so it must be **parsed and normalized** to its origin triple before
+  comparison — never string-compared whole, which would reject every legitimate request. Reject a
+  `Referer` carrying credentials, and reject malformed values. A request carrying **neither** header
+  is rejected. `public_origin` is explicit configuration, not derived from
   `Host`: a `Host` header is attacker-controlled and is not an origin.
 
 ### Response headers (all routes)
 
-`Content-Security-Policy: default-src 'self'; frame-ancestors 'none'; base-uri 'none'` ·
+`Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-<per-response>';
+style-src 'self' 'nonce-<per-response>'; frame-ancestors 'none'; base-uri 'none'` — a fresh
+CSPRNG nonce per response, emitted on the login page's inlined `<style>`/`<script>`. `'self'` alone
+does NOT authorize inline elements, so the bare `default-src 'self'` would have silently blocked the
+very assets 6c.2 requires to be inlined. ·
 `X-Content-Type-Options: nosniff` · `Referrer-Policy: no-referrer` ·
 `Cache-Control: no-store` on every authenticated page (balances must never land in a shared cache
 or the back button after logout).
 
 ## 6c.3 The verb surface
 
-**Full `wallet-cli` parity** (ADR-0028), covering every route in `wallet-daemon/src/server.rs`:
+**Parity with everything the daemon API exposes** (ADR-0028) — which is *not* the same as full
+`wallet-cli` parity, and the spec previously overclaimed. `wallet-cli` refuses these in client mode
+because they have no daemon endpoint, so a sidecar cannot offer them either:
+`discover`, `probe`, `tick` (agent verbs), `history --fed`, `show` by numeric sequence, and
+`status` with policy overrides (`wallet-cli/src/main.rs:576-592`). They stay CLI+`--standalone`
+only. Everything the daemon does expose:
 
 | Area | Daemon routes |
 |---|---|
@@ -156,11 +171,15 @@ background timers are throttled and mobile pages are suspended. So:
 - `history()` currently **skips undecodable ledger rows silently**. For the `status=open` path that
   would let a corrupt open operation vanish while the UI reports "nothing outstanding". The
   response must signal that rows were skipped, and the UI must render a fail-closed warning rather
-  than an empty list.
+  than an empty list. **This response-shape addition is part of the single budgeted daemon change**,
+  not a second one: it is the same handler, the same endpoint, and equally read-only. Land it in the
+  same PR so the budget stays one reviewable diff.
 - **UI:** an **Outstanding** section, rendered on every page load from `?status=open`, listing
   **every** non-terminal operation with its age. One request returns at most `limit` rows, so the
-  sidecar must **follow `next_before_seq` to exhaustion** (bounded by a sane page cap) — "all
-  outstanding" is a lie if it silently means "the newest 50 outstanding". This is how a days-old
+  sidecar must **follow `next_before_seq` to exhaustion**, bounded by a page cap. "All outstanding"
+  is a lie if it silently means "the newest 50 outstanding" — and equally a lie if the cap is hit
+  and the UI still presents the list as complete. **If the cap is reached, the list must be labelled
+  incomplete** and say so in the UI, with a test covering that state. This is how a days-old
   held payment stays visible no matter how much history accumulated behind it.
 - **Polling:** only for operations currently on screen — `GET /v1/operations/{key}` every 3s while
   visible, stopping on terminal status or when the page is hidden (`visibilitychange`). Polling is a
@@ -196,13 +215,16 @@ Disabling a button in JavaScript is not a defence — the spec requires the UI t
 
 - Every money form **generates its idempotency value at render time** into a hidden field, so a
   resubmit of the same rendered form carries the same key and dedupes at the daemon.
-- All money POSTs use **Post/Redirect/Get**, so a browser refresh re-issues a GET, never the POST.
-- Re-attaching the same receive key re-yields the *same* invoice from the daemon, which also solves
-  "refresh loses the invoice".
-
-**Receive and DirectInflow return their payable invoice only in the POST response.** Redirecting
-straight to the operation page would discard it. Those two flows render a **result page** carrying
-the invoice, its server-rendered QR, the operation key, and a link to the detail page.
+- **Pay and Move use Post/Redirect/Get**, so a refresh re-issues a GET, never the POST.
+- **Receive and DirectInflow do NOT redirect** — they render their result directly from the POST
+  response. Their payable invoice exists *only* in that response body (`ReceiveAccepted`), and
+  `OperationView` cannot reconstruct it, so a 303 would discard the one artifact the user needs (a
+  browser does not render the body of a redirect). Rendering in place is safe precisely because the
+  idempotency key is fixed at render time: a refresh re-POSTs the same key, and the daemon
+  re-yields the *same* invoice rather than minting a second one. Do not "fix" this by storing
+  transient result state in the sidecar — the same key returning the same invoice is the mechanism.
+- Those two flows render a **result page** carrying the invoice, its server-rendered QR, the
+  operation key, and a link to the detail page.
 
 ### Money form contracts
 
@@ -305,9 +327,9 @@ over-specification, and should be declined with a reference to this section:
 
 ## 6c.9 Build order
 
-1. Crate skeleton, config + `init`, fail-closed startup, `0600` handling. *(tests 6)*
-2. Auth: Argon2id, sessions, expiry, rate limiting, CSRF, headers, login/logout. *(tests 1-5,7,8)*
-3. Daemon `?status=open` filter + its tests, landed as its own PR. *(test 9)*
+1. Crate skeleton, config + `init`, fail-closed startup, `0600` handling. *(test 9)*
+2. Auth: Argon2id, sessions, expiry, rate limiting, CSRF, headers, login/logout. *(tests 2-8)*
+3. Daemon `?status=open` filter + its tests, landed as its own PR. *(test 10)*
 4. Read surface: dashboard, balance, federations, activity, operation detail, Outstanding.
 5. Polling JS + degraded-daemon banner and `/healthz`.
 6. Money surface: send, receive (server-side QR), move, direct-inflow.

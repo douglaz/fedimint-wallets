@@ -11,16 +11,19 @@ terminal. It is the everyday surface for a self-hosting user before the Android 
 - **Exposure.** The sidecar binds `127.0.0.1`. Reaching it from a phone is the **operator's**
   job, via a private overlay (Tailscale/WireGuard) or their own reverse proxy. The wallet ships
   no public listener, no certificates, and no renewal story.
-- **Authentication covers everything** except `GET /healthz`, a deliberate carve-out for
-  supervisors that exposes exactly two booleans (sidecar alive, daemon reachable) and no wallet
-  data. There is otherwise no unauthenticated surface — not even balance. Login is a password
+- **Authentication covers everything.** The complete unauthenticated allowlist is exactly
+  `GET /login`, `POST /login`, and `GET /healthz` — the last a deliberate carve-out for supervisors
+  that exposes exactly two booleans (sidecar alive, daemon reachable) and no wallet data. There is otherwise no unauthenticated surface — not even balance. Login is a password
   verified with Argon2id, carried by an `HttpOnly`, `SameSite=Strict`, host-only session cookie
   whose `Secure` flag follows the **configured public origin's scheme** (the sidecar terminates no
   TLS, so a request-derived condition could never fire). Passkeys/WebAuthn are the planned upgrade,
   so the session layer is built to accept a second credential type without rework.
 - **No step-up before spending.** One login gates the whole UI; sending does not prompt again.
-- **Full parity with `wallet-cli`**, including `join`, `approve`, `recover`, `reconcile`, and
-  policy edits.
+- **Parity with everything the daemon API exposes**, including `join`, `approve`, `recover`,
+  `reconcile`, and policy edits. This is deliberately *not* full `wallet-cli` parity: the agent
+  verbs (`discover`, `probe`, `tick`), `history --fed`, numeric `show`, and policy-override
+  `status` have no daemon endpoint and are refused by `wallet-cli` in client mode too, so they stay
+  CLI + `--standalone` only.
 - **Fail closed.** The sidecar refuses to start without a configured password hash. It is
   provisioned by an explicit init subcommand (`0600`, mode re-asserted on write, as
   `walletd` already does for its own secrets). There is no default credential and no
@@ -79,7 +82,9 @@ terminal. It is the everyday surface for a self-hosting user before the Android 
 - **Deploying this widens what a host compromise costs** while the seed is still plaintext at
   rest (ADR-0026 accepted, not built). It does not change the seed's exposure, but it adds a
   second process that can spend. Public-internet exposure should wait for ADR-0026.
-- **One daemon change** (`?status=open`) is owed by this work; everything else is additive in a
+- **One daemon change** is owed by this work — the `?status=open` filter together with its
+  skipped-undecodable-row signal, which is the same endpoint, the same handler, and equally
+  read-only, landed as one reviewable diff; everything else is additive in a
   new crate. A consequence of holding that line: the web operation-detail page cannot show a
   `Stranded` move's preimage or leg op-ids, because the wire `OperationView` carries neither and
   the rich move record is `--standalone` only. Stranded recovery stays a CLI/runbook path until

@@ -84,7 +84,8 @@ clients drive the wallet — no UI code.
 A sidecar process that renders HTML over the same public API (ADR-0023) — `wallet-cli` in a
 browser, and the everyday surface for a self-hosting user before the Android app exists. Binds
 `127.0.0.1`; remote access is the operator's job via their own overlay or reverse proxy. Every
-route is behind a password login (Argon2id + session cookie), full CLI parity, fail-closed
+route outside a three-entry allowlist (`GET`/`POST /login`, `GET /healthz`) is behind a password
+login (Argon2id + session cookie); parity with what the daemon API exposes; fail-closed
 provisioning. Security posture fixed by [ADR-0028](./adr/0028-web-frontend-localhost-sidecar-session-auth.md);
 build plan in [phase6c-web-frontend-plan.md](./phase6c-web-frontend-plan.md). Requires exactly one
 daemon change: a `?status=open` filter on `/v1/history`, so an operation held for hours or days
