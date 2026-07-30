@@ -29,9 +29,21 @@ referenced from `phase6a-plan.md` and the README, so it keeps its number.
 
 ## 6c.1 Exposure
 
-Binds `127.0.0.1` on its own port (default `9737`, configurable). Remote access is the operator's
-job via a private overlay or their own reverse proxy — the wallet ships no public listener and no
-certificate handling (ADR-0028).
+The bind address is **hard-coded to `127.0.0.1`** — only the port is configurable (default `9737`).
+A configurable bind address would let `0.0.0.0` satisfy this spec while violating the fixed posture,
+so the option does not exist. Startup must reject any attempt to bind elsewhere.
+
+The **daemon URL must resolve to literal loopback** and use `http://`; the server fails to start
+otherwise. Otherwise a typo sends the full-access bearer token in plaintext to a remote host.
+
+**A dedicated origin is required.** Co-hosting the wallet under a path on an origin shared with
+another application is UNSUPPORTED and must be documented as such: `HttpOnly`, `SameSite`, and
+Origin checks do not isolate two applications on one origin — the neighbour can fetch authenticated
+wallet pages, read the CSRF field out of the HTML, and submit actions. Mount at the root and use a
+host-only cookie (no `Domain` attribute).
+
+Remote access is the operator's job via a private overlay or their own reverse proxy — the wallet
+ships no public listener and no certificate handling (ADR-0028).
 
 **The bind address is NOT an authentication boundary.** Behind a reverse proxy every request
 arrives from `127.0.0.1`. Nothing in the code may treat a loopback peer address as authenticated,
@@ -45,30 +57,50 @@ client IP — rate limiting is global per 6c.2).
 
 Per ADR-0028:
 
-- **Every route requires a session** except `GET /login`, `POST /login`, and the static asset
-  route. There is no unauthenticated read of balance, history, or status.
-- **Password** verified with **Argon2id** (`argon2` crate, default params). Compared via the
-  verifier's own constant-time check.
-- **Session cookie**: `HttpOnly`, `SameSite=Strict`, `Secure` set when the request is HTTPS,
-  `Path=/`. Value is a 256-bit random token from a CSPRNG, stored in an in-memory map
-  (`token -> {created_at, last_seen}`). Not a JWT; no signing key needed at rest.
-- **Lifetime**: sliding **4h idle**, absolute cap **24h**. Both configurable. Expiry is enforced
-  server-side on every request, never by cookie `Max-Age` alone.
-- **No step-up.** Sending does not re-prompt. This is deliberate; see ADR-0028's consequences.
-- **Login rate limiting**: global (not per-IP, which a proxy makes meaningless) — exponential
-  backoff after 5 consecutive failures, capped at 30s, reset on success. Failures are logged at
-  `warn` with no password material.
-- **Logout** clears the server-side entry, not just the cookie.
-- **Restarting the sidecar clears all sessions.** That is the documented "revoke everything".
+- **Every route requires a session** except `GET /login`, `POST /login`, and `GET /healthz`
+  (6c.6). There is **no static-asset exemption**: CSS/JS for the login page is inlined into that
+  page, and every other asset route requires a session.
+- **Password** verified with **Argon2id** (`argon2` crate), compared via the verifier's own
+  constant-time check. **Parameters are pinned in code** (m=19456 KiB, t=2, p=1 — the OWASP
+  baseline) and recorded in the PHC string. Startup **fails** on a PHC string that is malformed, or
+  whose algorithm/parameters fall below those minimums. `init` enforces a **12-character minimum**,
+  rejects a >1024-byte input before hashing (an unbounded password is a CPU DoS), and reads with no
+  echo.
+- **Session cookie**: `HttpOnly`, `SameSite=Strict`, `Path=/`, **host-only** (no `Domain`).
+  `Secure` is set **iff the configured `public_origin`'s scheme is `https`** — NEVER derived from
+  the incoming request and never from `X-Forwarded-Proto`. The sidecar terminates no TLS, so a
+  request-derived condition can never fire, and the cookie behind the operator's HTTPS proxy would
+  be permanently non-`Secure` and stealable via one induced `http://` request to the same host.
+- Cookie value is a 256-bit CSPRNG token. Server-side map `token -> {created_at, last_seen,
+  csrf_secret}`. Not a JWT; no signing key at rest.
+- **A separate 256-bit CSRF secret per session**, distinct from the cookie value. The session
+  cookie must never be echoed into HTML.
+- **Both values are regenerated on every successful login**, regardless of any cookie presented
+  (session fixation).
+- **Lifetime**: sliding **4h idle**, absolute **24h** cap, enforced server-side on every request.
+- **Polling and `/healthz` are PASSIVE**: they validate the session but must NOT update
+  `last_seen`. Otherwise 3-second polling (6c.4) refreshes the idle timer forever and an unattended
+  visible tab stays fully authorized for the full 24h — defeating the idle timeout entirely.
+- **No step-up.** Sending does not re-prompt. Deliberate; see ADR-0028.
+- **Login rate limiting**: global (per-IP is meaningless behind a proxy). The counter is checked
+  and incremented **atomically before any hashing**, so concurrent attempts cannot slip past the
+  five-failure boundary. Argon2 runs on a **bounded blocking pool** and no lock is held across
+  hashing or backoff, so login attempts cannot starve authenticated requests. Exponential backoff
+  after 5 consecutive failures, capped at 30s, reset on success.
+- **Logout is `POST`** with CSRF, and clears the server-side entry.
+- Restarting the sidecar clears all sessions — the documented "revoke everything".
 
 ### CSRF
 
 `SameSite=Strict` is the primary defence; it is not the only one.
 
-- Every mutating request (`POST`/`PUT`) carries a **per-session CSRF token** in a hidden form
-  field, compared in constant time against the session's token.
-- Every mutating request is rejected unless `Origin` (or `Referer` when `Origin` is absent)
-  matches the configured public origin, which defaults to the `Host` header.
+- Every mutating request (`POST`/`PUT`) carries the session's **CSRF secret** in a hidden form
+  field, compared in constant time. `POST /login` is the one exception — no session exists yet —
+  and it is still subject to the origin check below.
+- Every mutating request is rejected unless `Origin` (or `Referer` when `Origin` is absent) matches
+  the configured `public_origin` **exactly** (scheme + host + effective port). A request carrying
+  **neither** header is rejected. `public_origin` is explicit configuration, not derived from
+  `Host`: a `Host` header is attacker-controlled and is not an origin.
 
 ### Response headers (all routes)
 
@@ -88,6 +120,15 @@ or the back button after logout).
 | Federation | `/v1/join`, `/v1/approve`, `/v1/candidates` |
 | Admin | `/v1/recover`, `/v1/reconcile`, `/v1/policy` (GET/PUT) |
 
+`/v1/status`, `/v1/watch/status` and `/v1/health` are surfaced by a **diagnostics panel** on the
+Admin page (scheduler alive, watch state, daemon health). Naming them under "parity" without a page
+was a coverage gap.
+
+**Policy edits are read-modify-write, never reconstruct.** `PUT /v1/policy` takes a whole `Policy`,
+and new policy fields ship `#[serde(default)]`, so a form that rebuilds `Policy` from only the
+fields it knows would silently reset any field added later — including money caps. The UI must
+`GET` the current policy, merge the edited fields into that value, and `PUT` the result.
+
 Destructive/irreversible actions (`recover`, `approve`, `join`, policy edits) require an explicit
 **confirmation step** on a separate page that names what will happen in plain language. This is a
 UI affordance, not an auth gate — ADR-0028 chose no step-up, and this does not smuggle one back in.
@@ -102,10 +143,25 @@ background timers are throttled and mobile pages are suspended. So:
 - **Daemon change (the only one):** `HistoryQuery` gains an optional `status` filter. `?status=open`
   returns operations whose status is `Started` or `Awaiting`. It is a **read-only journal query** —
   it must not touch the actor, the executor, or any money path. Existing behaviour with no `status`
-  parameter is unchanged. Cursor semantics (`before_seq`/`next_before_seq`) are preserved.
-- **UI:** an **Outstanding** section, rendered on every page load from `?status=open`, listing all
-  non-terminal operations with age. This is how a days-old held payment stays visible no matter how
-  much history accumulated behind it.
+  parameter is unchanged.
+- **The filter MUST be applied inside the journal scan, before `take(limit)`**
+  (`wallet-fedimint/src/journal.rs` `history()` already filters `before_seq` inside the same
+  iterator chain). Filtering in the handler *after* `history(limit, ..)` returns would filter an
+  already-truncated page, so a days-old open operation sitting behind `limit` newer terminal rows
+  becomes invisible — which is precisely the failure this feature exists to prevent. This matches
+  the CLI's documented contract that filters apply before limit.
+- Cursor semantics (`before_seq`/`next_before_seq`) are preserved under the filter.
+- An unrecognised `status` value is a **422 `refused`** `ApiError`, matching the daemon's existing
+  malformed-query contract — not a 400, and never a silent unfiltered listing.
+- `history()` currently **skips undecodable ledger rows silently**. For the `status=open` path that
+  would let a corrupt open operation vanish while the UI reports "nothing outstanding". The
+  response must signal that rows were skipped, and the UI must render a fail-closed warning rather
+  than an empty list.
+- **UI:** an **Outstanding** section, rendered on every page load from `?status=open`, listing
+  **every** non-terminal operation with its age. One request returns at most `limit` rows, so the
+  sidecar must **follow `next_before_seq` to exhaustion** (bounded by a sane page cap) — "all
+  outstanding" is a lie if it silently means "the newest 50 outstanding". This is how a days-old
+  held payment stays visible no matter how much history accumulated behind it.
 - **Polling:** only for operations currently on screen — `GET /v1/operations/{key}` every 3s while
   visible, stopping on terminal status or when the page is hidden (`visibilitychange`). Polling is a
   live-view convenience, never the tracking mechanism.
@@ -122,9 +178,38 @@ background timers are throttled and mobile pages are suspended. So:
 
 **Page inventory:** Login · Dashboard (unified balance, per-federation breakdown, Outstanding,
 recent activity) · Send (invoice paste, decoded preview, fee cap, confirm) · Receive (amount →
-invoice + QR) · Activity (paginated history, filters) · Operation detail (`/v1/operations/{key}`,
-including the preimage and op-ids a `Stranded` move needs) · Federations (list, join, candidates,
-approve) · Policy (view + edit) · Admin (reconcile, recover) · Settings.
+invoice + QR) · Activity (paginated history, filters) · Operation detail · Federations (list, join,
+candidates, approve) · Policy (view + edit) · Admin (reconcile, recover, diagnostics) · Settings.
+
+**Operation detail renders only what `OperationView` carries** — `kind`, `status`, `amount`, fees,
+`actor`, `reason`, `error`, and `refusal` diagnostics. It does **not** show a `Stranded` move's
+preimage or leg op-ids: the wire DTO carries neither, and the rich move record is `--standalone`
+only. A stranded operation therefore renders its `error` string verbatim and links the runbook's
+stop-the-daemon recovery procedure. Adding those fields would need a second daemon change, which
+this phase does not budget.
+
+### Idempotency and double-submit (money-critical)
+
+`ReceiveRequest.nonce` and `MoveRequest.occurrence` are **client-supplied idempotency inputs**. A
+refresh or resubmit that regenerates them is admitted by the daemon as a *second* money operation.
+Disabling a button in JavaScript is not a defence — the spec requires the UI to work without JS.
+
+- Every money form **generates its idempotency value at render time** into a hidden field, so a
+  resubmit of the same rendered form carries the same key and dedupes at the daemon.
+- All money POSTs use **Post/Redirect/Get**, so a browser refresh re-issues a GET, never the POST.
+- Re-attaching the same receive key re-yields the *same* invoice from the daemon, which also solves
+  "refresh loses the invoice".
+
+**Receive and DirectInflow return their payable invoice only in the POST response.** Redirecting
+straight to the operation page would discard it. Those two flows render a **result page** carrying
+the invoice, its server-rendered QR, the operation key, and a link to the detail page.
+
+### Money form contracts
+
+Each money form states explicitly: which federation (a selector where the DTO accepts one, defaulted
+to the policy's spending pin), which fields are optional, and the units. **Amounts are entered as
+exact decimal sats with at most three fractional digits and converted to integer msat without
+floating point.** Never parse an amount into `f64`.
 
 **QR codes** are rendered **server-side** as inline SVG (`qrcode` crate). No JS QR library, no
 external service.
@@ -143,9 +228,12 @@ past-tense language with reasons.
   to start without a password hash** — fail closed, no default credential, no first-load setup page
   (ADR-0028).
 - **Daemon unreachable**: read pages render a clear banner ("the wallet daemon is not responding");
-  money and admin forms are disabled with an explanation rather than failing on submit. `/healthz`
-  on the sidecar reports its own liveness plus daemon reachability, so a supervisor can distinguish
-  "sidecar down" from "daemon down".
+  money and admin forms are disabled with an explanation rather than failing on submit.
+- **`GET /healthz` is an explicit, deliberate exception to "every route requires a session"** — a
+  supervisor cannot log in. It is therefore restricted to exactly two booleans (sidecar alive,
+  daemon reachable) and MUST expose no balance, no operation, no federation, and no version
+  detail. It is listed in the 6c.2 exemption list and in the route-enumeration test's allowlist, so
+  the carve-out is asserted rather than accidental.
 - **Secrets never rendered.** The seed/mnemonic is not exposed by any route, at any time, to any
   session. Seed export stays a CLI-only, daemon-stopped operation (runbook Day 0).
 - Structured `tracing` logs; never log the password, the session token, the bearer token, or a full
@@ -154,28 +242,48 @@ past-tense language with reasons.
 ## 6c.7 Tests + gates
 
 **Unit/integration (`cargo test`, must run in the default suite):**
-1. Every non-login route returns 401/redirect without a session — enumerated over the full route
-   table, so a newly added route cannot silently default to public.
-2. A loopback peer address does **not** authenticate: a request from `127.0.0.1` with no session is
-   still rejected.
-3. Session expiry: idle beyond 4h rejected; absolute beyond 24h rejected even with continuous use.
-4. CSRF: mutating request without a valid token rejected; with a mismatched `Origin` rejected.
-5. Login rate limiting engages after 5 failures and resets on success.
-6. `wallet-web init` writes `0600`; the server refuses to start with no hash configured.
-7. Argon2id verification accepts the right password and rejects the wrong one.
-8. Security headers present on every authenticated response.
-9. `?status=open` (daemon-side): returns exactly `Started`+`Awaiting`; omitting `status` is
-   byte-identical to today's response; cursor paging still works.
+1. **One final route manifest**, asserted after all routes exist (not only in the auth bead):
+   every route either requires a session or is on the explicit allowlist (`GET /login`,
+   `POST /login`, `GET /healthz`). A newly added route fails this test by default.
+2. Required security headers are present on **every** response — authenticated pages, redirects,
+   errors, the login page, and `/healthz` — not only on authenticated pages.
+3. A loopback peer address does **not** authenticate: an unauthenticated request from `127.0.0.1`
+   is still rejected.
+4. Startup rejects a non-loopback bind address and a non-loopback daemon URL.
+5. Session expiry: idle beyond 4h rejected; absolute beyond 24h rejected even under continuous
+   use; **and continuous 3s polling still expires at 4h** (polling must not slide `last_seen`).
+6. Session and CSRF values are regenerated on login; the hidden CSRF field never equals the cookie.
+7. CSRF: mutating request without a valid token rejected; mismatched `Origin` rejected; **neither
+   `Origin` nor `Referer` present** rejected; `POST /login` exempt from the token but not the
+   origin check.
+8. Rate limiting engages after 5 failures and resets on success, **including under concurrent
+   attempts** (the boundary must hold), and authenticated requests stay responsive while logins
+   are being throttled.
+9. `init` writes `0600`; startup fails with no hash, with a malformed PHC string, and with
+   Argon2id parameters below the pinned minimums; passwords under 12 chars are rejected;
+   oversized input is rejected before hashing.
+10. `?status=open` (daemon): returns exactly `Started`+`Awaiting`; omitting `status` is
+    byte-identical to today's response; **an open row older than more than one full page of
+    terminal rows is still returned** (proves filtering happens before `take(limit)` — a
+    handler-side filter must fail this); cursor paging works with the filter on; an unknown status
+    value returns 422 `refused`.
+11. Outstanding follows `next_before_seq` to exhaustion — with more open operations than one page,
+    every one of them is listed.
+12. Money idempotency **with JavaScript disabled**: submitting the same rendered receive/move form
+    twice produces exactly ONE operation, and the same receive key re-yields the same invoice.
+13. Policy round-trip preserves a field the form does not know about (read-modify-write, not
+    reconstruct).
+14. Receive/DirectInflow result pages carry the invoice and QR from the POST response.
 
 **Live gate (devimint, driven like the existing CLI gates):**
 Start `walletd` + `wallet-web` against a two-fed devimint. Log in over HTTP. Receive: create an
-invoice, pay it externally, watch the dashboard reflect settlement. Send: pay an invoice and see it
-terminalize. Confirm an in-flight operation appears under **Outstanding**, survives a full browser
-restart (no client state), and is still listed with correct status. Kill `walletd`, confirm the
-degraded banner and disabled forms; restart it and confirm recovery.
+invoice through the UI, pay it externally, watch settlement appear. Send: pay an invoice and see it
+terminalize. Confirm an in-flight operation appears under **Outstanding**, survives a browser
+restart with no cookies or client state, and is still listed with correct status. Kill `walletd`,
+confirm the degraded banner and disabled forms; restart and confirm recovery.
 
-**Definition of done:** the above pass; `cargo fmt`/`clippy -D warnings` clean; no new dependency on
-a JS toolchain; the daemon diff is limited to the `status` filter and its tests.
+**Definition of done:** the above pass; `cargo fmt`/`clippy -D warnings` clean; no JS toolchain; the
+daemon diff is limited to the `status` filter and its tests.
 
 ## 6c.8 Non-goals + size budget
 

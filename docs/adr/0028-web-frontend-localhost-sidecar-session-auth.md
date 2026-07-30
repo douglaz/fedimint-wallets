@@ -11,10 +11,13 @@ terminal. It is the everyday surface for a self-hosting user before the Android 
 - **Exposure.** The sidecar binds `127.0.0.1`. Reaching it from a phone is the **operator's**
   job, via a private overlay (Tailscale/WireGuard) or their own reverse proxy. The wallet ships
   no public listener, no certificates, and no renewal story.
-- **Authentication covers everything.** There is no unauthenticated surface — not even balance.
-  Login is a password verified with Argon2id, carried by an `HttpOnly`, `SameSite=Strict`
-  session cookie. Passkeys/WebAuthn are the planned upgrade, so the session layer is built to
-  accept a second credential type without rework.
+- **Authentication covers everything** except `GET /healthz`, a deliberate carve-out for
+  supervisors that exposes exactly two booleans (sidecar alive, daemon reachable) and no wallet
+  data. There is otherwise no unauthenticated surface — not even balance. Login is a password
+  verified with Argon2id, carried by an `HttpOnly`, `SameSite=Strict`, host-only session cookie
+  whose `Secure` flag follows the **configured public origin's scheme** (the sidecar terminates no
+  TLS, so a request-derived condition could never fire). Passkeys/WebAuthn are the planned upgrade,
+  so the session layer is built to accept a second credential type without rework.
 - **No step-up before spending.** One login gates the whole UI; sending does not prompt again.
 - **Full parity with `wallet-cli`**, including `join`, `approve`, `recover`, `reconcile`, and
   policy edits.
@@ -22,11 +25,15 @@ terminal. It is the everyday surface for a self-hosting user before the Android 
   provisioned by an explicit init subcommand (`0600`, mode re-asserted on write, as
   `walletd` already does for its own secrets). There is no default credential and no
   first-load setup page.
-- **State.** The Argon2id hash and a cookie-signing key live in the sidecar's own `0600` config
-  file; sessions live **in memory**. The sidecar never opens `client.db` or `journal.db` — the
+- **State.** The Argon2id hash lives in the sidecar's own `0600` config file; sessions live **in
+  memory** as opaque random tokens (no signing key at rest — the cookie is not a JWT). The sidecar never opens `client.db` or `journal.db` — the
   daemon holds those locks exclusively by design.
-- **Sessions** use a sliding ~4h idle timeout with an absolute cap of ~24h. Login is
+- **Sessions** use a sliding ~4h idle timeout with an absolute cap of ~24h. Polling requests are
+  passive and do not slide the idle timer, or an open tab would never time out. Login is
   rate-limited and the password compared in constant time, matching the daemon's token check.
+- **A dedicated origin is required.** Co-hosting the wallet under a path beside another
+  application is unsupported: same-origin neighbours can read the CSRF token out of the page and
+  drive the wallet, and no cookie attribute prevents it.
 - **Long-running operations.** `/v1/history` gains a `?status=open` filter — a read-only journal
   query, the only daemon change this frontend requires. The UI holds **no** in-flight state: it
   reconstructs outstanding operations from the journal on every load and polls
@@ -73,7 +80,10 @@ terminal. It is the everyday surface for a self-hosting user before the Android 
   rest (ADR-0026 accepted, not built). It does not change the seed's exposure, but it adds a
   second process that can spend. Public-internet exposure should wait for ADR-0026.
 - **One daemon change** (`?status=open`) is owed by this work; everything else is additive in a
-  new crate.
+  new crate. A consequence of holding that line: the web operation-detail page cannot show a
+  `Stranded` move's preimage or leg op-ids, because the wire `OperationView` carries neither and
+  the rich move record is `--standalone` only. Stranded recovery stays a CLI/runbook path until
+  someone budgets a second read-only daemon change.
 - **`Actor` is unchanged.** Web-initiated operations are `Actor::User`, like `wallet-cli`'s —
   this is a frontend the owner drives, not a delegated authority. A third `Actor` variant was
   considered and deferred with NWC, where a revocable third-party delegation would need it.
