@@ -80,6 +80,20 @@ probe in flight deterministically. **Gate (real sats):** a 24h+ soak burn-in.
 **6a.2 (fast-follow, gated on the soak):** the NWC facade (NIP-47) so existing phone
 clients drive the wallet — no UI code.
 
+### Phase 6c — `wallet-web`: the browser frontend (ships BEFORE 6b)
+A sidecar process that renders HTML over the same public API (ADR-0023) — `wallet-cli` in a
+browser, and the everyday surface for a self-hosting user before the Android app exists. Binds
+`127.0.0.1`; remote access is the operator's job via their own overlay or reverse proxy. Every
+route is behind a password login (Argon2id + session cookie), full CLI parity, fail-closed
+provisioning. Security posture fixed by [ADR-0028](./adr/0028-web-frontend-localhost-sidecar-session-auth.md);
+build plan in [phase6c-web-frontend-plan.md](./phase6c-web-frontend-plan.md). Requires exactly one
+daemon change: a `?status=open` filter on `/v1/history`, so an operation held for hours or days
+stays visible however much history accumulates behind it. **Gate:** receive → pay → outstanding
+operation survives a browser restart, on devimint.
+
+(It keeps the number 6c despite shipping first: 6b is already referenced from `phase6a-plan.md`
+and the README, and renumbering would invalidate those.)
+
 ### Phase 6b — Android frontend (Slint) + the WoS-simple surface
 The locked architecture (pure Rust, Slint, thin JNI shims). First-run standing-instruction
 acknowledgement (ADR-0014 — the consent record, gating any receive); one balance +
