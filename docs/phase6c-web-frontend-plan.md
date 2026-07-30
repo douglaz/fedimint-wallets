@@ -198,7 +198,10 @@ background timers are throttled and mobile pages are suspended. So:
 **Page inventory:** Login · Dashboard (unified balance, per-federation breakdown, Outstanding,
 recent activity) · Send (invoice paste, decoded preview, fee cap, confirm) · Receive (amount →
 invoice + QR) · Activity (paginated history, filters) · Operation detail · Federations (list, join,
-candidates, approve) · Policy (view + edit) · Admin (reconcile, recover, diagnostics) · Settings.
+candidates, approve) · Policy (view + edit) · Admin (reconcile, recover, diagnostics) · Settings
+(**change password only** — nothing else belongs here: the sidecar's config is a `0600` file, not
+UI-editable, and allocator parameters live on the Policy page. Owned by the auth work, since the
+password is the credential it manages).
 
 **Operation detail renders only what `OperationView` carries** — `kind`, `status`, `amount`, fees,
 `actor`, `reason`, `error`, and `refusal` diagnostics. It does **not** show a `Stranded` move's
