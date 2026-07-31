@@ -148,6 +148,26 @@ the v1 closed beta (real WoS/Blink users activating + repeat-paying) gates the e
 default; finalize the ADR-0017 probe-gating selection spec alongside the legal opinion.
 **Gate:** an outside-voice review finds no P1s.
 
+## Non-goals (decided, not deferred)
+
+**A second Lightning gateway is a NON-GOAL.** Both pilot federations route through one gateway,
+and that is the shape v1 ships with. Do not propose registering an alternate gateway as
+resilience work, and do not treat the single gateway as a gap awaiting closure — it was
+considered and declined.
+
+What that makes permanent, rather than temporary:
+
+- **The wallet's real invariant is "one gateway serves both federations."** Every move and every
+  evacuation resolves a SINGLE gateway that serves both ends (`resolve_move_gateway` and
+  `resolve_fallback_move_gateway` both return one `GatewayUrl`, gated on `gateway_serves_route`).
+  There is no two-gateway path in the code and none is planned.
+- **If that gateway is unavailable, automated movement stops.** Funds are not at risk — nothing
+  is in flight and balances are untouched — but the allocator cannot rebalance and cannot
+  evacuate until it returns. Evacuation is therefore NOT an escape hatch from a gateway outage;
+  it depends on the same gateway.
+- Federation choice for the pilot should account for this: prefer federations the operating
+  gateway already serves.
+
 ## Definition of "fully featured v1"
 
 | Area | Bar |

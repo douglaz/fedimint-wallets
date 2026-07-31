@@ -91,7 +91,12 @@ send_op_id            = A.send(invoice, gateway = G)        # A auto-steers into
 # B claims (auto); A.send -> Success(preimage). We just await both.
 ```
 Cheaper, **not more private** (G sees both legs), and **bounded by G's B-side liquidity**.
-Fallback when no shared gateway: a real Lightning hop (`send_fee_default`, up to the cap).
+**There is NO fallback when no shared gateway exists.** An earlier draft of this line promised
+a real Lightning hop between two gateways; the code does not do that. Both
+`resolve_move_gateway` and `resolve_fallback_move_gateway` return a SINGLE gateway and gate it
+on `gateway_serves_route(to, from)` — the "fallback" resolver only searches for a cheaper
+gateway that still serves BOTH ends. With no such gateway the move is refused. A second
+gateway is an explicit non-goal (roadmap), so this is the permanent v1 shape.
 
 ## 6. Balance reality
 - The client gives **one number per federation**: the sum of confirmed spendable mint notes

@@ -180,6 +180,12 @@ scheduler-dead daemon as healthy.
 - **A pay came back `refunded`/failed after submission.** lnv2 permits ONE payment
   attempt per invoice: the wallet refuses a retry of that same invoice by design
   ("already consumed its single payment attempt"). Get a fresh invoice from the payee.
+- **The Lightning gateway is unavailable.** Automated movement STOPS: every move and every
+  evacuation needs one gateway serving both federations, and a second gateway is a deliberate
+  non-goal, so there is no alternate route. Funds are not at risk — nothing is in flight, balances
+  are untouched, and the allocator refuses rather than half-moving — but do not expect evacuation
+  to rescue you from a gateway outage, because it depends on the same gateway. Wait for it to
+  return; if it will not, moving funds is a manual operation.
 - **A federation signals shutdown.** The scheduler evacuates on its own (the 6a chain
   gate proves the path). Verify with `wallet-cli history | grep evacuation`, and check
   the destination fed's balance grew accordingly.
