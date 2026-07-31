@@ -27,3 +27,6 @@
 target-musl/
 result
 result-image
+
+# bv (beads viewer) local config and caches
+.bv/
