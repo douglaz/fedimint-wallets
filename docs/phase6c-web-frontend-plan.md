@@ -205,7 +205,10 @@ the operation status the daemon actually supports — outstanding versus all —
 exposes `limit`, `before_seq` and `status` and nothing else, so richer filtering would require a
 second daemon change this phase does not budget) · Operation detail · Federations (list, join,
 candidates, approve) · Policy (view + edit) · Admin (reconcile, recover, diagnostics) · Settings
-(**change password only** — nothing else belongs here: the sidecar's config is a `0600` file, not
+(**change password only** — the old password must be
+re-entered; on success the config is rewritten atomically and re-asserted to `0600`, the in-memory
+verifier is replaced only after that write succeeds, the acting session SURVIVES and every other
+session is invalidated. Nothing else belongs here: the sidecar's config is a `0600` file, not
 UI-editable, and allocator parameters live on the Policy page. Owned by the auth work, since the
 password is the credential it manages).
 
