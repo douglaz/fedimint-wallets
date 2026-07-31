@@ -324,9 +324,12 @@ past-tense language with reasons.
     daemon re-derive it, which is exactly the defect the snapshot requirement exists to prevent
     (a re-derived cap changes `move_key`). Likewise assert Receive keeps its snapshotted federation
     and cap across a policy edit.
-14. Policy round-trip preserves a field the form does not know about (read-modify-write, not
+14. After `POST /logout`, replaying the pre-logout session cookie on an authenticated route is
+    REFUSED. A logout that clears only the browser cookie while leaving the server-side entry
+    live passes every other test in this list.
+15. Policy round-trip preserves a field the form does not know about (read-modify-write, not
     reconstruct).
-15. Receive/DirectInflow result pages carry the invoice and QR from the POST response.
+16. Receive/DirectInflow result pages carry the invoice and QR from the POST response.
 
 **Live gate (devimint, driven like the existing CLI gates):**
 Start `walletd` + `wallet-web` against a two-fed devimint. Log in over HTTP. Receive: create an
