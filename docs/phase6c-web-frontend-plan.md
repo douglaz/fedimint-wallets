@@ -200,7 +200,10 @@ background timers are throttled and mobile pages are suspended. So:
 
 **Page inventory:** Login · Dashboard (unified balance, per-federation breakdown, Outstanding,
 recent activity) · Send (invoice paste, decoded preview, fee cap, confirm) · Receive (amount →
-invoice + QR) · Activity (paginated history, filters) · Operation detail · Federations (list, join,
+invoice + QR) · Activity (paginated history; the only filter is
+the operation status the daemon actually supports — outstanding versus all — since `HistoryQuery`
+exposes `limit`, `before_seq` and `status` and nothing else, so richer filtering would require a
+second daemon change this phase does not budget) · Operation detail · Federations (list, join,
 candidates, approve) · Policy (view + edit) · Admin (reconcile, recover, diagnostics) · Settings
 (**change password only** — nothing else belongs here: the sidecar's config is a `0600` file, not
 UI-editable, and allocator parameters live on the Policy page. Owned by the auth work, since the
@@ -360,3 +363,25 @@ over-specification, and should be declined with a reference to this section:
 7. Money surface: send, receive (server-side QR), move, direct-inflow.
 8. Federation + admin + policy surfaces with confirmation pages.
 9. The devimint live gate.
+
+### 6c.9a Notes on shape and sequencing
+
+**The build order above is narrative, not a dependency contract.** The only hard orderings are the
+ones in the bead graph. In particular the daemon filter (step 3) is deliberately INDEPENDENT of the
+auth work: it is read-only daemon work in a different crate, so it can land in parallel and should
+not be serialised behind the sidecar.
+
+**The read surface is a real bottleneck, and that is accepted rather than overlooked.** It blocks
+the money, admin and polling surfaces, and it is the largest single piece. Splitting an "app shell"
+out of it was considered and rejected: the money surface genuinely needs the operation-detail page
+to redirect to, and the admin surface genuinely needs the federations list, so the edges are real
+dependencies rather than an artefact of bundling. Extracting a shell would manufacture a node to
+flatten a graph metric while the true ordering constraint stayed exactly where it is. The
+consequence is a narrow frontier: run ONE owner per large bead rather than trying to parallelise
+inside them.
+
+**On ADR-0028's "accepts a second credential type without rework":** the testable content of that
+statement is a structural one — session creation must take an ALREADY-VERIFIED principal, so the
+credential check is a separate step from session establishment. Adding WebAuthn later then touches
+the verifier and not the session layer. It is not a behavioural requirement and has no test of its
+own beyond that separation being visible in the code.
