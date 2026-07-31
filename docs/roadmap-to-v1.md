@@ -5,7 +5,7 @@ multi-federation risk engine underneath, every action auditable. Detailed plans 
 this doc owns the sequence and the definition of done.
 
 **Relationship to the report's v1/v2 sequencing.** The CEO review
-(SIMPLE-FEDIMINT-WALLET-REPORT.md §0.5) re-sequenced the SHIP plan to foundation-first: v1 a
+(docs/archive/SIMPLE-FEDIMINT-WALLET-REPORT.md §0.5) re-sequenced the SHIP plan to foundation-first: v1 a
 single-federation wallet, the engine ON in v2 behind the fee-vs-risk EV gate. The BUILD order
 then evolved: the engine was built first, headless (Phases 1–3), because it is the novel,
 risky core. This roadmap supersedes the report on BUILD order only; the SHIP decision — engine

@@ -106,13 +106,20 @@ them only after a clean first week.)
 #
 #    Terminal-failed money ops are the candidate set; `show` carries the error that
 #    distinguishes a stranded move from an ordinary failure.
-wallet-cli history --limit 200 \
+#    Collect first, THEN judge. `... done || echo clean` is wrong twice over: the loop's exit
+#    status is its LAST body command's, so a clean run prints nothing at all, and a stranded row
+#    followed by an ordinary failure prints "STRANDED" and then "clean".
+stranded=$(wallet-cli history --limit 200 \
   | awk -F'\t' '($3=="move" || $3=="evacuation" || $3=="pay") && $4=="failed" {print $10}' \
   | while read -r key; do
       wallet-cli show "$key" \
-        | grep -q "send settled but receive was not credited" \
-        && echo "STRANDED: $key"
-    done || echo clean
+        | grep -q "send settled but receive was not credited" && echo "$key"
+    done)
+if [ -n "$stranded" ]; then
+  echo "STRANDED - investigate immediately:"; echo "$stranded"
+else
+  echo clean
+fi
 
 # 2. Self-heal accounting: watchdog firings mean settlement silently died and the daemon
 #    restarted itself. Since the invoice-expiry fix, an open UNPAID invoice on a quiet
