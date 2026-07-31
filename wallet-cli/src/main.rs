@@ -85,7 +85,7 @@ enum Command {
     /// Join a federation by its invite code (idempotent: re-joining an already-joined
     /// federation just opens it).
     Join { invite: String },
-    /// Rebuild a federation's balance from the seed (`docs/wallet-recovery-spec.md`): a deliberate
+    /// Rebuild a federation's balance from the seed (`docs/archive/wallet-recovery-spec.md`): a deliberate
     /// last resort for a wallet whose local stores were lost. Recovers into a FRESH partition and
     /// never wipes one; refuses if the federation is still registered (open OR
     /// registered-but-unopened — a surviving journal could double-pay). The seed must already be

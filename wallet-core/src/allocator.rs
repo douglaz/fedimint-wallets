@@ -224,7 +224,7 @@ fn fund_into(
         return;
     }
 
-    // ROUTE ECONOMICS (`docs/route-economics-decisions.md` §Q5). The I/O layer prices each
+    // ROUTE ECONOMICS (`docs/archive/route-economics-decisions.md` §Q5). The I/O layer prices each
     // ordered pair; `decide()` only READS the entry, staying pure:
     //  - ABSENT — permissive: the bare protocol `min_move` floor, i.e. exactly the behavior
     //    before route economics existed. Absence is transient (first tick, a failed quote RPC,

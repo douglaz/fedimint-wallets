@@ -6,7 +6,7 @@
 > **Phase 3.A COMPLETE** (Evacuate execution merged `5315df3`, live exit gate passed
 > 2026-07-04; 3.B/3.C re-scoped into Phase 5, see [roadmap-to-v1.md](../roadmap-to-v1.md)).
 > Next: [phase4-plan.md](./phase4-plan.md) (hardening + operation ledger; buildable spec in
-> [phase4-implementation-spec.md](./phase4-implementation-spec.md)). Naming drift from
+> [phase4-implementation-spec.md](../phase4-implementation-spec.md)). Naming drift from
 > reality: the durable journal shipped as `FedimintJournal` over the fedimint RocksDB
 > `Database` (NOT SQLite) — read `SqliteJournal` (and the test pyramid's "real SQLite")
 > below as `FedimintJournal`.

@@ -128,8 +128,10 @@ gateway pinning details, and known gotchas.
 - [CONTEXT.md](./CONTEXT.md) - canonical product language and domain definitions.
 - [docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md) - current build sequence and
   definition of "fully featured v1".
-- [docs/archive/phase5-plan.md](./docs/archive/phase5-plan.md) - active probe, discovery, and
-  self-running loop plan.
+- [docs/phase6a-plan.md](./docs/phase6a-plan.md) - the 24/7 daemon and local API: the
+  field-level authority for the runtime in production today.
+- [docs/phase6c-web-frontend-plan.md](./docs/phase6c-web-frontend-plan.md) - the browser
+  frontend, specced and next to build.
 - [docs/operation-history-spec.md](./docs/operation-history-spec.md) - append-only
   ledger semantics.
 - [docs/adr/](./docs/adr/) - architecture decisions. These are canonical when they

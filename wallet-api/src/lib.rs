@@ -278,7 +278,7 @@ pub struct JoinRequest {
 }
 
 /// Body of `POST /v1/recover`: rebuild a federation's balance from the seed
-/// (`docs/wallet-recovery-spec.md`). Mirrors [`JoinRequest`]; the seed must already be present
+/// (`docs/archive/wallet-recovery-spec.md`). Mirrors [`JoinRequest`]; the seed must already be present
 /// (via `walletd restore-mnemonic` or a prior run).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

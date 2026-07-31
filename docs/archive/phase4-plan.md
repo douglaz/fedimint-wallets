@@ -11,7 +11,7 @@
 > All six 2026-07-05 review P1s are closed in code. Next: Phase 5
 > ([roadmap-to-v1.md](../roadmap-to-v1.md)).
 
-Sequenced from the 2026-07-03 review ([reviews/2026-07-03-engine-review.md](./2026-07-03-engine-review.md)).
+Sequenced from the 2026-07-03 review ([2026-07-03-engine-review.md](./2026-07-03-engine-review.md)).
 Runs **after Phase 3.A (Evacuate execution) merges** — 4.A edits the same files 3.A has in
 flight — and **before 3.B (discovery) / 3.C (triggers)**: the fixes close money-path holes the
 automation would otherwise scale, and every operation from 3.B/3.C onward must be born recorded.
@@ -33,7 +33,7 @@ layers anywhere in this phase.
 2. **Send-leg fee quote on the contract amount** — **the quote-base fix LANDED with the 3.A
    merge (`5315df3`)**: `send_fee_quote_for_amount` quotes on an explicit amount and the Pay
    arm computes the full outgoing contract (see
-   [phase4-implementation-spec.md](./phase4-implementation-spec.md) §2). Remaining work:
+   [phase4-implementation-spec.md](../phase4-implementation-spec.md) §2). Remaining work:
    persist the final quotes on the `MoveRecord` (feeds 4.B). Devimint check: a cap set just
    under the true cost refuses.
 3. **Strand handling** (`executor.rs`): persist the send preimage on the `MoveRecord`; on
@@ -50,12 +50,12 @@ layers anywhere in this phase.
    `requires_auth`; wire `AllocatorSnapshot.now` (CLI passes real time — the evacuation
    lead-time logic from 3.A reads it) or delete it. Keep `FedBalance`'s reserved fields.
 6. **2026-07-05 review absorption** — the fresh-eyes review
-   ([reviews/2026-07-05-fresh-eyes-review.md](./2026-07-05-fresh-eyes-review.md))
+   ([2026-07-05-fresh-eyes-review.md](./2026-07-05-fresh-eyes-review.md))
    added six P1s to 4.A: shutdown-signal corroboration, perform-time per-fed-cap
    enforcement, evacuation-destination scorer eligibility, deterministic-send-rejection
    classification (the expired-invoice wedge), never-over TOCTOU verification, plus the
    gateway-scan / partial-open / tick-deadline P2s. Buildable specs:
-   [phase4-implementation-spec.md](./phase4-implementation-spec.md) §15.
+   [phase4-implementation-spec.md](../phase4-implementation-spec.md) §15.
 
 ## 4.B — The operation ledger
 

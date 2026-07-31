@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# THE SEED-RECOVERY GATE (br-m9m, `docs/wallet-recovery-spec.md`): proves that the SEED ALONE —
+# THE SEED-RECOVERY GATE (br-m9m, `docs/archive/wallet-recovery-spec.md`): proves that the SEED ALONE —
 # plus the federation's invite — rebuilds a lost wallet's ecash EXACTLY, in BOTH loss shapes the
 # no-wipe V1 admits, through BOTH front ends that can drive a recovery.
 #

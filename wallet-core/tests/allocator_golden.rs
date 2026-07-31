@@ -96,7 +96,7 @@ fn move_tops_up_spending_below_target() {
 #[test]
 fn decide_never_emits_recover() {
     // D1 invariant: `decide()` is allocator PLANNING — it emits only DirectInflow/Move/Evacuate/
-    // RefuseInflow. `Action::Recover` is a DELIBERATE user verb (`docs/wallet-recovery-spec.md`);
+    // RefuseInflow. `Action::Recover` is a DELIBERATE user verb (`docs/archive/wallet-recovery-spec.md`);
     // recovery must never be auto-planned (a recovering fed is unregistered and invisible to the
     // allocator until it completes). Cover the top-up, standby-fund, and evacuation branches — all
     // known to emit an action — and assert none is a Recover.
@@ -147,7 +147,7 @@ fn floor_does_not_block_a_real_shortfall() {
     assert_eq!(decide(&snapshot, occ(1)), decision!(move_action!(1, 2, 6_000), ReasonCode::StandbyBelowTarget, occ(1), move_key(1, 2, 1)));
 }
 
-// --- route economics (docs/route-economics-decisions.md) ---
+// --- route economics (docs/archive/route-economics-decisions.md) ---
 //
 // One golden per `route_economics_by_pair` branch. Every case uses the SAME shape — spending fed
 // 1 holding 200_000 with a 50_000 target, standby fed 2 holding 94_000 against a 100_000 target,

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # devimint smoke test for the ACTIVE PROBE — the Phase 5.0 exit gate
-# (docs/phase5-plan.md §5.0.8). A probe is a two-leg exact-net round trip on the ordinary
+# (docs/archive/phase5-plan.md §5.0.8). A probe is a two-leg exact-net round trip on the ordinary
 # move machinery: mint on the candidate (S -> C), then redeem back (C -> S), proving
 # REDEEMABILITY. This gate drives it LIVE on the two-fed harness and asserts: the round
 # trip nets its own delta then drains back (combined wallet loss = fees only, never a

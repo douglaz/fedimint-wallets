@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # devimint smoke test for DISCOVERY + the probe-gated funding path — the Phase 5.1 exit gate
-# (docs/phase5-plan.md §5.1.7). It drives the WHOLE §5.1 invariant end-to-end on the two-fed
+# (docs/archive/phase5-plan.md §5.1.7). It drives the WHOLE §5.1 invariant end-to-end on the two-fed
 # harness: a federation the agent DISCOVERS and auto-joins is probe-GATED — the allocator must
 # refuse to fund it until it has PASSED an active probe, and must fund it once it has. Chain:
 #

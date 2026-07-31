@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # devimint smoke test for the `wallet-cli` ORCHESTRATOR TICK — the Phase 2 step 2.3 exit gate
-# (docs/phase2-plan.md). ONE tick = probe every open fed → score() → build the
+# (docs/archive/phase2-plan.md). ONE tick = probe every open fed → score() → build the
 # AllocatorSnapshot from the standing-instruction policy → decide() → apply() through the
 # Phase-1 executor. This smoke proves the WHOLE engine wires end-to-end: with the spending fed
 # funded ABOVE its target and the standby EMPTY (below its target), the pure allocator's

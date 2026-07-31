@@ -2643,7 +2643,7 @@ impl Runtime {
         })
     }
 
-    /// ONE orchestrator tick (Phase 2 step 2.2, `docs/phase2-plan.md`): probe every open
+    /// ONE orchestrator tick (Phase 2 step 2.2, `docs/archive/phase2-plan.md`): probe every open
     /// federation → build the `AllocatorSnapshot` (via `build_snapshot` — `score()` +
     /// designation) → `decide()` → `wallet_core::apply` the decisions through the
     /// [`FedimintExecutor`], which performs the resulting `Move`s AND `Evacuate`s (each a
@@ -3670,7 +3670,7 @@ pub fn join_intent_key(federation: FederationId, invite: &str) -> IdempotencyKey
     ))
 }
 
-/// The idempotency key for a seed `recover` (`docs/wallet-recovery-spec.md`). Distinct `recover:`
+/// The idempotency key for a seed `recover` (`docs/archive/wallet-recovery-spec.md`). Distinct `recover:`
 /// prefix from [`join_intent_key`] so recovery rows never classify as `KeyClass::Join` and so a
 /// re-submitted recover of the same `(federation, invite)` dedups to the live/terminal intent
 /// instead of forking a second recovery.

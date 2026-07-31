@@ -1,7 +1,7 @@
 //! The orchestrator "decide" glue (Phase 2 step 2.2): the standing-instruction
 //! [`TickPolicy`] and the PURE [`build_snapshot`] that turns a batch of recorded
 //! [`ProbeResult`]s into the `wallet_core::AllocatorSnapshot` the pure allocator
-//! (`wallet_core::decide`) consumes (`docs/phase2-plan.md`).
+//! (`wallet_core::decide`) consumes (`docs/archive/phase2-plan.md`).
 //!
 //! Split like [`crate::probe`]: everything here is PURE (no I/O, no async, no
 //! fedimint types) so it sits in the fast rb-lite gate — a recorded `ProbeResult`

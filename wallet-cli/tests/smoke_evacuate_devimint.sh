@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # devimint smoke test for the `wallet-cli` EVACUATE TICK — the Phase 3.A exit gate
-# (docs/phase3-plan.md §3.A.4). ONE tick = probe every open fed → score() → build the
+# (docs/archive/phase3-plan.md §3.A.4). ONE tick = probe every open fed → score() → build the
 # AllocatorSnapshot from the standing-instruction policy → decide() → apply(). Here fed A is
 # forced to look like it is winding DOWN, so the pure allocator's `decide()` must emit an
 # `Evacuate A→B` (drain the dying fed into `safest_other`, bounded by B's cap room), and

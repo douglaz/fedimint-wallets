@@ -443,7 +443,7 @@ pub async fn join(
     submit_operation(&state, action, key, BTreeMap::new()).await
 }
 
-/// `POST /v1/recover`: rebuild a federation's balance from the seed (`docs/wallet-recovery-spec.md`,
+/// `POST /v1/recover`: rebuild a federation's balance from the seed (`docs/archive/wallet-recovery-spec.md`,
 /// D1). Mirrors [`join`] — admit and return the operation key; the long recovery drives in a
 /// detached task (D5), so the operator polls `GET /v1/operations/{key}` for the terminal state.
 /// Recovering an already-registered federation (open OR registered-but-unopened), or a failed

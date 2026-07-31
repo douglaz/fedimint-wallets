@@ -93,7 +93,7 @@ pub enum OperationKind {
     Join {
         fed: FederationId,
     },
-    /// A seed-based recovery of `fed` (`docs/wallet-recovery-spec.md`). Distinct from `Join`
+    /// A seed-based recovery of `fed` (`docs/archive/wallet-recovery-spec.md`). Distinct from `Join`
     /// because this ledger row is the ONLY durable record that a partition was rebuilt from the
     /// seed rather than freshly joined — the registry row it writes is byte-identical to a join's.
     Recover {

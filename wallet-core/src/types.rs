@@ -109,7 +109,7 @@ pub struct AllocatorSnapshot {
     /// soak logged 91 such doomed sub-minimum moves). Zero disables the floor.
     pub min_move: Msat,
     /// Per-ORDERED-PAIR `(from, to)` route economics, supplied by the I/O layer so `decide()`
-    /// stays PURE (`docs/route-economics-decisions.md`). Where `min_move` is one protocol
+    /// stays PURE (`docs/archive/route-economics-decisions.md`). Where `min_move` is one protocol
     /// constant for every pair, this is what it actually costs to route a funding move through
     /// the cheapest gateway serving BOTH ends of THAT pair — so a pair whose fees can never fit
     /// the proportional cap is not funded at all, and a pair that needs a bigger move to amortise
@@ -240,7 +240,7 @@ pub enum Action {
         membership_preexisting: bool,
     },
     /// Rebuild a federation's funded balance from the seed via `ClientPreview::recover`
-    /// (`docs/wallet-recovery-spec.md`). A DELIBERATE, user-initiated last resort — the auto-join
+    /// (`docs/archive/wallet-recovery-spec.md`). A DELIBERATE, user-initiated last resort — the auto-join
     /// and driver-retry paths keep calling [`Action::Join`], and `decide()` must NEVER emit this
     /// (recovery recovers into a FRESH client partition, invisible to the allocator until it
     /// completes). It is executable but carries no money source/destination and no fee budget.

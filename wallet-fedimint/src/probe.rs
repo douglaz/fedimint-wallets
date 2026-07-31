@@ -1,6 +1,6 @@
 //! The "sense" layer (Phase 2 step 2.1): turn each OPEN federation into the real
 //! inputs the pure `wallet_core::scorer::score` / `wallet_core::allocator::decide`
-//! consume (`docs/phase2-plan.md`).
+//! consume (`docs/archive/phase2-plan.md`).
 //!
 //! Split deliberately in two:
 //! - a PURE assembler ([`assemble_facts`] / [`assemble_status`]) that maps a raw,

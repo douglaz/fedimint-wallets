@@ -41,7 +41,7 @@ review's P1s (scorer trust floor, strand handling; the send-leg fee-quote base w
 fixed in the 3.A merge) plus the 2026-07-05 fresh-eyes review's P1s (shutdown-signal
 corroboration, perform-time cap enforcement, evacuation-destination eligibility, the
 deterministic-send-rejection wedge, never-over TOCTOU —
-[phase4-implementation-spec.md §15](./archive/phase4-implementation-spec.md)) — and builds the
+[phase4-implementation-spec.md §15](./phase4-implementation-spec.md)) — and builds the
 append-only operation ledger + `history`/`show`
 ([operation-history-spec.md](./operation-history-spec.md)) — the ADR-0014 auditability
 substrate every later phase writes into. **Gate:** a full devimint session is

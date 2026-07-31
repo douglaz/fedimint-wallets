@@ -286,7 +286,7 @@ impl MultiClient {
     }
 
     /// Rebuild `invite`'s federation from the seed via [`ClientPreview::recover`]
-    /// (`docs/wallet-recovery-spec.md`, D3/D4). A DELIBERATE, user-initiated last resort: the
+    /// (`docs/archive/wallet-recovery-spec.md`, D3/D4). A DELIBERATE, user-initiated last resort: the
     /// auto-join and driver-retry paths keep calling [`Self::join`], and the allocator's
     /// `decide()` never emits it.
     ///

@@ -52,7 +52,7 @@ enum Command {
     /// while the daemon is stopped — same while-stopped semantics as `init`'s token rotation.
     Mnemonic,
     /// Import a 12-word seed into a store that has NONE, so a lost wallet can be rebuilt with
-    /// `recover` (`docs/wallet-recovery-spec.md`). The mirror of `mnemonic`: reads the words from
+    /// `recover` (`docs/archive/wallet-recovery-spec.md`). The mirror of `mnemonic`: reads the words from
     /// STDIN (never argv — argv leaks into shell history and `ps`), validates the BIP-39 checksum,
     /// and REFUSES if a seed already exists (no `--force`; overwriting silently strands whatever it
     /// funded). Ordering: `init` → `restore-mnemonic` → then start (`init` mints no seed; only the
