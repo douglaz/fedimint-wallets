@@ -4,7 +4,7 @@ status: accepted
 # Integration layer: concrete over traits, a real-not-fake test pyramid, money-path first
 
 Reviewed via `/plan-eng-review` + a codex outside-voice pass. Detailed plan:
-[../integration-phase-plan.md](../integration-phase-plan.md).
+[../integration-phase-plan.md](../archive/integration-phase-plan.md).
 
 The integration phase (real fedimint-client I/O on top of the pure scorer/allocator/
 executor core) is built **concrete-first**, not as a hexagonal port-and-adapter lattice.

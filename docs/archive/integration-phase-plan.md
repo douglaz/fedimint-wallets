@@ -4,7 +4,7 @@
 > crash/reconcile gate passed) — **Phase 2 COMPLETE** (probe → score → snapshot → decide →
 > apply via `Runtime::tick`; two-fed exit gate passed, see [phase2-plan.md](./phase2-plan.md)) —
 > **Phase 3.A COMPLETE** (Evacuate execution merged `5315df3`, live exit gate passed
-> 2026-07-04; 3.B/3.C re-scoped into Phase 5, see [roadmap-to-v1.md](./roadmap-to-v1.md)).
+> 2026-07-04; 3.B/3.C re-scoped into Phase 5, see [roadmap-to-v1.md](../roadmap-to-v1.md)).
 > Next: [phase4-plan.md](./phase4-plan.md) (hardening + operation ledger; buildable spec in
 > [phase4-implementation-spec.md](./phase4-implementation-spec.md)). Naming drift from
 > reality: the durable journal shipped as `FedimintJournal` over the fedimint RocksDB
@@ -92,7 +92,7 @@ manages a small active set + ephemeral probe-joins, not an N-client registry.
 
 ## Phasing
 - **Phase 1 — prove the money path. The model is now GROUNDED** in
-  [fedimint-mechanics.md](./fedimint-mechanics.md) (a five-way read of the fedimint SDK +
+  [fedimint-mechanics.md](../fedimint-mechanics.md) (a five-way read of the fedimint SDK +
   harbor + Fedi), so this is implement + validate, not learn-from-scratch.
   - **1a HARNESS + LIVE VALIDATION.** Stand up devimint + the test harness (T4). By hand,
     run the grounded recipe live — `B.receive(gateway=G)` → `A.send(invoice, gateway=G)` →
@@ -120,7 +120,7 @@ manages a small active set + ephemeral probe-joins, not an N-client registry.
   paid round-trip or a peg-out quote. Acceptable while rebalancing only among USER-joined feds;
   the ADR-0017 trust gate for funding a DISCOVERED federation is the real sats-spending active
   probe, so discovery-driven auto-funding is BLOCKED on building it — see
-  [roadmap-to-v1.md](./roadmap-to-v1.md) Phase 5.0.)
+  [roadmap-to-v1.md](../roadmap-to-v1.md) Phase 5.0.)
 - **Phase 3 — discovery + triggers.** `ObserverClient` + `NostrClient` (untrusted candidate
   set + prior) + the concrete tick runner's triggers (foreground / WorkManager / push) +
   evacuation on shutdown notice. Exit: self-driving discover → score → rebalance vs devimint.

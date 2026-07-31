@@ -4,7 +4,7 @@ status: accepted
 # The cross-federation MOVE is a first-class modeled protocol; inflow-direction is the primary lever
 
 From a codex state review (2026-06-29) of the built pure core + the integration plan
-([../integration-phase-plan.md](../integration-phase-plan.md)). The architecture
+([../integration-phase-plan.md](../archive/integration-phase-plan.md)). The architecture
 (ADR-0021) holds; the data model was written before the fedimint SDK reality and is
 corrected here.
 

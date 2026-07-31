@@ -16,32 +16,32 @@ either outcome (the ledger, hardening, UI, and recovery serve a single-fed walle
 ## Where we are
 
 - **Phase 1 — money engine: COMPLETE.** Join/receive/pay/DirectInflow/cross-fed Move,
-  crash/reconcile gate live-validated ([phase1-implementation-spec.md](./phase1-implementation-spec.md)).
+  crash/reconcile gate live-validated ([phase1-implementation-spec.md](./archive/phase1-implementation-spec.md)).
 - **Phase 2 — sense + decide: COMPLETE.** probe → score → snapshot → decide → apply via
-  `Runtime::tick`, two-fed exit gate passed ([phase2-plan.md](./phase2-plan.md)).
+  `Runtime::tick`, two-fed exit gate passed ([phase2-plan.md](./archive/phase2-plan.md)).
 - **Phase 3.A — Evacuate execution: COMPLETE** (merged `5315df3`; live two-fed exit gate
-  passed 2026-07-04 — [phase3-plan.md](./phase3-plan.md)). 3.B discovery + 3.C triggers are
+  passed 2026-07-04 — [phase3-plan.md](./archive/phase3-plan.md)). 3.B discovery + 3.C triggers are
   re-scoped into Phase 5 below.
 - **Phase 4 — hardening + operation ledger: COMPLETE (2026-07-06)** — all six 2026-07-05
   review P1s closed; the append-only ledger + `history`/`show` shipped; both live exit
-  gates passed ([phase4-plan.md](./phase4-plan.md)).
+  gates passed ([phase4-plan.md](./archive/phase4-plan.md)).
 - **Phase 5.0 — active probe: COMPLETE (2026-07-07)** — the sats-spending A->B->A
   redeemability probe passed its live devimint gate and now records durable verdict history
-  for discovery-driven funding decisions ([phase5-plan.md](./phase5-plan.md)).
-- **Phase 5.1 — discovery: COMPLETE (2026-07-09)** — source-agnostic candidate pipeline (Observer HTTP + Manual; Nostr deferred), the `0x09` candidate registry, and the probe GATE wiring: an agent-discovered/auto-joined federation is fundable only after a sustained active-probe PASS (operator-tunable), never on discovery alone. Live devimint exit gate passed ([phase5-plan.md](./phase5-plan.md)).
+  for discovery-driven funding decisions ([phase5-plan.md](./archive/phase5-plan.md)).
+- **Phase 5.1 — discovery: COMPLETE (2026-07-09)** — source-agnostic candidate pipeline (Observer HTTP + Manual; Nostr deferred), the `0x09` candidate registry, and the probe GATE wiring: an agent-discovered/auto-joined federation is fundable only after a sustained active-probe PASS (operator-tunable), never on discovery alone. Live devimint exit gate passed ([phase5-plan.md](./archive/phase5-plan.md)).
 - **Phase 6a — `walletd` daemon + local API: COMPLETE (2026-07).** The 24/7 single-owner daemon (axum on 127.0.0.1 + bearer-token file) owns the DB and runs the watch scheduler; `wallet-cli` is a thin client (client mode default, `--standalone` explicit; the `watch` verb is gone — the daemon IS the watch). The fully-async intent model holds: route pricing and all network IO run OFF the actor, so a mid-flight (hours-long LN hold) payment never blocks another operation's start (ADR-0024). The responsiveness gate (`POST /v1/pay` reaches its first external call <250 ms under load) and the 24h+ soak passed; deployed as `walletd` (systemd + k8s) for the real-sats pilot ([phase6a-plan.md](./phase6a-plan.md), [real-sats-pilot-runbook.md](./real-sats-pilot-runbook.md)).
 - **Seed recovery (Phase 7 partial): COMPLETE.** A wallet restores each federation's ecash balance from the 12-word seed alone (fedimint recovery) — the SUCCESS path is live-validated on devimint ([ADR-0025](./adr/0025-recovery-fresh-partition-seed-is-the-backup-unit.md)). Complete-or-fail semantics (a failed module recovery terminalizes rather than hanging forever) are unit-tested only; the live failure gate needs a fault hook in the fedimint fork and is deferred ([recovery-failure-gate-analysis.md](./recovery-failure-gate-analysis.md)). The seed is the backup unit; the encrypted app-state/history backup and seed encryption-at-rest remain deferred — see Phase 7 and [ADR-0026](./adr/0026-seed-at-rest-encryption-headless.md).
 - **Route economics: COMPLETE.** Before each committable tick the allocator prices the designated funding pair through the cheapest gateway serving both ends and floors moves at that route's economic break-even, ending the uneconomic sub-viable churn a flat/proportional cap could not. Current pin: `douglaz/fedimint` `72b1e5b` (`wallet-pin/iroh-recovery-tpe8838`: iroh long-poll + recovery-complete-or-fail + #8838 single-share TPE).
 
 ## Sequence
 
-### Phase 4 — engine hardening + operation ledger ([phase4-plan.md](./phase4-plan.md))
+### Phase 4 — engine hardening + operation ledger ([phase4-plan.md](./archive/phase4-plan.md))
 After 3.A (merged), before more automation. Fixes the review backlog — the 2026-07-03
 review's P1s (scorer trust floor, strand handling; the send-leg fee-quote base was already
 fixed in the 3.A merge) plus the 2026-07-05 fresh-eyes review's P1s (shutdown-signal
 corroboration, perform-time cap enforcement, evacuation-destination eligibility, the
 deterministic-send-rejection wedge, never-over TOCTOU —
-[phase4-implementation-spec.md §15](./phase4-implementation-spec.md)) — and builds the
+[phase4-implementation-spec.md §15](./archive/phase4-implementation-spec.md)) — and builds the
 append-only operation ledger + `history`/`show`
 ([operation-history-spec.md](./operation-history-spec.md)) — the ADR-0014 auditability
 substrate every later phase writes into. **Gate:** a full devimint session is

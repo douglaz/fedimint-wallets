@@ -72,7 +72,7 @@ frontend (Phase 6b) and release hardening (Phase 8) are next. See
 - [wallet-api](./wallet-api/) - the wire DTOs and the runtime-mutable `Policy` struct
   shared between the daemon and its clients.
 - [docs/](./docs/) - the build plans, runbooks, ADRs, review notes, and specs.
-- [SIMPLE-FEDIMINT-WALLET-REPORT.md](./SIMPLE-FEDIMINT-WALLET-REPORT.md) - the
+- [SIMPLE-FEDIMINT-WALLET-REPORT.md](./docs/archive/SIMPLE-FEDIMINT-WALLET-REPORT.md) - the
   original wallet survey and product design report. It is useful background, but the
   ADRs and roadmap supersede it where they differ.
 
@@ -128,7 +128,7 @@ gateway pinning details, and known gotchas.
 - [CONTEXT.md](./CONTEXT.md) - canonical product language and domain definitions.
 - [docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md) - current build sequence and
   definition of "fully featured v1".
-- [docs/phase5-plan.md](./docs/phase5-plan.md) - active probe, discovery, and
+- [docs/archive/phase5-plan.md](./docs/archive/phase5-plan.md) - active probe, discovery, and
   self-running loop plan.
 - [docs/operation-history-spec.md](./docs/operation-history-spec.md) - append-only
   ledger semantics.

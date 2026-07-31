@@ -7,7 +7,7 @@
 > The gate also caught + fixed a latent over-credit in the shared §6 receive fixed point
 > (`5588b44` — never-over verification clamp). The `/status` shutdown signal requires f+1
 > corroborating peers. Next: [phase4-plan.md](./phase4-plan.md) (hardening + operation
-> ledger, spec review-clean), then 3.B/3.C per [roadmap-to-v1.md](./roadmap-to-v1.md).
+> ledger, spec review-clean), then 3.B/3.C per [roadmap-to-v1.md](../roadmap-to-v1.md).
 
 Phase 1 built the **money engine**; Phase 2 wired **sense + decide** (probe → score → snapshot →
 decide → apply) and proved a self-directed rebalance live on two federations. Phase 3 closes the
@@ -26,12 +26,12 @@ the public `STATUS_ENDPOINT`). Three no-auth signals:
 - **PRIMARY** `client.get_meta_expiration_timestamp() -> Option<SystemTime>` (`fedimint-client/src/client.rs:647`) — consensus-backed `federation_expiry_timestamp` meta; reactive via `meta_service().subscribe_to_field`.
 - **SECONDARY** `client.api().status()?.federation?.scheduled_shutdown: Option<u64>` (`fedimint-api-client/src/api/mod.rs:845`; public `STATUS_ENDPOINT` @ `fedimint-server/src/consensus/api.rs:871`, no `check_auth`).
 - **TERTIARY** quorum degradation from the same `/status`: `peers_flagged`/`peers_offline` + `session_count()` stall.
-Matches the June-2026 research in `docs/federation-data-sources-spec.md` + [ADR-0019](./adr/0019-federation-signals-trust-model.md).
+Matches the June-2026 research in `docs/federation-data-sources-spec.md` + [ADR-0019](../adr/0019-federation-signals-trust-model.md).
 
 ## Constraints already decided (ADRs)
-- **Evacuation is LN-only in v1** ([ADR-0018](./adr/0018-v1-evacuation-balance-cap.md), [ADR-0004](./adr/0004-v1-lightning-only.md)): shared-gateway internal swap → public-LN fallback. NO on-chain peg-out (early v2). Plus a hard low per-federation balance cap to bound stranding.
-- **Never silent** ([ADR-0014](./adr/0014-on-device-agent-standing-instruction.md), which superseded ADR-0007): the agent acts on the user's recorded standing instruction, and every evacuation is disclosed/surfaced (the CLI/report shows it; durably auditable once the operation ledger lands — [operation-history-spec.md](./operation-history-spec.md)), not consented per-move.
-- **Discovery/Observer/Nostr are UNTRUSTED** ([ADR-0017](./adr/0017-sybil-resistant-selection-probes-gate.md)/[ADR-0019](./adr/0019-federation-signals-trust-model.md)): they can only supply a candidate set + a demote-only prior; the empirical probe gate + authenticated config are the only trust inputs. Nostr kind-38000 ratings are dropped entirely; kind-38173 is a discovery feed only.
+- **Evacuation is LN-only in v1** ([ADR-0018](../adr/0018-v1-evacuation-balance-cap.md), [ADR-0004](../adr/0004-v1-lightning-only.md)): shared-gateway internal swap → public-LN fallback. NO on-chain peg-out (early v2). Plus a hard low per-federation balance cap to bound stranding.
+- **Never silent** ([ADR-0014](../adr/0014-on-device-agent-standing-instruction.md), which superseded ADR-0007): the agent acts on the user's recorded standing instruction, and every evacuation is disclosed/surfaced (the CLI/report shows it; durably auditable once the operation ledger lands — [operation-history-spec.md](../operation-history-spec.md)), not consented per-move.
+- **Discovery/Observer/Nostr are UNTRUSTED** ([ADR-0017](../adr/0017-sybil-resistant-selection-probes-gate.md)/[ADR-0019](../adr/0019-federation-signals-trust-model.md)): they can only supply a candidate set + a demote-only prior; the empirical probe gate + authenticated config are the only trust inputs. Nostr kind-38000 ratings are dropped entirely; kind-38173 is a discovery feed only.
 
 ## Build order (Evacuate first — self-contained, completes the money path)
 

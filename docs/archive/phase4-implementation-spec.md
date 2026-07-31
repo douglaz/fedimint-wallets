@@ -1,13 +1,13 @@
 # Phase 4 implementation spec — engine hardening + the operation ledger
 
 Detailed, buildable design for [phase4-plan.md](./phase4-plan.md), implementing
-[operation-history-spec.md](./operation-history-spec.md) and the fix backlog from
-[reviews/2026-07-03-engine-review.md](./reviews/2026-07-03-engine-review.md). SDK claims
+[operation-history-spec.md](../operation-history-spec.md) and the fix backlog from
+[reviews/2026-07-03-engine-review.md](./2026-07-03-engine-review.md). SDK claims
 verified against the pin (`~/p/fedimint` @ `b108ec6`); exact citations inline.
 **Status: hardened through 19 codex passes (gpt-5.4 / xhigh) — 48 findings absorbed,
 final pass clean. Updated 2026-07-05:** §2's quote-base fix LANDED with the 3.A merge
 (`5315df3`) — §2 now covers only the remaining persistence work — and §15 absorbs the
-[2026-07-05 fresh-eyes review](./reviews/2026-07-05-fresh-eyes-review.md)'s P1/P2 backlog
+[2026-07-05 fresh-eyes review](./2026-07-05-fresh-eyes-review.md)'s P1/P2 backlog
 into 4.A. Decisions settled in §14.
 
 **Base:** `main` AFTER Phase 3.A (Evacuate execution) merged (`5315df3`) — 3.A touched
@@ -237,7 +237,7 @@ eligibles tie.
 
 # Part II — the operation ledger (4.B)
 
-Implements [operation-history-spec.md](./operation-history-spec.md); this section is the
+Implements [operation-history-spec.md](../operation-history-spec.md); this section is the
 code-level mapping. Authority split (recorded in both docs): the history spec is normative
 for the MODEL — the three-structures separation, the write discipline (append-once /
 advance-forward / terminal-immutable / same-dbtx), and the correlation-key rules; **this
@@ -703,7 +703,7 @@ wallet-cli show <correlation-key | seq> [--json]
 
 # Part III — 2026-07-05 review absorption (4.A continued)
 
-The [fresh-eyes review](./reviews/2026-07-05-fresh-eyes-review.md) (five independent passes +
+The [fresh-eyes review](./2026-07-05-fresh-eyes-review.md) (five independent passes +
 8 adversarial verification passes; every claim below verified against code and the SDK pin)
 found six P1s. §4.2's reservation already covers the planning half of the cap problem; the
 rest lands here. Priority order per the review: 15.1 → 15.2 → 15.3/15.4 → 15.5/15.6 → 15.7+.

@@ -16,7 +16,7 @@ places: (1) two money-path P1s in the executor, (2) one trust-model P1 in the sc
 (3) the biggest product gap: **there is no user-facing operation history at all** — the durable
 layer is a crash-recovery substrate, not a record of what the wallet did. That last one gets its
 own spec: [operation-history-spec.md](../operation-history-spec.md), built in
-[phase4-plan.md](../phase4-plan.md).
+[phase4-plan.md](./phase4-plan.md).
 
 ---
 
@@ -164,7 +164,7 @@ cache. The fix is a third durable structure — see
 ## Fix backlog + sequencing
 
 3.A (in flight) touches `executor.rs`/`probe.rs`/`tick.rs`/`runtime.rs`, so code fixes wait for
-its merge, then land as **Phase 4.A** ([phase4-plan.md](../phase4-plan.md)):
+its merge, then land as **Phase 4.A** ([phase4-plan.md](./phase4-plan.md)):
 
 1. Scorer: threshold sanity floor + rank clamp (+ decide proportional-threshold stance).
 2. Executor: send-leg quote on contract amount; persist preimage; `Stranded`-not-`Failed`

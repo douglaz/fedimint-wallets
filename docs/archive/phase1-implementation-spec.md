@@ -2,7 +2,7 @@
 
 Detailed design for Phase 1 of the integration phase
 ([integration-phase-plan.md](./integration-phase-plan.md)). Grounded in the validated
-mechanics ([fedimint-mechanics.md](./fedimint-mechanics.md)) and the devimint runbook.
+mechanics ([fedimint-mechanics.md](../fedimint-mechanics.md)) and the devimint runbook.
 API claims verified against `~/p/fedimint` (branch `docs/custodial-receive-spec`).
 **Status: hardened through 12 codex passes (gpt-5.5 / xhigh).** Decisions settled in §11.
 

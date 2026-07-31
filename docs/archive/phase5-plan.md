@@ -13,7 +13,7 @@
 > lifetime bound). 5.0 gates nothing yet by design.
 
 
-The re-scoped 3.B + 3.C ([roadmap-to-v1.md](./roadmap-to-v1.md)): turn the engine from
+The re-scoped 3.B + 3.C ([roadmap-to-v1.md](../roadmap-to-v1.md)): turn the engine from
 "rebalances the feds the user joined" into "discovers, vets, and manages federations
 unattended". **5.0 (the active probe) is fully specified here and BLOCKS the rest** —
 ADR-0017's trust gate for funding a discovered federation is an empirical, sats-spending
@@ -21,10 +21,10 @@ probe, and today's `round_trip_ok` is a free proxy (gateway availability), fine 
 user-joined feds only. 5.1/5.2 are plan-level below; their buildable specs follow after
 5.0 lands.
 
-Grounding: [ADR-0017](./adr/0017-sybil-resistant-selection-probes-gate.md) (probes GATE,
+Grounding: [ADR-0017](../adr/0017-sybil-resistant-selection-probes-gate.md) (probes GATE,
 for THIS device, over a SUSTAINED window; reputation only demotes),
-[ADR-0019/0020](./adr/0019-federation-signals-trust-model.md) (discovery inputs are
-untrusted), [federation-data-sources-spec.md](./federation-data-sources-spec.md) (the
+[ADR-0019/0020](../adr/0019-federation-signals-trust-model.md) (discovery inputs are
+untrusted), [federation-data-sources-spec.md](../federation-data-sources-spec.md) (the
 probe set; Nostr = discovery only), and the pinned SDK — the Cargo pin
 `douglaz/fedimint @ b108ec66ab…` (Cargo.lock is authoritative; the local `~/p/fedimint`
 checkout sits AHEAD of the pin — docs commits + the two-fed harness patch — so verify
@@ -481,7 +481,7 @@ and probe-gate candidate federations." 5.0 built the empirical trust gate (`acti
 5.1 builds the CANDIDATE PIPELINE that feeds it and WIRES the gate so a discovered fed is
 allocator-fundable only once it has PASSED. Grounded in ADR-0017 (probes gate, discovery
 never promotes), ADR-0019/0020 (discovery inputs are UNTRUSTED, the Observer is a swappable
-prior behind the gate), and [federation-data-sources-spec.md](./federation-data-sources-spec.md)
+prior behind the gate), and [federation-data-sources-spec.md](../federation-data-sources-spec.md)
 (the Observer API §C; Nostr kind-38173 is discovery-only §E; kind-38000 ratings dropped).
 
 **Greenfield note.** Pre-release, no persisted data, no external users: NO backwards
@@ -796,7 +796,7 @@ unaffected.
 
 `ObserverSource { base_url, http }` over `reqwest` (rustls; the workspace's HTTP stance):
 `GET {base}/federations` → the summaries (`{id, name, invite, ...}`,
-[data-sources §C](./federation-data-sources-spec.md)); map each to a `CandidateAnnouncement`
+[data-sources §C](../federation-data-sources-spec.md)); map each to a `CandidateAnnouncement`
 carrying the Observer's OWN `id` as `claimed_id` (NOT re-derived from the invite — so the
 5.1.2 `claimed == invite == config` check can actually catch an Observer row whose `id` and
 `invite` disagree) plus the parsed `invite`. **UNTRUSTED + swappable + never load-bearing
