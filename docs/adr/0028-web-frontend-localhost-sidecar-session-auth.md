@@ -87,8 +87,10 @@ terminal. It is the everyday surface for a self-hosting user before the Android 
   read-only, landed as one reviewable diff; everything else is additive in a
   new crate. A consequence of holding that line: the web operation-detail page cannot show a
   `Stranded` move's preimage or leg op-ids, because the wire `OperationView` carries neither and
-  the rich move record is `--standalone` only. Stranded recovery stays a CLI/runbook path until
-  someone budgets a second read-only daemon change.
+  the rich move record is `--standalone` only. Stranded recovery is today an EVIDENCE-PRESERVATION path, not a
+  recovery one: the preimage is persisted on the move record but no shipped command displays it,
+  so the runbook's answer is to stop the daemon and keep the data directory. Exposing it needs a
+  second read-only daemon change nobody has budgeted.
 - **`Actor` is unchanged.** Web-initiated operations are `Actor::User`, like `wallet-cli`'s —
   this is a frontend the owner drives, not a delegated authority. A third `Actor` variant was
   considered and deferred with NWC, where a revocable third-party delegation would need it.

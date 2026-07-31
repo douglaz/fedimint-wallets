@@ -9,7 +9,7 @@ The wallet reads a federation's config once at join/open and does not track or r
 to changes in its `consensus_version` or module versions. Nothing detects or handles a
 federation that **upgrades** its modules or consensus while the wallet holds a client
 for it. `FederationFacts` carries gateway-availability but not `consensus_version` —
-the field was planned (`docs/integration-phase-plan.md`) but never added. This is an
+the field was planned (`docs/archive/integration-phase-plan.md`) but never added. This is an
 acknowledged-open item, not silently done (codex + fable flagged it).
 
 A federation that upgrades its modules to a version the pinned fedimint client cannot

@@ -98,8 +98,21 @@ them only after a clean first week.)
 
 ```bash
 # 1. The loss surface: a Stranded move (send settled, receive not credited) is the ONLY
-#    state where money can be in limbo; Refunded pays are money-safe but user-visible.
-wallet-cli history --limit 200 | grep -iE "stranded|refunded" || echo clean
+#    state where money can be in limbo.
+#
+#    DO NOT grep history for "stranded" — that word NEVER appears in its output. `Stranded`
+#    shares the terminal `failed` surface (move_protocol.rs §3), and the ten-column TSV carries
+#    no error field, so a naive grep prints "clean" even while funds are stranded.
+#
+#    Terminal-failed money ops are the candidate set; `show` carries the error that
+#    distinguishes a stranded move from an ordinary failure.
+wallet-cli history --limit 200 \
+  | awk -F'\t' '($3=="move" || $3=="evacuation" || $3=="pay") && $4=="failed" {print $10}' \
+  | while read -r key; do
+      wallet-cli show "$key" \
+        | grep -q "send settled but receive was not credited" \
+        && echo "STRANDED: $key"
+    done || echo clean
 
 # 2. Self-heal accounting: watchdog firings mean settlement silently died and the daemon
 #    restarted itself. Since the invoice-expiry fix, an open UNPAID invoice on a quiet
@@ -130,13 +143,21 @@ scheduler-dead daemon as healthy.
   by design. If it fires more than once a week, capture `journalctl` around the firing
   and treat it as a bug (the known upstream trigger is fixed at our pin; a new firing has
   a new cause).
-- **A `stranded` row in history.** The move's send leg settled but the receive was not
-  credited. **`Stranded` is TERMINAL — waiting and restarting will NOT repair it.**
+- **A stranded move** (found by check 1 above — it appears as a `failed` move whose `show`
+  error reads "send settled but receive was not credited"). The send leg settled but the receive
+  was not credited. **`Stranded` is TERMINAL — waiting and restarting will NOT repair it.**
   `reconcile` re-drives `pending()` only (`Pending`/`Executing`); `Failed`/`Permanent` stay
   terminal and `Awaiting` is subscription-owned, so nothing re-drives a stranded move. Do not
-  burn an hour waiting for a self-heal that cannot come. Instead, act immediately: preserve
-  `journalctl` + `wallet-cli history` output, and recover using the durable artifact the move
-  record saved for exactly this case — **the payment preimage** — together with the recv op-id.
+  burn an hour waiting for a self-heal that cannot come. Instead, act immediately:
+
+  **STOP the daemon and preserve the data directory before anything else.** The preimage that
+  proves the send settled is persisted on the move record, but **no shipped command can display
+  it** — `show --standalone` prints `send_op`/`recv_op`/`gateway` and stops there, and recovery
+  tooling was explicitly deferred in Phase 4. Extracting it today means decoding `journal.db`
+  directly, so the data directory IS the evidence: losing it loses the proof.
+
+  What you CAN get: `wallet-cli show <key>` gives the error detail, and
+  `wallet-cli show <key> --standalone` (daemon stopped) adds the send and receive op-ids.
   The preimage is proof the send settled and is what a gateway/federation operator needs to
   reconcile the un-credited leg. Do NOT re-submit the move by hand (the executor's dedup is
   what is protecting you from a double-spend).
