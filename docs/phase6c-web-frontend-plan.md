@@ -33,8 +33,9 @@ The bind address is **hard-coded to `127.0.0.1`** — only the port is configura
 A configurable bind address would let `0.0.0.0` satisfy this spec while violating the fixed posture,
 so the option does not exist. Startup must reject any attempt to bind elsewhere.
 
-The **daemon URL must resolve to literal loopback** and use `http://`; the server fails to start
-otherwise. Otherwise a typo sends the full-access bearer token in plaintext to a remote host.
+The **daemon URL's host must be an IP LITERAL** in `127.0.0.0/8` or `::1`, over `http://`; the
+server fails to start otherwise. DNS names are rejected outright — including `localhost`, which
+resolves but is not a literal and can be repointed. Otherwise a typo sends the full-access bearer token in plaintext to a remote host.
 
 **A dedicated origin is required.** Co-hosting the wallet under a path on an origin shared with
 another application is UNSUPPORTED and must be documented as such: `HttpOnly`, `SameSite`, and
@@ -118,9 +119,17 @@ style-src 'self' 'nonce-<per-response>'; frame-ancestors 'none'; base-uri 'none'
 CSPRNG nonce per response, emitted on the login page's inlined `<style>`/`<script>`. `'self'` alone
 does NOT authorize inline elements, so the bare `default-src 'self'` would have silently blocked the
 very assets 6c.2 requires to be inlined. ·
-`X-Content-Type-Options: nosniff` · `Referrer-Policy: no-referrer` ·
+`X-Content-Type-Options: nosniff` · `Referrer-Policy: same-origin` ·
 `Cache-Control: no-store` on every authenticated page (balances must never land in a shared cache
 or the back button after logout).
+
+**`Referrer-Policy` is `same-origin`, deliberately NOT `no-referrer`.** Under `no-referrer` a
+non-CORS form POST has its `Origin` serialized as `null` even same-origin (WHATWG Fetch, "append a
+request Origin header"), and `Referer` is suppressed outright — so every login and every money POST
+from a real browser would arrive with `Origin: null` and no `Referer`, and be refused by the origin
+check above. Hand-crafted unit tests and a scripted live gate set their own headers and would never
+see it. `same-origin` keeps both signals on same-origin requests and still sends nothing to third
+parties.
 
 ## 6c.3 The verb surface
 
@@ -173,8 +182,11 @@ background timers are throttled and mobile pages are suspended. So:
   malformed-query contract — not a 400, and never a silent unfiltered listing.
 - `history()` currently **skips undecodable ledger rows silently**. For the `status=open` path that
   would let a corrupt open operation vanish while the UI reports "nothing outstanding". The
-  response must signal that rows were skipped, and the UI must render a fail-closed warning rather
-  than an empty list. **This response-shape addition is part of the single budgeted daemon change**,
+  response must signal that rows were skipped via an OPTIONAL integer `skipped_rows` field, and the
+  UI must render a fail-closed warning rather than an empty list. **The field is emitted ONLY on the
+  `status=open` path**, never on an unfiltered request — otherwise a corrupt store would change the
+  unfiltered response and break the byte-identical guarantee above, and the two requirements could
+  not both hold. **This response-shape addition is part of the single budgeted daemon change**,
   not a second one: it is the same handler, the same endpoint, and equally read-only. Land it in the
   same PR so the budget stays one reviewable diff.
 - **UI:** an **Outstanding** section, rendered on every page load from `?status=open`, listing
@@ -208,7 +220,11 @@ candidates, approve) · Policy (view + edit) · Admin (reconcile, recover, diagn
 (**change password only** — the old password must be
 re-entered; on success the config is rewritten atomically and re-asserted to `0600`, the in-memory
 verifier is replaced only after that write succeeds, the acting session SURVIVES and every other
-session is invalidated. Nothing else belongs here: the sidecar's config is a `0600` file, not
+session is invalidated. The whole sequence — verify old password, write, swap
+verifier, invalidate other sessions — runs in ONE critical section: two sessions changing the
+password concurrently could otherwise both pass the old-password check and interleave to leave disk
+holding one password and memory another, so the process accepts one until restart and a different
+one after. Nothing else belongs here: the sidecar's config is a `0600` file, not
 UI-editable, and allocator parameters live on the Policy page. Owned by the auth work, since the
 password is the credential it manages).
 
@@ -361,14 +377,17 @@ over-specification, and should be declined with a reference to this section:
 
 ## 6c.9 Build order
 
-1. Crate skeleton, config + `init`, fail-closed startup, `0600` handling. *(test 9)*
-2. Auth: Argon2id, sessions, expiry, rate limiting, CSRF, headers, login/logout. *(tests 2-8)*
-3. Daemon `?status=open` filter + its tests, landed as its own PR. *(test 10)*
-5. Read surface: dashboard, balance, federations, activity, operation detail, Outstanding.
-6. Polling JS + degraded-daemon banner and `/healthz`.
-7. Money surface: send, receive (server-side QR), move, direct-inflow.
-8. Federation + admin + policy surfaces with confirmation pages.
-9. The devimint live gate.
+Steps are named rather than cross-referenced by test number: numeric pointers into §6c.7 have
+gone stale twice across revisions, so each step owns the tests its own bead lists.
+
+1. Crate skeleton, config + `init`, fail-closed startup, `0600` handling.
+2. Auth: Argon2id, sessions, expiry, rate limiting, CSRF, headers, login/logout, Settings.
+3. Daemon `?status=open` filter + its tests, landed as its own PR.
+4. Read surface: dashboard, balance, federations, activity, operation detail, Outstanding.
+5. Polling JS + degraded-daemon banner and `/healthz`.
+6. Money surface: send, receive (server-side QR), move, direct-inflow.
+7. Federation + admin + policy surfaces with confirmation pages.
+8. The devimint live gate.
 
 ### 6c.9a Notes on shape and sequencing
 
