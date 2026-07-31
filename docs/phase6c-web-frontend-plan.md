@@ -218,7 +218,9 @@ exposes `limit`, `before_seq` and `status` and nothing else, so richer filtering
 second daemon change this phase does not budget) · Operation detail · Federations (list, join,
 candidates, approve) · Policy (view + edit) · Admin (reconcile, recover, diagnostics) · Settings
 (**change password only** — the old password must be
-re-entered; on success the config is rewritten atomically and re-asserted to `0600`, the in-memory
+re-entered, and the NEW password is subject to every check `init` applies — confirmation entry,
+the 12-character minimum, and rejection above 1024 bytes before hashing; on success the config is
+rewritten atomically and re-asserted to `0600`, the in-memory
 verifier is replaced only after that write succeeds, the acting session SURVIVES and every other
 session is invalidated. The whole sequence — verify old password, write, swap
 verifier, invalidate other sessions — runs in ONE critical section: two sessions changing the
@@ -314,7 +316,8 @@ past-tense language with reasons.
    auth test here presumes login works; none of them actually assert it.
 4. A loopback peer address does **not** authenticate: an unauthenticated request from `127.0.0.1`
    is still rejected.
-5. Startup rejects a non-loopback daemon URL. (There is no bind-address test: the address is a
+5. Startup rejects a non-loopback daemon URL, **including `http://localhost:9736` explicitly** —
+   a suite that only rejects a routable address passes while a resolve-and-accept implementation ships. (There is no bind-address test: the address is a
    hard-coded constant, not configuration — 6c.1/6c.6.)
 6. Session expiry: idle beyond 4h rejected; absolute beyond 24h rejected even under continuous
    use; **and continuous 3s polling still expires at 4h** (polling must not slide `last_seen`).

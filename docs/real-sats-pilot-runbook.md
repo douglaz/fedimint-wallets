@@ -106,19 +106,28 @@ them only after a clean first week.)
 #
 #    Terminal-failed money ops are the candidate set; `show` carries the error that
 #    distinguishes a stranded move from an ordinary failure.
-#    Collect first, THEN judge. `... done || echo clean` is wrong twice over: the loop's exit
-#    status is its LAST body command's, so a clean run prints nothing at all, and a stranded row
-#    followed by an ordinary failure prints "STRANDED" and then "clean".
-stranded=$(wallet-cli history --limit 200 \
-  | awk -F'\t' '($3=="move" || $3=="evacuation" || $3=="pay") && $4=="failed" {print $10}' \
-  | while read -r key; do
-      wallet-cli show "$key" \
-        | grep -q "send settled but receive was not credited" && echo "$key"
-    done)
-if [ -n "$stranded" ]; then
-  echo "STRANDED - investigate immediately:"; echo "$stranded"
+#    Collect first, THEN judge -- and distinguish "inspected everything, found nothing" from
+#    "could not inspect". `... done || echo clean` was wrong twice over (the loop's status is its
+#    LAST body command's), and a verdict that ignores exit codes is wrong a third way: a bouncing
+#    daemon makes `show` fail exactly when a stranded move is most likely to exist.
+if ! hist=$(wallet-cli history --limit 200); then
+  echo "CHECK FAILED - could not read history; rerun before trusting a clean result"
 else
-  echo clean
+  failed=0; stranded=""
+  for key in $(printf '%s\n' "$hist" | awk -F'\t' \
+      '($3=="move"||$3=="evacuation"||$3=="pay") && $4=="failed" {print $10}'); do
+    if ! detail=$(wallet-cli show "$key"); then failed=1; continue; fi
+    case "$detail" in
+      *"send settled but receive was not credited"*) stranded="$stranded$key ";;
+    esac
+  done
+  if [ "$failed" = 1 ]; then
+    echo "CHECK FAILED - could not inspect every candidate; rerun"
+  elif [ -n "$stranded" ]; then
+    echo "STRANDED - investigate immediately: $stranded"
+  else
+    echo clean
+  fi
 fi
 
 # 2. Self-heal accounting: watchdog firings mean settlement silently died and the daemon
