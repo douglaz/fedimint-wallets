@@ -110,8 +110,15 @@ and note the wallet meets v1 federations whenever it pays an invoice minted by o
 a real Lightning hop between two gateways; the code does not do that. Both
 `resolve_move_gateway` and `resolve_fallback_move_gateway` return a SINGLE gateway and gate it
 on `gateway_serves_route(to, from)` — the "fallback" resolver only searches for a cheaper
-gateway that still serves BOTH ends. With no such gateway the move is refused. A second
-gateway is an explicit non-goal (roadmap), so this is the permanent v1 shape.
+gateway that still serves BOTH ends. With no such gateway the move is not "refused" in any
+terminal sense — `resolve_gateway` returns `ExecError::Retryable` (`executor.rs:350-356`,
+documented `Retryable`, NOT `Permanent` at `:333-335`), so the intent stays `Pending` and is
+re-tried every tick: a silent livelock, not a failure the operator is told about.
+
+A second gateway remains an explicit non-goal for routine `Move`s. It is NO LONGER the permanent
+shape for evacuation: [ADR-0029](./adr/0029-evacuation-must-be-executable.md) accepts a
+two-gateway Lightning hop as a best-effort fallback for `Evacuate` only. That is decided but NOT
+yet built; this section describes the code as it stands today.
 
 ## 6. Balance reality
 - The client gives **one number per federation**: the sum of confirmed spendable mint notes

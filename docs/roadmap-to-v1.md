@@ -160,7 +160,8 @@ What that makes permanent, rather than temporary:
 - **The wallet's real invariant is "one gateway serves both federations."** Every move and every
   evacuation resolves a SINGLE gateway that serves both ends (`resolve_move_gateway` and
   `resolve_fallback_move_gateway` both return one `GatewayUrl`, gated on `gateway_serves_route`).
-  There is no two-gateway path in the code and none is planned.
+  There is no two-gateway path in the code today. One IS planned for evacuation only — see the
+  next bullet — so do not read this invariant as permanent.
 - **Evacuation is the one exception, per
   [ADR-0029](./adr/0029-evacuation-must-be-executable.md):** when no gateway serves both
   federations it may fall back to a real Lightning hop through two different gateways. That is
