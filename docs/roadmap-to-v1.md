@@ -75,8 +75,10 @@ authored as `docs/phase6a-plan.md` from the approved design (eng-review 2026-07-
 `~/.gstack/projects/fedimint-wallets/master-main-design-20260710-031905.md`).
 **Gate (merge):** existing live gates rerun through the daemon + the responsiveness gate —
 a pay issued mid-probe starts (first external call) <250 ms, instrumented by a
-misbehaving-gateway test double (accepts-contract-never-provides-preimage) that holds a
-probe in flight deterministically. **Gate (real sats):** a 24h+ soak burn-in.
+stalling-gateway test double (accepts-contract-never-provides-preimage) that holds a
+probe in flight deterministically. (It is a CONCURRENCY instrument only — a stalled gateway
+does not by itself strand a move; see the runbook's stranded-move entry.)
+**Gate (real sats):** a 24h+ soak burn-in.
 **6a.2 (fast-follow, gated on the soak):** the NWC facade (NIP-47) so existing phone
 clients drive the wallet — no UI code.
 

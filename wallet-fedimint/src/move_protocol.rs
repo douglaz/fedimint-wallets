@@ -5,25 +5,26 @@
 //! `MultiClient`, the journal, the executor — live in LATER steps and call into the two
 //! pure functions here: [`next_step`] (what side effect a move needs next) and
 //! [`assemble_move_record`] (rebuild the derived record from its durable sources).
+//!
+//! Where a move currently sits in its lifecycle is recorded by [`MovePhase`] (spec §3.3).
+//! `Created`/`Invoiced`/`Sending` are derivable from which op-ids/invoice are known. The terminal
+//! phases — `Settled`/`Refunded`/`Failed`/`Stranded` — encode the SETTLEMENT outcome, which is
+//! learned by awaiting the operations, not from the presence of op-ids; they are therefore
+//! preserved across re-assembly (§5).
+//!
+//! [`MovePhase::Stranded`] (spec §3, settled decision 3) records ONE observation: A's send leg
+//! reached a SETTLED terminal while B's receive leg reached an op-terminal NON-claim. It is a
+//! distinct terminal so the ledger/UI reports the debited-not-credited move loudly. It does NOT
+//! establish a gateway fault, a loss, or malice. The preimage on [`MoveRecord`] cannot recover it:
+//! it claims A's OUTGOING contract and cannot credit B. The canonical operator account is the
+//! stranded-move incident entry in `docs/real-sats-pilot-runbook.md`; deliberately no cause list
+//! lives here.
 
 use crate::types::{GatewayUrl, Invoice, OperationId};
 use wallet_core::{Action, FederationId, IdempotencyKey, Msat};
 
 pub use wallet_core::{MovePhase, MoveRecord};
 
-/// Where a move currently sits in its lifecycle (spec §3.3).
-///
-/// `Created`/`Invoiced`/`Sending` are derivable from which op-ids/invoice are known.
-/// The terminal phases — `Settled`/`Refunded`/`Failed`/`Stranded` — encode the SETTLEMENT
-/// outcome, which is learned by awaiting the operations, not from the presence of op-ids;
-/// they are therefore preserved across re-assembly (§5).
-///
-/// `Stranded` (spec §3, settled decision 3) is the misbehaving-gateway terminal: A's send
-/// SETTLED (we hold the preimage) but B's receive was NOT credited (expired/failed op). It is
-/// terminal like `Refunded`/`Failed` — an op-log-terminal receive cannot be fixed by
-/// re-driving — but DISTINCT so the ledger/UI can say "debited, not credited — payment proof
-/// saved" rather than a silent loss; the preimage on the [`MoveRecord`] is the durable
-/// recovery artifact.
 /// The next side effect a move needs, computed purely from a [`MoveRecord`] (spec §3.3).
 /// RESUME, not restart: once a step's artifact is recorded, that step is never re-issued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -281,7 +282,8 @@ pub fn next_step(rec: &MoveRecord) -> MoveStep {
     match rec.phase {
         MovePhase::Settled => return MoveStep::Done,
         // `Stranded` (spec §3) shares the terminal `Failed` surface: `perform` returns
-        // `Permanent(outcome)`, naming the debited-not-credited state with its saved preimage.
+        // `Permanent(outcome)`, reporting the debited-not-credited observation without claiming
+        // a cause or pointing at the preimage as a recovery instrument.
         MovePhase::Refunded | MovePhase::Failed | MovePhase::Stranded => return MoveStep::Failed,
         MovePhase::Created | MovePhase::Invoiced | MovePhase::Sending => {}
     }

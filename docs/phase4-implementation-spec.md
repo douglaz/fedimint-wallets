@@ -112,44 +112,65 @@ Tests: golden on the arithmetic helper (extract
 reads cleaner); devimint (deferred smoke): a `--fee-cap` set to `true_cost − 1` msat refuses
 with "fee over cap" BEFORE paying; `true_cost` passes.
 
-## 3. Stranded moves: preserve the preimage, never a silent terminal loss (`executor.rs`, `move_protocol.rs`)
+## 3. Stranded moves: a distinct terminal, never a silent terminal loss (`executor.rs`, `move_protocol.rs`)
 
 Today (`executor.rs:430-452`) `SendState::Success(_preimage)` discards the preimage, and a
 non-`Claimed` receive marks `MovePhase::Failed` → `ExecError::Permanent` — after the money
-irreversibly left the source. That is the misbehaving-gateway case (T4): the gateway claimed
-A's payment and did not fund B's contract.
+irreversibly left the source. That collapses a debited-not-credited move into an ordinary
+failure. It needs its own terminal so the ledger can say so loudly.
+
+`Stranded` asserts ONE observation — send settled, receive op-terminal non-claim — and nothing
+about its cause. It is specifically NOT the "misbehaving gateway" case: a gateway alone cannot
+produce it. That argument turns on the destination preimage being undecryptable until the
+destination's funding is accepted — a settling gateway legitimately HOLDS a preimage verified
+against the outgoing contract, so "the send verifies a preimage" does not on its own establish
+anything. The argument is written out once, in the stranded-move incident entry of
+`docs/real-sats-pilot-runbook.md`, which is also the canonical account of what cannot be
+inferred. Do not re-derive it here or in a code comment: a partial restatement is how the wrong
+version spread the first time.
 
 1. `MoveRecord` gains (greenfield row-shape change, no migration):
    ```rust
-   pub preimage: Option<Preimage>,        // proof A's payment settled; recovery artifact
+   pub preimage: Option<Preimage>,        // EVIDENCE A's payment settled — not a recovery
+                                          // instrument: it claims A's OUTGOING contract and
+                                          // cannot credit B
    pub receive_fee_quoted: Option<Msat>,  // §2 — receive-side quote, set at CreateInvoice
                                           // (== the paid cost iff the receive claims)
    pub send_fee_quoted: Option<Msat>,     // §2 — send-side quote, set at Pay
    ```
 2. `MovePhase` gains a `Stranded` variant. Semantics: TERMINAL (like
    `Refunded`/`Failed` — preserved by `derive_phase`, `move_protocol.rs:361-370`), but
-   distinct so the ledger/UI can say "debited, not credited — payment proof saved".
+   distinct so the ledger/UI reports a debited-not-credited move rather than a silent loss.
 3. `AwaitSettle` arm, on `SendState::Success(preimage)`:
    - FIRST persist: `rec.preimage = Some(preimage); self.journal.put_move(&rec).await?;`
-     (a crash after this point can never lose the proof), THEN await the receive.
+     (a crash after this point can never lose the evidence that the send leg completed), THEN
+     await the receive.
    - `ReceiveState::Claimed` → `Settled` (unchanged).
    - `ReceiveState::Expired | Failed(msg)` → `rec.phase = MovePhase::Stranded`,
-     `rec.outcome = Some("send settled but receive was not credited: <detail>; payment
-     preimage saved on the move record")`, `put_move`, and the loop falls through to the
-     terminal arm. Transport errors still bubble as `Retryable` via the existing
-     `map_err(retryable)` BEFORE reaching these match arms — only op-TERMINAL receive states
-     strand.
+     `rec.outcome = Some("send settled but receive was not credited: <detail>; not proven
+     lost, not proven recoverable — preserve the data directory and follow the stranded-move
+     entry in docs/real-sats-pilot-runbook.md")`, `put_move`, and the loop falls through to the
+     terminal arm. The leading substring is an ANCHOR the runbook's daily check greps for; a
+     reword must update that grep in the same change. Transport errors still bubble as
+     `Retryable` via the existing `map_err(retryable)` BEFORE reaching these match arms — only
+     op-TERMINAL receive states strand.
 4. `next_step` (`move_protocol.rs:219+`): `Stranded` → `MoveStep::Failed` (the existing
    terminal surface — `perform` returns `Permanent(outcome)`); `derive_phase` preserves it
    like the other terminal phases.
 5. Goldens: `next_step(Stranded) == Failed`; `derive_phase` preserves `Stranded`;
    assemble/merge keeps `preimage`/fee fields from cache (extend the no-blank tests);
    executor unit test: success-send + terminal-failed receive → record is `Stranded`, carries
-   the preimage, error mentions "preimage saved".
+   the preimage, error states "not proven lost, not proven recoverable". The receive-failure
+   detail used in tests must be one the wallet can actually mint: in-crate unit tests reference
+   `multi_client.rs`'s `RECEIVE_FAILURE_DETAIL` directly. The byte-for-byte integration ledger
+   fixture under `wallet-fedimint/tests/` carries the composed outcome string. A test pins the
+   runbook's grep anchor.
 
 Explicitly settled: `Stranded` is terminal (an op-log-terminal receive cannot be fixed by
-re-driving); recovery tooling (claim with the saved preimage / support escalation) is future
-work — the invariant THIS phase buys is that the proof is durable and the state is honest.
+re-driving). There is no recovery tooling and none is planned on the preimage: the preimage
+claims A's OUTGOING contract and cannot credit B, so a "claim with the saved preimage" flow
+would recover nothing. The invariant THIS phase buys is that the state is distinct and honest —
+the evidence is durable and the ledger says exactly what is and is not known.
 
 ## 4. Allocator polish (`wallet-core/src/allocator.rs`)
 
@@ -665,9 +686,10 @@ wallet-cli show <correlation-key | seq> [--json]
   Retryable-vs-Permanent over-cap 15.5, gateway scan 15.6, TOCTOU mismatch 15.7, tick
   timeout 15.9, solve-loop quote-stream goldens 15.10). MemDatabase journal suites: same-dbtx
   atomicity, seq monotonicity + ordering, replay-does-not-duplicate, poison tolerance of
-  ledger scans. The misbehaving-gateway (Stranded) case is covered at the EXECUTOR level with
-  a mock gateway double (§3.5's golden); a live adversarial-gateway harness stays deferred to
-  Phase 8's threat-model pass — tracked, not forgotten.
+  ledger scans. The `Stranded` transition is covered at the EXECUTOR level by §3.5's goldens
+  (a settled send meeting an op-terminal non-claim receive); a live adversarial-gateway harness
+  stays deferred to Phase 8's threat-model pass — tracked, not forgotten, and note it would be
+  probing a case that cannot by itself strand a move.
 - **Deferred devimint smoke (`wallet-cli/tests/smoke_history_devimint.sh`, the 4.C exit
   gate):** two-fed harness (await-send-first pattern): join A+B → direct-inflow A →
   move A→B → tick (agent move) → one forced failure (fee cap 1 msat) → assert `history`
@@ -682,8 +704,8 @@ wallet-cli show <correlation-key | seq> [--json]
 1. Proportional scorer floor = fedimint's own BFT bound `n − (n−1)/3` (§1) — nothing real
    rejected, dishonest configs rejected.
 2. Send-side quoting needs NO fixed point; gateway-on-invoice is SDK-exact (§2).
-3. `Stranded` is a TERMINAL `MovePhase` with the preimage persisted; recovery tooling is
-   future work (§3).
+3. `Stranded` is a TERMINAL `MovePhase`; the preimage is persisted only as evidence that the send
+   settled, not as a recovery instrument, and no recovery tooling is planned on it (§3).
 4. Per-tick reservation lives INSIDE `decide()` as local maps — no snapshot mutation, no new
    types (§4).
 5. `Action::Cap` and `requires_auth` are deleted, not deprecated (greenfield) (§5).
@@ -879,6 +901,6 @@ bisection. The same extraction makes the `CreateInvoice` hair-under path testabl
 ## Scope guard / non-goals
 
 ONLY Phase 4: no discovery (3.B), no watch loop/triggers (3.C), no UI, no on-chain peg-out,
-no event-sourced transition log, no pruning, no recovery tooling for `Stranded` (the preimage
-is persisted for it). Do not touch the fedimint pin, `MoveMeta`, or the Move/DirectInflow
-money logic beyond §2/§3. `cargo fmt` only on files changed.
+no event-sourced transition log, no pruning, no recovery tooling for `Stranded` (the preimage is
+persisted only as evidence that the send settled). Do not touch the fedimint pin, `MoveMeta`, or
+the Move/DirectInflow money logic beyond §2/§3. `cargo fmt` only on files changed.

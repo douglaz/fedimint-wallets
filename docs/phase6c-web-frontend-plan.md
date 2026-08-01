@@ -234,10 +234,14 @@ password is the credential it manages).
 `actor`, `reason`, `error`, and `refusal` diagnostics. It does **not** show a `Stranded` move's
 preimage or leg op-ids: the wire DTO carries neither, and the rich move record is `--standalone`
 only. A stranded operation therefore renders its `error` string verbatim and links the runbook's
-stranded-move incident entry. Note what that entry actually says: no shipped command can display
-the preimage, so the runbook stops the daemon to PRESERVE EVIDENCE rather than to run a recovery
-procedure. Do not promise the user a recovery flow that does not exist. Adding those fields would need a second daemon change, which
-this phase does not budget.
+stranded-move incident entry. That is the right surface, and NOT a gap worth closing with the
+preimage: the preimage claims the source's outgoing contract and cannot credit the destination,
+so showing it would recover nothing and would only send the user after a dead end. The runbook
+stops the daemon to PRESERVE EVIDENCE — the destination's complete client state across both
+receive-failure branches — rather than to run a recovery procedure, and no such procedure exists.
+Do not promise the user a recovery flow that does not exist, and do not describe stranding as a
+gateway failure: a gateway alone cannot cause it. Adding those fields would need a second daemon
+change, which this phase does not budget.
 
 ### Idempotency and double-submit (money-critical)
 

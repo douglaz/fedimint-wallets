@@ -1327,7 +1327,8 @@ pub enum ReceiveState {
     Claimed,
     /// The invoice expired before it was paid.
     Expired,
-    /// The receive failed (programming error or malicious federation).
+    /// The receive reached the SDK's `Failure` terminal; carries `RECEIVE_FAILURE_DETAIL`
+    /// (crate-private, so it is named here rather than linked).
     Failed(String),
 }
 
@@ -1338,7 +1339,8 @@ pub enum SendState {
     Success(Preimage),
     /// The payment failed and the outgoing contract was refunded to us.
     Refunded,
-    /// The send failed (programming error or malicious federation).
+    /// The send reached the SDK's `Failure` terminal; the detail says which outcomes that
+    /// terminal collapses rather than claiming a cause.
     Failed(String),
 }
 
@@ -1422,13 +1424,20 @@ fn map_send_result(
     }
 }
 
+/// The only receive-failure detail this wallet produces. The SDK exposes one terminal for the
+/// distinct mint-output failures described in the string, so the operation state cannot say which
+/// occurred. The runbook's stranded-move entry is the canonical operator account.
+pub(crate) const RECEIVE_FAILURE_DETAIL: &str =
+    "receive failed: either the claim transaction was rejected (so this wallet claimed nothing, \
+     which does not prove the contract is unclaimed) or it was accepted and note issuance then \
+     failed; lnv2 collapses both into one terminal, so which one occurred is not known from the \
+     operation state";
+
 fn map_receive_state(state: FinalReceiveOperationState) -> ReceiveState {
     match state {
         FinalReceiveOperationState::Claimed => ReceiveState::Claimed,
         FinalReceiveOperationState::Expired => ReceiveState::Expired,
-        FinalReceiveOperationState::Failure => ReceiveState::Failed(
-            "receive failed (programming error or malicious federation)".into(),
-        ),
+        FinalReceiveOperationState::Failure => ReceiveState::Failed(RECEIVE_FAILURE_DETAIL.into()),
     }
 }
 
@@ -1436,9 +1445,12 @@ fn map_send_state(state: FinalSendOperationState) -> SendState {
     match state {
         FinalSendOperationState::Success(preimage) => SendState::Success(Preimage(preimage)),
         FinalSendOperationState::Refunded => SendState::Refunded,
-        FinalSendOperationState::Failure => {
-            SendState::Failed("send failed (programming error or malicious federation)".into())
-        }
+        FinalSendOperationState::Failure => SendState::Failed(
+            "send failed: either the funding transaction was rejected or the refund did not \
+             complete; lnv2 collapses both into one terminal, so which one occurred is not known \
+             from the operation state"
+                .into(),
+        ),
     }
 }
 
@@ -1688,7 +1700,12 @@ fn send_terminal(state: SendOperationState) -> Option<RawTerminal> {
         }),
         SendOperationState::Failure => Some(RawTerminal {
             succeeded: false,
-            error: Some("send failed (programming error or malicious federation)".into()),
+            error: Some(
+                "send failed: either the funding transaction was rejected or the refund did not \
+                 complete; lnv2 collapses both into one terminal, so which one occurred is not \
+                 known from the operation state"
+                    .into(),
+            ),
         }),
         SendOperationState::Funding
         | SendOperationState::Funded
@@ -1709,7 +1726,7 @@ fn receive_terminal(state: ReceiveOperationState) -> Option<RawTerminal> {
         }),
         ReceiveOperationState::Failure => Some(RawTerminal {
             succeeded: false,
-            error: Some("receive failed (programming error or malicious federation)".into()),
+            error: Some(RECEIVE_FAILURE_DETAIL.into()),
         }),
         ReceiveOperationState::Pending | ReceiveOperationState::Claiming => None,
     }

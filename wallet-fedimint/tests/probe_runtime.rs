@@ -705,7 +705,8 @@ async fn stranded_leg_and_source_and_local_faults_write_umbrella_only_outcomes()
                 MovePhase::Stranded,
                 Some(
                     "send settled but receive was not credited: receive invoice expired; \
-                      payment preimage saved on the move record",
+                      not proven lost, not proven recoverable — preserve the data directory and \
+                      follow the stranded-move entry in docs/real-sats-pilot-runbook.md",
                 ),
             ))
             .await

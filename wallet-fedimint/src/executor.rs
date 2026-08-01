@@ -1549,8 +1549,10 @@ impl FedimintExecutor {
                     {
                         SendState::Success(preimage) => {
                             // §3: A's payment SETTLED — persist the preimage FIRST, BEFORE awaiting
-                            // the receive, so a crash after this point can never lose the recovery
-                            // proof for a stranded move. THEN await the receive.
+                            // the receive, so a crash after this point can never lose the evidence
+                            // that the send leg completed. It EVIDENCES the send; it is not a way
+                            // to recover a stranded move (see the `Stranded` note at the top of
+                            // `move_protocol`). THEN await the receive.
                             rec.preimage = Some(preimage);
                             self.journal.put_move(&rec).await?;
                             let recv_op = rec.recv_op.ok_or_else(|| {
@@ -1561,9 +1563,10 @@ impl FedimintExecutor {
                             // Transport faults bubble as `Retryable` via `map_err(retryable)` BEFORE
                             // this decision — only an op-TERMINAL non-`Claimed` receive strands
                             // (spec §3): the send debited the source but the destination was never
-                            // credited (the misbehaving-gateway T4 case), which re-driving cannot
-                            // fix. `settle_after_successful_send` maps it to `Stranded` (loud,
-                            // terminal), naming the saved preimage.
+                            // credited, which re-driving cannot fix.
+                            // `settle_after_successful_send` maps it to `Stranded` (loud,
+                            // terminal); the `Stranded` note at the top of `move_protocol` says
+                            // what that observation does and does not establish.
                             let receive_state = self
                                 .mc
                                 .await_receive(&rec.to, recv_op)
@@ -1587,8 +1590,8 @@ impl FedimintExecutor {
                 MoveStep::Done => return Ok(PerformOutcome::Done),
                 // A `Refunded`/`Failed`/`Stranded` phase is terminal (spec §7): the send
                 // self-refunded, a leg failed, or the send settled but the receive was not credited
-                // (§3). Surface the recorded reason so the CLI/log names the actual cause — for a
-                // `Stranded` move that reason names the saved preimage.
+                // (§3). Surface the recorded outcome so the CLI/log reports the terminal state —
+                // for a `Stranded` move it states what was observed without claiming a cause.
                 MoveStep::Failed => {
                     return Err(ExecError::Permanent(
                         rec.outcome
@@ -2019,12 +2022,20 @@ fn pay_step_cap_verdict(
 }
 
 /// The §3 stranded-move outcome message: A's send SETTLED but B's receive was not credited. Names
-/// the receive-side `detail` and the durable recovery artifact (the saved preimage) so history/UI
-/// can present a debited-not-credited move honestly rather than as a silent loss.
+/// the receive-side `detail` and then states the honest uncertainty — not proven lost, not proven
+/// recoverable — so history/UI presents a debited-not-credited move without claiming either a loss
+/// or a recovery. It deliberately does NOT point at the saved preimage: that preimage claims A's
+/// OUTGOING contract and cannot credit B (see the `Stranded` note at the top of `move_protocol`).
+/// The operator procedure is the runbook's.
+///
+/// The leading substring "send settled but receive was not credited" is an ANCHOR: the daily
+/// stranded check in `docs/real-sats-pilot-runbook.md` greps `wallet-cli show` output for it, so a
+/// reword here silently disables that check. `stranded_outcome_keeps_the_runbook_anchor` pins it.
 fn stranded_outcome(detail: &str) -> String {
     format!(
         "send settled but receive was not credited: {detail}; \
-         payment preimage saved on the move record"
+         not proven lost, not proven recoverable — preserve the data directory and follow the \
+         stranded-move entry in docs/real-sats-pilot-runbook.md"
     )
 }
 
@@ -3098,29 +3109,53 @@ mod tests {
             settle_after_successful_send(ReceiveState::Claimed),
             (MovePhase::Settled, None)
         );
-        // An expired receive after a settled send STRANDS, naming the saved preimage.
+        // An expired receive after a settled send STRANDS, stating the honest uncertainty.
         let (phase, outcome) = settle_after_successful_send(ReceiveState::Expired);
         assert_eq!(phase, MovePhase::Stranded);
         let msg = outcome.expect("a stranded move carries an outcome");
-        assert!(msg.contains("preimage saved"), "{msg}");
+        assert!(
+            msg.contains("not proven lost, not proven recoverable"),
+            "{msg}"
+        );
         assert!(msg.contains("receive invoice expired"), "{msg}");
-        // A failed receive strands too, carrying the failure detail plus the saved preimage.
-        let (phase, outcome) =
-            settle_after_successful_send(ReceiveState::Failed("forfeited".into()));
+        // A failed receive strands too, carrying the failure detail. The detail is the REAL string
+        // `map_receive_state` mints — a fabricated one would let the test pass on a message the
+        // wallet cannot actually produce.
+        let (phase, outcome) = settle_after_successful_send(ReceiveState::Failed(
+            crate::multi_client::RECEIVE_FAILURE_DETAIL.into(),
+        ));
         assert_eq!(phase, MovePhase::Stranded);
         let msg = outcome.expect("a stranded move carries an outcome");
         assert!(
-            msg.contains("preimage saved") && msg.contains("forfeited"),
+            msg.contains("not proven lost, not proven recoverable")
+                && msg.contains(crate::multi_client::RECEIVE_FAILURE_DETAIL),
             "{msg}"
         );
     }
 
     #[test]
-    fn successful_send_then_terminal_failed_receive_strands_with_preimage() {
+    fn stranded_outcome_keeps_the_runbook_anchor() {
+        // The daily stranded check in docs/real-sats-pilot-runbook.md greps `wallet-cli show`
+        // output for this exact leading substring. Rewording the outcome without updating that
+        // grep in the same change silently disables the check, so pin the anchor here.
+        // The assertion pins the STRING, not the runbook file: `docs/` is outside the nix source
+        // filter (`flake.nix` `rustSrc.paths` lists only the manifests and the five crate dirs),
+        // so an `include_str!` of the runbook from this crate's test code fails to build in the
+        // sandbox. Do not add one back.
+        const ANCHOR: &str = "send settled but receive was not credited";
+        let msg = stranded_outcome("receive invoice expired");
+        assert!(msg.starts_with(ANCHOR), "{msg}");
+        // And the message must never send an operator after the preimage: it claims A's OUTGOING
+        // contract and cannot credit B, so it recovers nothing here.
+        assert!(!msg.contains("preimage"), "{msg}");
+    }
+
+    #[test]
+    fn successful_send_then_terminal_failed_receive_strands() {
         // Mirror the `AwaitSettle` Success arm without live I/O: persist the preimage FIRST (§3),
         // then map the op-terminal receive. A failed receive after a settled send leaves the record
-        // `Stranded`, still carrying the preimage, routed to the terminal `Failed` surface with a
-        // "preimage saved" outcome (`perform` returns `Permanent(outcome)`).
+        // `Stranded`, still carrying the preimage as evidence the send leg completed, routed to the
+        // terminal `Failed` surface (`perform` returns `Permanent(outcome)`).
         let mut rec = MoveRecord {
             key: IdempotencyKey("move-strand".into()),
             from: Some(FED_A),
@@ -3141,7 +3176,7 @@ mod tests {
         let preimage = crate::types::Preimage([0x9a; 32]);
         rec.preimage = Some(preimage);
         let (phase, outcome) = settle_after_successful_send(ReceiveState::Failed(
-            "gateway claimed A but never funded B".into(),
+            crate::multi_client::RECEIVE_FAILURE_DETAIL.into(),
         ));
         rec.phase = phase;
         rec.outcome = outcome;
@@ -3150,12 +3185,18 @@ mod tests {
         assert_eq!(
             rec.preimage,
             Some(preimage),
-            "the recovery proof is preserved"
+            "the evidence that the send leg settled is preserved"
         );
         assert_eq!(next_step(&rec), MoveStep::Failed);
         let msg = rec.outcome.clone().expect("stranded outcome present");
-        assert!(msg.contains("preimage saved"), "{msg}");
-        assert!(msg.contains("never funded B"), "{msg}");
+        assert!(
+            msg.contains("not proven lost, not proven recoverable"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(crate::multi_client::RECEIVE_FAILURE_DETAIL),
+            "{msg}"
+        );
     }
 
     // ---- §15.11: DirectInflow hair-under records the DELIVERED net unconditionally ----------

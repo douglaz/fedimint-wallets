@@ -97,15 +97,16 @@ them only after a clean first week.)
 ## Daily — the one-minute glance
 
 ```bash
-# 1. The loss surface: a Stranded move (send settled, receive not credited) is the ONLY
-#    state where money can be in limbo.
+# 1. Unresolved-money terminals this check can identify: a Stranded move (send settled,
+#    receive not credited), plus lnv2's ambiguous send/receive `Failure` terminals. A send
+#    `Failure` does not distinguish rejected funding from an incomplete refund; a receive
+#    `Failure` does not distinguish a rejected claim from accepted-but-failed note issuance.
 #
 #    DO NOT grep history for "stranded" — that word NEVER appears in its output. `Stranded`
 #    shares the terminal `failed` surface (move_protocol.rs §3), and the ten-column TSV carries
 #    no error field, so a naive grep prints "clean" even while funds are stranded.
 #
-#    Terminal-failed money ops are the candidate set; `show` carries the error that
-#    distinguishes a stranded move from an ordinary failure.
+#    Terminal-failed money ops are the candidate set; `show` carries the distinguishing error.
 #    Collect first, THEN judge -- and distinguish "inspected everything, found nothing" from
 #    "could not inspect". `... done || echo clean` was wrong twice over (the loop's status is its
 #    LAST body command's), and a verdict that ignores exit codes is wrong a third way: a bouncing
@@ -113,18 +114,24 @@ them only after a clean first week.)
 if ! hist=$(wallet-cli history --limit 200); then
   echo "CHECK FAILED - could not read history; rerun before trusting a clean result"
 else
-  failed=0; stranded=""
+  failed=0; stranded=""; ambiguous=""
   for key in $(printf '%s\n' "$hist" | awk -F'\t' \
-      '($3=="move"||$3=="evacuation"||$3=="pay") && $4=="failed" {print $10}'); do
+      '($3=="move"||$3=="evacuation"||$3=="pay"||$3=="receive"||$3=="direct-inflow") && $4=="failed" {print $10}'); do
     if ! detail=$(wallet-cli show "$key"); then failed=1; continue; fi
     case "$detail" in
       *"send settled but receive was not credited"*) stranded="$stranded$key ";;
+      *"send failed:"*|*"receive failed:"*) ambiguous="$ambiguous$key ";;
     esac
   done
   if [ "$failed" = 1 ]; then
     echo "CHECK FAILED - could not inspect every candidate; rerun"
-  elif [ -n "$stranded" ]; then
-    echo "STRANDED - investigate immediately: $stranded"
+  elif [ -n "$stranded$ambiguous" ]; then
+    if [ -n "$stranded" ]; then
+      echo "STRANDED - investigate immediately: $stranded"
+    fi
+    if [ -n "$ambiguous" ]; then
+      echo "AMBIGUOUS TERMINAL - stop the daemon, preserve its data directory, investigate: $ambiguous"
+    fi
   else
     echo clean
   fi
@@ -160,23 +167,109 @@ scheduler-dead daemon as healthy.
   and treat it as a bug (the known upstream trigger is fixed at our pin; a new firing has
   a new cause).
 - **A stranded move** (found by check 1 above — it appears as a `failed` move whose `show`
-  error reads "send settled but receive was not credited"). The send leg settled but the receive
-  was not credited. **`Stranded` is TERMINAL — waiting and restarting will NOT repair it.**
+  error reads "send settled but receive was not credited"). **This entry is the canonical
+  account of what `Stranded` means.** Code comments deliberately point here instead of carrying
+  their own explanation, because every previous attempt to enumerate causes in a comment was
+  later shown to be wrong. The state has never been observed in the pilot.
+
+  **What it asserts.** Exactly one observation: the send leg reached a SETTLED terminal, and the
+  receive leg reached an op-terminal NON-claim (the invoice expired, or lnv2 yielded its single
+  `Failure`). That is all.
+
+  **What it does NOT assert.**
+  - *Not a gateway fault.* A misbehaving gateway alone cannot produce it. The send leg reaches
+    `Success` only against a preimage verified against the outgoing contract, or via the source
+    federation's guardians, whose `await_preimage` is populated only on a verified claim. The
+    destination's preimage is derived client-side and never transmitted; the only copy that
+    leaves the client is threshold-encrypted to the destination's guardians. The gateway cannot
+    open that ciphertext before the destination funding transaction is accepted. Only then can it
+    collect guardian decryption shares and decrypt the preimage, so it cannot obtain the preimage
+    while skipping accepted destination funding.
+  - *Not proof of loss, and not proof of malice.* A receive `Failure` proves very little: lnv2
+    yields it whenever the mint outputs fail to come back, which collapses two structurally
+    different states — the containing transaction was REJECTED (so this wallet's claim changed
+    nothing, which is NOT the same as the contract being unclaimed), and the transaction was
+    ACCEPTED but note issuance then failed. It therefore does not prove the
+    contract was claimed, does not prove funds reached the destination, and does not exclude a
+    dishonest federation.
+
+  The honest operator statement is **"not proven lost, and not proven recoverable."** State the
+  uncertainty; do not pick a story to fill it.
+
+  **The preimage is NOT the recovery instrument.** It claims the SOURCE's outgoing contract —
+  which a settled send already accounts for — and spending that contract is additionally
+  authorised to `claim_pk`, not by the preimage alone. Nothing about it credits the destination.
+  Where recovery is possible at all, it depends on the destination's **complete client state**.
+  If the claim transaction was rejected, the receive state machine's `contract`,
+  `claim_keypair`, and `agg_decryption_key` may matter. If the claim was accepted but note
+  issuance failed, the mint-output state and seed-derived note material may matter instead.
+  The receive terminal does not distinguish those branches. Preserve the whole data directory;
+  do not go hunting for the preimage or build tooling to extract it, because it cannot recover
+  either branch.
+
+  **`Stranded` is TERMINAL — waiting and restarting will NOT repair it.**
   `reconcile` re-drives `pending()` only (`Pending`/`Executing`); `Failed`/`Permanent` stay
   terminal and `Awaiting` is subscription-owned, so nothing re-drives a stranded move. Do not
-  burn an hour waiting for a self-heal that cannot come. Instead, act immediately:
+  burn an hour waiting for a self-heal that cannot come. Instead, act in this order:
 
-  **STOP the daemon and preserve the data directory before anything else.** The preimage that
-  proves the send settled is persisted on the move record, but **no shipped command can display
-  it** — `show --standalone` prints `send_op`/`recv_op`/`gateway` and stops there, and recovery
-  tooling was explicitly deferred in Phase 4. Extracting it today means decoding `journal.db`
-  directly, so the data directory IS the evidence: losing it loses the proof.
+  1. **STOP the daemon and preserve the data directory before anything else.** This is an
+     EVIDENCE-PRESERVATION step, not a recovery procedure — there is no recovery procedure to
+     run. The directory holds the destination's complete client state for both failure branches;
+     losing it forecloses whatever options exist.
+  2. **Check whether another wallet instance has copied or snapshotted in-flight client state.**
+     This is the FIRST diagnostic — step 1 is preservation, not diagnosis — because it is the
+     cheapest thing to rule out and the most severe if true, **not** because it is the
+     established cause. It is a hypothesis until you measure it. Note
+     what is *not* sufficient: the seed alone. lnv2 declares `type Backup = NoModuleBackup` and
+     starts a receive state machine only when handed the specific randomized contract, so a
+     seed-only recovery does **not** resume an in-flight receive. Producing a second claimant
+     takes duplicated in-flight client state or explicit access to the contract and claim
+     material.
 
-  What you CAN get: `wallet-cli show <key>` gives the error detail, and
-  `wallet-cli show <key> --standalone` (daemon stopped) adds the send and receive op-ids.
-  The preimage is proof the send settled and is what a gateway/federation operator needs to
-  reconcile the un-credited leg. Do NOT re-submit the move by hand (the executor's dedup is
-  what is protecting you from a double-spend).
+     *How to run it.* (a) Rule out this host first, and cheaply: `client.db` is exclusively
+     locked, so neither a second shipped `walletd` nor `wallet-cli --standalone` against the same
+     disk can be a concurrent claimant. The second daemon waits for the lock and can resume the
+     persisted state only after the owner exits; the standalone CLI instead fails immediately with
+     "another process owns the wallet store." (b) The check that matters is therefore off-host:
+     enumerate every copy of the data directory that has ever existed — a restored backup, a disk
+     or volume snapshot, a container volume clone, a copy carried to a second machine — and for
+     each one establish whether any wallet process was ever pointed at it. (c) Bound it by time:
+     `wallet-cli show <key>` dates the move, and a copy that no process opened inside that window
+     cannot have produced a competing claim.
+     If every copy is accounted for, the hypothesis is ruled out — write that down and go to
+     step 3. If you do find a duplicated claimant, it is a route *into* the rejected-transaction
+     case above, not a separate parallel cause.
+  3. **Collect what the shipped commands actually give you.** `wallet-cli show <key>` gives the
+     error detail; `wallet-cli show <key> --standalone` (daemon stopped) adds the send and
+     receive op-ids. That is the extent of it — `show --standalone` stops at
+     `send_op`/`recv_op`/`gateway`; the shipped commands expose no recovery procedure, and the
+     preimage is not one.
+  4. **Do NOT re-submit the move by hand.** The executor's dedup is what is protecting you from
+     a double-spend.
+
+  **On forfeit.** A forfeited send NORMALLY ends `Refunded`, not stranded: the gateway's cancel
+  signature drives an immediate refund. But "forfeit can never strand" is FALSE. If the gateway
+  incorrectly claimed the outgoing contract and the refund transaction is therefore rejected, the
+  SDK re-checks `await_preimage` and PROMOTES the leg to send-`Success`
+  (`lnv2-client/lib.rs:705-725` at our pin). That promoted success can then meet a non-claimed
+  receive and land here. Do not reason from "it was forfeited, so it cannot be stranded."
+
+- **An ambiguous send or receive terminal** (flagged by check 1 above). A send `Failure` can be
+  the SIBLING exit of the forfeit block, and it does not land in `Stranded`. If the refund does not
+  complete and no preimage is available either, the SDK yields send-`Failure`
+  (`lnv2-client/lib.rs:725`), which this wallet records as a plain `MovePhase::Failed`
+  (`wallet-fedimint/src/executor.rs:1583-1585`) — the same terminal it uses for a send whose
+  funding transaction was simply rejected. In that second case nothing was ever funded and no
+  money moved; in the first the outgoing contract WAS funded and its position is unresolved. The
+  operation state does not say which one happened. So a `failed` move whose error starts with
+  `send failed:` is NOT evidence the money stayed put.
+
+  A receive `Failure`, including a raw receive or direct inflow, has the two mint-leg meanings
+  documented in the stranded entry above. It likewise does not establish whether the incoming
+  contract was claimed or whether destination notes can be recovered. In either case, **STOP the
+  daemon and preserve the complete data directory before concluding anything**; the check cannot
+  tell which underlying branch occurred, and selecting one artifact early can discard the state
+  needed by the other.
 - **A pay came back `refunded`/failed after submission.** lnv2 permits ONE payment
   attempt per invoice: the wallet refuses a retry of that same invoice by design
   ("already consumed its single payment attempt"). Get a fresh invoice from the payee.
