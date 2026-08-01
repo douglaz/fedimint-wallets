@@ -90,7 +90,22 @@ send_op_id            = A.send(invoice, gateway = G)        # A auto-steers into
 # both clients self-drive: A funds outgoing contract -> G direct-swaps into B ->
 # B claims (auto); A.send -> Success(preimage). We just await both.
 ```
-Cheaper, **not more private** (G sees both legs), and **bounded by G's B-side liquidity**.
+Cheaper **in lnv2 only, and only if the gateway prices it that way**; **not more private** (G sees
+both legs); **bounded by G's B-side liquidity**.
+
+The lnv2 discount is a real mechanism, not a routing accident: a gateway advertises
+`send_fee_default = lightning_fee + transaction_fee` but `send_fee_minimum = transaction_fee`, and
+`send_parameters` returns the MINIMUM when the invoice's payee pubkey is the gateway's own node —
+exactly the internal-swap case (`gateway-server/lib.rs:3039-3043`,
+`lnv2-common/gateway_api.rs:178-184`). The saving is precisely the `lightning_fee` component, so a
+gateway configuring `lightning_fee = 0` has minimum == default and there is NO discount. Measured
+on our own pilot gateway, same amount and same gateway: internal-swap send leg 8,948 msat versus
+external send leg 16,064 msat on 1,000,000 msat.
+
+**lnv1 has no such distinction.** A v1 gateway registers one `RoutingFees { base_msat,
+proportional_millionths }` with no minimum/default split and no self-payment case, so a v1 internal
+swap costs the SAME as an external payment. Do not carry the lnv2 intuition into a v1 federation —
+and note the wallet meets v1 federations whenever it pays an invoice minted by one.
 **There is NO fallback when no shared gateway exists.** An earlier draft of this line promised
 a real Lightning hop between two gateways; the code does not do that. Both
 `resolve_move_gateway` and `resolve_fallback_move_gateway` return a SINGLE gateway and gate it
