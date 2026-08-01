@@ -3,6 +3,8 @@ status: accepted
 ---
 # v1 evacuation: hard low balance cap, not on-chain peg-out
 
+> **Amended by [ADR-0029](./0029-evacuation-must-be-executable.md) (2026-08-01).** This ADR's balance cap and its acceptance of a stranded capped amount both STAND. What ADR-0029 adds is a second, still gateway-DEPENDENT route for evacuation (a Lightning hop between two gateways) and a workable fee cap — the absolute cap here could not fund a full-balance evacuation. The gateway-INdependent escape this ADR deferred to v2 (on-chain peg-out) remains deferred.
+
 Approved resolution (autoplan final gate, 2026-06-28) for the LN-only-evacuation
 stranding risk in [ADR-0004](./0004-v1-lightning-only.md). Rather than pull
 on-chain peg-out into v1, v1 enforces a HARD, LOW per-federation balance cap and

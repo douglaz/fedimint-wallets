@@ -161,6 +161,11 @@ What that makes permanent, rather than temporary:
   evacuation resolves a SINGLE gateway that serves both ends (`resolve_move_gateway` and
   `resolve_fallback_move_gateway` both return one `GatewayUrl`, gated on `gateway_serves_route`).
   There is no two-gateway path in the code and none is planned.
+- **Evacuation is the one exception, per
+  [ADR-0029](./adr/0029-evacuation-must-be-executable.md):** when no gateway serves both
+  federations it may fall back to a real Lightning hop through two different gateways. That is
+  best-effort, not a guarantee, and it does not change the balance cap. `Move` keeps the swap-only
+  path.
 - **If that gateway is unavailable, automated movement stops.** Funds are not at risk — nothing
   is in flight and balances are untouched — but the allocator cannot rebalance and cannot
   evacuate until it returns. Evacuation is therefore NOT an escape hatch from a gateway outage;
