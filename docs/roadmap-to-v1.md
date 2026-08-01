@@ -165,8 +165,18 @@ What that makes permanent, rather than temporary:
   is in flight and balances are untouched — but the allocator cannot rebalance and cannot
   evacuate until it returns. Evacuation is therefore NOT an escape hatch from a gateway outage;
   it depends on the same gateway.
-- Federation choice for the pilot should account for this: prefer federations the operating
-  gateway already serves.
+- Federation choice must account for this, but the constraint is **a shared gateway, not a
+  particular one**: any gateway registered on both federations satisfies it. Preferring
+  federations that the operator's OWN gateway serves is a tradeoff, not a requirement, and it
+  cuts against the point of the wallet — spreading across independent federations while routing
+  them all through infrastructure one party runs re-centralises what is being diversified, and
+  makes that operator's uptime the single point of failure for the safety mechanism. The
+  arguments for self-hosting anyway are real: with no fallback, gateway downtime is the
+  availability of automated movement, and you can restart your own; and the gateway sees BOTH
+  legs of every move (§5), so a third-party gateway learns the cross-federation movement pattern
+  that a self-run one does not. Decide it deliberately rather than by default. Note a gateway
+  cannot be added to a federation unilaterally — its guardians register gateways — so in practice
+  this constrains WHICH federations can be paired, not which gateway can be made to serve them.
 
 ## Definition of "fully featured v1"
 
