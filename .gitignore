@@ -30,3 +30,8 @@ result-image
 
 # bv (beads viewer) local config and caches
 .bv/
+
+# stray build artifacts that were committed by accident (see purge below)
+await_temp
+match_field
+match_field2
