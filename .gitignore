@@ -31,7 +31,8 @@ result-image
 # bv (beads viewer) local config and caches
 .bv/
 
-# stray build artifacts that were committed by accident (see purge below)
+# stray build artifacts committed by accident alongside 5016a04, then purged by a history
+# rewrite (so they no longer appear at that commit); ignored so `add -A` cannot reintroduce them
 await_temp
 match_field
 match_field2

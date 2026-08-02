@@ -1424,9 +1424,18 @@ fn map_send_result(
     }
 }
 
+/// The only send-failure detail this wallet produces. Hoisted because it is minted at two sites
+/// (`map_send_state` and `send_terminal`) that must not drift, and because the runbook's daily
+/// check greps its `send failed:` prefix — see `failure_details_keep_the_runbook_ambiguous_prefixes`.
+pub(crate) const SEND_FAILURE_DETAIL: &str =
+    "send failed: either the funding transaction was rejected or the refund did not complete; \
+     lnv2 collapses both into one terminal, so which one occurred is not known from the \
+     operation state";
+
 /// The only receive-failure detail this wallet produces. The SDK exposes one terminal for the
 /// distinct mint-output failures described in the string, so the operation state cannot say which
-/// occurred. The runbook's stranded-move entry is the canonical operator account.
+/// occurred. The runbook's stranded-move entry is the canonical operator account. Its
+/// `receive failed:` prefix is likewise a runbook grep anchor, pinned by the same test.
 pub(crate) const RECEIVE_FAILURE_DETAIL: &str =
     "receive failed: either the claim transaction was rejected (so this wallet claimed nothing, \
      which does not prove the contract is unclaimed) or it was accepted and note issuance then \
@@ -1445,12 +1454,7 @@ fn map_send_state(state: FinalSendOperationState) -> SendState {
     match state {
         FinalSendOperationState::Success(preimage) => SendState::Success(Preimage(preimage)),
         FinalSendOperationState::Refunded => SendState::Refunded,
-        FinalSendOperationState::Failure => SendState::Failed(
-            "send failed: either the funding transaction was rejected or the refund did not \
-             complete; lnv2 collapses both into one terminal, so which one occurred is not known \
-             from the operation state"
-                .into(),
-        ),
+        FinalSendOperationState::Failure => SendState::Failed(SEND_FAILURE_DETAIL.into()),
     }
 }
 
@@ -1700,12 +1704,7 @@ fn send_terminal(state: SendOperationState) -> Option<RawTerminal> {
         }),
         SendOperationState::Failure => Some(RawTerminal {
             succeeded: false,
-            error: Some(
-                "send failed: either the funding transaction was rejected or the refund did not \
-                 complete; lnv2 collapses both into one terminal, so which one occurred is not \
-                 known from the operation state"
-                    .into(),
-            ),
+            error: Some(SEND_FAILURE_DETAIL.into()),
         }),
         SendOperationState::Funding
         | SendOperationState::Funded
