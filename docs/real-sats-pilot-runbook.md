@@ -121,6 +121,11 @@ else
     case "$detail" in
       *"send settled but receive was not credited"*) stranded="$stranded$key ";;
       *"send failed:"*|*"receive failed:"*) ambiguous="$ambiguous$key ";;
+      # Rows written BEFORE the diagnostics were reworded keep the old text. Ledger error
+      # strings are persisted, not re-derived (journal.rs CAS falls back to MoveRecord.outcome),
+      # so a terminal row from an earlier release still carries this wording. One pattern covers
+      # the legacy send and receive forms.
+      *"programming error or malicious federation"*) ambiguous="$ambiguous$key ";;
     esac
   done
   if [ "$failed" = 1 ]; then
@@ -226,22 +231,31 @@ scheduler-dead daemon as healthy.
      takes duplicated in-flight client state or explicit access to the contract and claim
      material.
 
-     *How to run it.* (a) Rule out this host first, and cheaply: `client.db` is exclusively
-     locked, so neither a second shipped `walletd` nor `wallet-cli --standalone` against the same
-     disk can be a concurrent claimant. The second daemon waits for the lock and can resume the
-     persisted state only after the owner exits; the standalone CLI instead fails immediately with
-     "another process owns the wallet store." (b) The check that matters is therefore off-host:
-     enumerate every copy of the data directory that has ever existed — a restored backup, a disk
+     *How to run it.* (a) What the store lock does and does NOT rule out. The lock is a FILE
+     INSIDE the data directory (`<data_dir>/client.db.lock`, `wallet-cli/src/main.rs:1222-1240`),
+     so it only excludes two processes opening **that same directory**: a second `walletd` waits
+     for the lock and resumes only after the owner exits, and `wallet-cli --standalone` fails
+     immediately with "another process owns the wallet store." It does NOT make the host safe. A
+     restored backup or cloned volume mounted at a DIFFERENT path on this same host has its own
+     lock file and runs concurrently with the original — which is exactly the competing claimant
+     being diagnosed. (b) So enumerate every copy of the data directory that has ever existed,
+     **on this host and off it** — a restored backup, a disk
      or volume snapshot, a container volume clone, a copy carried to a second machine — and for
      each one establish whether any wallet process was ever pointed at it. (c) Bound it by time:
-     `wallet-cli show <key>` dates the move, and a copy that no process opened inside that window
-     cannot have produced a competing claim.
+     `wallet-cli show <key> --standalone` dates the move (the daemon is stopped from step 1, and
+     plain `show` talks to it over HTTP with no silent fallback, so it would simply fail here),
+     and a copy is cleared only if no wallet process HELD IT OPEN AT ANY POINT during that
+     window. That is NOT the same test as "no process opened it during the window": a daemon
+     started BEFORE the move and still running through it never opens anything inside the
+     window, yet is exactly the claimant you are hunting. Compare process LIFETIMES against
+     the window (start before/end after both count as overlap), not open events within it. If
+     a copy's history cannot establish that, treat it as unresolved rather than cleared.
      If every copy is accounted for, the hypothesis is ruled out — write that down and go to
      step 3. If you do find a duplicated claimant, it is a route *into* the rejected-transaction
      case above, not a separate parallel cause.
-  3. **Collect what the shipped commands actually give you.** `wallet-cli show <key>` gives the
-     error detail; `wallet-cli show <key> --standalone` (daemon stopped) adds the send and
-     receive op-ids. That is the extent of it — `show --standalone` stops at
+  3. **Collect what the shipped commands actually give you.** With the daemon stopped, every
+     `show` here needs `--standalone`. `wallet-cli show <key> --standalone` gives the error
+     detail AND the send and receive op-ids. That is the extent of it — `show --standalone` stops at
      `send_op`/`recv_op`/`gateway`; the shipped commands expose no recovery procedure, and the
      preimage is not one.
   4. **Do NOT re-submit the move by hand.** The executor's dedup is what is protecting you from
@@ -322,8 +336,10 @@ wipe (see Never).
 ## Never
 
 - Never run two daemons (or a daemon + `wallet-cli --standalone`) against the same seed
-  or data dir. The RocksDB lock protects the same-host case; nothing protects a restored
-  copy on a second host.
+  or data dir. The store lock protects ONLY processes opening the same data directory —
+  it is a file inside that directory (`<data_dir>/client.db.lock`). A restored backup or
+  cloned volume at another path is NOT protected, on this host or any other. Do not read
+  "same host" as safe; see the stranded-move incident entry.
 - Never delete `client.db` "to fix" a stuck state. Reconcile + restart is the fix;
   `client.db` IS the wallet.
 - Never share `walletd mnemonic` output, the token file, or a disk image of the data

@@ -31,7 +31,7 @@ result-image
 # bv (beads viewer) local config and caches
 .bv/
 
-# stray build artifacts that were committed by accident (see purge below)
+# stray build artifacts committed by accident in 4c529e8; blobs purged from history in 0dba569
 await_temp
 match_field
 match_field2

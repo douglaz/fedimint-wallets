@@ -466,7 +466,9 @@ fn assemble_preserves_cached_terminal_phase() {
 /// artifacts do NOT carry, so — like the terminal `outcome` — they must survive re-assembly
 /// via the cache. A `Stranded` record carrying its saved preimage and both quotes, re-assembled
 /// with a fresh backfill of its receive+send artifacts, must keep all three (else a resume would
-/// lose the recovery proof and the history's fee accounting).
+/// lose the evidence that the send settled, and the history's fee accounting). The preimage is
+/// EVIDENCE of the send, not a recovery instrument — it claims the source's outgoing contract and
+/// cannot credit the destination.
 #[test]
 fn assemble_keeps_cached_preimage_and_fee_quotes() {
     let k = key("move-preimage-fees");

@@ -3781,9 +3781,11 @@ enum LegFault {
 /// not demote.
 fn classify_leg_failure(leg: ProbeLeg, rec: Option<&MoveRecord>, error: &str) -> LegFault {
     match rec.map(|r| r.phase) {
-        // A `Stranded` leg (send settled, receive never credited) cannot distinguish a
-        // thieving gateway from a broken candidate; `Refunded` failed downstream and made
-        // the payer whole. Neither demotes.
+        // A `Stranded` leg (send settled, receive never credited) attributes to nothing this
+        // classifier can act on: the terminal collapses several destination-side outcomes and
+        // establishes no fault, least of all the gateway's — a gateway alone cannot produce it
+        // (see the `Stranded` note at the top of `move_protocol`). `Refunded` failed downstream
+        // and made the payer whole. Neither demotes.
         Some(MovePhase::Stranded) | Some(MovePhase::Refunded) => return LegFault::UmbrellaOnly,
         // The send leg reached a terminal FAILED settlement: the PAYER owns it. Leg OUT's
         // payer is the candidate — the redeemability core.

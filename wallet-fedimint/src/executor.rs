@@ -3134,6 +3134,31 @@ mod tests {
     }
 
     #[test]
+    fn failure_details_keep_the_runbook_ambiguous_prefixes() {
+        // The daily check's AMBIGUOUS branch greps `wallet-cli show` output for these two
+        // prefixes (docs/real-sats-pilot-runbook.md, check 1). They are grep couplings exactly
+        // like the stranded anchor below, so pin them for the same reason: rewording either
+        // prefix compiles and leaves the suite green while silently disabling that branch.
+        assert!(
+            crate::multi_client::SEND_FAILURE_DETAIL.starts_with("send failed:"),
+            "{}",
+            crate::multi_client::SEND_FAILURE_DETAIL
+        );
+        assert!(
+            crate::multi_client::RECEIVE_FAILURE_DETAIL.starts_with("receive failed:"),
+            "{}",
+            crate::multi_client::RECEIVE_FAILURE_DETAIL
+        );
+        // The stranded outcome embeds the receive detail, and the runbook's `case` is
+        // first-match, so a stranded row must still match the STRANDED arm before this one.
+        let stranded = stranded_outcome(crate::multi_client::RECEIVE_FAILURE_DETAIL);
+        assert!(
+            stranded.starts_with("send settled but receive was not credited"),
+            "{stranded}"
+        );
+    }
+
+    #[test]
     fn stranded_outcome_keeps_the_runbook_anchor() {
         // The daily stranded check in docs/real-sats-pilot-runbook.md greps `wallet-cli show`
         // output for this exact leading substring. Rewording the outcome without updating that
