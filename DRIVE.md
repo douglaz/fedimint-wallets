@@ -37,14 +37,33 @@ required; bare `cargo` fails on missing cmake.
   - `reclaim_receive_recovers_parked_claim` — ok ← the retroactive-recovery claim, verified
 
 ## Next
-Decide the fork-patch question below, then: bump the pin, run the wallet gate, teach the
-executor to read the recorded receive SM state, rewrite the runbook's stranded entry.
+Nothing below is authorized until the fork-patch question is answered. The two paths
+differ in what gets pinned, not in what gets verified:
+
+- **If we wait for upstream merge (preferred):** bump the pin to the upstream commit that
+  contains #8935, then run the verification list.
+- **If we adopt before merge:** carry `eaa35c03067` as a fourth fork-only patch on the pin
+  branch, then run the same verification list.
+
+Verification list, either way — this is the bead's, not a shortened version of it. The
+three in-process tests already recorded do **not** substitute for the first two:
+1. the full lnv2 integration suite, run by us;
+2. a devimint exercise that parks a receive on a rejected claim and recovers it with
+   `reclaim-receive`, against a record written by the OLD client (this is what proves the
+   retroactive path end to end);
+3. the wallet gate on the bumped pin;
+4. teach the executor to read the recorded receive SM state;
+5. rewrite the runbook's stranded entry.
 
 ## Open questions for the human
-- **fedimint#8935 is OPEN, not merged.** Adopting now means a FOURTH fork-only patch on
-  money-path receive code. Evidence above says it applies and passes cleanly, so the
-  technical risk is low; the cost is divergence from upstream, against br-jga. The bead's
-  preferred resolution — wait for it to merge, then one pin bump serves both — still looks
-  right now that we know the cherry-pick is clean and can be redone at will.
-- **The conflict is a staleness signal.** Our pin is ~10 upstream commits behind #8935's
-  base. That gap will only grow.
+- **fedimint#8935 is OPEN, not merged** (observed 2026-08-02). Adopting now means a FOURTH
+  fork-only patch on money-path receive code. The evidence above bounds only part of the
+  risk: cherry-pick application and package-level validation are low risk and demonstrated.
+  End-to-end wallet risk is **unverified** — the wallet gate has not run against a bumped
+  pin, and the executor integration is unwritten. The cost of adopting early is divergence
+  from upstream, against br-jga. The bead's preferred resolution — wait for it to merge,
+  then one pin bump serves both — still looks right now that we know the cherry-pick is
+  clean and can be redone at will.
+- **The conflict is a staleness signal.** As of 2026-08-02, our pin `72b1e5be` is ~10
+  commits behind `4716374a` (#8935's branch tip), whose base is `fedimint/fedimint@master`.
+  That gap grows for as long as the pin stays put while upstream advances.
