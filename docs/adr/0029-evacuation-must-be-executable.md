@@ -18,6 +18,35 @@ rather than in ~27 fee-capped chunks or not at all when no gateway is shared:
 `Move` is unchanged: it keeps the swap-only path and its proportional cap. Routine rebalancing can
 safely decline and wait; evacuation cannot.
 
+## Amendment: what "serves both ends" means, and what strict ordering costs
+
+Both statements above turn on a gateway "serving" a route, which the original text used as if it
+were self-evident. It is not, and the loose reading is the one that livelocks.
+
+**A gateway SERVES a route when it is registered for both federations, VALIDATES, and a viable
+amount can actually be sized over it.** Registry presence is not the test: a gateway that is
+listed but dead, or that cannot price the route, does not serve it, and treating it as though it
+did leaves a dying federation with a listed-but-useless gateway and no way out — precisely the
+incident the second route exists for.
+
+Being unable to fund the **full** ask is not a failure to serve. `InsufficientBalanceError` at the
+desired amount is the ordinary downsize signal, not a fall-through trigger; reading it as one
+would route every full-balance evacuation onto the dearer hop while a healthy shared gateway sat
+idle. This has a structural consequence: route selection can no longer precede sizing. Each
+candidate is sized with its own fee bases, and only the resulting executed net is compared against
+that route's cap.
+
+**Strict ordering stays strict even when it costs operations.** With a base+proportional cap the
+two goals in this ADR can disagree: a high-ppm shared gateway has a narrow feasible window and may
+serve only a small net, while a hop pair would serve the full drain. The swap still wins, and the
+source drains in several operations. Chunking is slow, not lossy — each chunk settles — and the
+alternative is sizing both route classes on every tick to compare them, which is more machinery
+than the case earns.
+
+**Nothing here concerns gateway pins.** Automated routing is never pinned; see
+[ADR-0030](./0030-automated-routing-is-never-pinned.md). An earlier draft of the implementing bead
+specified a four-case pin-precedence table for evacuation — that table is deleted, not answered.
+
 ## Why
 
 **The absolute cap cannot fund a real evacuation, and it fails in TWO different ways depending on
