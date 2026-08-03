@@ -8,12 +8,21 @@ Two rules, drawn along a line the code did not previously have:
 1. **Automated routing resolves only from the federation's vetted list.** The scheduler, the
    allocator, probes and evacuation may never be pinned to a gateway. The `gateway` key is
    removed from `walletd.toml`, so a daemon cannot express one.
-2. **The operator keeps a single-invocation break-glass.** `wallet-cli --standalone --gateway
-   <url>` survives, and deliberately routes through a gateway **outside** the vetted list without
-   validating it first.
+2. **The operator keeps a single-invocation break-glass, on money verbs only.** `wallet-cli
+   --standalone --gateway <url>` survives for the verbs that move money at an operator's explicit
+   instruction, and deliberately routes through a gateway **outside** the vetted list without
+   validating it first. It is **rejected** for `discover`, `probe`, `tick` and `status`.
 
 The asymmetry is the decision: the CLI has a flag the daemon config does not. That is intentional
 and is the thing a future reader will otherwise assume was an oversight.
+
+**Rule 1 is about the decision, not the process.** "Automated" means the scheduler/allocator/probe
+machinery wherever it runs — including when a human starts it from a terminal. `wallet-cli
+--standalone tick` runs the same allocator that walletd runs; `probe` and `discover` write the
+same health signals the allocator reads. Letting a flag reach those is the daemon pin under
+another name: a stale `--gateway` on a standalone `tick` can suppress healthy vetted routes, mark
+a destination unusable, and force an evacuation route. The flag survives only where a human is
+directing a specific payment, not where they are starting a machine that decides for itself.
 
 ## Why
 
