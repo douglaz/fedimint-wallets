@@ -92,6 +92,53 @@ secondarily by probes detecting degradation. The Allocator's core resilience
 action.
 _Avoid_: "sweep" (reserve for consolidating many inputs), "withdraw"
 
+**Serves** (of a gateway, with respect to a route):
+A gateway **serves** a route when it is registered for both federations, validates,
+and a viable amount can actually be sized over it. Presence in the registry is NOT
+the test: a gateway that is listed but dead, or that cannot price the route, does
+not serve it. Being unable to fund the *full* ask is likewise not a failure to
+serve — that is an ordinary instruction to move less.
+_Avoid_: "supports", "is available for" — both get read as registry presence, which
+is the reading that leaves a dying federation with a listed-but-useless gateway and
+no way out.
+
+**Break-glass gateway override**:
+An operator's explicit, single-invocation instruction to route through a named gateway
+**outside the federation's vetted list**. It exists for one incident: a federation whose
+vetted gateways are dead, empty, or unreachable from this host, where consensus still
+redeems the ecash but no route to it can be selected. Reaching for it is an incident
+action, not configuration — it applies to that invocation and nothing else.
+_Avoid_: "gateway preference" and "the operator's chosen gateway" — both frame it as a
+policy about which counterparty to trust, when the actual question is whether ANY route
+exists. Also avoid "pin": automated routing is never pinned, and calling this a pin is
+what let a break-glass be mistaken for a routing policy.
+
+**Vetted list**:
+The gateways a federation's guardians have admitted for lnv2. It is the ONLY input to
+automated route selection — the scheduler, allocator, probes and evacuation choose from
+it and nothing else. Adding to it is a guardian action, per guardian, not a wallet one:
+an operator with no guardian cooperation cannot change it, which is precisely why the
+break-glass exists.
+_Avoid_: "registered gateways" when you mean routable ones — presence in the list is not
+the same as **serving** a route.
+
+**Route hint**:
+The gateway an action was PRICED against, carried on the action. Explicitly a hint and
+not a constraint: it is used only while it still serves both ends, and otherwise the
+route is re-resolved under the same fee cap. The cap, never gateway identity, is the
+money backstop.
+_Avoid_: calling this a "pin" — it is the opposite, and conflating the two is what
+makes route-selection rules contradict each other.
+
+**Shared route** / **Hop**:
+A **shared route** is one gateway serving both ends (an internal swap). A **hop** is
+two different gateways, one serving each end, bridged over Lightning. The distinction
+is economic, not one of trust: both legs stay hash-locked either way, and the hop
+simply costs more because the internal-swap discount does not apply across two
+gateways.
+_Avoid_: "direct" for the shared route — it invites the idea that the hop is
+indirect and therefore less safe, which is not the difference.
+
 **Lightning Address**:
 A human-readable receive handle (`user@domain`) that resolves via LNURL-pay to
 fresh invoices. On Fedimint it is provided by **recurringd**, not a
