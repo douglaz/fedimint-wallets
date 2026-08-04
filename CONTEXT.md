@@ -100,8 +100,13 @@ serve it.
 
 Which vetted list depends on what is being served, and the two are different
 predicates:
-- **A shared route** — one gateway carrying both ends — is served only by a gateway
-  vetted by **both** federations.
+- **A shared route** — one gateway carrying both ends — should be served only by a gateway
+  vetted by **both** federations. NOTE this is the INTENT, not today's behaviour: automated
+  selection starts from the destination's list (`mc.gateways(&to)`) and validates the source end
+  only by fetching `routing_info` (`route_econ.rs:301-333`, `executor.rs:344-349`,
+  `multi_client.rs:958-964`), so a responsive gateway vetted only by the destination — or since
+  revoked by the source — can still carry an automated move. Closing that gap is work, not
+  vocabulary; until it is closed, do not cite this entry as though the invariant holds.
 - **A hop leg** is served by a gateway vetted by the **one** federation at that end.
   A hop's source leg and destination leg are judged separately, each against its own
   federation's list; neither gateway need be known to the other federation.
@@ -141,6 +146,12 @@ What an action was PRICED against, carried on the action. Explicitly a hint and 
 constraint: it is used only while it still **serves**, and otherwise the route is
 re-resolved under the same fee cap. The cap, never gateway identity, is the money
 backstop.
+
+The hint check is CHEAPER than **serving**: a hint is discarded when the route it names no
+longer validates for the ends it claimed, not when a full sizing pass fails over it. Sizing is
+what decides the amount; the hint check only decides whether to keep the route it was priced
+against. Reading "still serves" as "re-run the affordability search" would price every candidate
+twice.
 
 A hint names a whole route, not a gateway — so its shape follows the **route kind**.
 For a **shared route** that is one gateway, judged against the two-federation

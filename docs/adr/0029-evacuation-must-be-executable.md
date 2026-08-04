@@ -23,18 +23,27 @@ safely decline and wait; evacuation cannot.
 Both statements above turn on a gateway "serving" a route, which the original text used as if it
 were self-evident. It is not, and the loose reading is the one that livelocks.
 
-**A gateway SERVES a route when it is registered for both federations, VALIDATES, and a viable
-amount can actually be sized over it.** Registry presence is not the test: a gateway that is
-listed but dead, or that cannot price the route, does not serve it, and treating it as though it
-did leaves a dying federation with a listed-but-useless gateway and no way out — precisely the
-incident the second route exists for.
+**A gateway SERVES when it is on the relevant vetted list, VALIDATES, and a viable amount can
+actually be sized over it.** Registry presence is not the test: a gateway that is listed but dead,
+or that cannot price the route, does not serve it, and treating it as though it did leaves a dying
+federation with a listed-but-useless gateway and no way out — precisely the incident the second
+route exists for.
+
+*Which* vetted list depends on what is being served, and the shared route and the hop need
+different predicates: a **shared route** wants a gateway vetted by BOTH federations, while a **hop
+leg** needs only the one federation at its end, each leg judged separately. Note the shared-route
+half is the intent rather than today's behaviour — automated selection starts from the
+destination's list and validates the source end only by fetching `routing_info` — so closing that
+gap is implementation work this ADR names, not a property to assume. `CONTEXT.md` carries the
+canonical wording.
 
 Being unable to fund the **full** ask is not a failure to serve. `InsufficientBalanceError` at the
 desired amount is the ordinary downsize signal, not a fall-through trigger; reading it as one
 would route every full-balance evacuation onto the dearer hop while a healthy shared gateway sat
 idle. This has a structural consequence: route selection can no longer precede sizing. Each
-candidate is sized with its own fee bases, and only the resulting executed net is compared against
-that route's cap.
+candidate is sized with its own fee bases, and the fee charged at its resulting executed net is
+what gets compared against that route's cap — the cap bounds the FEE, computed on the net, never
+the net itself.
 
 **Strict ordering stays strict even when it costs operations.** With a base+proportional cap the
 two goals in this ADR can disagree: a high-ppm shared gateway has a narrow feasible window and may

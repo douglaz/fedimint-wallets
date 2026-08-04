@@ -43,7 +43,7 @@ deletes all four questions instead of answering them.
 
 **The daemon pin's cost was not limited to route selection.** A pinned daemon hands the pin to
 every federation probe; probing then validates only that gateway and never scans the registered
-list (`probe.rs:458`). A failure sets `probed_ok=false` (`probe.rs:153`), and the allocator drops
+list (`probe.rs:458`). A failure surfaces as `probed_ok: false`, and the allocator drops
 that federation as an evacuation destination (`allocator.rs:437`, `:471`). So a pin that served
 one end — or a stale one serving neither — meant **no `Action::Evacuate` was ever emitted**, while
 executor-level tests would pass. A knob that can silently disable evacuation has no business
@@ -88,10 +88,11 @@ and validating, and removing the daemon pin cannot strand one behind an empty li
   peer replies — so it must be run against *every* guardian or the gateway appears
   nondeterministically. An operator with no guardian cooperation cannot repair the list at all;
   the break-glass moves money in the meantime, it does not fix the federation.
-- **Devimint smokes must register rather than pin — ten of fourteen, for two different reasons.**
+- **Devimint smokes must register rather than pin — ten of fifteen, for two different reasons.**
   Five set the daemon pin being removed (daemon, soak, responsiveness, recover, daemon_chain).
   Five more append `--gateway` from a helper function to verbs that now reject it (probe, tick,
-  discover, evacuate, history). Only crash_move, directinflow, money and move are untouched. A
+  discover, evacuate, history). Five are untouched: crash_move, directinflow, money, move, and
+  `smoke_devimint.sh`, which passes no gateway at all. A
   global flag on a helper means a smoke cannot be judged by which pin it sets — an earlier count
   of "five change, nine are untouched" was wrong for exactly that reason. This finally gives the
   registered-scan path live coverage — today every smoke pins, so the code production actually
@@ -101,10 +102,19 @@ and validating, and removing the daemon pin cannot strand one behind an empty li
   `routing_info` and hang only on payment endpoints, which in turn breaks its accept-level timing
   oracle: HTTP connections are pooled and reused (`fedimint-connectors/src/http.rs:57-61`), so a
   request-level double is required. Budgeted in `br-remove-gateway-pin-yjw`, not discovered later.
-- **`Action::Pay { gateway }` / `Receive { gateway }` become setter-less.** Their only populator
-  is the standalone flag, so they remain reachable only through the break-glass. They are hard
-  constraints with no registry fallback (`executor.rs:1017-1027`, `:1133-1138`) — deliberately
-  retained, and distinct from the `Move`/`Evacuate` route *hint*, which is checked before use.
+- **The break-glass is deliberately NON-DURABLE, and does not travel on the action.** It is easy
+  to assume `Action::Pay { gateway }` / `Receive { gateway }` carry it. They do not: every
+  production constructor passes `gateway: None` (`wallet-cli/src/main.rs:1460`, `:1545`;
+  `wallet-daemon/src/handlers.rs:313`, `:382`), and the only code that can set `Some` has no
+  production callers. The flag reaches the money verbs through the executor's fallback,
+  `gateway.clone().or_else(|| self.pinned_gateway.clone())` (`executor.rs:1024`, `:1137`), whose
+  own comment records the choice: "The pin is deliberately NOT journaled into the intent, so a
+  pin change applies to re-drives after a restart" (`executor.rs:1019-1021`).
+  That is the correct semantic for an incident override — it applies to the invocation and to
+  re-drives under the same flag, and vanishes when the operator stops passing it. Two things
+  follow, and both matter to an implementer: the `.or_else(pinned_gateway)` fallback is NOT dead
+  code and must not be deleted, and the flag must NOT be journaled into intents to make a
+  "durable break-glass" story true. An operator repeating the operation must repeat the flag.
 - **This does not make routing reliable**, and no document should say so. A federation whose
   guardians vet no reachable gateway is unroutable automatically, and the honest operator
   statement is that the break-glass buys manual movement while the list is repaired.
