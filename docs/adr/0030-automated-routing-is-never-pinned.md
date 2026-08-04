@@ -13,7 +13,7 @@ Two rules, drawn along a line the code did not previously have:
    instruction, and deliberately routes through a gateway **outside** the vetted list — skipping
    vetted-list membership and the serves-check, though not the operation's own liveness check or
    the fee cap (see Consequences). It is **rejected** for `discover`, `probe`, `tick`, `status` and
-   `reconcile`.
+   `reconcile`. The **await verbs keep it**, but only once their recovery is scoped — see below.
 
 The asymmetry is the decision: the CLI has a flag the daemon config does not. That is intentional
 and is the thing a future reader will otherwise assume was an oversight.
@@ -27,6 +27,17 @@ flag on it pins automated money operations wholesale. Letting a flag reach those
 another name: a stale `--gateway` on a standalone `tick` can suppress healthy vetted routes, mark
 a destination unusable, and force an evacuation route. The flag survives only where a human is
 directing a specific payment, not where they are starting a machine that decides for itself.
+
+**The await verbs are the same backdoor, and banning the flag there would be the wrong fix.**
+`await_standalone` calls `client.reconcile()` unconditionally as its first step
+(`wallet-cli/src/main.rs:1719`) — a full re-drive of every pending intent, not just the awaited
+key — so `--gateway <url> await-move <key>` pins the re-drive of every pending allocator move and
+evacuation, exactly the hazard `reconcile` is rejected for. But rejecting the flag on await would
+stop an operator awaiting the very payment they just made with the break-glass, and 14 of the 15
+devimint smokes call an await verb through a `--gateway` helper. So: the await verbs KEEP the
+flag, and `await_standalone`'s recovery is SCOPED TO THE REQUESTED KEY instead of re-driving
+everything. That removes the hazard rather than the capability, and it follows the principle
+above — awaiting one named operation *is* a human directing a specific payment.
 
 ## Why
 
@@ -80,9 +91,16 @@ check the implementing bead owns, not a fact this ADR may assume.
   **serves** the route, so neither vetted-list membership nor the two-ends check applies. What
   still applies is the operation's own liveness check — explicit-gateway `send`/`receive` require
   `routing_info` to answer (`fedimint-lnv2-client/src/lib.rs:574-587`) — and the fee cap, which
-  is re-checked at the Pay step regardless of how the route was chosen. So a dead gateway still
-  fails, and an overpriced one still fails; what an operator overrides is the federation's
-  judgement about *which* gateways are admissible, not the wallet's arithmetic. For automated
+  is re-checked at the Pay step regardless of how the route was chosen. So a dead gateway still fails. An overpriced
+  one *usually* fails — but not atomically, and the difference matters for an UNVETTED gateway:
+  the executor quotes `routing_info`, then `MultiClient::pay` has lnv2 `send` fetch `routing_info`
+  AGAIN before committing the contract, with no post-commit local cap re-check. A hostile gateway
+  can therefore answer cheaply at quote time and dearly at commit time, and the pinned SDK's
+  lexicographic `PaymentFee` comparison will not catch the second answer. RESIDUAL, stated rather
+  than papered over: the cap bounds what the wallet will knowingly agree to, not what a gateway
+  outside the vetted list can charge between quote and commit. Vetting is what normally covers
+  that, which is precisely what the break-glass sets aside. What an operator overrides is the
+  federation's judgement about *which* gateways are admissible; they also accept this residual. For automated
   routing skipping the serves-check was a defect; here it is the required behaviour. Do not
   "fix" it into a serves-check: `gateway_serves_route` validates BOTH ends through the gateway
   (`executor.rs:459-469`), which refuses exactly the one-end-only or half-responsive gateway the
@@ -93,11 +111,14 @@ check the implementing bead owns, not a fact this ADR may assume.
   peer replies — so it must be run against *every* guardian or the gateway appears
   nondeterministically. An operator with no guardian cooperation cannot repair the list at all;
   the break-glass moves money in the meantime, it does not fix the federation.
-- **Devimint smokes must register rather than pin — ten of fifteen, for two different reasons.**
-  Five set the daemon pin being removed (daemon, soak, responsiveness, recover, daemon_chain).
-  Five more append `--gateway` from a helper function to verbs that now reject it (probe, tick,
-  discover, evacuate, history). Five are untouched: crash_move, directinflow, money, move, and
-  `smoke_devimint.sh`, which passes no gateway at all. A
+- **Devimint smokes must register rather than pin — THIRTEEN of fifteen.** Five set the daemon
+  pin (daemon, soak, responsiveness, recover, daemon_chain). Eight more append `--gateway` from a
+  helper to verbs that now reject it (probe, tick, discover, evacuate, history, crash_move,
+  directinflow, move). Only `smoke_money` and `smoke_devimint.sh` are untouched.
+  This count was wrong twice before — first at "five of fourteen", then at "ten of fifteen" —
+  because `reconcile` was added to the rejection list without re-measuring the split. Re-measure
+  it whenever the rejection list changes; a global `--gateway` on a helper means a script cannot
+  be judged by which pin it sets. A
   global flag on a helper means a smoke cannot be judged by which pin it sets — an earlier count
   of "five change, nine are untouched" was wrong for exactly that reason. This finally gives the
   registered-scan path live coverage — today every smoke that routes at all pins, so the code

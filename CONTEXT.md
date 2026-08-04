@@ -149,6 +149,10 @@ backstop.
 
 The hint check is CHEAPER than **serving**, but only by ONE term: it re-checks current
 **vetted-list** membership and endpoint validation, and skips only the affordability sizing.
+As with **Serves**, the membership half is the INTENT, not today's behaviour — the current check
+validates endpoints without re-testing the source federation's list — and it becomes true when
+the evacuation-hop work closes that gap. Until then, do not cite this entry as though the
+membership half holds.
 Sizing decides the amount; the hint check decides whether to keep the route it was priced
 against. Reading "still serves" as "re-run the affordability search" would price every candidate
 twice — but dropping the membership half is worse: a hint priced before the source federation
