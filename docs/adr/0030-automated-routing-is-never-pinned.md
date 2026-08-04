@@ -12,8 +12,8 @@ Two rules, drawn along a line the code did not previously have:
    --standalone --gateway <url>` survives for the verbs that move money at an operator's explicit
    instruction, and deliberately routes through a gateway **outside** the vetted list — skipping
    vetted-list membership and the serves-check, though not the operation's own liveness check or
-   the fee cap (see Consequences). It is **rejected** for `discover`, `probe`, `tick` and
-   `status`.
+   the fee cap (see Consequences). It is **rejected** for `discover`, `probe`, `tick`, `status` and
+   `reconcile`.
 
 The asymmetry is the decision: the CLI has a flag the daemon config does not. That is intentional
 and is the thing a future reader will otherwise assume was an oversight.
@@ -21,7 +21,9 @@ and is the thing a future reader will otherwise assume was an oversight.
 **Rule 1 is about the decision, not the process.** "Automated" means the scheduler/allocator/probe
 machinery wherever it runs — including when a human starts it from a terminal. `wallet-cli
 --standalone tick` runs the same allocator that walletd runs; `probe` and `discover` write the
-same health signals the allocator reads. Letting a flag reach those is the daemon pin under
+same health signals the allocator reads; and `reconcile` re-drives EVERY pending intent
+(`wallet-cli/src/main.rs:681`, `:1590`), allocator-created moves and evacuations included, so a
+flag on it pins automated money operations wholesale. Letting a flag reach those is the daemon pin under
 another name: a stale `--gateway` on a standalone `tick` can suppress healthy vetted routes, mark
 a destination unusable, and force an evacuation route. The flag survives only where a human is
 directing a specific payment, not where they are starting a machine that decides for itself.

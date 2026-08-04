@@ -3,8 +3,11 @@ status: accepted
 ---
 # Evacuation must be executable: a proportional fee cap, and a second route when no gateway is shared
 
-Two changes so that draining a dying federation happens in ONE operation over a route that exists,
-rather than in ~27 fee-capped chunks or not at all when no gateway is shared:
+Two changes so that draining a dying federation happens in AS FEW OPERATIONS AS THE ROUTE ALLOWS
+— one where the route can carry it — over a route that exists, rather than in ~27 fee-capped
+chunks or not at all when no gateway is shared. (The Amendment below records the one case where
+this deliberately stays multi-operation: a shared route that serves only a small net still wins
+over a hop that could drain the balance, because the swap is cheaper and chunks settle.)
 
 1. **`Evacuate`'s fee cap becomes base + proportional** — an absolute allowance plus a percentage
    of the amount (starting point: **200 sats + 3%**), replacing today's single absolute

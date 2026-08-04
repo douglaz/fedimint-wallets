@@ -147,11 +147,13 @@ constraint: it is used only while it still **serves**, and otherwise the route i
 re-resolved under the same fee cap. The cap, never gateway identity, is the money
 backstop.
 
-The hint check is CHEAPER than **serving**: a hint is discarded when the route it names no
-longer validates for the ends it claimed, not when a full sizing pass fails over it. Sizing is
-what decides the amount; the hint check only decides whether to keep the route it was priced
+The hint check is CHEAPER than **serving**, but only by ONE term: it re-checks current
+**vetted-list** membership and endpoint validation, and skips only the affordability sizing.
+Sizing decides the amount; the hint check decides whether to keep the route it was priced
 against. Reading "still serves" as "re-run the affordability search" would price every candidate
-twice.
+twice — but dropping the membership half is worse: a hint priced before the source federation
+revoked that gateway would keep routing money outside the vetted list, which is exactly what
+ADR-0030 forbids.
 
 A hint names a whole route, not a gateway — so its shape follows the **route kind**.
 For a **shared route** that is one gateway, judged against the two-federation
