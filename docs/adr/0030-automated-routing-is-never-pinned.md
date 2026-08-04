@@ -66,9 +66,12 @@ release.
 
 **Nothing deployed relies on the daemon pin.** The production `walletd.toml` is a ConfigMap
 carrying exactly `data_dir`, `address`, `port`, `token_path`, `log_level`
-(`remote-devops/k8s/argo/walletd/walletd.yaml:24-29`). Production has always run unpinned, and
-the 2026-07-28 canary paid a real invoice — so the joined federations' vetted lists are non-empty
-and validating, and removing the daemon pin cannot strand one behind an empty list.
+(`remote-devops/k8s/argo/walletd/walletd.yaml:24-29`). Production has always run unpinned, so nothing deployed
+can be relying on the pin today. Note what that does and does not establish about the vetted
+lists: a production pay runs with `gateway: None` (`wallet-daemon/src/handlers.rs:313`) and scans
+the SOURCE federation's list (`executor.rs:1024-1027`), so the 2026-07-28 canary proves ONE
+federation's list serves — not every joined federation's. Confirming the rest is a pre-flight
+check the implementing bead owns, not a fact this ADR may assume.
 
 ## Consequences
 
@@ -97,8 +100,8 @@ and validating, and removing the daemon pin cannot strand one behind an empty li
   `smoke_devimint.sh`, which passes no gateway at all. A
   global flag on a helper means a smoke cannot be judged by which pin it sets — an earlier count
   of "five change, nine are untouched" was wrong for exactly that reason. This finally gives the
-  registered-scan path live coverage — today every smoke pins, so the code production actually
-  runs has none.
+  registered-scan path live coverage — today every smoke that routes at all pins, so the code
+  production actually runs has none.
 - **The responsiveness gate is the awkward case.** It pins a never-responding double *because* the
   pin skips validation. Converting it to the vetted list means the double must answer
   `routing_info` and hang only on payment endpoints, which in turn breaks its accept-level timing
