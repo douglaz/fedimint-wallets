@@ -68,9 +68,18 @@ and validating, and removing the daemon pin cannot strand one behind an empty li
 
 ## Consequences
 
-- **The break-glass does not validate, and that is the point.** `resolve_move_gateway` returns a
-  pinned gateway without checking it serves the route. For automated routing that was a defect;
-  for an operator overriding a dead vetted list it is the required behaviour. Do not "fix" it.
+- **The break-glass skips VETTED-LIST membership, and that is the point — it is not
+  unvalidated.** Precisely: `resolve_move_gateway` returns the named gateway without checking it
+  **serves** the route, so neither vetted-list membership nor the two-ends check applies. What
+  still applies is the operation's own liveness check — explicit-gateway `send`/`receive` require
+  `routing_info` to answer (`fedimint-lnv2-client/src/lib.rs:574-587`) — and the fee cap, which
+  is re-checked at the Pay step regardless of how the route was chosen. So a dead gateway still
+  fails, and an overpriced one still fails; what an operator overrides is the federation's
+  judgement about *which* gateways are admissible, not the wallet's arithmetic. For automated
+  routing skipping the serves-check was a defect; here it is the required behaviour. Do not
+  "fix" it into a serves-check: `gateway_serves_route` validates BOTH ends through the gateway
+  (`executor.rs:459-469`), which refuses exactly the one-end-only or half-responsive gateway the
+  break-glass exists to reach.
 - **Restoring automated movement after a vetted-list failure is guardian-side.** `gateways add`
   is a per-guardian authenticated write, not a consensus item
   (`fedimint-lnv2-server/src/lib.rs:696-704`), and a client's view unions the first threshold of

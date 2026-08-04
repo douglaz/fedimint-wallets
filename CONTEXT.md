@@ -92,12 +92,26 @@ secondarily by probes detecting degradation. The Allocator's core resilience
 action.
 _Avoid_: "sweep" (reserve for consolidating many inputs), "withdraw"
 
-**Serves** (of a gateway, with respect to a route):
-A gateway **serves** a route when it is registered for both federations, validates,
-and a viable amount can actually be sized over it. Presence in the registry is NOT
-the test: a gateway that is listed but dead, or that cannot price the route, does
-not serve it. Being unable to fund the *full* ask is likewise not a failure to
-serve — that is an ordinary instruction to move less.
+**Serves** (of a gateway, with respect to a route or a leg):
+A gateway **serves** when it is on the relevant **vetted list**, validates, and a
+viable amount can actually be sized over it. Presence in the registry is NOT the
+test: a gateway that is listed but dead, or that cannot price the route, does not
+serve it.
+
+Which vetted list depends on what is being served, and the two are different
+predicates:
+- **A shared route** — one gateway carrying both ends — is served only by a gateway
+  vetted by **both** federations.
+- **A hop leg** is served by a gateway vetted by the **one** federation at that end.
+  A hop's source leg and destination leg are judged separately, each against its own
+  federation's list; neither gateway need be known to the other federation.
+
+Two things are NOT failures to serve, and conflating either with one is how a healthy
+gateway gets abandoned for a dearer route:
+- Being unable to fund the *full* ask. That is an ordinary instruction to move less.
+- Any single over-cap quote at one amount. Only "no amount fits" is a failure.
+Genuine failures are: not vetted, does not validate, its quote errors or times out, or
+no amount can be sized over it at all.
 _Avoid_: "supports", "is available for" — both get read as registry presence, which
 is the reading that leaves a dying federation with a listed-but-useless gateway and
 no way out.
@@ -123,10 +137,21 @@ _Avoid_: "registered gateways" when you mean routable ones — presence in the l
 the same as **serving** a route.
 
 **Route hint**:
-The gateway an action was PRICED against, carried on the action. Explicitly a hint and
-not a constraint: it is used only while it still serves both ends, and otherwise the
-route is re-resolved under the same fee cap. The cap, never gateway identity, is the
-money backstop.
+What an action was PRICED against, carried on the action. Explicitly a hint and not a
+constraint: it is used only while it still **serves**, and otherwise the route is
+re-resolved under the same fee cap. The cap, never gateway identity, is the money
+backstop.
+
+A hint names a whole route, not a gateway — so its shape follows the **route kind**.
+For a **shared route** that is one gateway, judged against the two-federation
+predicate. For a **hop** it is two gateway identities plus the kind, each leg judged
+against its own end. A hint is only usable if the route it names still serves in the
+same shape it was priced in: a shared hint whose gateway now serves one end has not
+become a hop hint, it has stopped serving.
+
+**Once an operation has committed, the route stops being a hint.** A recorded route is
+replayed as persisted, without re-resolution — otherwise a restart can pay through a
+different gateway than the one the invoice was sized and recorded for.
 _Avoid_: calling this a "pin" — it is the opposite, and conflating the two is what
 makes route-selection rules contradict each other.
 
