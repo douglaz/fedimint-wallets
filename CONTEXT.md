@@ -169,9 +169,13 @@ against its own end. A hint is only usable if the route it names still serves in
 same shape it was priced in: a shared hint whose gateway now serves one end has not
 become a hop hint, it has stopped serving.
 
-**Once an operation has committed, the route stops being a hint.** A recorded route is
-replayed as persisted, without re-resolution — otherwise a restart can pay through a
-different gateway than the one the invoice was sized and recorded for.
+**Once an operation has committed, the route should stop being a hint** — a recorded route
+replayed as persisted, without re-resolution, since otherwise a restart can pay through a
+different gateway than the one the invoice was sized and recorded for. As with **Serves**,
+this is the INTENT and not today's behaviour: after cache loss the op artifact carries no
+gateway, so reassembly falls back to resolving afresh. The evacuation-hop work is what makes
+it true, by persisting the route with the operation. Until then, do not cite this entry as
+though the invariant holds.
 _Avoid_: calling this a "pin" — it is the opposite, and conflating the two is what
 makes route-selection rules contradict each other.
 

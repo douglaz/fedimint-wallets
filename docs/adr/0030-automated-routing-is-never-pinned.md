@@ -12,11 +12,30 @@ Two rules, drawn along a line the code did not previously have:
    --standalone --gateway <url>` survives for the verbs that move money at an operator's explicit
    instruction, and deliberately routes through a gateway **outside** the vetted list — skipping
    vetted-list membership and the serves-check, though not the operation's own liveness check or
-   the fee cap (see Consequences). It is **rejected** for `discover`, `probe`, `tick`, `status` and
-   `reconcile`. The **await verbs keep it**, but only once their recovery is scoped — see below.
+   the fee cap (see Consequences). Three dispositions, because "money verbs only" and a five-verb reject list are *different sets*
+   and the gap between them is where implementations diverge:
+   - **Accepted** on the verbs that route at an operator's direction: the money verbs, and the
+     await verbs once their recovery is scoped (see below).
+   - **Rejected**, loudly, on the verbs that route AUTOMATICALLY: `discover`, `probe`, `tick`,
+     `status`, `reconcile`. Silently ignoring it there is the failure this rule exists to prevent.
+   - **Ignored** on verbs that resolve no route at all — `join`, `balance`, `history`, `show`,
+     `list-feds`, `policy`, `health`, `candidates`, `approve`, `recover`. The flag is global, so a
+     helper script that appends it to every invocation must not break on these; there is nothing
+     for it to mean and nothing it can mislead about. `smoke_money` depends on exactly this: its
+     helper passes `--gateway` to `join` and `balance` (`smoke_money_devimint.sh:74`, `:77`,
+     `:85`), which is why it is one of the two untouched smokes.
 
 The asymmetry is the decision: the CLI has a flag the daemon config does not. That is intentional
 and is the thing a future reader will otherwise assume was an oversight.
+
+**Rule 1 binds the API, not just the CLI.** Rejecting `--gateway` on the automated verbs closes
+the operator-facing door; it does not close the door itself. An in-process caller can still build
+`Runtime::new(.., Some(gateway), ..)` and call the public `tick`, and route preflight selects that
+pin (`runtime.rs:3127-3129`), forwarding it to the executor. Since this rule is stated
+independently of process, the enforcement has to be there too: the automated entry points must
+reject or clear an override, or the break-glass must live on a money-only runtime type that the
+automated ones cannot carry. Whichever shape ships, it needs a test at that boundary — a CLI-level
+test cannot observe this.
 
 **Rule 1 is about the decision, not the process.** "Automated" means the scheduler/allocator/probe
 machinery wherever it runs — including when a human starts it from a terminal. `wallet-cli
