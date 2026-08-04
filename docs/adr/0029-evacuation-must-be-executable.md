@@ -6,8 +6,9 @@ status: accepted
 Two changes so that draining a dying federation happens in AS FEW OPERATIONS AS THE ROUTE ALLOWS
 — one where the route can carry it — over a route that exists, rather than in ~27 fee-capped
 chunks or not at all when no gateway is shared. (The Amendment below records the one case where
-this deliberately stays multi-operation: a shared route that serves only a small net still wins
-over a hop that could drain the balance, because the swap is cheaper and chunks settle.)
+this deliberately stays multi-operation — a shared route serving only a small net still wins over
+a hop that could drain the balance, because the swap is cheaper — and the condition that makes
+that safe: every chunk must deliver at least what it costs, or the route does not serve at all.)
 
 1. **`Evacuate`'s fee cap becomes base + proportional** — an absolute allowance plus a percentage
    of the amount (starting point: **200 sats + 3%**), replacing today's single absolute
@@ -48,12 +49,41 @@ candidate is sized with its own fee bases, and the fee charged at its resulting 
 what gets compared against that route's cap — the cap bounds the FEE, computed on the net, never
 the net itself.
 
-**Strict ordering stays strict even when it costs operations.** With a base+proportional cap the
-two goals in this ADR can disagree: a high-ppm shared gateway has a narrow feasible window and may
-serve only a small net, while a hop pair would serve the full drain. The swap still wins, and the
-source drains in several operations. Chunking is slow, not lossy — each chunk settles — and the
-alternative is sizing both route classes on every tick to compare them, which is more machinery
-than the case earns.
+**Strict ordering stays strict even when it costs operations — but only over routes that carry
+more than they cost.** With a base+proportional cap the two goals in this ADR can disagree: a
+high-ppm shared gateway has a narrow feasible window and may serve only a small net, while a hop
+pair would serve the full drain. The swap still wins, and the source drains in several operations.
+
+"Chunking is slow, not lossy" is only true once a chunk must deliver at least what it costs, and
+that condition has to be enforced rather than assumed. The cap's BASE component is
+amount-independent, so at the lnv2 contract floor (5 sats) a 200-sat base cap admits a chunk that
+burns 200 sats to move 5. The remainder re-emits every watch cycle with no minimum-progress guard,
+no attempt budget and no fee accounting, so a 75,000-sat balance drains in ~365 such chunks —
+delivering ~1,825 sats and burning ~73,000, a 97% loss. That is not slow-but-safe; it is the
+evacuation destroying the balance it exists to rescue. It needs a hostile or misconfigured gateway
+(base just under 200 sats, ppm above the 3% slope), which the pinned SDK's fee limits do not
+prevent; on the measured pilot gateway at 1.78% the same mechanism drains in one or two chunks.
+
+**So serving requires ECONOMIC viability: `total_fee <= executed net`.** A route whose best
+available chunk costs more than it delivers does not serve, strict ordering falls through to the
+hop, and if neither class serves the evacuation stays `Retryable` — stranding rather than burning,
+which is the posture [ADR-0018](./0018-v1-evacuation-balance-cap.md) already accepts.
+
+Three properties of that rule worth stating, because each is easy to get wrong:
+- **It is a post-check on the search result, never a term in the fits predicate.** `fee(n) <= n`
+  is false at small `n` and true above `base/(1 - rate)`, so folding it into the bisection would
+  re-break the fits-then-doesn't monotonicity that search depends on.
+- **Checking the search's top is sufficient.** Per-chunk efficiency `fee(n)/n = base/n + rate` is
+  monotonically DECREASING in `n`, so the largest fitting amount is also the most efficient one
+  available. If the top fails, nothing below it passes.
+- **It applies per route class, including the hop.** The hop stacks two gateways' bases and is
+  ~80% dearer on the send leg, so its floor efficiency is worse, not better. The defect is in the
+  cap shape and the acceptance rule, not in which route is chosen.
+
+Accepted residual: a gateway pricing exactly at `fee == net` still extracts up to half the balance
+across chunks. An aggregate per-evacuation fee budget would bound that, at the cost of durable
+spend accounting and an episode identity across occurrence-keyed intents; it is the named
+follow-up if that residual is judged unacceptable, not part of this decision.
 
 **Nothing here concerns gateway pins.** Automated routing is never pinned; see
 [ADR-0030](./0030-automated-routing-is-never-pinned.md). An earlier draft of the implementing bead

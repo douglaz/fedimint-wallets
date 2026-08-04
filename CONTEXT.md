@@ -93,8 +93,10 @@ action.
 _Avoid_: "sweep" (reserve for consolidating many inputs), "withdraw"
 
 **Serves** (of a gateway, with respect to a route or a leg):
-A gateway **serves** when it is on the relevant **vetted list**, validates, and a
-viable amount can actually be sized over it. Presence in the registry is NOT the
+A gateway **serves** when it is on the relevant **vetted list**, validates, and an
+ECONOMICALLY viable amount can be sized over it — one whose total fee does not exceed
+what it actually delivers. A route that can only carry chunks costing more than they
+move does not serve, however many times it would settle. Presence in the registry is NOT the
 test: a gateway that is listed but dead, or that cannot price the route, does not
 serve it.
 
@@ -115,8 +117,9 @@ Two things are NOT failures to serve, and conflating either with one is how a he
 gateway gets abandoned for a dearer route:
 - Being unable to fund the *full* ask. That is an ordinary instruction to move less.
 - Any single over-cap quote at one amount. Only "no amount fits" is a failure.
-Genuine failures are: not vetted, does not validate, its quote errors or times out, or
-no amount can be sized over it at all.
+Genuine failures are: not vetted, does not validate, its quote errors or times out, no amount
+can be sized over it at all, or the best amount it CAN carry costs more in fees than it
+delivers.
 _Avoid_: "supports", "is available for" — both get read as registry presence, which
 is the reading that leaves a dying federation with a listed-but-useless gateway and
 no way out.
