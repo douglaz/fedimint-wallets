@@ -10,8 +10,10 @@ Two rules, drawn along a line the code did not previously have:
    removed from `walletd.toml`, so a daemon cannot express one.
 2. **The operator keeps a single-invocation break-glass, on money verbs only.** `wallet-cli
    --standalone --gateway <url>` survives for the verbs that move money at an operator's explicit
-   instruction, and deliberately routes through a gateway **outside** the vetted list without
-   validating it first. It is **rejected** for `discover`, `probe`, `tick` and `status`.
+   instruction, and deliberately routes through a gateway **outside** the vetted list — skipping
+   vetted-list membership and the serves-check, though not the operation's own liveness check or
+   the fee cap (see Consequences). It is **rejected** for `discover`, `probe`, `tick` and
+   `status`.
 
 The asymmetry is the decision: the CLI has a flag the daemon config does not. That is intentional
 and is the thing a future reader will otherwise assume was an oversight.
@@ -86,10 +88,14 @@ and validating, and removing the daemon pin cannot strand one behind an empty li
   peer replies — so it must be run against *every* guardian or the gateway appears
   nondeterministically. An operator with no guardian cooperation cannot repair the list at all;
   the break-glass moves money in the meantime, it does not fix the federation.
-- **Devimint smokes must register rather than pin.** Only the five daemon-pinning smokes change
-  (daemon, soak, responsiveness, recover, daemon_chain); the nine that use the standalone flag are
-  untouched. This finally gives the registered-scan path live coverage — today every smoke pins,
-  so the code production actually runs has none.
+- **Devimint smokes must register rather than pin — ten of fourteen, for two different reasons.**
+  Five set the daemon pin being removed (daemon, soak, responsiveness, recover, daemon_chain).
+  Five more append `--gateway` from a helper function to verbs that now reject it (probe, tick,
+  discover, evacuate, history). Only crash_move, directinflow, money and move are untouched. A
+  global flag on a helper means a smoke cannot be judged by which pin it sets — an earlier count
+  of "five change, nine are untouched" was wrong for exactly that reason. This finally gives the
+  registered-scan path live coverage — today every smoke pins, so the code production actually
+  runs has none.
 - **The responsiveness gate is the awkward case.** It pins a never-responding double *because* the
   pin skips validation. Converting it to the vetted list means the double must answer
   `routing_info` and hang only on payment endpoints, which in turn breaks its accept-level timing
