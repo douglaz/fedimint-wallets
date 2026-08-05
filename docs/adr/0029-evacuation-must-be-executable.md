@@ -258,13 +258,16 @@ not rest on something a user can click past.
   entries without bound, so the per-tick scan is capped BY CANDIDATE COUNT AND BY WALL TIME.
   MIND THE HOP CLASS'S CARDINALITY: it is `|source| × |destination|`, so two honest six-gateway
   lists already exceed a 32-candidate bound without any adversary at all. The bound must therefore
-  be sized against the PAIR space, or the hop must traverse the Cartesian product across ticks —
-  otherwise a sole viable low-support pair sits outside a support-ordered window every tick and is
-  never reached. "Honest lists fit one scan" is true of the shared class and false of the hop.
+  be sized against the PAIR space. The alternative of traversing the Cartesian product ACROSS
+  ticks is NOT available here: this design keeps no cross-tick state and takes a fresh prefix of
+  an order the SDK reshuffles per call, so there is nothing to advance. Without a product-sized
+  per-tick bound a sole viable low-support pair sits outside a support-ordered window every tick
+  and is never reached. "Honest lists fit one scan" is true of the shared class and false of the hop.
   The count bound is —
-  count alone is not enough, since slow-but-responsive candidates cost up to FOUR `routing_info`
-  round-trips each (two per leg, and br-y2j's sizing budget is per pass with a conditional second
-  pass) and a full window of them can exhaust `perform_timeout` before the hop is ever reached,
+  count alone is not enough, since slow-but-responsive candidates cost TWO `routing_info`
+  round-trips each — one per leg, fetched ONCE and reused across both sizing passes (br-s0e
+  requires the single snapshot; only the local dry-run quotes are per pass) — and a full window of
+  them can exhaust `perform_timeout` before the hop is ever reached,
   cancelling the operation and restarting the scan from nothing. Bound the elapsed time per route
   class so the hop is always attempted within the operation's budget. A longer list is scanned
   truncated —
