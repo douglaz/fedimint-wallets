@@ -1,8 +1,8 @@
 # Route economics (`route_economics_by_pair`): the five settled questions
 
-Status: DESIGN DECISION (br-ljj.3), **Q1, Q2 and Q4 SUPERSEDED in part by
-[ADR-0029](../adr/0029-evacuation-must-be-executable.md) and
-[ADR-0030](../adr/0030-automated-routing-is-never-pinned.md)**. No production code ships from
+Status: DESIGN DECISION (br-ljj.3). **Q4 is SUPERSEDED OUTRIGHT by
+[ADR-0030](../adr/0030-automated-routing-is-never-pinned.md); Q1 and Q2 are superseded IN PART
+by [ADR-0029](../adr/0029-evacuation-must-be-executable.md) and ADR-0030.** No production code ships from
 this doc. It authorises an implementation bead. All file:line refs were verified against `main`
 post br-ljj.2 and have not been re-verified since.
 
@@ -12,10 +12,17 @@ post br-ljj.2 and have not been re-verified since.
 > re-prioritised. The surviving `--gateway` is an operator break-glass on money verbs, which
 > route economics never runs for. Read Q4 below as history.
 >
-> **Q1 and Q2 are superseded for `Evacuate` only.** Q1 mandates a single `Option<GatewayUrl>` on
-> `Action::Evacuate`; Q2 describes re-resolving one gateway that serves both ends. ADR-0029 gives
-> evacuation a two-gateway hop, so it needs a route KIND plus two identities. Both questions still
-> hold for `Move` and for the shared-route case; only their `Evacuate` portions are overtaken.
+> **Q1 is superseded for `Evacuate` only.** It mandates a single `Option<GatewayUrl>` on
+> `Action::Evacuate`; ADR-0029 gives evacuation a two-gateway hop, so it needs a route KIND plus
+> two identities. Q1 still holds for `Move` and for the shared-route case.
+>
+> **Q2 is superseded for BOTH.** Its rule — "use `action.gateway` iff it still validates" — is an
+> ENDPOINT-ONLY check (`gateway_serves_route`, `wallet-fedimint/src/executor.rs:459-469`, which
+> calls only `validate_gateway`/`routing_info`). br-s0e requirement 2b re-checks current
+> vetted-list MEMBERSHIP on the hint path, and does so for `Move` as well as `Evacuate`, because
+> an endpoint-only hint check will happily route money over a gateway the source federation never
+> vetted or has since revoked. Do not read Q2 as still governing the hint check for `Move`: what
+> survives for `Move` is only that a hint is a hint and the cap is the backstop.
 
 ## Recap of what was already locked (not relitigated)
 Ordered-pair-keyed floor `route_economics_by_pair[(from,to)]` carrying `resolved_gateway`,

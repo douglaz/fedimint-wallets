@@ -137,6 +137,15 @@ policy about which counterparty to trust, when the actual question is whether AN
 exists. Also avoid "pin": automated routing is never pinned, and calling this a pin is
 what let a break-glass be mistaken for a routing policy.
 
+**Money verb**:
+A `wallet-cli` subcommand that moves value on behalf of the human running it, as opposed to one
+that observes state or drives the automated lanes. Exactly four: `pay`, `receive`, `move`,
+`direct-inflow`. These are the ONLY verbs the **break-glass gateway override** is accepted on
+(the await verbs also keep the flag, under the provenance rule in ADR-0030, but they complete an
+existing payment rather than starting one). `direct-inflow` is the one an implementer is most
+likely to misclassify — it reads like plumbing, but it funds a federation and most devimint
+smokes fund through it, so classifying it as rejected or ignored breaks the funding step.
+
 **Vetted list**:
 The gateways a federation's guardians have admitted for lnv2. It is the ONLY input to
 automated route selection — the scheduler, allocator, probes and evacuation choose from
@@ -151,12 +160,15 @@ the same as **serving** a route.
 
 **Route hint**:
 What an action was PRICED against, carried on the action. Explicitly a hint and not a
-constraint: it is used only while it still **serves**, and otherwise the route is
+constraint: it is used only while it still **holds**, and otherwise the route is
 re-resolved under the same fee cap. The cap, never gateway identity, is the money
 backstop.
 
-The hint check is CHEAPER than **serving**, but only by ONE term: it re-checks current
-**vetted-list** membership and endpoint validation, and skips only the affordability sizing.
+A hint **holds** when it is still on the relevant **vetted list** and still validates. That is
+deliberately WEAKER than **serving** — by exactly one term, the affordability sizing — which is
+why it needs its own word: a hint that holds may still turn out unaffordable, and is then
+re-resolved. Do not substitute "serves" here; the canonical predicate includes affordability and
+using it would silently demand a sizing pass the hint path does not run.
 As with **Serves**, the membership half is the INTENT, not today's behaviour — the current check
 validates endpoints without re-testing the source federation's list — and it becomes true when
 the evacuation-hop work closes that gap. Until then, do not cite this entry as though the

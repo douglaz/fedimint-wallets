@@ -320,9 +320,11 @@ scheduler-dead daemon as healthy.
 
 ## Upgrades — a release that changes the stored-policy schema
 
-A release that ADDS a policy field marks it `#[serde(default)]`, so a policy row persisted by a
-previous release still decodes (the new field adopts its shipped default) and walletd starts
-normally. Just deploy and restart; re-run `policy set` afterward only if you want to set the new
+A release that ADDS a policy field marks it `#[serde(default = "default_<field>")]` with a NAMED
+default function returning the shipped value (the repo's pattern — `wallet-api/src/lib.rs:9`), so
+a policy row persisted by a previous release still decodes and walletd starts normally. A PLAIN
+`#[serde(default)]` on a numeric field is a BUG: it yields ZERO, not the shipped default, and a
+zero fee cap or zero threshold silently disables the thing it was meant to bound. Just deploy and restart; re-run `policy set` afterward only if you want to set the new
 field to a non-default value.
 
 **Do NOT try to "reset" a stuck policy by wiping `journal.db`.** The federation registry

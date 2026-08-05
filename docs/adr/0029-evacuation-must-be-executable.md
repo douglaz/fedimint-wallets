@@ -22,6 +22,12 @@ that safe: every chunk must deliver at least what it costs, or the route does no
 `Move` is unchanged: it keeps the swap-only path and its proportional cap. Routine rebalancing can
 safely decline and wait; evacuation cannot.
 
+This ADR supersedes, in part, Q1 and Q2 of
+[docs/archive/route-economics-decisions.md](../archive/route-economics-decisions.md): Q1's single
+`Option<GatewayUrl>` on `Action::Evacuate` (the hop needs a route kind plus two identities), and
+Q2's endpoint-only "use `action.gateway` iff it still validates" hint rule, which br-s0e replaces
+with a membership re-check for `Move` as well as `Evacuate`.
+
 ## Amendment: what "serves both ends" means, and what strict ordering costs
 
 Both statements above turn on a gateway "serving" a route, which the original text used as if it
@@ -62,9 +68,13 @@ no attempt budget and no fee accounting, so a 75,000-sat balance drains in ~365 
 delivering ~1,825 sats and burning ~73,000, a 97% loss. That is not slow-but-safe; it is the
 evacuation destroying the balance it exists to rescue. It needs a hostile or misconfigured gateway
 (base just under 200 sats, ppm above the 3% slope), which the pinned SDK's fee limits do not
-prevent; on the measured pilot gateway at 1.78% the same mechanism drains in ONE operation (the bisection
-residual is bounded well below the 5-sat contract floor, so no second chunk can be emitted — the
-implementing bead pins the exact expected net as a red/green fixture).
+prevent; on the measured pilot gateway at 1.78% the same mechanism drains in ONE operation. No second
+chunk can be emitted, but NOT because the bisection residual is small: the search may undershoot
+the true maximum by up to ~`2A`, which br-y2j prices at up to ~18,000 msat at eleven mint tiers —
+above the 5,000-msat contract floor, so that bound proves nothing here. The reason is that a
+second chunk's SOURCE DEBIT is a 5-sat net grossed up plus both legs' fees, which is already
+≳13,000 msat at pilot fees and so exceeds any residual the search can leave. The implementing
+bead pins the exact expected net as a red/green fixture.
 
 **So serving requires ECONOMIC viability: `total_fee <= executed net`.** A route whose best
 available chunk costs more than it delivers does not serve, strict ordering falls through to the

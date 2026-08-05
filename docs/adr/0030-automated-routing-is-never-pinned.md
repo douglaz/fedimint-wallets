@@ -14,8 +14,13 @@ Two rules, drawn along a line the code did not previously have:
    vetted-list membership and the serves-check, though not the operation's own liveness check or
    the fee cap (see Consequences). Three dispositions, because "money verbs only" and a five-verb reject list are *different sets*
    and the gap between them is where implementations diverge:
-   - **Accepted** on the verbs that route at an operator's direction: the money verbs, and the
-     await verbs once their recovery is scoped (see below).
+   - **Accepted** on the verbs that route at an operator's direction: the money verbs — and this
+     ADR must name them, since its own thesis is that unenumerated sets diverge — `pay`,
+     `receive`, `move`, `direct-inflow`; plus the await verbs once their recovery is scoped and
+     provenance-gated (see below). `direct-inflow` is the classification an implementer is most
+     likely to get wrong: it reads like plumbing, but it funds a federation and most devimint
+     smokes fund through it, so putting it in either other bucket breaks the funding step.
+     CONTEXT.md carries the same four under **Money verb**.
    - **Rejected**, loudly, on the verbs that route AUTOMATICALLY: `discover`, `probe`, `tick`,
      `status`, `reconcile`. Silently ignoring it there is the failure this rule exists to prevent.
    - **Ignored** on verbs that resolve no route at all — `join`, `balance`, `history`, `show`,
@@ -67,6 +72,10 @@ specific payment, but only when the payment was theirs to direct.
 ## Why
 
 **A pin and a break-glass were the same field, and that conflation cost real design work.**
+This ADR SUPERSEDES Q4 of
+[docs/archive/route-economics-decisions.md](../archive/route-economics-decisions.md) outright,
+and (with ADR-0029) supersedes that document's Q1 and Q2 in part.
+
 `FedimintExecutor.pinned_gateway` was set from two places with opposite intents. The daemon's
 `walletd.toml` key made it a standing property of every automated decision. The CLI flag made it
 an operator's one-off. The codebase described both in the same breath and contradicted itself
@@ -102,7 +111,8 @@ release.
 
 **Nothing deployed relies on the daemon pin.** The production `walletd.toml` is a ConfigMap
 carrying exactly `data_dir`, `address`, `port`, `token_path`, `log_level`
-(`remote-devops/k8s/argo/walletd/walletd.yaml:24-29`). Production has always run unpinned, so nothing deployed
+(`/home/master/newmachine/remote-devops/k8s/argo/walletd/walletd.yaml:24-29` — an EXTERNAL
+checkout, not a path in this repo). Production has always run unpinned, so nothing deployed
 can be relying on the pin today. Note what that does and does not establish about the vetted
 lists: a production pay runs with `gateway: None` (`wallet-daemon/src/handlers.rs:313`) and scans
 the SOURCE federation's list (`executor.rs:1024-1027`), so the 2026-07-28 canary proves ONE
@@ -154,8 +164,15 @@ check the implementing bead owns, not a fact this ADR may assume.
   pin (daemon, soak, responsiveness, recover, daemon_chain). Eight more append `--gateway` from a
   helper to verbs that now reject it (probe, tick, discover, evacuate, history, crash_move,
   directinflow, move). Only `smoke_money` and `smoke_devimint.sh` are untouched.
-  This count was wrong twice before — first at "five of fourteen", then at "ten of fifteen" —
-  because `reconcile` was added to the rejection list without re-measuring the split. Re-measure
+  THE TWO REASONS OVERLAP: `daemon_chain` (`:99`), `soak` (`:105`) and `responsiveness` (`:109`)
+  each call `wsa discover` through a `--gateway` helper as well as setting the daemon pin, so
+  three of the five need BOTH fixes. Converting one of them by swapping the `walletd.toml` pin
+  for registration and leaving the helper alone yields a hard failure on `discover` — which is
+  this section's own warning, committed against this section's own measurement. Only `daemon`
+  and `recover` are pin-only.
+  This count has been wrong five times — "five of fourteen", "ten of fifteen", a stale acceptance
+  criterion, "14 of the 15" propagated into this ADR and back into the bead, and this
+  reason-overlap miss — each time because the split was restated without being re-measured. Re-measure
   it whenever the rejection list changes: a global `--gateway` on a helper means a script cannot
   be judged by which pin it sets, which is exactly how "five change, nine are untouched" went
   wrong. This finally gives the
