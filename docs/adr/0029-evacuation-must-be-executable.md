@@ -256,7 +256,11 @@ not rest on something a user can click past.
   by examining the whole shared candidate set, not a prefix of it.
   THE EXCEPTION: an honest vetted list fits in one bounded scan, but a guardian can inject
   entries without bound, so the per-tick scan is capped BY CANDIDATE COUNT AND BY WALL TIME.
-  MIND THE HOP CLASS'S CARDINALITY: it is `|source| × |destination|`, so two honest six-gateway
+  MIND THE HOP CLASS'S CARDINALITY, AND EXCLUDE THE DIAGONAL: the pair set is
+  `{(s, d) : s ∈ source, d ∈ destination, s ≠ d}`. Where the two vetted lists overlap the raw
+  product contains `(g, g)`, which is NOT a hop — CONTEXT.md defines a hop as TWO gateways, and
+  pricing `(g, g)` with external-send assumptions would persist an unavailable shared gateway as
+  though it were one. The cardinality is therefore `|source| × |destination| − |overlap|`, so two honest six-gateway
   lists already exceed a 32-candidate bound without any adversary at all. The bound must therefore
   be sized against the PAIR space. The alternative of traversing the Cartesian product ACROSS
   ticks is NOT available here: this design keeps no cross-tick state and takes a fresh prefix of
@@ -264,12 +268,18 @@ not rest on something a user can click past.
   per-tick bound a sole viable low-support pair sits outside a support-ordered window every tick
   and is never reached. "Honest lists fit one scan" is true of the shared class and false of the hop.
   The count bound is —
-  count alone is not enough, since slow-but-responsive candidates cost TWO `routing_info`
-  round-trips each — one per leg, fetched ONCE and reused across both sizing passes (br-s0e
-  requires the single snapshot; only the local dry-run quotes are per pass) — and a full window of
-  them can exhaust `perform_timeout` before the hop is ever reached,
+  count alone is not enough. Fetch `routing_info` ONCE PER UNIQUE `(federation, gateway)` LEG for
+  the whole perform, and reuse it across every pair that mentions that leg AND across both sizing
+  passes. Per-PAIR fetching repeats identical lookups — two six-gateway lists need 12 unique leg
+  snapshots but would make up to 72 calls — and at the 10-second request timeout that alone can
+  exhaust `perform_timeout` before the hop is ever reached,
   cancelling the operation and restarting the scan from nothing. Bound the elapsed time per route
-  class so the hop is always attempted within the operation's budget. A longer list is scanned
+  class so the hop is always attempted within the operation's budget — AND SO THAT SETTLEMENT
+  STILL FITS. A budget sized only to REACH the hop can consume `perform_timeout` before invoice
+  creation and payment, so the future is cancelled and the next tick restarts the scan: a livelock
+  that satisfies "the hop was attempted" while never completing. The scan deadlines must reserve
+  explicit time for commit, and the acceptance case must assert COMPLETION, not merely that the
+  hop was reached. A longer list is scanned
   truncated —
   the hop is therefore reachable without every shared candidate having been examined. A bounded, deliberate departure, stated precisely because the honest version is
   weaker than "never a stranding". `gateways()` shuffles and then STABLE-sorts by how many peers

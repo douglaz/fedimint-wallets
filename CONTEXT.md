@@ -160,8 +160,11 @@ the same as **serving** a route.
 
 **Route hint**:
 What an action was PRICED against, carried on the action. Explicitly a hint and not a
-constraint: it is used only while it still **holds**, and otherwise the route is
-re-resolved under the same fee cap. The cap, never gateway identity, is the money
+constraint: for a `Move` it is used only while it still **holds**, and otherwise the route is
+re-resolved under the same fee cap. For an `Evacuate` a holding hint is NOT automatically kept:
+that route class is selected by largest sized executed net (br-s0e owns the mechanism), because
+honouring a hint that sizes to a small viable chunk when another candidate drains far more
+re-creates the repeated-operation cumulative-base-fee failure ADR-0029 exists to fix. The cap, never gateway identity, is the money
 backstop.
 
 A hint **holds** when it is still on the relevant **vetted list** and still validates. That is

@@ -250,8 +250,11 @@ check the implementing bead owns, not a fact this ADR may assume.
 - **Restoring automated movement after a vetted-list failure is guardian-side.** `gateways add`
   is a per-guardian authenticated write, not a consensus item
   (`fedimint-lnv2-server/src/lib.rs:696-704`), and a client's view unions the first threshold of
-  peer replies — so it must be run against *every* guardian or the gateway appears
-  nondeterministically. An operator with no guardian cooperation cannot repair the list at all;
+  peer replies. `f+1` registrations SUFFICE for deterministic visibility: any reply quorum has
+  `n−f` members, and `(f+1) + (n−f) = n+1 > n`, so every possible quorum intersects the registered
+  set — for four guardians, two. Requiring *every* guardian would make recovery impossible while
+  one is unavailable, which is the incident this exists to serve. Register on all REACHABLE
+  guardians for support-ordering breadth, but treat `f+1` as the availability minimum. An operator with no guardian cooperation cannot repair the list at all;
   the break-glass moves money in the meantime, it does not fix the federation.
 - **Every devimint smoke that routes today pins.** `br-remove-gateway-pin-yjw` carries the
   measured split and converts them; it is the single authority for that count, which has drifted
