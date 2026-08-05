@@ -114,12 +114,10 @@ Three properties of that rule worth stating, because each is easy to get wrong:
   can fail `fee <= n` while a slightly smaller candidate passes.
   So: if the top fails by AT MOST the oscillation bound `A` (the same `A` the robustness
   contract uses) — `shortfall <= A`, equality included — probe candidates below it before
-  refusing the route, on a DETERMINISTIC SCHEDULE the bead must pin: "a bounded number" is not a
-  specification. `A` bounds the vertical fee jump, NOT the horizontal distance to the next
-  note-selection discontinuity, so an implementation can satisfy the words literally, probe the
-  wrong offsets, miss an executable amount and leave the evacuation `Retryable` forever. The
-  schedule needs a stated count, stated offsets (or the boundaries they derive from), and an
-  acceptance case that fails without it. Refuse only when the top fails by strictly MORE than `A`,
+  refusing the route. `A` bounds the vertical fee jump, not the horizontal distance to the next
+  note-selection discontinuity, so probe the adjacent note-selection boundaries rather than
+  arbitrary offsets, and let the fixture — not a stated offset count — be what binds: br-y2j
+  carries a case whose feasible amount sits one boundary from the failing probe. Refuse only when the top fails by strictly MORE than `A`,
   or when the bounded probe finds nothing. The boundary belongs to the probe, not the refusal:
   `br-y2j` must state the same `<=` or an implementation refuses an executable evacuation at
   exactly `A` — refusing on

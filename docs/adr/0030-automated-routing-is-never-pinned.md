@@ -84,14 +84,12 @@ re-exported with a public constructor that takes the override, so `Executor::per
 handed an allocator-created `Move` or `Evacuate` directly, past every `Runtime` method.
 An enumeration cannot close a set that keeps growing — which is this ADR's own thesis about
 "money verbs only" turned on itself.
-So the REQUIRED answer is structural: the override must be reachable only through a money-only
-path, so that no automated caller can receive it whatever entry point they hold. Gate by ACTION
-PROVENANCE at the executor boundary — the one place every route resolution funnels through —
-rather than at each public method. Rejecting or clearing per-method is acceptable ONLY as an
-interim WITHIN THE IMPLEMENTING BEAD'S DEVELOPMENT — never as the landed state, since the
-executor-boundary criterion cannot be satisfied by per-method enforcement and would stay red by
-construction — with a direct test per method, and it carries the standing risk that the next public
-composition reopens the hole. A direct `Executor::perform` test on an allocator-created action is
+So the requirement is stated as a PROPERTY, not a shape: automated routing must never observe the
+override, and that is proven at the executor boundary — the one place every route resolution
+funnels through — with a direct `Executor::perform` call on an allocator-created action under an
+active override. Whether the implementation achieves it with a money-only type, constructor
+separation, or clearing the override at the automated entry points is the implementer's call; the
+test is what binds, and it is the test an enumeration cannot pass by accident. A direct `Executor::perform` test on an allocator-created action is
 the one that proves the structural version.
 
 **Do not implement "user-initiated" as an `Actor` check.** A manually invoked probe calls
