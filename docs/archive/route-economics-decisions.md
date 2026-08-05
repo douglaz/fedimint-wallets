@@ -1,7 +1,15 @@
 # Route economics (`route_economics_by_pair`): the five settled questions
 
-Status: DESIGN DECISION (br-ljj.3). No production code ships from this doc. It authorises an
-implementation bead. All file:line refs verified against current `main` (post br-ljj.2).
+Status: DESIGN DECISION (br-ljj.3), **Q4 SUPERSEDED by
+[ADR-0030](../adr/0030-automated-routing-is-never-pinned.md)**. No production code ships from
+this doc. It authorises an implementation bead. All file:line refs were verified against `main`
+post br-ljj.2 and have not been re-verified since.
+
+> **Q4 no longer holds.** ADR-0030 removes the daemon pin entirely: automated routing — the
+> scheduler, allocator, probes and evacuation — resolves only from the vetted list and can never
+> be pinned. The `route_econ.rs` pinned branch this document's Q4 specifies is deleted, not
+> re-prioritised. The surviving `--gateway` is an operator break-glass on money verbs, which
+> route economics never runs for. Read Q4 below as history.
 
 ## Recap of what was already locked (not relitigated)
 Ordered-pair-keyed floor `route_economics_by_pair[(from,to)]` carrying `resolved_gateway`,

@@ -62,7 +62,9 @@ no attempt budget and no fee accounting, so a 75,000-sat balance drains in ~365 
 delivering ~1,825 sats and burning ~73,000, a 97% loss. That is not slow-but-safe; it is the
 evacuation destroying the balance it exists to rescue. It needs a hostile or misconfigured gateway
 (base just under 200 sats, ppm above the 3% slope), which the pinned SDK's fee limits do not
-prevent; on the measured pilot gateway at 1.78% the same mechanism drains in one or two chunks.
+prevent; on the measured pilot gateway at 1.78% the same mechanism drains in ONE operation (the bisection
+residual is bounded well below the 5-sat contract floor, so no second chunk can be emitted — the
+implementing bead pins the exact expected net as a red/green fixture).
 
 **So serving requires ECONOMIC viability: `total_fee <= executed net`.** A route whose best
 available chunk costs more than it delivers does not serve, strict ordering falls through to the
