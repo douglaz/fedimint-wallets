@@ -52,11 +52,17 @@ directing a specific payment, not where they are starting a machine that decides
 (`wallet-cli/src/main.rs:1719`) — a full re-drive of every pending intent, not just the awaited
 key — so `--gateway <url> await-move <key>` pins the re-drive of every pending allocator move and
 evacuation, exactly the hazard `reconcile` is rejected for. But rejecting the flag on await would
-stop an operator awaiting the very payment they just made with the break-glass, and 14 of the 15
-devimint smokes call an await verb through a `--gateway` helper. So: the await verbs KEEP the
+stop an operator awaiting the very payment they just made with the break-glass, and 13 of the 15
+devimint smokes call an await verb through a `--gateway` helper (`smoke_daemon`'s awaits go
+through the deliberately flag-free client-mode helper, and `smoke_devimint.sh` calls
+`await-move` with no flag at all). So: the await verbs KEEP the
 flag, and `await_standalone`'s recovery is SCOPED TO THE REQUESTED KEY instead of re-driving
-everything. That removes the hazard rather than the capability, and it follows the principle
-above — awaiting one named operation *is* a human directing a specific payment.
+everything. That removes the *wholesale* hazard, but not all of it: if the requested key names a
+scheduler- or allocator-created `Move` or `Evacuate`, scoping still re-drives THAT automated
+intent through an executor carrying the override. So the override applies only when the target
+intent was USER-INITIATED; awaiting an allocator's own operation must not carry it. With that,
+the rule follows the principle above — awaiting one named operation *is* a human directing a
+specific payment, but only when the payment was theirs to direct.
 
 ## Why
 
@@ -124,6 +130,20 @@ check the implementing bead owns, not a fact this ADR may assume.
   "fix" it into a serves-check: `gateway_serves_route` validates BOTH ends through the gateway
   (`executor.rs:459-469`), which refuses exactly the one-end-only or half-responsive gateway the
   break-glass exists to reach.
+- **"On the vetted list" is NOT a threshold-vetted property, and this ADR must not be read as
+  claiming it is.** `gateways()` builds a UNION of the peer responses
+  (`fedimint-lnv2-client/src/api.rs:84-116`): `FilterMapThreshold` thresholds the RESPONSE COUNT,
+  then every URL any responding guardian returned is flattened into one set. So a single guardian
+  — Byzantine, compromised, or merely misconfigured — can put a gateway into the candidate list
+  that no threshold ever admitted. Partial mitigation, worth knowing: the SDK sorts the union by
+  how many peers LACK each URL, so a one-guardian entry sorts last and a wallet taking the first
+  serving candidate will normally prefer a widely-vetted one. It is a preference, not a bound —
+  if the better-vetted gateways do not serve, the one-guardian entry is reachable.
+  Combined with the quote-then-commit gap above, that is the one place where "the cap is the
+  backstop" and "vetting covers the rest" are both weaker than they sound. Closing it needs
+  threshold-supported membership (query per-peer, require k-of-n) — a client-side change, named
+  here as the follow-up rather than assumed away.
+
 - **Restoring automated movement after a vetted-list failure is guardian-side.** `gateways add`
   is a per-guardian authenticated write, not a consensus item
   (`fedimint-lnv2-server/src/lib.rs:696-704`), and a client's view unions the first threshold of
@@ -136,10 +156,9 @@ check the implementing bead owns, not a fact this ADR may assume.
   directinflow, move). Only `smoke_money` and `smoke_devimint.sh` are untouched.
   This count was wrong twice before — first at "five of fourteen", then at "ten of fifteen" —
   because `reconcile` was added to the rejection list without re-measuring the split. Re-measure
-  it whenever the rejection list changes; a global `--gateway` on a helper means a script cannot
-  be judged by which pin it sets. A
-  global flag on a helper means a smoke cannot be judged by which pin it sets — an earlier count
-  of "five change, nine are untouched" was wrong for exactly that reason. This finally gives the
+  it whenever the rejection list changes: a global `--gateway` on a helper means a script cannot
+  be judged by which pin it sets, which is exactly how "five change, nine are untouched" went
+  wrong. This finally gives the
   registered-scan path live coverage — today every smoke that routes at all pins, so the code
   production actually runs has none.
 - **The responsiveness gate is the awkward case.** It pins a never-responding double *because* the

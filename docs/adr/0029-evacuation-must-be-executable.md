@@ -82,9 +82,12 @@ Three properties of that rule worth stating, because each is easy to get wrong:
   per-note MINT fee each floor independently, and the note COUNT can change between adjacent
   amounts, so `fee` can jump by more than the one-msat gain in `n`. At such a boundary the top
   can fail `fee <= n` while a slightly smaller candidate passes.
-  So: if the top fails by less than the oscillation bound `A` (the same `A` the robustness
-  contract uses), probe a bounded number of candidates below it before refusing the route. Refuse
-  only when the top fails by MORE than `A`, or when the bounded probe finds nothing — refusing on
+  So: if the top fails by AT MOST the oscillation bound `A` (the same `A` the robustness
+  contract uses) — `shortfall <= A`, equality included — probe a bounded number of candidates
+  below it before refusing the route. Refuse only when the top fails by strictly MORE than `A`,
+  or when the bounded probe finds nothing. The boundary belongs to the probe, not the refusal:
+  `br-y2j` must state the same `<=` or an implementation refuses an executable evacuation at
+  exactly `A` — refusing on
   a single top-only reading would discard an executable evacuation at a note-count discontinuity.
 - **It applies per route class, including the hop.** The hop stacks two gateways' bases and is
   ~80% dearer on the send leg, so its floor efficiency is worse, not better. The defect is in the

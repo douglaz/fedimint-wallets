@@ -1,6 +1,7 @@
 # Route economics (`route_economics_by_pair`): the five settled questions
 
-Status: DESIGN DECISION (br-ljj.3), **Q4 SUPERSEDED by
+Status: DESIGN DECISION (br-ljj.3), **Q1, Q2 and Q4 SUPERSEDED in part by
+[ADR-0029](../adr/0029-evacuation-must-be-executable.md) and
 [ADR-0030](../adr/0030-automated-routing-is-never-pinned.md)**. No production code ships from
 this doc. It authorises an implementation bead. All file:line refs were verified against `main`
 post br-ljj.2 and have not been re-verified since.
@@ -10,6 +11,11 @@ post br-ljj.2 and have not been re-verified since.
 > be pinned. The `route_econ.rs` pinned branch this document's Q4 specifies is deleted, not
 > re-prioritised. The surviving `--gateway` is an operator break-glass on money verbs, which
 > route economics never runs for. Read Q4 below as history.
+>
+> **Q1 and Q2 are superseded for `Evacuate` only.** Q1 mandates a single `Option<GatewayUrl>` on
+> `Action::Evacuate`; Q2 describes re-resolving one gateway that serves both ends. ADR-0029 gives
+> evacuation a two-gateway hop, so it needs a route KIND plus two identities. Both questions still
+> hold for `Move` and for the shared-route case; only their `Evacuate` portions are overtaken.
 
 ## Recap of what was already locked (not relitigated)
 Ordered-pair-keyed floor `route_economics_by_pair[(from,to)]` carrying `resolved_gateway`,

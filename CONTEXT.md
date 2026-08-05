@@ -86,8 +86,10 @@ degradation.
 _Avoid_: "expiry" unless naming a specific metadata timestamp field
 
 **Evacuation**:
-Moving a user's balance out of a failing or closing federation into a healthy one
-(or out via on-chain peg-out). Triggered primarily by a **Shutdown notice**,
+Moving a user's balance out of a failing or closing federation into a healthy one.
+NOT on-chain: [ADR-0004](docs/adr/0004-v1-lightning-only.md) is lightning-only and ADR-0018's
+gateway-independent escape stays deferred, so a peg-out is not an evacuation route today.
+Triggered primarily by a **Shutdown notice**,
 secondarily by probes detecting degradation. The Allocator's core resilience
 action.
 _Avoid_: "sweep" (reserve for consolidating many inputs), "withdraw"
@@ -138,7 +140,10 @@ what let a break-glass be mistaken for a routing policy.
 **Vetted list**:
 The gateways a federation's guardians have admitted for lnv2. It is the ONLY input to
 automated route selection — the scheduler, allocator, probes and evacuation choose from
-it and nothing else. Adding to it is a guardian action, per guardian, not a wallet one:
+it and nothing else; an operator's **break-glass gateway override** deliberately steps
+outside it, but that is never automated. Two cautions, both from ADR-0030: this rule is
+NOT yet implemented (today's daemon still honours a pinned gateway), and membership is a
+UNION of what each responding guardian returned, so it is not a threshold property. Adding to it is a guardian action, per guardian, not a wallet one:
 an operator with no guardian cooperation cannot change it, which is precisely why the
 break-glass exists.
 _Avoid_: "registered gateways" when you mean routable ones — presence in the list is not
