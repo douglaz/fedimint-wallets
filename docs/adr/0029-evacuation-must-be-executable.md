@@ -121,10 +121,15 @@ Three properties of that rule worth stating, because each is easy to get wrong:
   can fail `fee <= n` while a slightly smaller candidate passes.
   So: if the top fails by AT MOST the oscillation bound `A` (the same `A` the robustness
   contract uses) — `shortfall <= A`, equality included — probe candidates below it before
-  refusing the route. `A` bounds the vertical fee jump, not the horizontal distance to the next
-  note-selection discontinuity, so probe the adjacent note-selection boundaries rather than
-  arbitrary offsets, and let the fixture — not a stated offset count — be what binds: br-y2j
-  carries a case whose feasible amount sits one boundary from the failing probe. Refuse only when the top fails by strictly MORE than `A`,
+  refusing the route. `A` bounds ONE vertical fee jump; it bounds neither the number of
+  discontinuities between a failing probe and a feasible window nor their horizontal spacing, so a
+  BOUNDED probe cannot guarantee "finds every amount that fits with `2A` of slack". Do not claim
+  it does. The contract is weakened deliberately: probe the adjacent note-selection boundaries,
+  bounded, and ACCEPT the residual that a feasible window separated from the probe by more
+  boundaries than are visited will be missed and the evacuation will keep retrying. That residual
+  is bounded in consequence (a retry, not a burn) and is the price of not scanning a
+  proven-complete boundary set. br-y2j carries a fixture whose feasible amount sits one boundary
+  from the failing probe; it demonstrates the mechanism, not completeness. Refuse only when the top fails by strictly MORE than `A`,
   or when the bounded probe finds nothing. The boundary belongs to the probe, not the refusal:
   `br-y2j` must state the same `<=` or an implementation refuses an executable evacuation at
   exactly `A` — refusing on

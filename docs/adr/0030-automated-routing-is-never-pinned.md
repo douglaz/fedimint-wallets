@@ -126,8 +126,11 @@ and the reason-code check will then apply the override. That is not the structur
 ADR asks for above, and the two must not be confused: the reason code decides what an
 already-authorised override applies to; it cannot decide whether the caller was entitled to one.
 The entitlement has to come from something a caller cannot forge — the override travelling as a
-money-only capability or type that only the money-verb construction path can produce, rather than
-as an `Option<GatewayUrl>` any constructor may pass. Build that, and the reason-code rule becomes
+money-only capability or type that only the OPERATOR-FACING construction paths can produce —
+the four money verbs AND the three provenance-eligible await verbs, which must be able to
+construct it or they cannot re-drive a break-glass operation — rather than an
+`Option<GatewayUrl>` any constructor may pass. The restriction excludes AUTOMATED callers, not
+await callers. Build that, and the reason-code rule becomes
 what it should be: routing logic on top of a boundary that already holds.
 
 With that, the rule follows the principle above — awaiting one named operation *is* a human
@@ -278,6 +281,11 @@ check the implementing bead owns, not a fact this ADR may assume.
   break-glass `Move` had to re-derive its route from a flag, a restart would either re-resolve
   under an already-committed invoice or stall because the unvetted gateway is not on any list.
   So: no flag, no route selection; but a recorded route replays without one.
+  ORDERING CAVEAT: `br-remove-gateway-pin-yjw` lands BEFORE `br-s0e`, and today's backfill retains
+  neither the source gateway nor the route kind. So between those two beads a break-glass `Move`
+  that commits its receive and then crashes has no recorded route to replay — it re-resolves from
+  the vetted list or stalls. Either the route persistence lands with the pin-removal work, or that
+  bead states this window explicitly rather than inheriting a guarantee that is not yet true.
 - **This does not make routing reliable**, and no document should say so. A federation whose
   guardians vet no reachable gateway is unroutable automatically, and the honest operator
   statement is that the break-glass buys manual movement while the list is repaired.
