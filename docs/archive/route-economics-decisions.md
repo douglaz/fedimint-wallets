@@ -160,8 +160,11 @@ that must agree forever.
 > KIND plus two identities; it still stands for `Action::Move`), the ENDPOINT-ONLY half of the perform-time
 > hint-with-cap-backstop fallback (Q2 — what goes is the "iff it still
 > validates" predicate, which the hint path must replace with a vetted-list MEMBERSHIP re-check,
-> for `Move` as well as `Evacuate`. Hint-FIRST selection and the fee-cap backstop both SURVIVE;
-> do not strike those), and the pin-precedence (Q4 — deleted outright; automated routing
+> for `Move` as well as `Evacuate`. the fee-cap backstop SURVIVES, and hint-FIRST selection survives FOR `Move`
+> ONLY -- for `Evacuate` it is overtaken by br-s0e 2c, which selects the largest sized executed
+> net within the route class, because honouring a hint that sizes to a small viable chunk when
+> another candidate drains far more re-creates the repeated-operation cumulative-base-fee problem
+> ADR-0029 exists to fix), and the pin-precedence (Q4 — deleted outright; automated routing
 > can never be pinned). The live successors are br-y2j, br-s0e and br-remove-gateway-pin-yjw.
 
 Title: "Implement route_economics_by_pair (per-pair economic move floor)".
