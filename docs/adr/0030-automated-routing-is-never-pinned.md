@@ -103,8 +103,11 @@ disagree.
 THREE outcomes, not two — the target's provenance decides which, and the middle one is easy to
 miss:
   - `ReasonCode::UserInitiated` on an intent that RESOLVES A ROUTE → the override APPLIES.
-  - `ReasonCode::UserInitiated` on an intent that resolves no route (a `Join`,
-    `wallet-fedimint/src/runtime.rs:1025-1030`) → the override APPLIES AND NO-OPS. This mirrors
+  - `ReasonCode::UserInitiated` on an intent that resolves no route → the override APPLIES AND
+    NO-OPS. `Join` (`wallet-fedimint/src/runtime.rs:1025-1030`) and `Action::Recover` are both in
+    this class; prefer testing route resolution GENERICALLY over enumerating actions, because
+    `smoke_recover` drives standalone recovery through an always-`--gateway` helper and resumes it
+    with `await-move`, so a `Join`-only implementation would refuse the pending recovery. This mirrors
     the Ignored bucket at the verb level and it is load-bearing: `smoke_money`'s `join_fed`
     helper runs `await-move <join-key>` through a `--gateway` helper
     (`wallet-cli/tests/smoke_money_devimint.sh:74`, `:77-79`), so refusing here breaks one of the

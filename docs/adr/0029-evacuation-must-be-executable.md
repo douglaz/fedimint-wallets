@@ -52,7 +52,8 @@ desired amount is the ordinary downsize signal, not a fall-through trigger; read
 would route every full-balance evacuation onto the dearer hop while a healthy shared gateway sat
 idle. This has a structural consequence: route selection can no longer precede sizing. Each
 candidate is sized with its own fee bases, and the fee charged at its resulting executed net is
-what gets compared against that route's cap — the cap bounds the FEE, computed on the net, never
+what gets compared against that route's cap — the cap — itself computed on the NET — bounds the fee, which is CHARGED ON THE GROSS
+(the two are different quantities; conflating them is the error recorded twice below), never
 the net itself.
 
 **Strict ordering stays strict even when it costs operations — but only over routes that carry
@@ -230,7 +231,10 @@ gateway-independent escape "pulled into EARLY v2". This ADR does not overturn th
 deferred was **gateway-independent** escape — on-chain peg-out. A two-gateway Lightning hop is
 still gateway-*dependent*: it relaxes "one gateway serves both federations" to "each federation has
 some gateway". That is a genuinely weaker requirement, it is Lightning-only so
-[ADR-0004](./0004-v1-lightning-only.md) still holds, and it appears not to have been weighed.
+[ADR-0004](./0004-v1-lightning-only.md) still holds, and it appears not to have been weighed as an EXECUTABLE route. Provenance, to be fair to
+the earlier decision: ADR-0004 already names the ladder as "shared-gateway swap, then
+public-Lightning", so the rung was chosen there. What was never worked out is how to make it
+execute — the fee cap, the sizing, the route kind — which is what this ADR supplies.
 
 **The balance cap stays where it is.** The fallback still fails if the source federation's own
 gateway is down, or if no gateway on either side has liquidity, so it reduces the probability of
