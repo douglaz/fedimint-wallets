@@ -47,10 +47,11 @@ that pin (`runtime.rs:3127-3129`), but it only produces a routability verdict an
 nothing; the pin reaches EXECUTION through `Runtime::executor()`, which builds
 `FedimintExecutor::new(.., self.pinned_gateway.clone(), ..)` (`runtime.rs:592-596`) — that handoff,
 not the preflight branch (which change 3 deletes), is what a structural gate must cover. Since this rule is stated
-independently of process, the enforcement has to be there too: the automated entry points must
-reject or clear an override, or the break-glass must live on a money-only runtime type that the
-automated ones cannot carry. Whichever shape ships, it needs a test at that boundary — a CLI-level
-test cannot observe this.
+independently of process, the enforcement has to be there too — and it must be STRUCTURAL: the
+break-glass lives on a money-only type the automated callers cannot carry. Clearing the override
+at each automated entry point does not qualify (see below: `watch_once` composes them and
+`FedimintExecutor` is publicly constructible, so the enumeration is bypassable). Whichever
+structural shape ships, it needs a test at that boundary — a CLI-level test cannot observe this.
 
 **Rule 1 is about the decision, not the process.** "Automated" means the scheduler/allocator/probe
 machinery wherever it runs — including when a human starts it from a terminal. `wallet-cli

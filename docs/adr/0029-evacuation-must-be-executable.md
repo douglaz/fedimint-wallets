@@ -243,7 +243,12 @@ not rest on something a user can click past.
   because it is cheaper; the hop is reached only when no gateway serves both ends — established
   by examining the whole shared candidate set, not a prefix of it.
   THE EXCEPTION: an honest vetted list fits in one bounded scan, but a guardian can inject
-  entries without bound, so the per-tick scan is capped and a longer list is scanned truncated —
+  entries without bound, so the per-tick scan is capped BY CANDIDATE COUNT AND BY WALL TIME —
+  count alone is not enough, since slow-but-responsive candidates cost two `routing_info`
+  round-trips each and 32 of them can exhaust `perform_timeout` before the hop is ever reached,
+  cancelling the operation and restarting the scan from nothing. Bound the elapsed time per route
+  class so the hop is always attempted within the operation's budget. A longer list is scanned
+  truncated —
   the hop is therefore reachable without every shared candidate having been examined. A bounded, deliberate departure, stated precisely because the honest version is
   weaker than "never a stranding": the scan samples a freshly permuted prefix each tick and keeps
   no cursor, so a serving shared candidate outside the window is not guaranteed to be examined in
