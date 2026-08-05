@@ -20,10 +20,18 @@ gateway-independent escape) is pulled into EARLY v2.
   (CEO finding #3: "spending wallet only" will not constrain behavior on its own).
   **RESOLVED (2026-08-05): REFUSE, for wallet-controlled balance increases.** "Refuse or warn"
   left this ADR contradicting its own title ("HARD, LOW … cap") and its own "Caps loss"
-  consequence, and it left ADR-0029:183 — which calls this cap "the real mitigation" for a
-  correlated federation+gateway death — resting on something a user could click past. A
+  consequence, and it left ADR-0029's "The balance cap stays where it is" paragraph — which calls
+  this cap "the real mitigation" for a correlated federation+gateway death — resting on something
+  a user could click past. (Cited by section, not line: this tree's line refs drift.) A
   dismissible warning is not a cap. So: a wallet-controlled action that would carry a federation
   balance above the threshold is REFUSED, and the user-visible rejection is accepted as the cost.
+  **Downsizing to fit satisfies this rule; refusal is only for when downsizing is impossible.**
+  Evacuation sizing into a destination's remaining room (`clamp_desired_to_cap_room`,
+  `wallet-fedimint/src/executor.rs:670-700`, kept by br-y2j 2c(a)) is the intended behaviour, not
+  a violation — reading "would carry the balance above the threshold is REFUSED" strictly enough
+  to forbid the clamp would strand a dying federation whenever its only destination sits near
+  cap. Refusal applies where the amount is fixed and cannot be reduced: `Pay`, `Receive`,
+  `DirectInflow`.
   Warnings remain correct for balances that rise by means the wallet does not control (an
   inbound payment already in flight, a federation-side change), because there is nothing to
   refuse there — surface those and let evacuation handle them.

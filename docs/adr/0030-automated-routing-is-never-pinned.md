@@ -67,13 +67,22 @@ scheduler- or allocator-created `Move` or `Evacuate`, scoping still re-drives TH
 intent through an executor carrying the override. So the override applies only when the target
 intent was USER-INITIATED; awaiting an allocator's own operation must not carry it.
 
-**The API boundary has THREE automated entry points, not two.** Beyond `tick` and `reconcile`,
-a caller holding `Runtime::new(.., Some(gateway), ..)` can invoke public `active_probe`, whose
-two legs go through `do_move` on an executor built from `self.pinned_gateway`
-(`wallet-fedimint/src/runtime.rs:593`, `:1758-1766`, `:2190-2220`). Rule 1 binds all three. An
-implementation that rejects or clears the override at each entry point must cover `active_probe`
-too; separating the override structurally so no automated path can receive it discharges all
-three at once and is the better answer.
+**Enumerating automated entry points is the WRONG fix — separate the override structurally.**
+This ADR has now counted the boundary three times and been wrong each time. It said `tick`; then
+`tick` and `reconcile`; then `tick`, `reconcile` and `active_probe` (`runtime.rs:593`,
+`:1758-1766`, `:2190-2220`). It is still short: `Runtime::watch_once` (`runtime.rs:1088`) is
+public and composes all three plus the discover pass, and `FedimintExecutor` is publicly
+re-exported with a public constructor that takes the override, so `Executor::perform` can be
+handed an allocator-created `Move` or `Evacuate` directly, past every `Runtime` method.
+An enumeration cannot close a set that keeps growing — which is this ADR's own thesis about
+"money verbs only" turned on itself.
+So the REQUIRED answer is structural: the override must be reachable only through a money-only
+path, so that no automated caller can receive it whatever entry point they hold. Gate by ACTION
+PROVENANCE at the executor boundary — the one place every route resolution funnels through —
+rather than at each public method. Rejecting or clearing per-method is acceptable ONLY as an
+interim with a direct test per method, and it carries the standing risk that the next public
+composition reopens the hole. A direct `Executor::perform` test on an allocator-created action is
+the one that proves the structural version.
 
 **Do not implement "user-initiated" as an `Actor` check.** A manually invoked probe calls
 `active_probe(.., Actor::User)` (`wallet-cli/src/main.rs:1106`) yet stamps its move legs
@@ -226,7 +235,14 @@ check the implementing bead owns, not a fact this ADR may assume.
   re-drives under the same flag, and vanishes when the operator stops passing it. Two things
   follow, and both matter to an implementer: the `.or_else(pinned_gateway)` fallback is NOT dead
   code and must not be deleted, and the flag must NOT be journaled into intents to make a
-  "durable break-glass" story true. An operator repeating the operation must repeat the flag.
+  "durable break-glass" story true.
+  SCOPE THE NON-DURABILITY TO PRE-COMMIT SELECTION. "An operator repeating the operation must
+  repeat the flag" is right about CHOOSING a route and wrong once an operation has committed:
+  from that point the PERSISTED ROUTE is authoritative and replays over it
+  (CONTEXT.md's "Once an operation has committed" entry, br-s0e requirement 5). If a committed
+  break-glass `Move` had to re-derive its route from a flag, a restart would either re-resolve
+  under an already-committed invoice or stall because the unvetted gateway is not on any list.
+  So: no flag, no route selection; but a recorded route replays without one.
 - **This does not make routing reliable**, and no document should say so. A federation whose
   guardians vet no reachable gateway is unroutable automatically, and the honest operator
   statement is that the break-glass buys manual movement while the list is repaired.

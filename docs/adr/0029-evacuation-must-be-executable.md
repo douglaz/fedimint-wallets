@@ -63,9 +63,9 @@ pair would serve the full drain. The swap still wins, and the source drains in s
 "Chunking is slow, not lossy" is only true once a chunk must deliver at least what it costs, and
 that condition has to be enforced rather than assumed. The cap's BASE component is
 amount-independent, so at the lnv2 contract floor (5 sats) a 200-sat base cap admits a chunk that
-burns ~150 sats to move 5. The remainder re-emits every watch cycle with no minimum-progress
-guard, no attempt budget and no fee accounting, so a 75,000-sat balance drains in ~480 such
-chunks — delivering ~2,400 sats and burning ~72,600, a ~96% loss. That is not slow-but-safe; it is
+burns ~200 sats to move 5. The remainder re-emits every watch cycle with no minimum-progress
+guard, no attempt budget and no fee accounting, so a 75,000-sat balance drains in ~366 such
+chunks — delivering ~1,828 sats and burning ~73,172, a ~97.6% loss. That is not slow-but-safe; it is
 the evacuation destroying the balance it exists to rescue.
 
 **The parameterisation matters, and an earlier draft of this ADR got it wrong.** It said "base
@@ -76,9 +76,17 @@ exceeds `SEND_FEE_LIMIT` (base 100 sats — `lnv2-client/src/lib.rs:590`, limit 
 `lib.rs:905`, limit at `gateway_api.rs:223`). A 199-sat-base gateway therefore fails the first
 chunk's receive and the evacuation STRANDS (`Retryable`); it does not burn. What the SDK's limits
 do NOT prevent is the PPM: because the comparison is lexicographic on `base` first, a compliant
-base admits an arbitrary ppm. So the hostile shape that actually executes is bases 99 + 49 = ~148
-sats with ppm far above the 3% slope — which is where the ~150-sat-per-chunk figure above comes
-from. The hazard is undiminished; only the numbers move. State the base/ppm split whenever this
+base admits an arbitrary ppm.
+
+So the executable hostile shape is **bases 99 + 49 = 148 sats with ppm ≈ 10,430,000**, and the
+~200 sats burned per chunk is the BASE PLUS THE PPM TERM, not a 200-sat base. Derivation, because
+the numbers must be reproducible: a chunk fits while `148 + r·n ≤ 200 + 0.03·n`, so the largest
+fitting net is `n* = 52/(r − 0.03)`; the sizing search returns that maximum, so `r ≈ 1043%` gives
+`n* = 5` sats at a fee of ~200 sats, a source debit of ~205, and `75,000/205 ≈ 366` chunks.
+NOTE the viability threshold is far below that: `fee(n*) > n*` only for `r > ~28.2%`
+(ppm ≈ 282,200). "Ppm far above the 3% slope" does NOT characterise the hazard — at 10% the route
+is economically VIABLE and a refusal assertion would fail. Any fixture must pin both numbers.
+The hazard is undiminished; only its attribution moves. State the base/ppm split whenever this
 scenario is cited, because "the fee limits do not prevent it" is true of the ppm and false of the
 base; on the measured pilot gateway at 1.78% the same mechanism is EXPECTED to drain in one operation.
 That expectation is EMPIRICAL, not derived, and this ADR previously claimed a derivation twice
@@ -144,7 +152,12 @@ any candidate clears that predicate:
    (`allocator.rs:629`), so a fresh `Evacuate` is emitted for the remainder. At the figures below
    the federation drains in roughly 27 operations at essentially the same total fee. This is what
    the pilot's MEASURED gateway does.
-2. **A SUMMED TWO-LEG QUOTE STRICTLY ABOVE the cap → GENUINE REFUSAL.** State it about the
+2. **NO AMOUNT FITS THE CAP → GENUINE REFUSAL.** The condition is about the whole search, not
+   one quote: a single over-cap quote at the desired size is NOT a refusal, because
+   `size_fresh_evacuation` downsizes (see the sizing rules above). Genuine refusal is when no
+   amount fits at all — characteristically when the fixed component alone (the two legs' bases
+   plus the fee floor) already exceeds the cap, so shrinking the amount cannot help.
+   The per-quote test underneath it is: **a summed two-leg quote STRICTLY ABOVE the cap fails.** State it about the
    QUOTE, not about base fees: `total_within_cap` compares `receive_quote + send_quote <= fee_cap`
    (`wallet-fedimint/src/fee.rs:163`). Exact equality is ADMITTED — only cap-plus-one-msat
    refuses, the same boundary as the `shortfall <= A` probe rule. Note the consequence for bases
@@ -198,9 +211,10 @@ some gateway". That is a genuinely weaker requirement, it is Lightning-only so
 gateway is down, or if no gateway on either side has liquidity, so it reduces the probability of
 stranding without making evacuation reliable. Treating it as reliable would justify raising the
 per-federation cap, and that is the change that could actually lose money if the assumption proves
-optimistic. ADR-0018's low cap remains the real mitigation — CONDITIONALLY: ADR-0018 permits
-enforcement by "refuse or warn", and warn-only does not cap anything a user can click past. That
-choice is flagged OPEN in ADR-0018's Consequences; this sentence holds only under refusal.
+optimistic. ADR-0018's low cap remains the real mitigation, and it is now unconditional:
+ADR-0018's Consequences RESOLVED the "refuse or warn" ambiguity on 2026-08-05 in favour of
+REFUSING wallet-controlled balance increases above the threshold, precisely so this sentence does
+not rest on something a user can click past.
 
 ## Consequences
 
