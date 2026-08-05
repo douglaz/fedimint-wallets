@@ -77,7 +77,9 @@ exceeds `SEND_FEE_LIMIT` (base 100 sats — `lnv2-client/src/lib.rs:590`, limit 
 `lib.rs:905`, limit at `gateway_api.rs:223`). A 199-sat-base gateway therefore cannot execute, and the evacuation
 STRANDS (`Retryable`) rather than burning. WHICH leg refuses depends on the split, and the
 send-heavy case is the one to reason from: a receive-heavy split (say 49 + 150) fails the receive
-limit before anything commits, but a send-heavy split (say 149 + 50) PASSES the receive limit,
+limit before anything commits, but a send-heavy split (say 149 + 50, WITH A RECEIVE PPM AT OR UNDER 5,000 —
+at a receive base of exactly 50 the lexicographic `le` ties on base and falls through to the ppm,
+so a higher one refuses pre-commit and the example goes vacuous) PASSES the receive limit,
 mints and commits the receive leg, and strands at the send-limit check — with a committed receive
 already outstanding. Either way some leg of a 199-sat total must exceed its limit, since the
 compliant maximum is 100 + 50. What the SDK's limits
@@ -142,8 +144,13 @@ Three properties of that rule worth stating, because each is easy to get wrong:
   amounts, so `fee` can jump by more than the one-msat gain in `n`. At such a boundary the top
   can fail `fee <= n` while a slightly smaller candidate passes.
   So: if the top fails by AT MOST the oscillation bound `A` (the same `A` the robustness
-  contract uses) — `shortfall <= A`, equality included — probe a bounded number of candidates
-  below it before refusing the route. Refuse only when the top fails by strictly MORE than `A`,
+  contract uses) — `shortfall <= A`, equality included — probe candidates below it before
+  refusing the route, on a DETERMINISTIC SCHEDULE the bead must pin: "a bounded number" is not a
+  specification. `A` bounds the vertical fee jump, NOT the horizontal distance to the next
+  note-selection discontinuity, so an implementation can satisfy the words literally, probe the
+  wrong offsets, miss an executable amount and leave the evacuation `Retryable` forever. The
+  schedule needs a stated count, stated offsets (or the boundaries they derive from), and an
+  acceptance case that fails without it. Refuse only when the top fails by strictly MORE than `A`,
   or when the bounded probe finds nothing. The boundary belongs to the probe, not the refusal:
   `br-y2j` must state the same `<=` or an implementation refuses an executable evacuation at
   exactly `A` — refusing on
@@ -236,8 +243,9 @@ the earlier decision: ADR-0004 already names the ladder as "shared-gateway swap,
 public-Lightning", so the rung was chosen there. What was never worked out is how to make it
 execute — the fee cap, the sizing, the route kind — which is what this ADR supplies.
 
-**The balance cap stays where it is.** The fallback still fails if the source federation's own
-gateway is down, or if no gateway on either side has liquidity, so it reduces the probability of
+**The balance cap stays where it is.** The fallback still fails when NO vetted source-side gateway serves or is
+reachable — there is no singular "the federation's gateway"; each leg selects from that
+federation's vetted list — or if no gateway on either side has liquidity, so it reduces the probability of
 stranding without making evacuation reliable. Treating it as reliable would justify raising the
 per-federation cap, and that is the change that could actually lose money if the assumption proves
 optimistic. ADR-0018's low cap remains the real mitigation, and it is now unconditional:
@@ -278,7 +286,15 @@ not rest on something a user can click past.
   selection from an arbitrary first window and breaking the largest-net rule — or scanned past
   expiry, which restores the stall the deadline exists to prevent. Give the hop class its own
   durable deadline, or reserve a fixed share of the shared one, so whichever class is finally
-  chosen was scanned under a bound. An oversized-hop case belongs in the acceptance criteria. This is a deliberate departure from strict ordering and it is bounded by
+  chosen was scanned under a bound. An oversized-hop case belongs in the acceptance criteria.
+  DEFINE THE ANCHOR FOR EVERY EVACUATION TRIGGER, not just the scheduled one. A scheduled shutdown
+  has `federation_expiry_timestamp` to anchor against, but a health-triggered evacuation does not:
+  `FederationStatus` carries `shutdown_notice` and `healthy` as BOOLEANS, with no detection time,
+  and `/status.scheduled_shutdown` is likewise a flag. Without a durable anchor an implementation
+  resets the budget on every restart and postpones the hop forever — the bound becomes fictional,
+  which is the failure this paragraph exists to prevent. So the implementing bead must persist a
+  detection timestamp per evacuation reason and say what the budget's duration is; it cannot be
+  left to "a sweep". This is a deliberate departure from strict ordering and it is bounded by
   the same principle that motivates the fallback in the first place: during an evacuation a worse
   counterparty beats stranding the balance. It is NOT a licence to hop on a partial scan in the
   ordinary case — absent the deadline, coverage is required. No reputation or liquidity bar gates the

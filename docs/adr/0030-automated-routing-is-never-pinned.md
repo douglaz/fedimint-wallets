@@ -88,7 +88,9 @@ So the REQUIRED answer is structural: the override must be reachable only throug
 path, so that no automated caller can receive it whatever entry point they hold. Gate by ACTION
 PROVENANCE at the executor boundary — the one place every route resolution funnels through —
 rather than at each public method. Rejecting or clearing per-method is acceptable ONLY as an
-interim with a direct test per method, and it carries the standing risk that the next public
+interim WITHIN THE IMPLEMENTING BEAD'S DEVELOPMENT — never as the landed state, since the
+executor-boundary criterion cannot be satisfied by per-method enforcement and would stay red by
+construction — with a direct test per method, and it carries the standing risk that the next public
 composition reopens the hole. A direct `Executor::perform` test on an allocator-created action is
 the one that proves the structural version.
 
@@ -182,9 +184,15 @@ check the implementing bead owns, not a fact this ADR may assume.
 
 ## Consequences
 
-- **The break-glass skips VETTED-LIST membership, and that is the point — it is not
+- **The break-glass skips PRESELECTION only — VETTED-LIST membership, and that is the point — it is not
   unvalidated.** Precisely: `resolve_move_gateway` returns the named gateway without checking it
-  **serves** the route, so neither vetted-list membership nor the two-ends check applies. What
+  **serves** the route, so neither vetted-list membership nor the two-ends check applies.
+  **BUT NOT ECONOMIC VIABILITY.** `Serves` in CONTEXT.md now folds `total_fee <= delivered net`
+  into the word, so "skips the serves check" would otherwise authorise bypassing a money-safety
+  condition rather than just preselection. It does not: the viability test still applies on the
+  break-glass path. This matters concretely for a small manual `move` under the default
+  200,000-msat cap, where an explicitly named gateway can charge more than the net while still
+  passing the cap — the cap alone does not catch that, and ADR-0029 requires viability to. What
   still applies is the operation's own liveness check — explicit-gateway `send`/`receive` require
   `routing_info` to answer (`fedimint-lnv2-client/src/lib.rs:574-587`) — and the fee cap, which
   is re-checked at the Pay step regardless of how the route was chosen. So a dead gateway still fails. An overpriced
