@@ -188,7 +188,15 @@ check the implementing bead owns, not a fact this ADR may assume.
 
 - **The break-glass skips PRESELECTION only — VETTED-LIST membership, and that is the point — it is not
   unvalidated.** Precisely: `resolve_move_gateway` returns the named gateway without checking it
-  **serves** the route, so neither vetted-list membership nor the two-ends check applies.
+  **serves** the route, so vetted-list membership and the two-end PRESELECTION are skipped.
+  LIVENESS IS NOT: `validate_move_gateway_before_receive` runs unconditionally at CreateInvoice,
+  pin included (`executor.rs:1311`, fn at `:571-587`), requiring the gateway to answer
+  `routing_info` for the SOURCE federation, and the pre-mint gross-up quotes the destination end —
+  so a one-end-only gateway is refused BEFORE anything is minted. Do not describe the break-glass
+  as a way to "reach" a one-end-only gateway: it is not, at this pin lnv2 `send` needs the
+  source's `routing_info` anyway, and an implementer making that description true by deleting the
+  pre-mint check would reintroduce the stranded-unpayable-invoice case that check exists to
+  prevent (`executor.rs:567-570`).
   **BUT NOT ECONOMIC VIABILITY.** `Serves` in CONTEXT.md now folds `total_fee <= delivered net`
   into the word, so "skips the serves check" would otherwise authorise bypassing a money-safety
   condition rather than just preselection.

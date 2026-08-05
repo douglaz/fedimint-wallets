@@ -74,8 +74,15 @@ just under 200 sats", which CANNOT execute at the pin: `PaymentFee` derives a ba
 lexicographic `PartialOrd` (`gateway_api.rs:190-200`), and the send leg is refused when its fee
 exceeds `SEND_FEE_LIMIT` (base 100 sats — `lnv2-client/src/lib.rs:590`, limit at
 `gateway_api.rs:209`) while the receive leg is refused against `RECEIVE_FEE_LIMIT` (base 50 sats —
-`lib.rs:905`, limit at `gateway_api.rs:223`). A 199-sat-base gateway therefore cannot execute, and the evacuation
-STRANDS (`Retryable`) rather than burning. WHICH leg refuses depends on the split, and the
+`lib.rs:905`, limit at `gateway_api.rs:223`). A 199-sat-base gateway therefore cannot execute, and the evacuation fails
+rather than burning — but WITH DIFFERENT TERMINAL CLASSES by split, and the send-heavy one is the
+worse shape. A receive-heavy split fails pre-commit and maps `Retryable` (`executor.rs:1378`). A
+send-heavy split fails at the send limit, and `GatewayFeeExceedsLimit` is a route rejection that
+`map_send_error` classifies **`Permanent`** (`multi_client.rs:1396-1401`, `executor.rs:2125-2127`,
+used by the Pay arm at `:1505-1507`) — so the intent terminally FAILS with a committed receive
+outstanding, and because the occurrence advances each watch cycle and `idem_evac` embeds it, a
+fresh `Evacuate` is emitted and repeats the mint-then-fail loop. No burn either way; do not write
+a test or runbook expectation asserting `Retryable` for the send-heavy case. WHICH leg refuses depends on the split, and the
 send-heavy case is the one to reason from: a receive-heavy split (say 49 + 150) fails the receive
 limit before anything commits, but a send-heavy split (say 149 + 50, WITH A RECEIVE PPM AT OR UNDER 5,000 —
 at a receive base of exactly 50 the lexicographic `le` ties on base and falls through to the ppm,
@@ -250,9 +257,12 @@ not rest on something a user can click past.
   class so the hop is always attempted within the operation's budget. A longer list is scanned
   truncated —
   the hop is therefore reachable without every shared candidate having been examined. A bounded, deliberate departure, stated precisely because the honest version is
-  weaker than "never a stranding": the scan samples a freshly permuted prefix each tick and keeps
-  no cursor, so a serving shared candidate outside the window is not guaranteed to be examined in
-  any bounded number of ticks. What follows in the ordinary case is a dearer route — the hop is
+  weaker than "never a stranding". `gateways()` shuffles and then STABLE-sorts by how many peers
+  lack each URL, so the window is support-ordered and randomised only WITHIN equal-support ties.
+  Two consequences, and neither is "random sampling": a low-support serving candidate sitting
+  behind a full window of higher-support entries is excluded DETERMINISTICALLY, every tick, not
+  probabilistically; and conversely a single guardian's injected entries sort LAST and cannot
+  displace a widely-vetted serving candidate from the window at all. What follows in the ordinary case is a dearer route — the hop is
   tried meanwhile, still capped and viability-checked. Stranding needs BOTH the shared candidate
   to keep being missed AND no examined hop pair to work; that is unlikely but not excluded, and it
   is the price of not carrying cross-tick state. During an evacuation a worse counterparty beats
