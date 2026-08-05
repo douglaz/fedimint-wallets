@@ -188,14 +188,12 @@ check the implementing bead owns, not a fact this ADR may assume.
   **BUT NOT ECONOMIC VIABILITY.** `Serves` in CONTEXT.md now folds `total_fee <= delivered net`
   into the word, so "skips the serves check" would otherwise authorise bypassing a money-safety
   condition rather than just preselection.
-  STATED AS INTENT, NOT TODAY'S BEHAVIOUR, because the distinction is exactly what this ADR keeps
-  getting wrong elsewhere: the viability test MUST apply on the break-glass path, and today it
-  does NOT. `total_fee <= net` arrives with br-y2j's b-bis post-check, which is scoped to
-  EVACUATION sizing; nothing applies it to a manual `move`. So this is an unassigned requirement,
-  and it is named here so it gets assigned rather than assumed. It matters concretely for a small
-  manual `move` under the default 200,000-msat cap, where an explicitly named gateway can charge
-  more than the net while still passing the cap — the cap alone does not catch that. Until a bead
-  owns it, do not cite this paragraph as though the protection exists. What
+  The viability test must apply on the break-glass path, and today it does not: `total_fee <=
+  net` arrives with br-y2j's post-check, which is scoped to evacuation sizing. It matters for a
+  small manual `move` under the default cap, where a named gateway can charge more than the net
+  while still passing the cap. OWNED BY `br-remove-gateway-pin-yjw`, which carries the
+  break-glass — not intent without an owner.
+  What
   still applies is the operation's own liveness check — explicit-gateway `send`/`receive` require
   `routing_info` to answer (`fedimint-lnv2-client/src/lib.rs:574-587`) — and the fee cap, which
   is re-checked at the Pay step regardless of how the route was chosen. So a dead gateway still fails. An overpriced
