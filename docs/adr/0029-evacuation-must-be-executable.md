@@ -250,7 +250,13 @@ not rest on something a user can click past.
   because it is cheaper; the hop is reached only when no gateway serves both ends — established
   by examining the whole shared candidate set, not a prefix of it.
   THE EXCEPTION: an honest vetted list fits in one bounded scan, but a guardian can inject
-  entries without bound, so the per-tick scan is capped BY CANDIDATE COUNT AND BY WALL TIME —
+  entries without bound, so the per-tick scan is capped BY CANDIDATE COUNT AND BY WALL TIME.
+  MIND THE HOP CLASS'S CARDINALITY: it is `|source| × |destination|`, so two honest six-gateway
+  lists already exceed a 32-candidate bound without any adversary at all. The bound must therefore
+  be sized against the PAIR space, or the hop must traverse the Cartesian product across ticks —
+  otherwise a sole viable low-support pair sits outside a support-ordered window every tick and is
+  never reached. "Honest lists fit one scan" is true of the shared class and false of the hop.
+  The count bound is —
   count alone is not enough, since slow-but-responsive candidates cost two `routing_info`
   round-trips each and 32 of them can exhaust `perform_timeout` before the hop is ever reached,
   cancelling the operation and restarting the scan from nothing. Bound the elapsed time per route

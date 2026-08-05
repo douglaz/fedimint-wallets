@@ -219,10 +219,12 @@ check the implementing bead owns, not a fact this ADR may assume.
   outside the vetted list can charge between quote and commit. Vetting is what normally covers
   that, which is precisely what the break-glass sets aside. What an operator overrides is the
   federation's judgement about *which* gateways are admissible; they also accept this residual. For automated
-  routing skipping the serves-check was a defect; here it is the required behaviour. Do not
-  "fix" it into a serves-check: `gateway_serves_route` validates BOTH ends through the gateway
-  (`executor.rs:459-469`), which refuses exactly the one-end-only or half-responsive gateway the
-  break-glass exists to reach.
+  routing skipping the PRESELECTION was a defect; here it is the required behaviour. Do not "fix"
+  it by adding `gateway_serves_route` to this path: that is the vetted-list-and-two-end
+  PRESELECTION (`executor.rs:459-469`), and running it would re-impose the membership test the
+  override exists to step around. This is NOT a licence to reach a one-end-only gateway — the
+  operation's own liveness checks still refuse one before anything is minted (see the
+  break-glass paragraph above), and they must stay.
 - **"On the vetted list" is NOT a threshold-vetted property, and this ADR must not be read as
   claiming it is.** `gateways()` builds a UNION of the peer responses
   (`fedimint-lnv2-client/src/api.rs:84-116`): `FilterMapThreshold` thresholds the RESPONSE COUNT,
