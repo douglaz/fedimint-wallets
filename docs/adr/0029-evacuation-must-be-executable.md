@@ -244,9 +244,14 @@ not rest on something a user can click past.
   by examining the whole shared candidate set, not a prefix of it.
   THE EXCEPTION: an honest vetted list fits in one bounded scan, but a guardian can inject
   entries without bound, so the per-tick scan is capped and a longer list is scanned truncated —
-  the hop is therefore reachable without every shared candidate having been examined. A bounded,
-  deliberate departure: the residual is a dearer route, still capped and viability-checked, never
-  a stranding, and during an evacuation a worse counterparty beats stranding the balance. It is
+  the hop is therefore reachable without every shared candidate having been examined. A bounded, deliberate departure, stated precisely because the honest version is
+  weaker than "never a stranding": the scan samples a freshly permuted prefix each tick and keeps
+  no cursor, so a serving shared candidate outside the window is not guaranteed to be examined in
+  any bounded number of ticks. What follows in the ordinary case is a dearer route — the hop is
+  tried meanwhile, still capped and viability-checked. Stranding needs BOTH the shared candidate
+  to keep being missed AND no examined hop pair to work; that is unlikely but not excluded, and it
+  is the price of not carrying cross-tick state. During an evacuation a worse counterparty beats
+  stranding the balance, which is why the hop is tried rather than waiting for coverage. It is
   NOT a licence to hop while an examined candidate serves.
   No reputation or liquidity bar gates the
   fallback: during an evacuation a worse counterparty beats stranding the balance, and every extra

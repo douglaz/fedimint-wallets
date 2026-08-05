@@ -11,8 +11,10 @@ Two rules, drawn along a line the code did not previously have:
 2. **The operator keeps a single-invocation break-glass, on money verbs only.** `wallet-cli
    --standalone --gateway <url>` survives for the verbs that move money at an operator's explicit
    instruction, and deliberately routes through a gateway **outside** the vetted list — skipping
-   vetted-list membership and the serves-check, though not the operation's own liveness check or
-   the fee cap (see Consequences). Three dispositions, because "money verbs only" and a five-verb reject list are *different sets*
+   vetted-list membership and the two-end PRESELECTION, though not the operation's own liveness
+   check, the fee cap, or ECONOMIC VIABILITY (see Consequences: `Serves` folds viability into the
+   word, so "skips the serves-check" must never be read as licensing a move that costs more than
+   it delivers). Three dispositions, because "money verbs only" and a five-verb reject list are *different sets*
    and the gap between them is where implementations diverge:
    - **Accepted** on the verbs that route at an operator's direction: the four money verbs plus the provenance-eligible await verbs ("money verbs only" is shorthand
      that understates the accepted set: await verbs are eligible, they are not money verbs) — and this
@@ -84,12 +86,13 @@ re-exported with a public constructor that takes the override, so `Executor::per
 handed an allocator-created `Move` or `Evacuate` directly, past every `Runtime` method.
 An enumeration cannot close a set that keeps growing — which is this ADR's own thesis about
 "money verbs only" turned on itself.
-So the requirement is stated as a PROPERTY, not a shape: automated routing must never observe the
-override, and that is proven at the executor boundary — the one place every route resolution
-funnels through — with a direct `Executor::perform` call on an allocator-created action under an
-active override. Whether the implementation achieves it with a money-only type, constructor
-separation, or clearing the override at the automated entry points is the implementer's call; the
-test is what binds, and it is the test an enumeration cannot pass by accident. A direct `Executor::perform` test on an allocator-created action is
+So the requirement is a PROPERTY: automated routing must never observe the override, proven at
+the executor boundary — the one place every route resolution funnels through — by a direct
+`Executor::perform` call on an allocator-created action under an active override. The shape is the
+implementer's call among those that make the override STRUCTURALLY unavailable to automated
+callers (a money-only type, or construction-path separation). Clearing it at each automated entry
+point is NOT among them: that is the enumeration this section rejects, and `FedimintExecutor` is
+publicly constructible, so it would leave the test red by construction. A direct `Executor::perform` test on an allocator-created action is
 the one that proves the structural version.
 
 **Do not implement "user-initiated" as an `Actor` check.** A manually invoked probe calls
