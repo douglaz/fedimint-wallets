@@ -257,8 +257,9 @@ not rest on something a user can click past.
   otherwise a sole viable low-support pair sits outside a support-ordered window every tick and is
   never reached. "Honest lists fit one scan" is true of the shared class and false of the hop.
   The count bound is —
-  count alone is not enough, since slow-but-responsive candidates cost two `routing_info`
-  round-trips each and 32 of them can exhaust `perform_timeout` before the hop is ever reached,
+  count alone is not enough, since slow-but-responsive candidates cost up to FOUR `routing_info`
+  round-trips each (two per leg, and br-y2j's sizing budget is per pass with a conditional second
+  pass) and a full window of them can exhaust `perform_timeout` before the hop is ever reached,
   cancelling the operation and restarting the scan from nothing. Bound the elapsed time per route
   class so the hop is always attempted within the operation's budget. A longer list is scanned
   truncated —
