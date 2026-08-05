@@ -225,7 +225,12 @@ check the implementing bead owns, not a fact this ADR may assume.
   if the better-vetted gateways do not serve, the one-guardian entry is reachable.
   Selection by largest sized net carries no support term, so once a scan covers the class this
   preference stops deciding anything — which is why threshold-supported membership is the real
-  fix and is named as the follow-up.
+  fix and is named as the follow-up. That follow-up also owns the INGESTION bound: `gateways()`
+  materialises the whole union and computes support quadratically before any wallet-side scan
+  limit applies, so a per-peer response bound belongs with the per-peer query path. It is
+  deliberately NOT in the evacuation beads — a guardian set on stalling a client has cheaper
+  levers (slow responses, timeouts, garbage) those beads correctly do not defend against either,
+  and generic response hardening is client-wide, not evacuation spec.
 
 
 - **Restoring automated movement after a vetted-list failure is guardian-side.** `gateways add`
