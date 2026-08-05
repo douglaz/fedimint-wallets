@@ -141,13 +141,9 @@ what let a break-glass be mistaken for a routing policy.
 A `wallet-cli` subcommand that moves value on behalf of the human running it, as opposed to one
 that observes state or drives the automated lanes. Exactly four: `pay`, `receive`, `move`,
 `direct-inflow`. These are the only verbs that INITIATE movement, and the
-**break-glass gateway override** is accepted on them. The await verbs (`await-receive`, `await-send`, `await-move`) also accept it,
-under the provenance rule in ADR-0030. "They complete a payment a human already started" is the
-motivation, not the rule: accepting is for compatibility, and ADR-0030's table then gives THREE
-outcomes — it APPLIES to a user-initiated route-resolving operation, APPLIES AND NO-OPS on a
-user-initiated one that resolves no route (a `Join`), and is REFUSED on automated provenance —
-so the accepted set is "the four money verbs plus the eligible await verbs", not the four
-alone. `direct-inflow` is the one an implementer is most likely to misclassify — it reads like plumbing, but it funds a federation and most devimint
+**break-glass gateway override** is accepted on them. The await verbs (`await-receive`, `await-send`, `await-move`) also accept it — what it then
+applies to is a dispatch rule owned by [ADR-0030](docs/adr/0030-automated-routing-is-never-pinned.md),
+not by this glossary. `direct-inflow` is the one an implementer is most likely to misclassify — it reads like plumbing, but it funds a federation and most devimint
 smokes fund through it, so classifying it as rejected or ignored breaks the funding step.
 
 **Vetted list**:

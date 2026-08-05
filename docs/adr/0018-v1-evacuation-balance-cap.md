@@ -19,27 +19,11 @@ gateway-independent escape) is pulled into EARLY v2.
 - The cap must be ENFORCED (refuse or warn above threshold), not relied on as copy
   (CEO finding #3: "spending wallet only" will not constrain behavior on its own).
   **RESOLVED (2026-08-05): REFUSE, for wallet-controlled balance increases.** "Refuse or warn"
-  left this ADR contradicting its own title ("HARD, LOW … cap") and its own "Caps loss"
-  consequence, and it left ADR-0029's "The balance cap stays where it is" paragraph — which calls
-  this cap "the real mitigation" for a correlated federation+gateway death — resting on something
-  a user could click past. (Cited by section, not line: this tree's line refs drift.) A
-  dismissible warning is not a cap. So: a wallet-controlled action that would carry a federation
-  balance above the threshold is REFUSED, and the user-visible rejection is accepted as the cost.
-  **Downsizing to fit satisfies this rule; refusal is only for when downsizing is impossible.**
-  Evacuation sizing into a destination's remaining room (`clamp_desired_to_cap_room`,
-  `wallet-fedimint/src/executor.rs:670-700`, kept by br-y2j 2c(a)) is the intended behaviour, not
-  a violation — reading "would carry the balance above the threshold is REFUSED" strictly enough
-  to forbid the clamp would strand a dying federation whenever its only destination sits near
-  cap. Refusal applies where the amount is fixed and cannot be reduced: `Receive`,
-  `DirectInflow`, and a fixed-amount topping-up `Move`. NOT `Pay` — a `Pay` spends a federation's
-  balance OUTWARD (`wallet-daemon/src/handlers.rs:310-316`) and cannot carry any balance above
-  the threshold, so there is nothing for this rule to refuse there. The topping-up `Move` is the
-  one that matters and the one the code already refuses today: "every OTHER inflow (a
-  DirectInflow or a topping-up Move) is refused pre-mint below if it would push the destination
-  over the cap" (`wallet-fedimint/src/executor.rs:1303-1305`). Listing `Pay` and omitting `Move`
-  would give textual authority to drop the real check and add a meaningless one.
-  Warnings remain correct for balances that rise by means the wallet does not control (an
-  inbound payment already in flight, a federation-side change), because there is nothing to
-  refuse there — surface those and let evacuation handle them.
+  contradicted this ADR's own title and its "Caps loss" consequence, and left ADR-0029's reliance
+  on this cap resting on something a user could click past. A dismissible warning is not a cap.
+  Downsizing to fit satisfies the rule — evacuation sizing into a destination's remaining room is
+  intended behaviour, not a violation; refusal is for amounts that cannot be reduced. Where the
+  wallet does not control the inflow there is nothing to refuse: warn, and let evacuation handle
+  it. That principle classifies every verb without an enumeration to keep in sync.
 - The per-federation balance/data model must support the cap and the
   stranded-funds UI from v1.

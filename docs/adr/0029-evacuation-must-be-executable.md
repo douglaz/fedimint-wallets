@@ -90,42 +90,11 @@ So the executable hostile shape is **bases 99 + 49 = 148 sats with an ASYMMETRIC
 split: send 940,000 ppm, receive 10,000 ppm**, and the ~200 sats burned per chunk is the BASE
 PLUS THE PPM TERM, not a 200-sat base.
 
-Derivation, because the numbers must be reproducible AND because two earlier revisions got this
-wrong by charging the ppm against the NET. **Gateway fees are charged on the GROSS invoice**, not
-on what the recipient nets: `contract = invoice − recv_gateway.on(invoice)`
-(`wallet-fedimint/src/fee.rs:174-181`, matching the SDK's `subtract_from`). Writing `a` for the
-gross invoice, `n = a − (rb + rp·a)` and the source debit is `a + sb + sp·a`, so
-`gateway_fee = (sb + rb) + (sp + rp)·a` while the cap is `cap_base + bps·n` — fee proportional to
-GROSS, cap proportional to NET. That equation is the GATEWAY SUBTOTAL only: the actual cap and
-viability comparisons run on the complete receive and send quotes, which also carry the two
-federation fees and the per-note mint fee, each flooring independently (see the robustness
-contract below). The fixtures here set those to negligible so the gateway arithmetic is legible;
-an implementation must not. Two consequences that killed the earlier fixtures. First, solvability is governed by the RECEIVE
-ppm ALONE, not the combined figure: the contract is `a − (rb + rp·a)`, so `rp ≥ 1,000,000` leaves
-nothing deliverable at any invoice size, while a send ppm above 1,000,000 is perfectly solvable —
-it merely inflates the source debit, and is caught downstream by the `total_fee ≤ n` viability
-check rather than by solvability. Do not state a COMBINED-ppm solvability threshold; an earlier
-revision did. Second, the receive ppm shrinks the contract directly, so a hostile split that still
-delivers something must load its ppm onto the SEND leg. At send 940,000 / receive 10,000 the largest cap-fitting invoice is ~54.9 sats,
-delivering `n ≈ 5.35` sats for a ~200-sat fee against a ~200.16-sat cap, a source debit of ~205,
-and `75,000/205 ≈ 365` chunks — ~1,953 sats delivered, ~73,047 burned, ~97.4%.
-A SYMMETRIC split does not reproduce this: at 150,000/150,000 the largest fitting chunk nets
-~107 sats and the loss is ~65% — still a viability failure, but not the headline. Any fixture
-must pin BOTH ppms, not a combined figure.
-The hazard is undiminished; only its attribution moves. State the base/ppm split whenever this
-scenario is cited, because "the fee limits do not prevent it" is true of the ppm and false of the
-base; on the measured pilot gateway at 1.78% the same mechanism is EXPECTED to drain in one operation.
-That expectation is EMPIRICAL, not derived, and this ADR previously claimed a derivation twice
-over — both wrong, recorded here so neither is reconstructed. The `2A` robustness contract in
-br-y2j is a FEE-SLACK guarantee; it does not bound how far the selected net sits below the true
-maximum, so it cannot bound the leftover balance at all. And even read as an amount bound, ~18,000
-msat at eleven tiers EXCEEDS the ~13,000-msat minimum source debit of a second chunk, so it would
-not exclude one — and ~18,000 is only the ZERO-PROPORTIONAL BASELINE, since br-y2j's full `A`
-adds `2*ceil(V_max * mint_ppm / 1e6)`, which scales with the denomination crossed and can dominate
-the tier term outright. What actually holds: whether a second chunk is emitted is a MEASURED property of
-the sized amount, which the implementing bead pins as a red/green fixture, and if one is emitted
-the economic-viability post-check bounds its damage rather than the chunk being free to strand
-97% of the balance. Do not restate the one-operation property as a consequence of `2A`.
+br-y2j owns the pinned fixture and every number in it: do not re-derive them here. Two facts
+belong in this ADR because they are decisions, not arithmetic — the SDK's limits bound each leg's
+BASE (100 sats send, 50 receive) but not the ppm, since the derived `PaymentFee` comparison is
+lexicographic on `base` first; and solvability is governed by the RECEIVE ppm alone, because the
+contract is `a − (rb + rp·a)`. Never cite a combined-ppm threshold.
 
 **So serving requires ECONOMIC viability: `total_fee <= executed net`.** A route whose best
 available chunk costs more than it delivers does not serve, strict ordering falls through to the
@@ -275,29 +244,13 @@ not rest on something a user can click past.
 - **Route ordering is strict, with ONE bounded exception.** The swap is always tried first
   because it is cheaper; the hop is reached only when no gateway serves both ends — established
   by examining the whole shared candidate set, not a prefix of it.
-  THE EXCEPTION, stated here because an implementing bead cannot grant itself one: a vetted list
-  is untrusted input and can be grown faster than a bounded per-tick scan retires it, so
-  requiring completed coverage unconditionally lets a hostile guardian stall an evacuation until
-  the federation is gone. If a sweep has not achieved coverage within a budget sized well inside
-  the shutdown detection lead, the hop MAY be taken with coverage incomplete, and the reason MUST
-  be recorded as such.
-  THE HOP CLASS NEEDS ITS OWN BUDGET, because `|source| × |destination|` is untrusted too. A
-  deadline consumed entirely by the shared sweep would leave the hop either unscanned — forcing
-  selection from an arbitrary first window and breaking the largest-net rule — or scanned past
-  expiry, which restores the stall the deadline exists to prevent. Give the hop class its own
-  durable deadline, or reserve a fixed share of the shared one, so whichever class is finally
-  chosen was scanned under a bound. An oversized-hop case belongs in the acceptance criteria.
-  DEFINE THE ANCHOR FOR EVERY EVACUATION TRIGGER, not just the scheduled one. A scheduled shutdown
-  has `federation_expiry_timestamp` to anchor against, but a health-triggered evacuation does not:
-  `FederationStatus` carries `shutdown_notice` and `healthy` as BOOLEANS, with no detection time,
-  and `/status.scheduled_shutdown` is likewise a flag. Without a durable anchor an implementation
-  resets the budget on every restart and postpones the hop forever — the bound becomes fictional,
-  which is the failure this paragraph exists to prevent. So the implementing bead must persist a
-  detection timestamp per evacuation reason and say what the budget's duration is; it cannot be
-  left to "a sweep". This is a deliberate departure from strict ordering and it is bounded by
-  the same principle that motivates the fallback in the first place: during an evacuation a worse
-  counterparty beats stranding the balance. It is NOT a licence to hop on a partial scan in the
-  ordinary case — absent the deadline, coverage is required. No reputation or liquidity bar gates the
+  THE EXCEPTION: an honest vetted list fits in one bounded scan, but a guardian can inject
+  entries without bound, so the per-tick scan is capped and a longer list is scanned truncated —
+  the hop is therefore reachable without every shared candidate having been examined. A bounded,
+  deliberate departure: the residual is a dearer route, still capped and viability-checked, never
+  a stranding, and during an evacuation a worse counterparty beats stranding the balance. It is
+  NOT a licence to hop while an examined candidate serves.
+  No reputation or liquidity bar gates the
   fallback: during an evacuation a worse counterparty beats stranding the balance, and every extra
   bar is another way the escape hatch fails to open.
 - **Neither change makes evacuation reliable**, and no document should claim it does. The honest

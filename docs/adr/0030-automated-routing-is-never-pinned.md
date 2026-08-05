@@ -205,12 +205,8 @@ check the implementing bead owns, not a fact this ADR may assume.
   the executor quotes `routing_info`, then `MultiClient::pay` has lnv2 `send` fetch `routing_info`
   AGAIN before committing the contract, with no post-commit local cap re-check. A hostile gateway
   can therefore answer cheaply at quote time and dearly at commit time, and the pinned SDK's
-  lexicographic `PaymentFee` comparison will not catch the second answer THROUGH THE PPM CHANNEL.
-  Split it, as ADR-0029 requires wherever this is cited: a commit-time answer that turns dear via
-  its BASE *is* caught — `send_fee.le(&SEND_FEE_LIMIT)` refuses a base above 100 sats at commit
-  (`fedimint-lnv2-client/src/lib.rs:590`), receive above 50 at `:905`. Only the ppm passes,
-  because the derived comparison is lexicographic on `base` first. The unsplit phrasing overstates
-  the residual. RESIDUAL, stated rather
+  lexicographic `PaymentFee` comparison will not catch the second answer.
+  RESIDUAL, stated rather
   than papered over: the cap bounds what the wallet will knowingly agree to, not what a gateway
   outside the vetted list can charge between quote and commit. Vetting is what normally covers
   that, which is precisely what the break-glass sets aside. What an operator overrides is the
@@ -228,18 +224,10 @@ check the implementing bead owns, not a fact this ADR may assume.
   how many peers LACK each URL, so a one-guardian entry sorts last and a wallet taking the first
   serving candidate will normally prefer a widely-vetted one. It is a preference, not a bound —
   if the better-vetted gateways do not serve, the one-guardian entry is reachable.
-  **AND THIS MITIGATION DOES NOT SURVIVE br-s0e.** That bead selects by LARGEST SIZED EXECUTED NET
-  over everything examined once the sweep completes — an objective with no support term — so
-  traversal order stops affecting the outcome: a one-guardian gateway quoting the largest
-  executable net wins outright over a widely-vetted one. That is defensible for evacuation
-  specifically (ADR-0029 accepts a worse counterparty over stranding, and the legs stay
-  hash-locked), but the breadth-of-vetting preference then survives only where a deadline
-  truncates the sweep. Recorded here so the threshold-supported-membership follow-up is understood
-  as MORE urgent once br-s0e lands, not less.
-  Combined with the quote-then-commit gap above, that is the one place where "the cap is the
-  backstop" and "vetting covers the rest" are both weaker than they sound. Closing it needs
-  threshold-supported membership (query per-peer, require k-of-n) — a client-side change, named
-  here as the follow-up rather than assumed away.
+  Selection by largest sized net carries no support term, so once a scan covers the class this
+  preference stops deciding anything — which is why threshold-supported membership is the real
+  fix and is named as the follow-up.
+
 
 - **Restoring automated movement after a vetted-list failure is guardian-side.** `gateways add`
   is a per-guardian authenticated write, not a consensus item
@@ -247,24 +235,9 @@ check the implementing bead owns, not a fact this ADR may assume.
   peer replies — so it must be run against *every* guardian or the gateway appears
   nondeterministically. An operator with no guardian cooperation cannot repair the list at all;
   the break-glass moves money in the meantime, it does not fix the federation.
-- **Devimint smokes must register rather than pin — THIRTEEN of fifteen.** Five set the daemon
-  pin (daemon, soak, responsiveness, recover, daemon_chain). Eight more append `--gateway` from a
-  helper to verbs that now reject it (probe, tick, discover, evacuate, history, crash_move,
-  directinflow, move). Only `smoke_money` and `smoke_devimint.sh` are untouched.
-  THE TWO REASONS OVERLAP: `daemon_chain` (`:99`), `soak` (`:105`) and `responsiveness` (`:109`)
-  each call `wsa discover` through a `--gateway` helper as well as setting the daemon pin, so
-  three of the five need BOTH fixes. Converting one of them by swapping the `walletd.toml` pin
-  for registration and leaving the helper alone yields a hard failure on `discover` — which is
-  this section's own warning, committed against this section's own measurement. Only `daemon`
-  and `recover` are pin-only.
-  This count has been wrong five times — "five of fourteen", "ten of fifteen", a stale acceptance
-  criterion, "14 of the 15" propagated into this ADR and back into the bead, and this
-  reason-overlap miss — each time because the split was restated without being re-measured. Re-measure
-  it whenever the rejection list changes: a global `--gateway` on a helper means a script cannot
-  be judged by which pin it sets, which is exactly how "five change, nine are untouched" went
-  wrong. This finally gives the
-  registered-scan path live coverage — today every smoke that routes at all pins, so the code
-  production actually runs has none.
+- **Every devimint smoke that routes today pins.** `br-remove-gateway-pin-yjw` carries the
+  measured split and converts them; it is the single authority for that count, which has drifted
+  every time it was restated in two places.
 - **The responsiveness gate is the awkward case.** It pins a never-responding double *because* the
   pin skips validation. Converting it to the vetted list means the double must answer
   `routing_info` and hang only on payment endpoints, which in turn breaks its accept-level timing
