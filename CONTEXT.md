@@ -174,7 +174,7 @@ validates endpoints without re-testing the source federation's list — and it b
 the evacuation-hop work closes that gap. Until then, do not cite this entry as though the
 membership half holds.
 Sizing decides the amount; the hint check decides whether to keep the route it was priced
-against. Reading "still serves" as "re-run the affordability search" would price every candidate
+against. Reading "still holds" as "re-run the affordability search" would price every candidate
 twice — but dropping the membership half is worse: a hint priced before the source federation
 revoked that gateway would keep routing money outside the vetted list, which is exactly what
 ADR-0030 forbids.
@@ -182,9 +182,9 @@ ADR-0030 forbids.
 A hint names a whole route, not a gateway — so its shape follows the **route kind**.
 For a **shared route** that is one gateway, judged against the two-federation
 predicate. For a **hop** it is two gateway identities plus the kind, each leg judged
-against its own end. A hint is only usable if the route it names still serves in the
-same shape it was priced in: a shared hint whose gateway now serves one end has not
-become a hop hint, it has stopped serving.
+against its own end. A hint is only usable if the route it names still **holds** in the same
+shape it was priced in: a shared hint whose gateway is now vetted-and-valid for one end only has
+not become a hop hint — it has stopped holding.
 
 **Once an operation has committed, the route should stop being a hint** — a recorded route
 replayed as persisted, without re-resolution, since otherwise a restart can pay through a

@@ -18,5 +18,12 @@ gateway-independent escape) is pulled into EARLY v2.
   and this is spending money.
 - The cap must be ENFORCED (refuse or warn above threshold), not relied on as copy
   (CEO finding #3: "spending wallet only" will not constrain behavior on its own).
+  **OPEN — "or warn" is not sufficient for the use ADR-0029 makes of this cap.** ADR-0029:183
+  calls this low cap "the real mitigation" for a correlated federation+gateway death. A warning
+  that the user can proceed past leaves the balance uncapped, so the loss is not capped and that
+  reliance is false. Decide explicitly, do not let the ambiguity ride into implementation:
+  either REFUSE wallet-controlled balance increases above the threshold (and accept the
+  user-visible rejection), or keep warn-only and strike ADR-0029's claim that the cap mitigates
+  anything. This ADR's own "Caps loss" consequence above assumes the first.
 - The per-federation balance/data model must support the cap and the
   stranded-funds UI from v1.

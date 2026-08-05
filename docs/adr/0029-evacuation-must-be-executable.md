@@ -68,13 +68,16 @@ no attempt budget and no fee accounting, so a 75,000-sat balance drains in ~365 
 delivering ~1,825 sats and burning ~73,000, a 97% loss. That is not slow-but-safe; it is the
 evacuation destroying the balance it exists to rescue. It needs a hostile or misconfigured gateway
 (base just under 200 sats, ppm above the 3% slope), which the pinned SDK's fee limits do not
-prevent; on the measured pilot gateway at 1.78% the same mechanism drains in ONE operation. No second
-chunk can be emitted, but NOT because the bisection residual is small: the search may undershoot
-the true maximum by up to ~`2A`, which br-y2j prices at up to ~18,000 msat at eleven mint tiers —
-above the 5,000-msat contract floor, so that bound proves nothing here. The reason is that a
-second chunk's SOURCE DEBIT is a 5-sat net grossed up plus both legs' fees, which is already
-≳13,000 msat at pilot fees and so exceeds any residual the search can leave. The implementing
-bead pins the exact expected net as a red/green fixture.
+prevent; on the measured pilot gateway at 1.78% the same mechanism is EXPECTED to drain in one operation.
+That expectation is EMPIRICAL, not derived, and this ADR previously claimed a derivation twice
+over — both wrong, recorded here so neither is reconstructed. The `2A` robustness contract in
+br-y2j is a FEE-SLACK guarantee; it does not bound how far the selected net sits below the true
+maximum, so it cannot bound the leftover balance at all. And even read as an amount bound, ~18,000
+msat at eleven tiers EXCEEDS the ~13,000-msat minimum source debit of a second chunk, so it would
+not exclude one. What actually holds: whether a second chunk is emitted is a MEASURED property of
+the sized amount, which the implementing bead pins as a red/green fixture, and if one is emitted
+the economic-viability post-check bounds its damage rather than the chunk being free to strand
+97% of the balance. Do not restate the one-operation property as a consequence of `2A`.
 
 **So serving requires ECONOMIC viability: `total_fee <= executed net`.** A route whose best
 available chunk costs more than it delivers does not serve, strict ordering falls through to the
@@ -177,7 +180,9 @@ some gateway". That is a genuinely weaker requirement, it is Lightning-only so
 gateway is down, or if no gateway on either side has liquidity, so it reduces the probability of
 stranding without making evacuation reliable. Treating it as reliable would justify raising the
 per-federation cap, and that is the change that could actually lose money if the assumption proves
-optimistic. ADR-0018's low cap remains the real mitigation.
+optimistic. ADR-0018's low cap remains the real mitigation — CONDITIONALLY: ADR-0018 permits
+enforcement by "refuse or warn", and warn-only does not cap anything a user can click past. That
+choice is flagged OPEN in ADR-0018's Consequences; this sentence holds only under refusal.
 
 ## Consequences
 

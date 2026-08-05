@@ -65,9 +65,18 @@ flag, and `await_standalone`'s recovery is SCOPED TO THE REQUESTED KEY instead o
 everything. That removes the *wholesale* hazard, but not all of it: if the requested key names a
 scheduler- or allocator-created `Move` or `Evacuate`, scoping still re-drives THAT automated
 intent through an executor carrying the override. So the override applies only when the target
-intent was USER-INITIATED; awaiting an allocator's own operation must not carry it. With that,
-the rule follows the principle above — awaiting one named operation *is* a human directing a
-specific payment, but only when the payment was theirs to direct.
+intent was USER-INITIATED; awaiting an allocator's own operation must not carry it.
+
+**Do not implement "user-initiated" as an `Actor` check.** A manually invoked probe calls
+`active_probe(.., Actor::User)` (`wallet-cli/src/main.rs:1106`) yet stamps its move legs
+`ReasonCode::ActiveProbe` (`wallet-fedimint/src/runtime.rs:2234`) — so an actor test says "user"
+for a leg the probe lane created, and `--gateway await-move <probe-leg-key>` would reopen exactly
+the backdoor this ADR closes. The gate is the leg's REASON CODE plus its being an eligible money
+action, never the actor that triggered the enclosing command. Test it with a manual probe leg,
+because that is the case where the two disagree.
+
+With that, the rule follows the principle above — awaiting one named operation *is* a human
+directing a specific payment, but only when the payment was theirs to direct.
 
 ## Why
 

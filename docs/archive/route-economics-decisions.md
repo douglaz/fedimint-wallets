@@ -139,6 +139,15 @@ that must agree forever.
 ---
 
 ## Implementation bead to create (acceptance handed off)
+
+> **DO NOT IMPLEMENT THIS LIST AS WRITTEN.** It predates ADR-0029 and ADR-0030 and still mandates
+> all three of the decisions the banner at the top of this file supersedes. Specifically, STRIKE:
+> the single `gateway: Option<GatewayUrl>` on `Action::Evacuate` (Q1 — evacuation needs a route
+> KIND plus two identities; it still stands for `Action::Move`), the perform-time
+> hint-with-cap-backstop fallback (Q2 — the hint path must re-check vetted-list MEMBERSHIP, for
+> `Move` as well as `Evacuate`), and the pin-precedence (Q4 — deleted outright; automated routing
+> can never be pinned). The live successors are br-y2j, br-s0e and br-remove-gateway-pin-yjw.
+
 Title: "Implement route_economics_by_pair (per-pair economic move floor)".
 Must carry: the snapshot field + IO population (tick.rs), the cheapest-serving-both-ends gateway
 selection replacing first-validator, the affine-upper-bound `min_viable_amount` with a hard
