@@ -117,7 +117,13 @@ constraint), not silently swallowed.
   is the money backstop (worst case: one move is attempted and fails the cap — bounded,
   self-healing churn, the exact thing the floor reduces but never a money loss).
 - **`Routable`**: floor = `min_viable_amount`.
-- **`Unroutable`** (no gateway serves the pair): skip funding for that pair (cannot route).
+- **`Unroutable`** (STRUCTURAL absence — no gateway on the relevant vetted list validates for
+  the pair): skip funding for that pair (cannot route). NOTE for implementers: do not phrase this
+  as "no gateway **serves** the pair". CONTEXT.md's canonical **Serves** now folds ECONOMIC
+  viability into the word, which would make this branch swallow `UneconomicAtAnySize` below —
+  when the proportional cap sits under the combined fee slope, no amount fits, so no gateway
+  "serves" either. Keep `Unroutable` structural and leave cap/economic exclusion to the next
+  branch, whose whole point is that it must be VISIBLE.
 - **`UneconomicAtAnySize`** (bps set below the gateways' combined ppm): skip funding AND surface
   it VISIBLY (persistent diagnostic / refusal reason). Unlike the deliberately-silent sub-dust
   skip (allocator.rs:222), this silently disables rebalancing for the pair FOREVER and is a
