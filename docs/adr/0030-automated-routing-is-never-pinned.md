@@ -121,7 +121,8 @@ deletes all four questions instead of answering them.
 **The daemon pin's cost was not limited to route selection.** A pinned daemon hands the pin to
 every federation probe; probing then validates only that gateway and never scans the registered
 list (`probe.rs:458`). A failure surfaces as `probed_ok: false`, and the allocator drops
-that federation as an evacuation destination (`allocator.rs:443`, `:475`). So a pin that served
+that federation as an evacuation destination (`allocator.rs:444` — `receive_blocker`'s `probed_ok` gate — and `:475`,
+`eligible_for_evacuation`). So a pin that served
 one end — or a stale one serving neither — meant **no `Action::Evacuate` was ever emitted**, while
 executor-level tests would pass. A knob that can silently disable evacuation has no business
 being a standing configuration.

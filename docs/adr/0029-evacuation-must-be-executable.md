@@ -63,12 +63,24 @@ pair would serve the full drain. The swap still wins, and the source drains in s
 "Chunking is slow, not lossy" is only true once a chunk must deliver at least what it costs, and
 that condition has to be enforced rather than assumed. The cap's BASE component is
 amount-independent, so at the lnv2 contract floor (5 sats) a 200-sat base cap admits a chunk that
-burns 200 sats to move 5. The remainder re-emits every watch cycle with no minimum-progress guard,
-no attempt budget and no fee accounting, so a 75,000-sat balance drains in ~365 such chunks —
-delivering ~1,825 sats and burning ~73,000, a 97% loss. That is not slow-but-safe; it is the
-evacuation destroying the balance it exists to rescue. It needs a hostile or misconfigured gateway
-(base just under 200 sats, ppm above the 3% slope), which the pinned SDK's fee limits do not
-prevent; on the measured pilot gateway at 1.78% the same mechanism is EXPECTED to drain in one operation.
+burns ~150 sats to move 5. The remainder re-emits every watch cycle with no minimum-progress
+guard, no attempt budget and no fee accounting, so a 75,000-sat balance drains in ~480 such
+chunks — delivering ~2,400 sats and burning ~72,600, a ~96% loss. That is not slow-but-safe; it is
+the evacuation destroying the balance it exists to rescue.
+
+**The parameterisation matters, and an earlier draft of this ADR got it wrong.** It said "base
+just under 200 sats", which CANNOT execute at the pin: `PaymentFee` derives a base-first
+lexicographic `PartialOrd` (`gateway_api.rs:190-200`), and the send leg is refused when its fee
+exceeds `SEND_FEE_LIMIT` (base 100 sats — `lnv2-client/src/lib.rs:590`, limit at
+`gateway_api.rs:209`) while the receive leg is refused against `RECEIVE_FEE_LIMIT` (base 50 sats —
+`lib.rs:905`, limit at `gateway_api.rs:223`). A 199-sat-base gateway therefore fails the first
+chunk's receive and the evacuation STRANDS (`Retryable`); it does not burn. What the SDK's limits
+do NOT prevent is the PPM: because the comparison is lexicographic on `base` first, a compliant
+base admits an arbitrary ppm. So the hostile shape that actually executes is bases 99 + 49 = ~148
+sats with ppm far above the 3% slope — which is where the ~150-sat-per-chunk figure above comes
+from. The hazard is undiminished; only the numbers move. State the base/ppm split whenever this
+scenario is cited, because "the fee limits do not prevent it" is true of the ppm and false of the
+base; on the measured pilot gateway at 1.78% the same mechanism is EXPECTED to drain in one operation.
 That expectation is EMPIRICAL, not derived, and this ADR previously claimed a derivation twice
 over — both wrong, recorded here so neither is reconstructed. The `2A` robustness contract in
 br-y2j is a FEE-SLACK guarantee; it does not bound how far the selected net sits below the true
@@ -132,10 +144,13 @@ any candidate clears that predicate:
    (`allocator.rs:629`), so a fresh `Evacuate` is emitted for the remainder. At the figures below
    the federation drains in roughly 27 operations at essentially the same total fee. This is what
    the pilot's MEASURED gateway does.
-2. **Base fees STRICTLY ABOVE the cap → GENUINE REFUSAL. (Exact equality is ADMITTED: the predicate
-is `total_within_cap`, a `<=` comparison, so a quote landing exactly on the cap executes and only
-cap-plus-one-msat refuses. "At or above" would refuse an executable evacuation at the boundary —
-the same off-by-one as the `shortfall <= A` probe rule.)** The base component does not shrink with
+2. **A SUMMED TWO-LEG QUOTE STRICTLY ABOVE the cap → GENUINE REFUSAL.** State it about the
+   QUOTE, not about base fees: `total_within_cap` compares `receive_quote + send_quote <= fee_cap`
+   (`wallet-fedimint/src/fee.rs:163`). Exact equality is ADMITTED — only cap-plus-one-msat
+   refuses, the same boundary as the `shortfall <= A` probe rule. Note the consequence for bases
+   specifically: bases summing to exactly the cap still refuse whenever ANY other component (the
+   ppm parts, federation or mint fees) is nonzero, because the comparison is on the total. "Base
+   fees at or above the cap" is wrong twice over — wrong term, wrong boundary. The base component does not shrink with
    the amount, so if the two legs' bases alone exceed `fee_cap`, NO candidate ever fits and the
    executor returns `Retryable` (`executor.rs:646-653`) on every tick — a livelock, not a terminal
    failure, so it retries silently forever. A gateway is permitted bases summing to ~150 sats
@@ -206,8 +221,18 @@ choice is flagged OPEN in ADR-0018's Consequences; this sentence holds only unde
   See [ADR-0018](./0018-v1-evacuation-balance-cap.md) and the `Stranded` analysis for what remains
   reachable — a Byzantine destination federation, which is the standard custodial assumption and
   is unchanged by route count.
-- **Route ordering is strict.** The swap is always tried first because it is cheaper; the hop is
-  reached only when no gateway serves both ends. No reputation or liquidity bar gates the
+- **Route ordering is strict, with ONE bounded exception.** The swap is always tried first
+  because it is cheaper; the hop is reached only when no gateway serves both ends — established
+  by examining the whole shared candidate set, not a prefix of it.
+  THE EXCEPTION, stated here because an implementing bead cannot grant itself one: a vetted list
+  is untrusted input and can be grown faster than a bounded per-tick scan retires it, so
+  requiring completed coverage unconditionally lets a hostile guardian stall an evacuation until
+  the federation is gone. If a sweep has not achieved coverage within a budget sized well inside
+  the shutdown detection lead, the hop MAY be taken with coverage incomplete, and the reason MUST
+  be recorded as such. This is a deliberate departure from strict ordering and it is bounded by
+  the same principle that motivates the fallback in the first place: during an evacuation a worse
+  counterparty beats stranding the balance. It is NOT a licence to hop on a partial scan in the
+  ordinary case — absent the deadline, coverage is required. No reputation or liquidity bar gates the
   fallback: during an evacuation a worse counterparty beats stranding the balance, and every extra
   bar is another way the escape hatch fails to open.
 - **Neither change makes evacuation reliable**, and no document should claim it does. The honest
