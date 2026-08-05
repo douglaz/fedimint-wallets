@@ -64,8 +64,8 @@ pair would serve the full drain. The swap still wins, and the source drains in s
 that condition has to be enforced rather than assumed. The cap's BASE component is
 amount-independent, so at the lnv2 contract floor (5 sats) a 200-sat base cap admits a chunk that
 burns ~200 sats to move 5. The remainder re-emits every watch cycle with no minimum-progress
-guard, no attempt budget and no fee accounting, so a 75,000-sat balance drains in ~366 such
-chunks — delivering ~1,828 sats and burning ~73,172, a ~97.6% loss. That is not slow-but-safe; it is
+guard, no attempt budget and no fee accounting, so a 75,000-sat balance drains in ~365 such
+chunks — delivering ~1,953 sats and burning ~73,047, a ~97.4% loss. That is not slow-but-safe; it is
 the evacuation destroying the balance it exists to rescue.
 
 **The parameterisation matters, and an earlier draft of this ADR got it wrong.** It said "base
@@ -73,19 +73,35 @@ just under 200 sats", which CANNOT execute at the pin: `PaymentFee` derives a ba
 lexicographic `PartialOrd` (`gateway_api.rs:190-200`), and the send leg is refused when its fee
 exceeds `SEND_FEE_LIMIT` (base 100 sats — `lnv2-client/src/lib.rs:590`, limit at
 `gateway_api.rs:209`) while the receive leg is refused against `RECEIVE_FEE_LIMIT` (base 50 sats —
-`lib.rs:905`, limit at `gateway_api.rs:223`). A 199-sat-base gateway therefore fails the first
-chunk's receive and the evacuation STRANDS (`Retryable`); it does not burn. What the SDK's limits
+`lib.rs:905`, limit at `gateway_api.rs:223`). A 199-sat-base gateway therefore cannot execute, and the evacuation
+STRANDS (`Retryable`) rather than burning. WHICH leg refuses depends on the split, and the
+send-heavy case is the one to reason from: a receive-heavy split (say 49 + 150) fails the receive
+limit before anything commits, but a send-heavy split (say 149 + 50) PASSES the receive limit,
+mints and commits the receive leg, and strands at the send-limit check — with a committed receive
+already outstanding. Either way some leg of a 199-sat total must exceed its limit, since the
+compliant maximum is 100 + 50. What the SDK's limits
 do NOT prevent is the PPM: because the comparison is lexicographic on `base` first, a compliant
 base admits an arbitrary ppm.
 
-So the executable hostile shape is **bases 99 + 49 = 148 sats with ppm ≈ 10,430,000**, and the
-~200 sats burned per chunk is the BASE PLUS THE PPM TERM, not a 200-sat base. Derivation, because
-the numbers must be reproducible: a chunk fits while `148 + r·n ≤ 200 + 0.03·n`, so the largest
-fitting net is `n* = 52/(r − 0.03)`; the sizing search returns that maximum, so `r ≈ 1043%` gives
-`n* = 5` sats at a fee of ~200 sats, a source debit of ~205, and `75,000/205 ≈ 366` chunks.
-NOTE the viability threshold is far below that: `fee(n*) > n*` only for `r > ~28.2%`
-(ppm ≈ 282,200). "Ppm far above the 3% slope" does NOT characterise the hazard — at 10% the route
-is economically VIABLE and a refusal assertion would fail. Any fixture must pin both numbers.
+So the executable hostile shape is **bases 99 + 49 = 148 sats with an ASYMMETRIC, SEND-HEAVY ppm
+split: send 940,000 ppm, receive 10,000 ppm**, and the ~200 sats burned per chunk is the BASE
+PLUS THE PPM TERM, not a 200-sat base.
+
+Derivation, because the numbers must be reproducible AND because two earlier revisions got this
+wrong by charging the ppm against the NET. **Gateway fees are charged on the GROSS invoice**, not
+on what the recipient nets: `contract = invoice − recv_gateway.on(invoice)`
+(`wallet-fedimint/src/fee.rs:174-181`, matching the SDK's `subtract_from`). Writing `a` for the
+gross invoice, `n = a − (rb + rp·a)` and the source debit is `a + sb + sp·a`, so
+`total_fee = (sb + rb) + (sp + rp)·a` while the cap is `cap_base + bps·n` — fee proportional to
+GROSS, cap proportional to NET. Two consequences that killed the earlier fixtures: a combined ppm
+above 1,000,000 is IMPOSSIBLE (it drives the contract negative, so nothing is deliverable at all),
+and the receive ppm shrinks the contract directly, so the hostile split must load the ppm onto the
+SEND leg. At send 940,000 / receive 10,000 the largest cap-fitting invoice is ~54.9 sats,
+delivering `n ≈ 5.35` sats for a ~200-sat fee against a ~200.16-sat cap, a source debit of ~205,
+and `75,000/205 ≈ 365` chunks — ~1,953 sats delivered, ~73,047 burned, ~97.4%.
+A SYMMETRIC split does not reproduce this: at 150,000/150,000 the largest fitting chunk nets
+~107 sats and the loss is ~65% — still a viability failure, but not the headline. Any fixture
+must pin BOTH ppms, not a combined figure.
 The hazard is undiminished; only its attribution moves. State the base/ppm split whenever this
 scenario is cited, because "the fee limits do not prevent it" is true of the ppm and false of the
 base; on the measured pilot gateway at 1.78% the same mechanism is EXPECTED to drain in one operation.

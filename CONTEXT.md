@@ -247,15 +247,17 @@ _Avoid_: implying funds "bounce back" if not claimed quickly
 **Operation**:
 The user-facing unit of wallet activity — a pay, receive, move, join, probe —
 identified by its **operation key** and listed by `history`. Every API/CLI/app
-surface speaks of operations; EXECUTABLE operations — money ones and `join` —
-are driven internally by an **Intent**.
+surface speaks of operations; EXECUTABLE operations are driven internally by an
+**Intent** — the money ones, and also `join` and `recover`
+(`wallet-cli/src/main.rs:1394-1400`, `wallet-fedimint/src/executor.rs:1258`).
 _Avoid_: "intent" in any user-facing surface, "transaction"
 
 **Intent**:
 The internal durable, executable record inside an executable **Operation**'s
 lifecycle: an idempotency-keyed decision driven Pending → Executing → terminal,
-crash-resumable via reconcile. NOT money-only — `Action::Join` is an `Intent`
-too (`wallet-fedimint/src/runtime.rs:1025-1030`), which is why ADR-0030's await
+crash-resumable via reconcile. NOT money-only — `Action::Join`
+(`wallet-fedimint/src/runtime.rs:1025-1030`) and `Action::Recover` are `Intent`s
+too, which is why ADR-0030's await
 provenance rule has to distinguish "user-initiated" from "resolves a route"
 rather than treating those as the same test. Never appears in API type names or user copy.
 _Avoid_: exposing "intent" outside the engine

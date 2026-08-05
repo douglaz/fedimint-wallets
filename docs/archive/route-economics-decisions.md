@@ -137,6 +137,10 @@ fallback only for the genuinely-absent case (proposal A), so neither swallows th
 takes the FIRST validating gateway with no fee comparison (executor.rs:269-272), while
 raw-receive scans for `lowest_quote` (executor.rs:964-989). Since computing the per-pair floor
 already quotes every validating gateway's fees, selecting the cheapest is free (same quotes):
+**[SCOPED TO `Move` BY ADR-0029 — for evacuation this objective is superseded: br-s0e picks the
+LARGEST SIZED EXECUTED NET, because draining in as few operations as the route permits beats
+paying least per operation, and candidates are now sized individually. Cheapest-first remains
+correct for routine `Move`.]**
 `resolved_gateway` := argmin over gateways serving BOTH ends of combined (fed+gateway) fee. This
 simultaneously (a) removes the asymmetry, (b) gives the Q1 preselected gateway real economic
 meaning, and (c) is the value the Q2 fallback re-resolves to. Folding it in avoids two passes

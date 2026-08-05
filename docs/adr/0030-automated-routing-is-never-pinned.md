@@ -105,6 +105,16 @@ miss:
 Refusal is reserved for automated provenance. Do not refuse merely because an intent is not a
 money action.
 
+**`ReasonCode` is a caller-supplied field, so it is a DISPATCH rule, not a security boundary.**
+An in-process caller can stamp an allocator-shaped `Move` — or an `Evacuate` — `UserInitiated`
+and the reason-code check will then apply the override. That is not the structural guarantee this
+ADR asks for above, and the two must not be confused: the reason code decides what an
+already-authorised override applies to; it cannot decide whether the caller was entitled to one.
+The entitlement has to come from something a caller cannot forge — the override travelling as a
+money-only capability or type that only the money-verb construction path can produce, rather than
+as an `Option<GatewayUrl>` any constructor may pass. Build that, and the reason-code rule becomes
+what it should be: routing logic on top of a boundary that already holds.
+
 With that, the rule follows the principle above — awaiting one named operation *is* a human
 directing a specific payment, but only when the payment was theirs to direct.
 
@@ -171,7 +181,12 @@ check the implementing bead owns, not a fact this ADR may assume.
   the executor quotes `routing_info`, then `MultiClient::pay` has lnv2 `send` fetch `routing_info`
   AGAIN before committing the contract, with no post-commit local cap re-check. A hostile gateway
   can therefore answer cheaply at quote time and dearly at commit time, and the pinned SDK's
-  lexicographic `PaymentFee` comparison will not catch the second answer. RESIDUAL, stated rather
+  lexicographic `PaymentFee` comparison will not catch the second answer THROUGH THE PPM CHANNEL.
+  Split it, as ADR-0029 requires wherever this is cited: a commit-time answer that turns dear via
+  its BASE *is* caught — `send_fee.le(&SEND_FEE_LIMIT)` refuses a base above 100 sats at commit
+  (`fedimint-lnv2-client/src/lib.rs:590`), receive above 50 at `:905`. Only the ppm passes,
+  because the derived comparison is lexicographic on `base` first. The unsplit phrasing overstates
+  the residual. RESIDUAL, stated rather
   than papered over: the cap bounds what the wallet will knowingly agree to, not what a gateway
   outside the vetted list can charge between quote and commit. Vetting is what normally covers
   that, which is precisely what the break-glass sets aside. What an operator overrides is the
