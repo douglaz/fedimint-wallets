@@ -14,7 +14,8 @@ Two rules, drawn along a line the code did not previously have:
    vetted-list membership and the serves-check, though not the operation's own liveness check or
    the fee cap (see Consequences). Three dispositions, because "money verbs only" and a five-verb reject list are *different sets*
    and the gap between them is where implementations diverge:
-   - **Accepted** on the verbs that route at an operator's direction: the money verbs — and this
+   - **Accepted** on the verbs that route at an operator's direction: the four money verbs plus the provenance-eligible await verbs ("money verbs only" is shorthand
+     that understates the accepted set: await verbs are eligible, they are not money verbs) — and this
      ADR must name them, since its own thesis is that unenumerated sets diverge — `pay`,
      `receive`, `move`, `direct-inflow`; plus the await verbs once their recovery is scoped and
      provenance-gated (see below). `direct-inflow` is the classification an implementer is most
@@ -35,8 +36,11 @@ and is the thing a future reader will otherwise assume was an oversight.
 
 **Rule 1 binds the API, not just the CLI.** Rejecting `--gateway` on the automated verbs closes
 the operator-facing door; it does not close the door itself. An in-process caller can still build
-`Runtime::new(.., Some(gateway), ..)` and call the public `tick`, and route preflight selects that
-pin (`runtime.rs:3127-3129`), forwarding it to the executor. Since this rule is stated
+`Runtime::new(.., Some(gateway), ..)` and call the public `tick`. Route preflight also consults
+that pin (`runtime.rs:3127-3129`), but it only produces a routability verdict and forwards
+nothing; the pin reaches EXECUTION through `Runtime::executor()`, which builds
+`FedimintExecutor::new(.., self.pinned_gateway.clone(), ..)` (`runtime.rs:592-596`) — that handoff,
+not the preflight branch (which change 3 deletes), is what a structural gate must cover. Since this rule is stated
 independently of process, the enforcement has to be there too: the automated entry points must
 reject or clear an override, or the break-glass must live on a money-only runtime type that the
 automated ones cannot carry. Whichever shape ships, it needs a test at that boundary — a CLI-level
@@ -204,6 +208,14 @@ check the implementing bead owns, not a fact this ADR may assume.
   how many peers LACK each URL, so a one-guardian entry sorts last and a wallet taking the first
   serving candidate will normally prefer a widely-vetted one. It is a preference, not a bound —
   if the better-vetted gateways do not serve, the one-guardian entry is reachable.
+  **AND THIS MITIGATION DOES NOT SURVIVE br-s0e.** That bead selects by LARGEST SIZED EXECUTED NET
+  over everything examined once the sweep completes — an objective with no support term — so
+  traversal order stops affecting the outcome: a one-guardian gateway quoting the largest
+  executable net wins outright over a widely-vetted one. That is defensible for evacuation
+  specifically (ADR-0029 accepts a worse counterparty over stranding, and the legs stay
+  hash-locked), but the breadth-of-vetting preference then survives only where a deadline
+  truncates the sweep. Recorded here so the threshold-supported-membership follow-up is understood
+  as MORE urgent once br-s0e lands, not less.
   Combined with the quote-then-commit gap above, that is the one place where "the cap is the
   backstop" and "vetting covers the rest" are both weaker than they sound. Closing it needs
   threshold-supported membership (query per-peer, require k-of-n) — a client-side change, named
@@ -243,7 +255,7 @@ check the implementing bead owns, not a fact this ADR may assume.
   production constructor passes `gateway: None` (`wallet-cli/src/main.rs:1460`, `:1545`;
   `wallet-daemon/src/handlers.rs:313`, `:382`), and the only code that can set `Some` has no
   production callers. The flag reaches the money verbs through the executor's fallback,
-  `gateway.clone().or_else(|| self.pinned_gateway.clone())` (`executor.rs:1024`, `:1137`), whose
+  `gateway.clone().or_else(|| self.pinned_gateway.clone())` (`executor.rs:1024`, `:1135`), whose
   own comment records the choice: "The pin is deliberately NOT journaled into the intent, so a
   pin change applies to re-drives after a restart" (`executor.rs:1019-1021`).
   That is the correct semantic for an incident override — it applies to the invocation and to

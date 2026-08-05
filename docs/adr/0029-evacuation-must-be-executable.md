@@ -93,10 +93,13 @@ on what the recipient nets: `contract = invoice − recv_gateway.on(invoice)`
 (`wallet-fedimint/src/fee.rs:174-181`, matching the SDK's `subtract_from`). Writing `a` for the
 gross invoice, `n = a − (rb + rp·a)` and the source debit is `a + sb + sp·a`, so
 `total_fee = (sb + rb) + (sp + rp)·a` while the cap is `cap_base + bps·n` — fee proportional to
-GROSS, cap proportional to NET. Two consequences that killed the earlier fixtures: a combined ppm
-above 1,000,000 is IMPOSSIBLE (it drives the contract negative, so nothing is deliverable at all),
-and the receive ppm shrinks the contract directly, so the hostile split must load the ppm onto the
-SEND leg. At send 940,000 / receive 10,000 the largest cap-fitting invoice is ~54.9 sats,
+GROSS, cap proportional to NET. Two consequences that killed the earlier fixtures. First, solvability is governed by the RECEIVE
+ppm ALONE, not the combined figure: the contract is `a − (rb + rp·a)`, so `rp ≥ 1,000,000` leaves
+nothing deliverable at any invoice size, while a send ppm above 1,000,000 is perfectly solvable —
+it merely inflates the source debit, and is caught downstream by the `total_fee ≤ n` viability
+check rather than by solvability. Do not state a COMBINED-ppm solvability threshold; an earlier
+revision did. Second, the receive ppm shrinks the contract directly, so a hostile split that still
+delivers something must load its ppm onto the SEND leg. At send 940,000 / receive 10,000 the largest cap-fitting invoice is ~54.9 sats,
 delivering `n ≈ 5.35` sats for a ~200-sat fee against a ~200.16-sat cap, a source debit of ~205,
 and `75,000/205 ≈ 365` chunks — ~1,953 sats delivered, ~73,047 burned, ~97.4%.
 A SYMMETRIC split does not reproduce this: at 150,000/150,000 the largest fitting chunk nets
