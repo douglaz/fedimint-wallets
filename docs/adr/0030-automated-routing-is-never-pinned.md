@@ -18,7 +18,11 @@ Two rules, drawn along a line the code did not previously have:
      that understates the accepted set: await verbs are eligible, they are not money verbs) — and this
      ADR must name them, since its own thesis is that unenumerated sets diverge — `pay`,
      `receive`, `move`, `direct-inflow`; plus the await verbs once their recovery is scoped and
-     provenance-gated (see below). `direct-inflow` is the classification an implementer is most
+     provenance-gated (see below) — and NAME THEM, for the same reason the money verbs are named:
+     `await-receive`, `await-send`, `await-move` (`wallet-cli/src/main.rs:175`, `:184`, `:211`).
+     `await-move` is the one every example uses, so an implementation accepting only it would pass
+     a careless review while leaving an operator unable to re-drive a break-glass `pay` or
+     `receive`. Test all three. `direct-inflow` is the classification an implementer is most
      likely to get wrong: it reads like plumbing, but it funds a federation and most devimint
      smokes fund through it, so putting it in either other bucket breaks the funding step.
      CONTEXT.md carries the same four under **Money verb**.

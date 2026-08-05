@@ -14,7 +14,11 @@ post br-ljj.2 and have not been re-verified since.
 >
 > **Q1 is superseded for `Evacuate` only.** It mandates a single `Option<GatewayUrl>` on
 > `Action::Evacuate`; ADR-0029 gives evacuation a two-gateway hop, so it needs a route KIND plus
-> two identities. Q1 still holds for `Move` and for the shared-route case.
+> two identities. Q1 still holds for `Move`. It does NOT survive for evacuation's shared-route
+> case either: a shared evacuation route is a route KIND whose shared variant happens to carry one
+> gateway identity, which is not the same as Q1's raw `Option<GatewayUrl>` field on
+> `Action::Evacuate` — the handoff banner further down strikes that field outright, and these two
+> statements must not drift apart again.
 >
 > **Q2 is superseded for BOTH.** Its rule — "use `action.gateway` iff it still validates" — is an
 > ENDPOINT-ONLY check (`gateway_serves_route`, `wallet-fedimint/src/executor.rs:459-469`, which

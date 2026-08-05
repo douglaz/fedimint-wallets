@@ -92,8 +92,12 @@ wrong by charging the ppm against the NET. **Gateway fees are charged on the GRO
 on what the recipient nets: `contract = invoice − recv_gateway.on(invoice)`
 (`wallet-fedimint/src/fee.rs:174-181`, matching the SDK's `subtract_from`). Writing `a` for the
 gross invoice, `n = a − (rb + rp·a)` and the source debit is `a + sb + sp·a`, so
-`total_fee = (sb + rb) + (sp + rp)·a` while the cap is `cap_base + bps·n` — fee proportional to
-GROSS, cap proportional to NET. Two consequences that killed the earlier fixtures. First, solvability is governed by the RECEIVE
+`gateway_fee = (sb + rb) + (sp + rp)·a` while the cap is `cap_base + bps·n` — fee proportional to
+GROSS, cap proportional to NET. That equation is the GATEWAY SUBTOTAL only: the actual cap and
+viability comparisons run on the complete receive and send quotes, which also carry the two
+federation fees and the per-note mint fee, each flooring independently (see the robustness
+contract below). The fixtures here set those to negligible so the gateway arithmetic is legible;
+an implementation must not. Two consequences that killed the earlier fixtures. First, solvability is governed by the RECEIVE
 ppm ALONE, not the combined figure: the contract is `a − (rb + rp·a)`, so `rp ≥ 1,000,000` leaves
 nothing deliverable at any invoice size, while a send ppm above 1,000,000 is perfectly solvable —
 it merely inflates the source debit, and is caught downstream by the `total_fee ≤ n` viability
@@ -113,7 +117,9 @@ over — both wrong, recorded here so neither is reconstructed. The `2A` robustn
 br-y2j is a FEE-SLACK guarantee; it does not bound how far the selected net sits below the true
 maximum, so it cannot bound the leftover balance at all. And even read as an amount bound, ~18,000
 msat at eleven tiers EXCEEDS the ~13,000-msat minimum source debit of a second chunk, so it would
-not exclude one. What actually holds: whether a second chunk is emitted is a MEASURED property of
+not exclude one — and ~18,000 is only the ZERO-PROPORTIONAL BASELINE, since br-y2j's full `A`
+adds `2*ceil(V_max * mint_ppm / 1e6)`, which scales with the denomination crossed and can dominate
+the tier term outright. What actually holds: whether a second chunk is emitted is a MEASURED property of
 the sized amount, which the implementing bead pins as a red/green fixture, and if one is emitted
 the economic-viability post-check bounds its damage rather than the chunk being free to strand
 97% of the balance. Do not restate the one-operation property as a consequence of `2A`.
@@ -262,7 +268,13 @@ not rest on something a user can click past.
   requiring completed coverage unconditionally lets a hostile guardian stall an evacuation until
   the federation is gone. If a sweep has not achieved coverage within a budget sized well inside
   the shutdown detection lead, the hop MAY be taken with coverage incomplete, and the reason MUST
-  be recorded as such. This is a deliberate departure from strict ordering and it is bounded by
+  be recorded as such.
+  THE HOP CLASS NEEDS ITS OWN BUDGET, because `|source| × |destination|` is untrusted too. A
+  deadline consumed entirely by the shared sweep would leave the hop either unscanned — forcing
+  selection from an arbitrary first window and breaking the largest-net rule — or scanned past
+  expiry, which restores the stall the deadline exists to prevent. Give the hop class its own
+  durable deadline, or reserve a fixed share of the shared one, so whichever class is finally
+  chosen was scanned under a bound. An oversized-hop case belongs in the acceptance criteria. This is a deliberate departure from strict ordering and it is bounded by
   the same principle that motivates the fallback in the first place: during an evacuation a worse
   counterparty beats stranding the balance. It is NOT a licence to hop on a partial scan in the
   ordinary case — absent the deadline, coverage is required. No reputation or liquidity bar gates the
