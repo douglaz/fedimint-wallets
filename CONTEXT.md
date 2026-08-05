@@ -140,10 +140,11 @@ what let a break-glass be mistaken for a routing policy.
 **Money verb**:
 A `wallet-cli` subcommand that moves value on behalf of the human running it, as opposed to one
 that observes state or drives the automated lanes. Exactly four: `pay`, `receive`, `move`,
-`direct-inflow`. These are the ONLY verbs the **break-glass gateway override** is accepted on
-(the await verbs also keep the flag, under the provenance rule in ADR-0030, but they complete an
-existing payment rather than starting one). `direct-inflow` is the one an implementer is most
-likely to misclassify — it reads like plumbing, but it funds a federation and most devimint
+`direct-inflow`. These are the only verbs that INITIATE movement, and the
+**break-glass gateway override** is accepted on them. The await verbs also accept and carry it,
+under the provenance rule in ADR-0030, because they complete a payment a human already started —
+so the accepted set is "the four money verbs plus the eligible await verbs", not the four
+alone. `direct-inflow` is the one an implementer is most likely to misclassify — it reads like plumbing, but it funds a federation and most devimint
 smokes fund through it, so classifying it as rejected or ignored breaks the funding step.
 
 **Vetted list**:

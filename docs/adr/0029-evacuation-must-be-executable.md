@@ -132,7 +132,10 @@ any candidate clears that predicate:
    (`allocator.rs:629`), so a fresh `Evacuate` is emitted for the remainder. At the figures below
    the federation drains in roughly 27 operations at essentially the same total fee. This is what
    the pilot's MEASURED gateway does.
-2. **Base fees at or above the cap → GENUINE REFUSAL.** The base component does not shrink with
+2. **Base fees STRICTLY ABOVE the cap → GENUINE REFUSAL. (Exact equality is ADMITTED: the predicate
+is `total_within_cap`, a `<=` comparison, so a quote landing exactly on the cap executes and only
+cap-plus-one-msat refuses. "At or above" would refuse an executable evacuation at the boundary —
+the same off-by-one as the `shortfall <= A` probe rule.)** The base component does not shrink with
    the amount, so if the two legs' bases alone exceed `fee_cap`, NO candidate ever fits and the
    executor returns `Retryable` (`executor.rs:646-653`) on every tick — a livelock, not a terminal
    failure, so it retries silently forever. A gateway is permitted bases summing to ~150 sats

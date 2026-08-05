@@ -67,13 +67,34 @@ scheduler- or allocator-created `Move` or `Evacuate`, scoping still re-drives TH
 intent through an executor carrying the override. So the override applies only when the target
 intent was USER-INITIATED; awaiting an allocator's own operation must not carry it.
 
+**The API boundary has THREE automated entry points, not two.** Beyond `tick` and `reconcile`,
+a caller holding `Runtime::new(.., Some(gateway), ..)` can invoke public `active_probe`, whose
+two legs go through `do_move` on an executor built from `self.pinned_gateway`
+(`wallet-fedimint/src/runtime.rs:593`, `:1758-1766`, `:2190-2220`). Rule 1 binds all three. An
+implementation that rejects or clears the override at each entry point must cover `active_probe`
+too; separating the override structurally so no automated path can receive it discharges all
+three at once and is the better answer.
+
 **Do not implement "user-initiated" as an `Actor` check.** A manually invoked probe calls
 `active_probe(.., Actor::User)` (`wallet-cli/src/main.rs:1106`) yet stamps its move legs
 `ReasonCode::ActiveProbe` (`wallet-fedimint/src/runtime.rs:2234`) — so an actor test says "user"
 for a leg the probe lane created, and `--gateway await-move <probe-leg-key>` would reopen exactly
-the backdoor this ADR closes. The gate is the leg's REASON CODE plus its being an eligible money
-action, never the actor that triggered the enclosing command. Test it with a manual probe leg,
-because that is the case where the two disagree.
+the backdoor this ADR closes. The gate is the leg's REASON CODE, never the actor that triggered
+the enclosing command. Test it with a manual probe leg, because that is the case where the two
+disagree.
+
+THREE outcomes, not two — the target's provenance decides which, and the middle one is easy to
+miss:
+  - `ReasonCode::UserInitiated` on an intent that RESOLVES A ROUTE → the override APPLIES.
+  - `ReasonCode::UserInitiated` on an intent that resolves no route (a `Join`,
+    `wallet-fedimint/src/runtime.rs:1025-1030`) → the override APPLIES AND NO-OPS. This mirrors
+    the Ignored bucket at the verb level and it is load-bearing: `smoke_money`'s `join_fed`
+    helper runs `await-move <join-key>` through a `--gateway` helper
+    (`wallet-cli/tests/smoke_money_devimint.sh:74`, `:77-79`), so refusing here breaks one of the
+    two smokes this ADR promises stay untouched.
+  - Any AUTOMATED reason code (`ActiveProbe`, allocator- or scheduler-stamped) → REFUSED, loudly.
+Refusal is reserved for automated provenance. Do not refuse merely because an intent is not a
+money action.
 
 With that, the rule follows the principle above — awaiting one named operation *is* a human
 directing a specific payment, but only when the payment was theirs to direct.
@@ -100,7 +121,7 @@ deletes all four questions instead of answering them.
 **The daemon pin's cost was not limited to route selection.** A pinned daemon hands the pin to
 every federation probe; probing then validates only that gateway and never scans the registered
 list (`probe.rs:458`). A failure surfaces as `probed_ok: false`, and the allocator drops
-that federation as an evacuation destination (`allocator.rs:437`, `:471`). So a pin that served
+that federation as an evacuation destination (`allocator.rs:443`, `:475`). So a pin that served
 one end — or a stale one serving neither — meant **no `Action::Evacuate` was ever emitted**, while
 executor-level tests would pass. A knob that can silently disable evacuation has no business
 being a standing configuration.
