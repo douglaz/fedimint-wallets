@@ -1,0 +1,20 @@
+[package]
+name = "wallet-web"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+# HTTP sidecar only: no wallet/fedimint dependency and no direct database access.
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+# `std` supplies the `OsRng` used for salts even in a single-crate build.
+argon2 = { version = "0.5.3", features = ["std"] }
+rpassword = "7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
