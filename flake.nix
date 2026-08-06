@@ -50,6 +50,7 @@
             "wallet-fedimint"
             "wallet-cli"
             "wallet-daemon"
+            "wallet-web"
           ];
         };
 

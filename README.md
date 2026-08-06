@@ -69,6 +69,10 @@ frontend (Phase 6b) and release hardening (Phase 8) are next. See
 - [wallet-daemon](./wallet-daemon/) - `walletd`, the 24/7 daemon: an axum local API
   (127.0.0.1 + bearer token) over a single Runtime-owning actor, with the watch
   scheduler, per-operation IO driver tasks, and the settlement-stall self-heal watchdog.
+- [wallet-web](./wallet-web/) - the localhost browser sidecar (ADR-0028): a client of
+  `walletd` over HTTP, exactly like `wallet-cli`, that renders HTML instead of terminal
+  output. Currently the crate skeleton, `wallet-web init` provisioning, and a fail-closed
+  startup; the served surfaces land in later Phase 6c beads.
 - [wallet-api](./wallet-api/) - the wire DTOs and the runtime-mutable `Policy` struct
   shared between the daemon and its clients.
 - [docs/](./docs/) - the build plans, runbooks, ADRs, review notes, and specs.
