@@ -121,7 +121,9 @@ gateway gets abandoned for a dearer route:
 - Any single over-cap quote at one amount. Only "no amount fits" is a failure.
 Genuine failures are: not vetted, does not validate, its quote errors or times out, no amount
 can be sized over it at all, or the best amount it CAN carry costs more in fees than it
-delivers.
+delivers. On that third one: the only sizing oracle is a BOUNDED search, so it means a PROVEN
+structural refusal — an empty bounded result is inconclusive and is retried, not a failure to
+serve.
 _Avoid_: "supports", "is available for" — both get read as registry presence, which
 is the reading that leaves a dying federation with a listed-but-useless gateway and
 no way out.
