@@ -33,7 +33,12 @@ Two rules, drawn along a line the code did not previously have:
      re-driving, and the forged-provenance criterion cannot be met by inspecting the intent.
      There is ONE exit, not two: `br-remove-gateway-pin-yjw` must persist an AUTHENTICATED origin
      marker when a money verb creates the intent, and gate the re-drive on it. SPECIFY ITS ABSENT
-     CASE: existing persisted `Intent` rows carry only `Action` and `ReasonCode`, so a REQUIRED
+     CASE, AND BIND IT TO THE INTENT: a marker that authenticates only "operator-originated" is
+     replayable — a caller can clone a legitimate operator intent, swap in an allocator-shaped
+     `Move` with `UserInitiated`, keep the marker, and pass the forged-provenance test while
+     restoring the override. Bind the proof to immutable intent identity (the idempotency key and
+     the action it authorises), so it cannot be lifted onto a different intent. On the absent
+     case: existing persisted `Intent` rows carry only `Action`, `ReasonCode` and `actor`, so a REQUIRED
      field makes pre-upgrade pending rows fail to decode and be skipped by reconcile — the same
      trap as the `MoveMeta` cap. Optional with a named default, and absent means NOT
      operator-originated, so a legacy row cannot silently inherit the override. "Narrow acceptance

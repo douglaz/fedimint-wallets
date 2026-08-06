@@ -131,7 +131,9 @@ Three properties of that rule worth stating, because each is easy to get wrong:
   is bounded in consequence (a retry, not a burn) and is the price of not scanning a
   proven-complete boundary set. br-y2j carries a fixture whose feasible amount sits one boundary
   from the failing probe; it demonstrates the mechanism, not completeness. Refuse only when the top fails by strictly MORE than `A`,
-  or when the bounded probe finds nothing. The boundary belongs to the probe, not the refusal:
+  or when the bounded probe finds nothing AND that emptiness is an analytically proven
+  structural refusal. Probe EXHAUSTION alone is inconclusive: it stays `Retryable` and must not
+  mark the route unavailable, which is the residual this ADR accepts a few lines above. The boundary belongs to the probe, not the refusal:
   `br-y2j` must state the same `<=` or an implementation refuses an executable evacuation at
   exactly `A` — refusing on
   a single top-only reading would discard an executable evacuation at a note-count discontinuity.
