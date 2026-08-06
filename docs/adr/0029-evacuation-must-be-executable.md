@@ -15,7 +15,8 @@ that safe: every chunk must deliver at least what it costs, or the route does no
    `snapshot.max_fee`.
 2. **`Evacuate` gains a second route**: when no gateway serves both federations, it may pay B's
    invoice from A over real Lightning through two different gateways, instead of refusing (routing
-   IS a genuine refusal today, unlike the fee cap). This is
+   IS a genuine refusal today — as the fee cap also is when NO amount fits, though it downsizes
+   first where it can). This is
    a **best-effort fallback, tried only after the shared-gateway swap**, and it is explicitly NOT a
    guarantee.
 
@@ -254,8 +255,11 @@ not rest on something a user can click past.
 - **Route ordering is strict, with ONE bounded exception.** The swap is always tried first
   because it is cheaper; the hop is reached only when no gateway serves both ends — established
   by examining the whole shared candidate set, not a prefix of it.
-  THE EXCEPTION: an honest vetted list fits in one bounded scan, but a guardian can inject
-  entries without bound, so the per-tick scan is capped BY CANDIDATE COUNT AND BY WALL TIME.
+  THE EXCEPTION covers BOTH truncation causes, because either can leave a serving shared
+  candidate unexamined: the candidate-COUNT bound (a guardian can inject entries without bound) and
+  the WALL-TIME bound (even a short, honest list can exhaust the per-class deadline if its
+  gateways answer slowly). In both cases the hop MAY be taken with a shared candidate unexamined —
+  an honest list is not guaranteed a complete scan, only a bounded one.
   MIND THE HOP CLASS'S CARDINALITY, AND EXCLUDE THE DIAGONAL: the pair set is
   `{(s, d) : s ∈ source, d ∈ destination, s ≠ d}`. Where the two vetted lists overlap the raw
   product contains `(g, g)`, which is NOT a hop — CONTEXT.md defines a hop as TWO gateways, and

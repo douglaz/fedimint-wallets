@@ -250,11 +250,15 @@ check the implementing bead owns, not a fact this ADR may assume.
 - **Restoring automated movement after a vetted-list failure is guardian-side.** `gateways add`
   is a per-guardian authenticated write, not a consensus item
   (`fedimint-lnv2-server/src/lib.rs:696-704`), and a client's view unions the first threshold of
-  peer replies. `f+1` registrations SUFFICE for deterministic visibility: any reply quorum has
-  `n−f` members, and `(f+1) + (n−f) = n+1 > n`, so every possible quorum intersects the registered
-  set — for four guardians, two. Requiring *every* guardian would make recovery impossible while
-  one is unavailable, which is the incident this exists to serve. Register on all REACHABLE
-  guardians for support-ordering breadth, but treat `f+1` as the availability minimum. An operator with no guardian cooperation cannot repair the list at all;
+  peer replies. `2f+1` registrations are the minimum for deterministic visibility UNDER THE
+  BYZANTINE MODEL THIS ADR ALREADY ASSUMES. `f+1` is not enough: the intersection argument only
+  puts a registered peer in the quorum, not a registered peer that ANSWERS TRUTHFULLY — with
+  `n=4, f=1`, registering on {A, B} where A is Byzantine admits the quorum {A, C, D}, in which A
+  returns an empty list and C, D were never registered, so the union loses the URL. At `2f+1` any
+  `n−f` quorum contains at least `f+1` registered peers, so at least one honest registered peer
+  answers. `f+1` remains sufficient for CRASH faults only; do not use it here. Requiring *every*
+  guardian would make recovery impossible while one is unavailable, which is the incident this
+  serves — so register on all REACHABLE guardians, and treat `2f+1` as the floor. An operator with no guardian cooperation cannot repair the list at all;
   the break-glass moves money in the meantime, it does not fix the federation.
 - **Every devimint smoke that routes today pins.** `br-remove-gateway-pin-yjw` carries the
   measured split and converts them; it is the single authority for that count, which has drifted
