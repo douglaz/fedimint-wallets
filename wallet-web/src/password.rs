@@ -58,8 +58,13 @@ pub fn validate_phc(phc: &str) -> Result<()> {
         parsed.algorithm
     );
     ensure!(
-        parsed.version.unwrap_or(u32::from(Version::V0x13)) == u32::from(Version::V0x13),
-        "password_hash uses an obsolete argon2 version; re-run `wallet-web init`"
+        // An ABSENT `v=` conventionally means Argon2 0x10, not the pinned 0x13, so defaulting it
+        // to the pinned value would accept a string the verifier then runs at the old version —
+        // the refusal moving from startup to first login. `init` always writes `v=19`, so a
+        // missing field is a hand-written hash, and requiring it costs a real config nothing.
+        parsed.version == Some(u32::from(Version::V0x13)),
+        "password_hash does not declare argon2 version v={}; re-run `wallet-web init`",
+        u32::from(Version::V0x13)
     );
     let salt = parsed
         .salt

@@ -99,6 +99,12 @@ impl WebConfig {
                 )
             })?;
         password::validate_phc(&password_hash)?;
+        // Port 0 asks the kernel for an arbitrary free port, so the sidecar would come up
+        // somewhere the operator's bookmark and their `public_origin` both point away from.
+        ensure!(
+            raw.port != 0,
+            "port 0 would bind an arbitrary free port; set the port the browser will use"
+        );
         Ok(Self {
             port: raw.port,
             daemon_url: validate_daemon_url(&raw.daemon_url)?,
@@ -146,8 +152,20 @@ pub fn load(config_path: &Path) -> Result<WebConfig> {
     ensure_config_dir_not_replaceable(config_parent(config_path))?;
     let text = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading sidecar config {}", config_path.display()))?;
-    let raw: RawConfig = toml::from_str(&text)
-        .with_context(|| format!("parsing sidecar config {}", config_path.display()))?;
+    // NEVER propagate the toml error's `Display`: it quotes the offending SOURCE LINE, so a stray
+    // quote on the `password_hash` line copies the Argon2 PHC string out of this 0600 file and
+    // into whatever collects the process's stderr — a service manager's journal, readable by
+    // people the 0600 mode exists to exclude, and enough for offline guessing. Report the
+    // position and the parser's own message, never the text at that position.
+    let raw: RawConfig = toml::from_str(&text).map_err(|error| {
+        anyhow!(
+            "parsing sidecar config {} failed at {:?}: {}. The offending line is deliberately not \
+             quoted — this file holds the password hash",
+            config_path.display(),
+            error.span(),
+            error.message()
+        )
+    })?;
     WebConfig::from_raw(raw)
 }
 
@@ -210,12 +228,24 @@ fn ensure_private_config_dir(path: &Path) -> Result<()> {
 /// mode check passes, `validate_phc` passes, and the sidecar authenticates against a password
 /// they chose, which is full wallet control including `/v1/recover` (ADR-0028 "Consequences").
 fn ensure_config_dir_not_replaceable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::fs::PermissionsExt as _;
 
-    let mode = std::fs::metadata(path)
-        .with_context(|| format!("reading config directory {}", path.display()))?
-        .permissions()
-        .mode();
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("reading config directory {}", path.display()))?;
+    // Mode alone is not enough: a 0755 directory owned by SOMEONE ELSE passes every bit test
+    // while its owner can still replace entries in it at will, and install a config carrying a
+    // password hash they chose. Ownership is the more basic of the two checks.
+    let owner = metadata.uid();
+    let us = unsafe { libc::geteuid() };
+    ensure!(
+        owner == us,
+        "config directory {} is owned by uid {owner}, not by uid {us} running the sidecar: its \
+         owner could replace the config there, and with it the password hash the sidecar \
+         authenticates against",
+        path.display()
+    );
+    let mode = metadata.permissions().mode();
     // The sticky bit is the `/tmp` case: writable by everyone, but only an entry's owner may
     // replace it, which is exactly the property being checked for.
     ensure!(
@@ -275,7 +305,11 @@ fn validate_daemon_url(raw: &str) -> Result<String> {
             "daemon_url {raw:?} host [{address}] is not the IPv6 loopback ::1"
         ),
     }
-    Ok(format!("http://{authority}"))
+    // Store the PARSED socket's spelling, not the operator's: `http://[0:0::1]:9736` and
+    // `http://[::1]:9736` are the same daemon, and later beads append request paths to whatever
+    // is stored. Canonicalizing here keeps `daemon_url` consistent with `public_origin` instead
+    // of leaving one field normalized and the other verbatim.
+    Ok(format!("http://{socket}"))
 }
 
 /// The sidecar is long-lived, so a CWD-relative token path resolves against wherever it happened
@@ -307,8 +341,25 @@ fn home_dir() -> Result<PathBuf> {
     }
 }
 
-/// Parse and canonicalize the explicit public origin; it is never derived from `Host`.
+/// Validate the explicit public origin; it is never derived from `Host`.
+///
+/// The contract is narrow on purpose: this REFUSES anything that is not already the exact string a
+/// browser puts in `Origin`, rather than trying to produce that string from arbitrary input. The
+/// difference matters because the browser side is WHATWG's host parser — hex and decimal IPv4
+/// aliases, IPv4-mapped IPv6, trailing dots, percent-encoding — and reimplementing it on top of
+/// `http::Uri` is a game this crate loses one edge case at a time. Refusing is a small, checkable
+/// predicate; canonicalizing is an open-ended one, and every gap in it stores an origin the exact
+/// `Origin`/`Referer` comparison in br-nfz can never match: startup clean, every mutating request
+/// including `POST /login` refused, and nothing visibly wrong in the config.
 fn validate_public_origin(raw: &str) -> Result<String> {
+    // `http::Uri` DISCARDS a fragment before we could see it, so check the raw text. Without this
+    // the error below claims to refuse fragments while `https://wallet.example#x` sails past, and
+    // `validate_daemon_url` refuses the same shape — a difference a later reader would misread as
+    // deliberate.
+    ensure!(
+        !raw.contains('#'),
+        "public_origin {raw:?} must be a bare origin (scheme, host, port) with no fragment"
+    );
     let uri: Uri = raw
         .parse()
         .with_context(|| format!("public_origin {raw:?} is not a valid URI origin"))?;
@@ -337,43 +388,78 @@ fn validate_public_origin(raw: &str) -> Result<String> {
         .strip_prefix(host)
         .and_then(|rest| rest.strip_prefix(':'));
     let explicit_port = match port_text {
-        Some(text) => Some(
-            text.parse::<u16>()
-                .with_context(|| format!("public_origin {raw:?} port {text:?} is not a number"))?,
-        ),
+        Some(text) => {
+            let port = text
+                .parse::<u16>()
+                .with_context(|| format!("public_origin {raw:?} port {text:?} is not a number"))?;
+            // A browser keeps `:0` in the origin but will not fetch from it, so the config could
+            // never work.
+            ensure!(port != 0, "public_origin {raw:?} port 0 is not reachable");
+            Some(port)
+        }
         None => None,
     };
     let host = match host
         .strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
     {
-        Some(ip) => format!(
-            "[{}]",
-            ip.parse::<Ipv6Addr>()
-                .with_context(|| format!("public_origin {raw:?} has an invalid IPv6 host"))?
-        ),
-        // A host of only digits and dots is an IPv4 address, and the one spelling that survives a
-        // browser's origin serialization is the dotted quad. Resolvers also accept the `inet_aton`
-        // shorthands — `127.1`, `2130706433`, `127.000.000.001` — which a browser normalizes to
-        // `127.0.0.1` before sending `Origin`. Storing a shorthand would therefore yield an origin
-        // the exact comparison can never match, and every mutating request would be refused with
-        // nothing visibly wrong in the config. Rust's parser accepts no shorthand and no leading
-        // zeros, so here "parses" is the same predicate as "is already canonical".
-        None if host
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'.') =>
-        {
-            host.parse::<Ipv4Addr>()
-                .with_context(|| {
-                    format!(
-                        "public_origin {raw:?} host {host:?} is a numeric address but not a \
-                     dotted-quad IPv4 one; write it the way a browser serializes it, e.g. \
-                     \"127.0.0.1\""
-                    )
-                })?
-                .to_string()
+        Some(inner) => {
+            let ip = inner
+                .parse::<Ipv6Addr>()
+                .with_context(|| format!("public_origin {raw:?} has an invalid IPv6 host"))?;
+            // Rust's `Display` special-cases an IPv4-MAPPED address to the dotted form
+            // (`::ffff:127.0.0.1`), while WHATWG's serializer emits hex pieces
+            // (`::ffff:7f00:1`). So neither spelling round-trips: a browser sends the hex form
+            // for both, and storing the dotted one guarantees the lockout. There is no input
+            // that would store the matchable value, so refuse the family outright. IPv4-
+            // COMPATIBLE addresses (`::127.0.0.1`) are unaffected — Rust displays those as
+            // `::7f00:1`, which is exactly what a browser sends.
+            ensure!(
+                ip.to_ipv4_mapped().is_none(),
+                "public_origin {raw:?} is an IPv4-mapped IPv6 address, which a browser serializes \
+                 with hex pieces rather than the dotted form Rust writes; no spelling of it can \
+                 match. Write the IPv4 origin you mean, e.g. \"http://127.0.0.1:9737\""
+            );
+            format!("[{ip}]")
         }
-        None => host.to_ascii_lowercase(),
+        None => {
+            let lowered = host.to_ascii_lowercase();
+            // A browser strips a trailing dot from an ADDRESS but keeps it on a NAME, so the two
+            // disagree about what `wallet.example.` even is. Refuse rather than model that: an
+            // operator typing the dot means the dotless name they typed everywhere else.
+            ensure!(
+                !lowered.ends_with('.'),
+                "public_origin {raw:?} host ends in a dot; write the host without it"
+            );
+            // WHATWG parses a host as IPv4 when its LAST label "ends in a number" — all digits,
+            // or `0x` followed by hex digits. That is why the earlier all-digits-and-dots test
+            // was not enough: `0x7f.0.0.1`, `0x7f000001` and `127.0.0.0x1` contain letters, so
+            // they read as names here while a browser sends `127.0.0.1` for each. Route every
+            // such host through the strict parser, which accepts no alias and no leading zeros,
+            // making "parses" the same predicate as "is already canonical". This also refuses
+            // `wallet.1` and `wallet.0x1f`, which browsers decline to parse at all — an origin
+            // no browser can reach is not one to store.
+            let last_label = lowered.rsplit('.').next().unwrap_or_default();
+            let ends_in_a_number = !last_label.is_empty()
+                && (last_label.bytes().all(|byte| byte.is_ascii_digit())
+                    || last_label.strip_prefix("0x").is_some_and(|hex| {
+                        !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    }));
+            if ends_in_a_number {
+                lowered
+                    .parse::<Ipv4Addr>()
+                    .with_context(|| {
+                        format!(
+                            "public_origin {raw:?} host {host:?} reads as a numeric address to a \
+                             browser but is not a dotted-quad IPv4 one; write it the way a browser \
+                             serializes it, e.g. \"127.0.0.1\""
+                        )
+                    })?
+                    .to_string()
+            } else {
+                lowered
+            }
+        }
     };
     // An absent port MEANS the scheme's default, and both spellings serialize to the same origin:
     // a browser sends `Origin: https://wallet.example` for `https://wallet.example` and for
@@ -428,8 +514,13 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt as _;
     use std::os::unix::fs::PermissionsExt as _;
 
+    // The temp name carries the pid, so two `init` runs cannot collide on one scratch file —
+    // with a shared name, one can unlink and rename over the other's in-progress write and still
+    // report success, having installed a config carrying the OTHER operator's password. The
+    // `create_new` below then means a leftover from an interrupted run is an error rather than
+    // something to silently reuse, so there is nothing to pre-remove.
     let mut tmp_path = path.as_os_str().to_owned();
-    tmp_path.push(".tmp");
+    tmp_path.push(format!(".{}.tmp", std::process::id()));
     let tmp_path = PathBuf::from(tmp_path);
     let _ = std::fs::remove_file(&tmp_path);
     let mut file = std::fs::OpenOptions::new()
@@ -764,6 +855,77 @@ mod tests {
         assert_eq!(config.public_origin, "https://wallet.example");
         let config = load_with(|raw| raw.public_origin = "http://[0:0::1]:9737/".to_owned())?;
         assert_eq!(config.public_origin, "http://[::1]:9737");
+        Ok(())
+    }
+
+    /// Every expectation here was taken from a browser, not from reasoning: each input was run
+    /// through the WHATWG URL parser (`new URL(input).origin`) and the row records what it said.
+    /// The stored value must equal that string exactly, or the `Origin`/`Referer` comparison in
+    /// br-nfz refuses every mutating request while startup looks clean.
+    #[test]
+    fn public_origin_matches_what_a_browser_would_send() -> Result<()> {
+        // Refused: a browser normalizes each of these to a DIFFERENT string than it was written
+        // as, so storing it verbatim could never match. The hex forms are the ones an
+        // all-digits-and-dots test misses, because they contain letters.
+        for aliased in [
+            "http://0x7f.0.0.1:9737",   // browser: http://127.0.0.1:9737
+            "http://0x7f000001:9737",   // browser: http://127.0.0.1:9737
+            "http://127.0.0.0x1:9737",  // browser: http://127.0.0.1:9737
+            "http://127.1:9737",        // browser: http://127.0.0.1:9737
+            "http://2130706433:9737",   // browser: http://127.0.0.1:9737
+            "http://127.0.0.1.:9737",   // browser strips the dot: http://127.0.0.1:9737
+            "https://wallet.example.",  // browser KEEPS the dot; the operator meant the dotless
+            "http://wallet.1:9737",     // browser refuses to parse this at all
+            "http://wallet.0x1f:9737",  // browser refuses to parse this at all
+            "https://wallet.example:0", // browser keeps :0 but will not fetch from it
+            "https://wallet.example#x", // a fragment is not part of an origin
+            // Rust writes an IPv4-MAPPED address dotted, a browser writes it in hex pieces, so
+            // NEITHER spelling can be stored in a form that matches.
+            "http://[::ffff:127.0.0.1]:9737",
+            "http://[::ffff:7f00:1]:9737",
+        ] {
+            let refused = load_with(|raw| raw.public_origin = aliased.to_owned()).is_err();
+            assert!(refused, "started with public_origin {aliased:?}");
+        }
+        // Accepted, and stored as exactly the origin the browser reported for that input.
+        for (written, browser_origin) in [
+            ("http://127.0.0.1:9737", "http://127.0.0.1:9737"),
+            ("http://wallet.example:9737", "http://wallet.example:9737"),
+            ("https://Wallet.EXAMPLE:443", "https://wallet.example"),
+            ("http://[0:0::1]:9737", "http://[::1]:9737"),
+            ("http://[2001:DB8::1]:9737", "http://[2001:db8::1]:9737"),
+            // IPv4-COMPATIBLE, unlike mapped: Rust and WHATWG agree on `::7f00:1`.
+            ("http://[::127.0.0.1]:9737", "http://[::7f00:1]:9737"),
+            (
+                "https://xn--bcher-kva.example",
+                "https://xn--bcher-kva.example",
+            ),
+        ] {
+            let config = load_with(|raw| raw.public_origin = written.to_owned())?;
+            assert_eq!(config.public_origin, browser_origin, "storing {written:?}");
+        }
+        Ok(())
+    }
+
+    /// Port 0 asks the kernel for an arbitrary free port, so the sidecar would answer somewhere
+    /// the operator's bookmark and their own `public_origin` both point away from.
+    #[test]
+    fn startup_refuses_bind_port_zero() {
+        assert!(load_with(|raw| raw.port = 0).is_err(), "started on port 0");
+    }
+
+    /// The daemon URL is stored canonically for the same reason `public_origin` is: later beads
+    /// build request URLs by appending to whatever is stored here.
+    #[test]
+    fn daemon_url_is_stored_canonically() -> Result<()> {
+        for (written, canonical) in [
+            ("http://[0:0::1]:9736", "http://[::1]:9736"),
+            ("http://127.0.0.1:9736/", "http://127.0.0.1:9736"),
+            ("http://127.0.0.1:9736", "http://127.0.0.1:9736"),
+        ] {
+            let config = load_with(|raw| raw.daemon_url = written.to_owned())?;
+            assert_eq!(config.daemon_url, canonical, "storing {written:?}");
+        }
         Ok(())
     }
 
