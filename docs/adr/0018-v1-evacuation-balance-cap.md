@@ -28,6 +28,8 @@ gateway-independent escape) is pulled into EARLY v2.
   This SUPERSEDES the `--allow-over-cap` contract in `docs/phase4-implementation-spec.md:760-779`,
   which still disables `hard_cap` and tests that the over-cap operation SUCCEEDS. That escape
   hatch is incompatible with this resolution: whoever implements the refusal must retire it and
-  its test rather than leave two live contracts.
+  its test rather than leave two live contracts. NO OPEN BEAD OWNS THIS YET: `--allow-over-cap`
+  and `operator_hard_cap` still disable the cap, so whichever bead implements the refusal must
+  also carry their removal, or the "unconditional" cap ships with a live bypass.
 - The per-federation balance/data model must support the cap and the
   stranded-funds UI from v1.

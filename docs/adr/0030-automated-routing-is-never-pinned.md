@@ -41,7 +41,11 @@ Two rules, drawn along a line the code did not previously have:
      case: existing persisted `Intent` rows carry only `Action`, `ReasonCode` and `actor`, so a REQUIRED
      field makes pre-upgrade pending rows fail to decode and be skipped by reconcile — the same
      trap as the `MoveMeta` cap. Optional with a named default, and absent means NOT
-     operator-originated, so a legacy row cannot silently inherit the override. "Narrow acceptance
+     operator-originated, so a legacy row cannot silently inherit the override. UPGRADE WINDOW: a
+     standalone `--gateway` operation pending ACROSS the upgrade necessarily has no marker, so
+     `await-* --gateway` on it will not re-drive. That is the safe direction, but it must be
+     stated in the runbook rather than surprising an operator mid-incident — re-issue rather than
+     await. "Narrow acceptance
      so await never carries the override" is NOT available — this ADR settles that the await verbs
      KEEP the flag, and `smoke_money` depends on it. Until the marker ships, do not call await
      re-drives provenance-safe. `direct-inflow` is the classification an implementer is most
