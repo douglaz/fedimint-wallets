@@ -1,7 +1,32 @@
 # Route economics (`route_economics_by_pair`): the five settled questions
 
-Status: DESIGN DECISION (br-ljj.3). No production code ships from this doc. It authorises an
-implementation bead. All file:line refs verified against current `main` (post br-ljj.2).
+Status: DESIGN DECISION (br-ljj.3). **Q4 is SUPERSEDED OUTRIGHT by
+[ADR-0030](../adr/0030-automated-routing-is-never-pinned.md); Q1 and Q2 are superseded IN PART
+by [ADR-0029](../adr/0029-evacuation-must-be-executable.md) and ADR-0030.** No production code ships from
+this doc. It authorises an implementation bead. All file:line refs were verified against `main`
+post br-ljj.2 and have not been re-verified since.
+
+> **Q4 no longer holds.** ADR-0030 removes the daemon pin entirely: automated routing — the
+> scheduler, allocator, probes and evacuation — resolves only from the vetted list and can never
+> be pinned. The `route_econ.rs` pinned branch this document's Q4 specifies is deleted, not
+> re-prioritised. The surviving `--gateway` is an operator break-glass on money verbs, which
+> route economics never runs for. Read Q4 below as history.
+>
+> **Q1 is superseded for `Evacuate` only.** It mandates a single `Option<GatewayUrl>` on
+> `Action::Evacuate`; ADR-0029 gives evacuation a two-gateway hop, so it needs a route KIND plus
+> two identities. Q1 still holds for `Move`. It does NOT survive for evacuation's shared-route
+> case either: a shared evacuation route is a route KIND whose shared variant happens to carry one
+> gateway identity, which is not the same as Q1's raw `Option<GatewayUrl>` field on
+> `Action::Evacuate` — the handoff banner further down strikes that field outright, and these two
+> statements must not drift apart again.
+>
+> **Q2 is superseded for BOTH.** Its rule — "use `action.gateway` iff it still validates" — is an
+> ENDPOINT-ONLY check (`gateway_serves_route`, `wallet-fedimint/src/executor.rs:459-469`, which
+> calls only `validate_gateway`/`routing_info`). br-s0e requirement 2b re-checks current
+> vetted-list MEMBERSHIP on the hint path, and does so for `Move` as well as `Evacuate`, because
+> an endpoint-only hint check will happily route money over a gateway the source federation never
+> vetted or has since revoked. Do not read Q2 as still governing the hint check for `Move`: what
+> survives for `Move` is only that a hint is a hint and the cap is the backstop.
 
 ## Recap of what was already locked (not relitigated)
 Ordered-pair-keyed floor `route_economics_by_pair[(from,to)]` carrying `resolved_gateway`,
@@ -96,7 +121,13 @@ constraint), not silently swallowed.
   is the money backstop (worst case: one move is attempted and fails the cap — bounded,
   self-healing churn, the exact thing the floor reduces but never a money loss).
 - **`Routable`**: floor = `min_viable_amount`.
-- **`Unroutable`** (no gateway serves the pair): skip funding for that pair (cannot route).
+- **`Unroutable`** (STRUCTURAL absence — no gateway on the relevant vetted list validates for
+  the pair): skip funding for that pair (cannot route). NOTE for implementers: do not phrase this
+  as "no gateway **serves** the pair". CONTEXT.md's canonical **Serves** now folds ECONOMIC
+  viability into the word, which would make this branch swallow `UneconomicAtAnySize` below —
+  when the proportional cap sits under the combined fee slope, no amount fits, so no gateway
+  "serves" either. Keep `Unroutable` structural and leave cap/economic exclusion to the next
+  branch, whose whole point is that it must be VISIBLE.
 - **`UneconomicAtAnySize`** (bps set below the gateways' combined ppm): skip funding AND surface
   it VISIBLY (persistent diagnostic / refusal reason). Unlike the deliberately-silent sub-dust
   skip (allocator.rs:222), this silently disables rebalancing for the pair FOREVER and is a
@@ -110,6 +141,10 @@ fallback only for the genuinely-absent case (proposal A), so neither swallows th
 takes the FIRST validating gateway with no fee comparison (executor.rs:269-272), while
 raw-receive scans for `lowest_quote` (executor.rs:964-989). Since computing the per-pair floor
 already quotes every validating gateway's fees, selecting the cheapest is free (same quotes):
+**[SCOPED TO `Move` BY ADR-0029 — for evacuation this objective is superseded: br-s0e picks the
+LARGEST SIZED EXECUTED NET, because draining in as few operations as the route permits beats
+paying least per operation, and candidates are now sized individually. Cheapest-first remains
+correct for routine `Move`.]**
 `resolved_gateway` := argmin over gateways serving BOTH ends of combined (fed+gateway) fee. This
 simultaneously (a) removes the asymmetry, (b) gives the Q1 preselected gateway real economic
 meaning, and (c) is the value the Q2 fallback re-resolves to. Folding it in avoids two passes
@@ -118,6 +153,20 @@ that must agree forever.
 ---
 
 ## Implementation bead to create (acceptance handed off)
+
+> **DO NOT IMPLEMENT THIS LIST AS WRITTEN.** It predates ADR-0029 and ADR-0030 and still mandates
+> all three of the decisions the banner at the top of this file supersedes. Specifically, STRIKE:
+> the single `gateway: Option<GatewayUrl>` on `Action::Evacuate` (Q1 — evacuation needs a route
+> KIND plus two identities; it still stands for `Action::Move`), the ENDPOINT-ONLY half of the perform-time
+> hint-with-cap-backstop fallback (Q2 — what goes is the "iff it still
+> validates" predicate, which the hint path must replace with a vetted-list MEMBERSHIP re-check,
+> for `Move` as well as `Evacuate`. the fee-cap backstop SURVIVES, and hint-FIRST selection survives FOR `Move`
+> ONLY -- for `Evacuate` it is overtaken by br-s0e 2c, which selects the largest sized executed
+> net within the route class, because honouring a hint that sizes to a small viable chunk when
+> another candidate drains far more re-creates the repeated-operation cumulative-base-fee problem
+> ADR-0029 exists to fix), and the pin-precedence (Q4 — deleted outright; automated routing
+> can never be pinned). The live successors are br-y2j, br-s0e and br-remove-gateway-pin-yjw.
+
 Title: "Implement route_economics_by_pair (per-pair economic move floor)".
 Must carry: the snapshot field + IO population (tick.rs), the cheapest-serving-both-ends gateway
 selection replacing first-validator, the affine-upper-bound `min_viable_amount` with a hard

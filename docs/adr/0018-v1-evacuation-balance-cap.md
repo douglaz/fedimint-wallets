@@ -18,5 +18,18 @@ gateway-independent escape) is pulled into EARLY v2.
   and this is spending money.
 - The cap must be ENFORCED (refuse or warn above threshold), not relied on as copy
   (CEO finding #3: "spending wallet only" will not constrain behavior on its own).
+  **RESOLVED (2026-08-05): REFUSE, for wallet-controlled balance increases.** "Refuse or warn"
+  contradicted this ADR's own title and its "Caps loss" consequence, and left ADR-0029's reliance
+  on this cap resting on something a user could click past. A dismissible warning is not a cap.
+  Downsizing to fit satisfies the rule — evacuation sizing into a destination's remaining room is
+  intended behaviour, not a violation; refusal is for amounts that cannot be reduced. Where the
+  wallet does not control the inflow there is nothing to refuse: warn, and let evacuation handle
+  it. That principle classifies every verb without an enumeration to keep in sync.
+  This SUPERSEDES the `--allow-over-cap` contract in `docs/phase4-implementation-spec.md:760-779`,
+  which still disables `hard_cap` and tests that the over-cap operation SUCCEEDS. That escape
+  hatch is incompatible with this resolution: whoever implements the refusal must retire it and
+  its test rather than leave two live contracts. NO OPEN BEAD OWNS THIS YET: `--allow-over-cap`
+  and `operator_hard_cap` still disable the cap, so whichever bead implements the refusal must
+  also carry their removal, or the "unconditional" cap ships with a live bypass.
 - The per-federation balance/data model must support the cap and the
   stranded-funds UI from v1.

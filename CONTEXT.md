@@ -86,11 +86,137 @@ degradation.
 _Avoid_: "expiry" unless naming a specific metadata timestamp field
 
 **Evacuation**:
-Moving a user's balance out of a failing or closing federation into a healthy one
-(or out via on-chain peg-out). Triggered primarily by a **Shutdown notice**,
+Moving a user's balance out of a failing or closing federation into a healthy one.
+NOT on-chain: [ADR-0004](docs/adr/0004-v1-lightning-only.md) is lightning-only and ADR-0018's
+gateway-independent escape stays deferred, so a peg-out is not an evacuation route today.
+Triggered primarily by a **Shutdown notice**,
 secondarily by probes detecting degradation. The Allocator's core resilience
 action.
 _Avoid_: "sweep" (reserve for consolidating many inputs), "withdraw"
+
+**Serves** (of a gateway, with respect to a route or a leg):
+A gateway **serves** when it is on the relevant **vetted list**, validates, and an
+ECONOMICALLY viable amount can be sized over it — one whose total fee does not exceed
+what it actually delivers. A route that can only carry chunks costing more than they
+move does not serve, however many times it would settle. Presence in the registry is NOT the
+test: a gateway that is listed but dead, or that cannot price the route, does not
+serve it.
+
+Which vetted list depends on what is being served, and the two are different
+predicates:
+- **A shared route** — one gateway carrying both ends — should be served only by a gateway
+  vetted by **both** federations. NOTE this is the INTENT, not today's behaviour: automated
+  selection starts from the destination's list (`mc.gateways(&to)`) and validates the source end
+  only by fetching `routing_info` (`route_econ.rs:301-333`, `executor.rs:344-349`,
+  `multi_client.rs:958-964`), so a responsive gateway vetted only by the destination — or since
+  revoked by the source — can still carry an automated move. Closing that gap is work, not
+  vocabulary; until it is closed, do not cite this entry as though the invariant holds.
+- **A hop leg** is served by a gateway vetted by the **one** federation at that end.
+  A hop's source leg and destination leg are judged separately, each against its own
+  federation's list; neither gateway need be known to the other federation.
+
+Two things are NOT failures to serve, and conflating either with one is how a healthy
+gateway gets abandoned for a dearer route:
+- Being unable to fund the *full* ask. That is an ordinary instruction to move less.
+- Any single over-cap quote at one amount. Only "no amount fits" is a failure.
+Genuine failures are: not vetted, does not validate, its quote errors or times out, no amount
+can be sized over it at all, or the best amount it CAN carry costs more in fees than it
+delivers, or it QUOTES BUT DOES NOT PERFORM — answering `routing_info` and fee quotes while
+hanging or rejecting the actual `receive`/`pay` (the request-level misbehaving double ADR-0030's
+responsiveness gate uses is exactly this shape). Quoting is not serving: without that term, strict
+swap-first reselects such a gateway every tick, or replays it once the receive has committed, and
+a viable hop is never reached. An implementation needs a bounded record of recent perform-level
+failures per gateway so a repeat offender stops counting as serving.
+On that third one: the only sizing oracle is a BOUNDED search, so it means a PROVEN
+structural refusal — an empty bounded result is inconclusive and is retried, not a failure to
+serve.
+_Avoid_: "supports", "is available for" — both get read as registry presence, which
+is the reading that leaves a dying federation with a listed-but-useless gateway and
+no way out.
+
+**Break-glass gateway override**:
+An operator's explicit, single-invocation instruction to route through a named gateway
+**outside the federation's vetted list**. It exists for one incident: a federation whose
+vetted gateways are dead, empty, or unreachable from this host, where consensus still
+redeems the ecash but no route to it can be selected. Reaching for it is an incident
+action, not configuration — it applies to that invocation and nothing else.
+_Avoid_: "gateway preference" and "the operator's chosen gateway" — both frame it as a
+policy about which counterparty to trust, when the actual question is whether ANY route
+exists. Also avoid "pin": automated routing is never pinned, and calling this a pin is
+what let a break-glass be mistaken for a routing policy.
+
+**Money verb**:
+A `wallet-cli` subcommand that moves value on behalf of the human running it, as opposed to one
+that observes state or drives the automated lanes. Exactly four: `pay`, `receive`, `move`,
+`direct-inflow`. These are the only verbs that INITIATE movement, and the
+**break-glass gateway override** is accepted on them. The await verbs (`await-receive`, `await-send`, `await-move`) also accept it — what it then
+applies to is a dispatch rule owned by [ADR-0030](docs/adr/0030-automated-routing-is-never-pinned.md),
+not by this glossary. `direct-inflow` is the one an implementer is most likely to misclassify — it reads like plumbing, but it funds a federation and most devimint
+smokes fund through it, so classifying it as rejected or ignored breaks the funding step.
+
+**Vetted list**:
+The gateways a federation's guardians have admitted for lnv2. It is the ONLY input to
+automated route selection — the scheduler, allocator, probes and evacuation choose from
+it and nothing else; an operator's **break-glass gateway override** deliberately steps
+outside it, but that is never automated. Two cautions, both from ADR-0030: this rule is
+NOT yet implemented (today's daemon still honours a pinned gateway), and membership is a
+UNION of what each responding guardian returned, so it is not a threshold property. Adding to it is a guardian action, per guardian, not a wallet one:
+an operator with no guardian cooperation cannot change it, which is precisely why the
+break-glass exists.
+_Avoid_: "registered gateways" when you mean routable ones — presence in the list is not
+the same as **serving** a route.
+
+**Route hint**:
+What an action was PRICED against, carried on the action. Explicitly a hint and not a
+constraint: for a `Move` it is used only while it still **holds**, and otherwise the route is
+re-resolved under the same fee cap. "Holds" is a membership-and-validation test, so a hint can
+hold while its fee has risen above the cap; the re-resolution promised here must then actually
+happen BEFORE the route is used, not be discovered at the receive step (permanent) or the pay
+step (which retries the persisted route). Price the held hint against the cap first. For an `Evacuate` a holding hint is not automatically kept either: it is a
+starting point, and br-s0e re-selects WITHIN the same route class by largest sized executed net.
+It does not change which class is tried — strict swap-first ordering is unaffected. The cap, never gateway identity, is the money
+backstop.
+
+A hint **holds** when it is still on the relevant **vetted list** and still validates. That is
+deliberately WEAKER than **serving** — by exactly one term, the affordability sizing — which is
+why it needs its own word: a hint that holds may still turn out unaffordable, and is then
+re-resolved. Do not substitute "serves" here; the canonical predicate includes affordability and
+using it would silently demand a sizing pass the hint path does not run.
+As with **Serves**, the membership half is the INTENT, not today's behaviour — the current check
+validates endpoints without re-testing the source federation's list — and it becomes true when
+the evacuation-hop work closes that gap. Until then, do not cite this entry as though the
+membership half holds.
+Sizing decides the amount; the hint check decides whether to keep the route it was priced
+against. Reading "still holds" as "re-run the affordability search" would price every candidate
+twice — but dropping the membership half is worse: a hint priced before the source federation
+revoked that gateway would keep routing money outside the vetted list, which is exactly what
+ADR-0030 forbids.
+
+A hint names a whole route, not a gateway — so its shape follows the **route kind**.
+For a **shared route** that is one gateway, judged against the two-federation
+predicate. For a **hop** it is two gateway identities plus the kind, each leg judged
+against its own end. A hint is only usable if the route it names still **holds** in the same
+shape it was priced in: a shared hint whose gateway is now vetted-and-valid for one end only has
+not become a hop hint — it has stopped holding.
+
+**Once an operation has committed, the route should stop being a hint** — a recorded route
+replayed as persisted, without re-resolution, since otherwise a restart can pay through a
+different gateway than the one the invoice was sized and recorded for. As with **Serves**,
+this is the INTENT and not today's behaviour: after cache loss the op artifact carries no
+gateway, so reassembly falls back to resolving afresh. The evacuation-hop work is what makes
+it true, by persisting the route with the operation. Until then, do not cite this entry as
+though the invariant holds.
+_Avoid_: calling this a "pin" — it is the opposite, and conflating the two is what
+makes route-selection rules contradict each other.
+
+**Shared route** / **Hop**:
+A **shared route** is one gateway serving both ends (an internal swap). A **hop** is
+two different gateways, one serving each end, bridged over Lightning. The distinction
+is economic, not one of trust: both legs stay hash-locked either way, and the hop
+simply costs more because the internal-swap discount does not apply across two
+gateways.
+_Avoid_: "direct" for the shared route — it invites the idea that the hop is
+indirect and therefore less safe, which is not the difference.
 
 **Lightning Address**:
 A human-readable receive handle (`user@domain`) that resolves via LNURL-pay to
@@ -133,14 +259,19 @@ _Avoid_: implying funds "bounce back" if not claimed quickly
 **Operation**:
 The user-facing unit of wallet activity — a pay, receive, move, join, probe —
 identified by its **operation key** and listed by `history`. Every API/CLI/app
-surface speaks of operations; money operations are driven internally by an
-**Intent**.
+surface speaks of operations; EXECUTABLE operations are driven internally by an
+**Intent** — the money ones, and also `join` and `recover`
+(`wallet-cli/src/main.rs:1394-1400`, `wallet-fedimint/src/executor.rs:1258`).
 _Avoid_: "intent" in any user-facing surface, "transaction"
 
 **Intent**:
-The internal durable, executable record inside a money **Operation**'s
+The internal durable, executable record inside an executable **Operation**'s
 lifecycle: an idempotency-keyed decision driven Pending → Executing → terminal,
-crash-resumable via reconcile. Never appears in API type names or user copy.
+crash-resumable via reconcile. NOT money-only — `Action::Join`
+(`wallet-fedimint/src/runtime.rs:1025-1030`) and `Action::Recover` are `Intent`s
+too, which is why ADR-0030's await
+provenance rule has to distinguish "user-initiated" from "resolves a route"
+rather than treating those as the same test. Never appears in API type names or user copy.
 _Avoid_: exposing "intent" outside the engine
 
 **Policy**:
