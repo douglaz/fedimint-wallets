@@ -4,7 +4,7 @@ use crate::password;
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use axum::http::Uri;
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -352,6 +352,27 @@ fn validate_public_origin(raw: &str) -> Result<String> {
             ip.parse::<Ipv6Addr>()
                 .with_context(|| format!("public_origin {raw:?} has an invalid IPv6 host"))?
         ),
+        // A host of only digits and dots is an IPv4 address, and the one spelling that survives a
+        // browser's origin serialization is the dotted quad. Resolvers also accept the `inet_aton`
+        // shorthands — `127.1`, `2130706433`, `127.000.000.001` — which a browser normalizes to
+        // `127.0.0.1` before sending `Origin`. Storing a shorthand would therefore yield an origin
+        // the exact comparison can never match, and every mutating request would be refused with
+        // nothing visibly wrong in the config. Rust's parser accepts no shorthand and no leading
+        // zeros, so here "parses" is the same predicate as "is already canonical".
+        None if host
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.') =>
+        {
+            host.parse::<Ipv4Addr>()
+                .with_context(|| {
+                    format!(
+                        "public_origin {raw:?} host {host:?} is a numeric address but not a \
+                     dotted-quad IPv4 one; write it the way a browser serializes it, e.g. \
+                     \"127.0.0.1\""
+                    )
+                })?
+                .to_string()
+        }
         None => host.to_ascii_lowercase(),
     };
     // An absent port MEANS the scheme's default, and both spellings serialize to the same origin:
@@ -743,6 +764,30 @@ mod tests {
         assert_eq!(config.public_origin, "https://wallet.example");
         let config = load_with(|raw| raw.public_origin = "http://[0:0::1]:9737/".to_owned())?;
         assert_eq!(config.public_origin, "http://[::1]:9737");
+        Ok(())
+    }
+
+    /// A resolver accepts `inet_aton` shorthands for an IPv4 address, but a browser serializes the
+    /// origin as the dotted quad, so a shorthand stored here would be an origin the exact
+    /// `Origin`/`Referer` comparison can never match — every mutating request refused, with a
+    /// config that looks correct. Refuse the shorthand at startup instead.
+    #[test]
+    fn startup_refuses_an_ipv4_host_a_browser_would_spell_differently() -> Result<()> {
+        for shorthand in [
+            "http://127.1:9737",
+            "http://2130706433:9737",
+            "http://127.000.000.001:9737",
+            "http://127.0.1:9737",
+            "http://.:9737",
+        ] {
+            let refused = load_with(|raw| raw.public_origin = shorthand.to_owned()).is_err();
+            assert!(refused, "started with public_origin {shorthand:?}");
+        }
+        // The dotted quad itself is untouched, and a name containing letters is not a numeric host.
+        let config = load_with(|raw| raw.public_origin = "http://127.0.0.1:9737".to_owned())?;
+        assert_eq!(config.public_origin, "http://127.0.0.1:9737");
+        let config = load_with(|raw| raw.public_origin = "https://wallet.example".to_owned())?;
+        assert_eq!(config.public_origin, "https://wallet.example");
         Ok(())
     }
 
