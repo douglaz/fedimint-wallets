@@ -27,7 +27,7 @@ Two rules, drawn along a line the code did not previously have:
      `receive`. Test all three.
      **The re-drive case needs a DURABLE origin marker, which does not exist yet.** A capability
      proves only that THIS invocation came through an operator-facing path. The target `Intent`
-     persists just `Action` and `ReasonCode`, both publicly constructible, and the override is
+     persists `Action`, `ReasonCode` and `actor` — all publicly constructible, and the override is
      deliberately non-durable — so on a later `--gateway await-*` a forged `UserInitiated`
      allocator move is indistinguishable from the manual move an operator is legitimately
      re-driving, and the forged-provenance criterion cannot be met by inspecting the intent.
