@@ -261,7 +261,12 @@ not rest on something a user can click past.
   gateways answer slowly). In both cases the hop MAY be taken with a shared candidate unexamined —
   an honest list is not guaranteed a complete scan, only a bounded one.
   MIND THE HOP CLASS'S CARDINALITY, AND EXCLUDE THE DIAGONAL: the pair set is
-  `{(s, d) : s ∈ source, d ∈ destination, s ≠ d}`. Where the two vetted lists overlap the raw
+  `{(s, d) : s ∈ source, d ∈ destination, s ≠ d}`. `N` IS A FIXED CONSTANT, NOT THE PAIR COUNT —
+  sizing it FROM the product would make it attacker-controlled, since the union is unbounded.
+  Choose it to cover the honest pair space (two six-gateway lists give 30, so 32 is a reasonable
+  floor) and accept the same residual the shared class carries: beyond that, a viable pair can sit
+  outside the window and not be reached this tick. Covering the honest space is a sizing GOAL, not
+  a guarantee under attack. Where the two vetted lists overlap the raw
   product contains `(g, g)`, which is NOT a hop — CONTEXT.md defines a hop as TWO gateways, and
   pricing `(g, g)` with external-send assumptions would persist an unavailable shared gateway as
   though it were one. The cardinality is therefore `|source| × |destination| − |overlap|`, so two honest six-gateway

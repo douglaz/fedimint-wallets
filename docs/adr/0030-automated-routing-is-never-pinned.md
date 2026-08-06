@@ -32,7 +32,11 @@ Two rules, drawn along a line the code did not previously have:
      allocator move is indistinguishable from the manual move an operator is legitimately
      re-driving, and the forged-provenance criterion cannot be met by inspecting the intent.
      There is ONE exit, not two: `br-remove-gateway-pin-yjw` must persist an AUTHENTICATED origin
-     marker when a money verb creates the intent, and gate the re-drive on it. "Narrow acceptance
+     marker when a money verb creates the intent, and gate the re-drive on it. SPECIFY ITS ABSENT
+     CASE: existing persisted `Intent` rows carry only `Action` and `ReasonCode`, so a REQUIRED
+     field makes pre-upgrade pending rows fail to decode and be skipped by reconcile — the same
+     trap as the `MoveMeta` cap. Optional with a named default, and absent means NOT
+     operator-originated, so a legacy row cannot silently inherit the override. "Narrow acceptance
      so await never carries the override" is NOT available — this ADR settles that the await verbs
      KEEP the flag, and `smoke_money` depends on it. Until the marker ships, do not call await
      re-drives provenance-safe. `direct-inflow` is the classification an implementer is most
@@ -102,7 +106,12 @@ So the requirement is a PROPERTY: automated routing must never observe the overr
 the executor boundary — the one place every route resolution funnels through — by a direct
 `Executor::perform` call on an allocator-created action under an active override. The shape is the
 implementer's call among those that make the override STRUCTURALLY unavailable to automated
-callers (a money-only type, or construction-path separation). Clearing it at each automated entry
+callers (a money-only type, or construction-path separation). NOTE THE SECOND DOOR: public
+`Action::Pay` / `Action::Receive` values can themselves carry `gateway: Some(..)`, which
+`drive_intent_step` PREFERS via `gateway.clone().or_else(|| self.pinned_gateway.clone())`
+(`executor.rs:1024`, `:1135`), so an in-process caller can journal a durable unvetted gateway
+without touching `pinned_gateway` at all. Closing only the runtime/executor field leaves that
+path open — the gate must cover the action-carried value too. Clearing it at each automated entry
 point is NOT among them: that is the enumeration this section rejects, and `FedimintExecutor` is
 publicly constructible, so it would leave the test red by construction. A direct `Executor::perform` test on an allocator-created action is
 the one that proves the structural version.
