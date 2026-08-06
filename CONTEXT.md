@@ -121,7 +121,13 @@ gateway gets abandoned for a dearer route:
 - Any single over-cap quote at one amount. Only "no amount fits" is a failure.
 Genuine failures are: not vetted, does not validate, its quote errors or times out, no amount
 can be sized over it at all, or the best amount it CAN carry costs more in fees than it
-delivers. On that third one: the only sizing oracle is a BOUNDED search, so it means a PROVEN
+delivers, or it QUOTES BUT DOES NOT PERFORM — answering `routing_info` and fee quotes while
+hanging or rejecting the actual `receive`/`pay` (the request-level misbehaving double ADR-0030's
+responsiveness gate uses is exactly this shape). Quoting is not serving: without that term, strict
+swap-first reselects such a gateway every tick, or replays it once the receive has committed, and
+a viable hop is never reached. An implementation needs a bounded record of recent perform-level
+failures per gateway so a repeat offender stops counting as serving.
+On that third one: the only sizing oracle is a BOUNDED search, so it means a PROVEN
 structural refusal — an empty bounded result is inconclusive and is retried, not a failure to
 serve.
 _Avoid_: "supports", "is available for" — both get read as registry presence, which
@@ -163,7 +169,10 @@ the same as **serving** a route.
 **Route hint**:
 What an action was PRICED against, carried on the action. Explicitly a hint and not a
 constraint: for a `Move` it is used only while it still **holds**, and otherwise the route is
-re-resolved under the same fee cap. For an `Evacuate` a holding hint is not automatically kept either: it is a
+re-resolved under the same fee cap. "Holds" is a membership-and-validation test, so a hint can
+hold while its fee has risen above the cap; the re-resolution promised here must then actually
+happen BEFORE the route is used, not be discovered at the receive step (permanent) or the pay
+step (which retries the persisted route). Price the held hint against the cap first. For an `Evacuate` a holding hint is not automatically kept either: it is a
 starting point, and br-s0e re-selects WITHIN the same route class by largest sized executed net.
 It does not change which class is tried — strict swap-first ordering is unaffected. The cap, never gateway identity, is the money
 backstop.
