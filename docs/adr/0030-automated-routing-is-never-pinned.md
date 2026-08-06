@@ -31,9 +31,11 @@ Two rules, drawn along a line the code did not previously have:
      deliberately non-durable — so on a later `--gateway await-*` a forged `UserInitiated`
      allocator move is indistinguishable from the manual move an operator is legitimately
      re-driving, and the forged-provenance criterion cannot be met by inspecting the intent.
-     `br-remove-gateway-pin-yjw` must pick one exit: persist an AUTHENTICATED origin marker when a
-     money verb creates the intent and gate the re-drive on it, or narrow acceptance so await
-     never carries the override. Until one ships, do not call await re-drives provenance-safe. `direct-inflow` is the classification an implementer is most
+     There is ONE exit, not two: `br-remove-gateway-pin-yjw` must persist an AUTHENTICATED origin
+     marker when a money verb creates the intent, and gate the re-drive on it. "Narrow acceptance
+     so await never carries the override" is NOT available — this ADR settles that the await verbs
+     KEEP the flag, and `smoke_money` depends on it. Until the marker ships, do not call await
+     re-drives provenance-safe. `direct-inflow` is the classification an implementer is most
      likely to get wrong: it reads like plumbing, but it funds a federation and most devimint
      smokes fund through it, so putting it in either other bucket breaks the funding step.
      CONTEXT.md carries the same four under **Money verb**.
@@ -268,7 +270,12 @@ check the implementing bead owns, not a fact this ADR may assume.
   `n−f` quorum contains at least `f+1` registered peers, so at least one honest registered peer
   answers. `f+1` remains sufficient for CRASH faults only; do not use it here. Requiring *every*
   guardian would make recovery impossible while one is unavailable, which is the incident this
-  serves — so register on all REACHABLE guardians, and treat `2f+1` as the floor. An operator with no guardian cooperation cannot repair the list at all;
+  serves — so register on ALL REACHABLE guardians rather than a computed minimum.
+  NOTE THESE ARE TWO DIFFERENT THRESHOLDS AND MUST BE CALIBRATED TOGETHER: this one counts
+  guardians the operator WRITES to, while `br-gw-threshold-membership-k4t` proposes a gate on how
+  many peers SUPPORT a URL in a reply. Registering on exactly `2f+1` does NOT guarantee `2f+1`
+  supporting responses — a Byzantine registered peer can answer empty — so that bead owns
+  reconciling the two against the fault model. An operator with no guardian cooperation cannot repair the list at all;
   the break-glass moves money in the meantime, it does not fix the federation.
 - **Every devimint smoke that routes today pins.** `br-remove-gateway-pin-yjw` carries the
   measured split and converts them; it is the single authority for that count, which has drifted
