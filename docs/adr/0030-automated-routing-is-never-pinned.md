@@ -271,11 +271,9 @@ check the implementing bead owns, not a fact this ADR may assume.
   answers. `f+1` remains sufficient for CRASH faults only; do not use it here. Requiring *every*
   guardian would make recovery impossible while one is unavailable, which is the incident this
   serves — so register on ALL REACHABLE guardians rather than a computed minimum.
-  NOTE THESE ARE TWO DIFFERENT THRESHOLDS AND MUST BE CALIBRATED TOGETHER: this one counts
-  guardians the operator WRITES to, while `br-gw-threshold-membership-k4t` proposes a gate on how
-  many peers SUPPORT a URL in a reply. Registering on exactly `2f+1` does NOT guarantee `2f+1`
-  supporting responses — a Byzantine registered peer can answer empty — so that bead owns
-  reconciling the two against the fault model. An operator with no guardian cooperation cannot repair the list at all;
+  How many peers must SUPPORT a URL before it is admitted is a separate threshold from how many
+  the operator writes to, and the two interact; `br-gw-threshold-membership-k4t` owns calibrating
+  both against the fault model and the availability cost. An operator with no guardian cooperation cannot repair the list at all;
   the break-glass moves money in the meantime, it does not fix the federation.
 - **Every devimint smoke that routes today pins.** `br-remove-gateway-pin-yjw` carries the
   measured split and converts them; it is the single authority for that count, which has drifted
