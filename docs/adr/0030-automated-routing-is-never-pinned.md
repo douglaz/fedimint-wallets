@@ -24,7 +24,16 @@ Two rules, drawn along a line the code did not previously have:
      `await-receive`, `await-send`, `await-move` (`wallet-cli/src/main.rs:175`, `:184`, `:211`).
      `await-move` is the one every example uses, so an implementation accepting only it would pass
      a careless review while leaving an operator unable to re-drive a break-glass `pay` or
-     `receive`. Test all three. `direct-inflow` is the classification an implementer is most
+     `receive`. Test all three.
+     **The re-drive case needs a DURABLE origin marker, which does not exist yet.** A capability
+     proves only that THIS invocation came through an operator-facing path. The target `Intent`
+     persists just `Action` and `ReasonCode`, both publicly constructible, and the override is
+     deliberately non-durable — so on a later `--gateway await-*` a forged `UserInitiated`
+     allocator move is indistinguishable from the manual move an operator is legitimately
+     re-driving, and the forged-provenance criterion cannot be met by inspecting the intent.
+     `br-remove-gateway-pin-yjw` must pick one exit: persist an AUTHENTICATED origin marker when a
+     money verb creates the intent and gate the re-drive on it, or narrow acceptance so await
+     never carries the override. Until one ships, do not call await re-drives provenance-safe. `direct-inflow` is the classification an implementer is most
      likely to get wrong: it reads like plumbing, but it funds a federation and most devimint
      smokes fund through it, so putting it in either other bucket breaks the funding step.
      CONTEXT.md carries the same four under **Money verb**.
@@ -239,7 +248,8 @@ check the implementing bead owns, not a fact this ADR may assume.
   if the better-vetted gateways do not serve, the one-guardian entry is reachable.
   Selection by largest sized net carries no support term, so once a scan covers the class this
   preference stops deciding anything — which is why threshold-supported membership is the real
-  fix and is named as the follow-up. That follow-up also owns the INGESTION bound: `gateways()`
+  fix — owned by **`br-gw-threshold-membership-k4t`** (query per peer, require `2f+1`) so it cannot
+  be lost when the routing beads finish. That bead also owns the INGESTION bound: `gateways()`
   materialises the whole union and computes support quadratically before any wallet-side scan
   limit applies, so a per-peer response bound belongs with the per-peer query path. It is
   deliberately NOT in the evacuation beads — a guardian set on stalling a client has cheaper
