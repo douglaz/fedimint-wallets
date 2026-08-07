@@ -1,69 +1,62 @@
-# DRIVE — close out the stranded-move / lnv2-claim thread
+# DRIVE — make an evacuation executable at real fee shapes (br-y2j)
 
-**Status: STOPPED at the user's request for a retrospective.** Resume by sweeping this
-file into the next branch — do not commit it on its own (see the LAND rule added to the
-drive skill in douglaz/skills#16).
+**Scope:** the evacuation fee-cap thread ONLY — `br-y2j` and its three children
+`br-evac-cap-policy-r3n` (1/3), `br-evac-cap-enforce-vn6` (2/3),
+`br-evac-cap-ledger-x9k` (3/3). NOT the wallet-web epic (br-nfz, br-5om, br-t8f,
+br-ucq, br-pfc, br-4yz), NOT br-2aa, NOT br-s0e, NOT the production canary.
 
-**Scope:** the stranded-move thread only — PR #26 (landed) and
-`br-adopt-lnv2-claim-retry-d3d`. NOT the wallet-web epic, the evacuation beads
-(br-y2j, br-s0e), or the production canary (br-prod-canary-nab).
+**Phase:** HARDEN · **Bead:** `br-evac-cap-enforce-vn6` ·
+**Branch:** `feat/br-evac-cap-enforce-vn6`
+**Pending:** —
+**Gate:** `nix develop -c bash -c 'cargo clippy --all-targets -- -D warnings && cargo test'`
+· last green 2026-08-07 (exit 0, 772 passed / 0 failed)
 
-**Phase:** BUILD (evidence gathered, decision pending) · **Bead:**
-`br-adopt-lnv2-claim-retry-d3d` · **Branch:** none yet — work is in a scratch worktree
-**Gate:** `nix develop /home/master/p/fedimint -c bash -c '<cmd>'` — the flake path is
-required; bare `cargo` fails on missing cmake.
+## Why this file was rewritten
+
+The previous `DRIVE.md` described the stranded-move / lnv2-claim drive, which was
+STOPPED for a retrospective and whose own scope line explicitly excluded the evacuation
+beads. It is not stale bookkeeping for *this* goal — it is a different goal. Record
+overridden deliberately.
+
+It also claimed the sibling `fedimint` checkout's flake was required for the gate. That
+is wrong: this repo's own flake runs the full workspace clippy at exit 0. Corrected in
+`AGENTS.md`.
 
 ## Done
-- PR #26 stranded diagnostics + operator procedure — squash-merged `4971b9f`.
-- Bead + first DRIVE.md — `25fc11f`, pushed direct to main. **This was the mistake**
-  that produced douglaz/skills#16: unreviewed commit on the default branch.
-- main verified healthy post-merge: fmt 0 / clippy 0 / test 0, **715 passed, 0 failed**.
-- fedimint#8935 cherry-picked onto our pin in a scratch worktree at
-  `<scratch>/fedimint-wt`, commit `eaa35c03067` on top of `72b1e5be`.
+- `/v1/recover` carved out of the web sidecar (ADR-0028 amendment + plan §6c.3) — `9f1f23b`
+- Five untracked gaps filed as beads; br-s0e and br-remove-gateway-pin-yjw demoted — `9f1f23b`
+- `br-y2j` decomposed along its deployability seam — `f107c5a`
+- **1/3 `br-evac-cap-policy-r3n`** Policy knobs + validation + propagation, no
+  enforcement — merged PR #30 (`7d5e69f`). rb-lite clean in 3 rounds, full 3-reviewer
+  panel, 742 tests, CodeRabbit no actionable comments.
 
-## Evidence gathered for br-adopt-lnv2-claim-retry-d3d
-- **Applies cleanly.** All three source files (`cli.rs`, `lib.rs`, `receive_sm.rs`) took
-  the cherry-pick with no conflict. The single conflict was an import line in
-  `modules/fedimint-lnv2-tests/tests/tests.rs`, caused by `InvoiceSendStatus` — a symbol
-  from unrelated upstream commit `c270a790569` that our pin predates. Its call sites are
-  in pre-existing upstream tests, not the ones #8935 adds, so dropping it from the import
-  list is the correct resolution rather than a workaround.
-- **Compiles at our pin.** `cargo check -p fedimint-lnv2-client` → 0;
-  `cargo check -p fedimint-lnv2-tests --all-targets` → 0. Zero errors. The 8 warnings are
-  pre-existing dead-code in `api.rs` (untouched by the cherry-pick) plus nix noise.
-- **The three tests #8935 adds pass at our pin**, all in-process, no devimint needed:
-  - `receive_sm::tests::decodes_legacy_receive_states` — ok (byte-for-byte legacy encoding)
-  - `funded_receive_is_claimed` — ok
-  - `reclaim_receive_recovers_parked_claim` — ok ← the retroactive-recovery claim, verified
+## Now
+**2/3 `br-evac-cap-enforce-vn6`** — the money change. Committed (`dd6c46c`) and pushed.
+
+Review round 1 is COMPLETE (findings recorded on the bead):
+- codex found one P1 — the receive fixed point's hair-under settle kept the cap computed
+  at the larger sized ask. **Verified and fixed.**
+- the money reviewer found no P0/P1/P2; it reproduced 13 pinned fixtures exactly and
+  grep-confirmed the sizing seam is the only writer of `rec.amount`. Five P3s open.
+- the skeptic found 11 P2s; one taken (a behavioural no-op that added a hunk to a money
+  audit surface), the rest declined as load-bearing.
+
+**HARDEN is not satisfied yet:** the P1 fix and the revert landed AFTER that panel ran,
+so the current tip has unreviewed substantive money code and there is no `cleared` marker.
+Round 2 over the current tip is the open work.
+
+Known limitation to carry forward, not to hide: the hair-under test pins the arithmetic
+but drives the sizing helper directly, so it would NOT go red if the bypass were
+reintroduced. Its own doc comment says so. A real guard needs a fixture driving
+`drive_intent_step` through a hair-under settle against a mocked multi-client.
 
 ## Next
-Nothing below is authorized until the fork-patch question is answered. The two paths
-differ in what gets pinned, not in what gets verified:
-
-- **If we wait for upstream merge (preferred):** bump the pin to the upstream commit that
-  contains #8935, then run the verification list.
-- **If we adopt before merge:** carry `eaa35c03067` as a fourth fork-only patch on the pin
-  branch, then run the same verification list.
-
-Verification list, either way — this is the bead's, not a shortened version of it. The
-three in-process tests already recorded do **not** substitute for the first two:
-1. the full lnv2 integration suite, run by us;
-2. a devimint exercise that parks a receive on a rejected claim and recovers it with
-   `reclaim-receive`, against a record written by the OLD client (this is what proves the
-   retroactive path end to end);
-3. the wallet gate on the bumped pin;
-4. teach the executor to read the recorded receive SM state;
-5. rewrite the runbook's stranded entry.
+`br-evac-cap-ledger-x9k` (3/3) — the ledger reporting the enforced cap and executed
+amount, plus runbook and README. Then `br-y2j` closes, which unblocks
+`br-recanary-y2j-ujs`.
 
 ## Open questions for the human
-- **fedimint#8935 is OPEN, not merged** (observed 2026-08-02). Adopting now means a FOURTH
-  fork-only patch on money-path receive code. The evidence above bounds only part of the
-  risk: cherry-pick application and package-level validation are low risk and demonstrated.
-  End-to-end wallet risk is **unverified** — the wallet gate has not run against a bumped
-  pin, and the executor integration is unwritten. The cost of adopting early is divergence
-  from upstream, against br-jga. The bead's preferred resolution — wait for it to merge,
-  then one pin bump serves both — still looks right now that we know the cherry-pick is
-  clean and can be redone at will.
-- **The conflict is a staleness signal.** As of 2026-08-02, our pin `72b1e5be` is ~10
-  commits behind `4716374a` (#8935's branch tip), whose base is `fedimint/fedimint@master`.
-  That gap grows for as long as the pin stays put while upstream advances.
+- **`br-y2j`'s live devimint gate is outstanding.** It changes a money path on a daemon
+  holding real sats, and no amount of unit tests closes it. It needs the two-federation
+  devimint setup and is a separate operation from the code beads. Flagging rather than
+  quietly treating green unit tests as satisfying it.
