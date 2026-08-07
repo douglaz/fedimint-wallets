@@ -23,7 +23,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
-use wallet_api::{AwaitTarget, OperationStatusDto, Policy};
+use wallet_api::{AwaitTarget, OperationStatusDto, Policy, PolicyValidationError};
 use wallet_core::{
     Action, ActiveProbeVerdict, Actor, AllocatorDecision, DiscoveryPolicy, DiscoverySource,
     ExecutionSummary, FederationId, IdempotencyKey, IntentStatus, Journal, Msat, Occurrence,
@@ -354,6 +354,14 @@ struct PolicySetFlags {
     /// Proportional funding-move fee cap, basis points (1-10000).
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..=10_000))]
     max_fee_bps_of_move: Option<u16>,
+    /// Base of the evacuation fee cap, msat. NOT YET ENFORCED — --max-fee still bounds
+    /// evacuation. Zero is allowed only alongside a non-zero --evac-fee-bps.
+    #[arg(long)]
+    evac_fee_base_msat: Option<u64>,
+    /// Proportional part of the evacuation fee cap, bps (0-10000). NOT YET ENFORCED —
+    /// --max-fee still bounds evacuation. Zero is allowed: a base-only cap.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(0..=10_000))]
+    evac_fee_bps: Option<u16>,
     #[arg(long)]
     spending_fed: Option<String>,
     #[arg(long)]
@@ -453,6 +461,14 @@ struct PolicyFlags {
     /// Proportional funding-move fee cap, in basis points of the amount moved (1-10000).
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..=10_000))]
     max_fee_bps_of_move: Option<u16>,
+    /// Base of the evacuation fee cap, msat. NOT YET ENFORCED — --max-fee still bounds
+    /// evacuation.
+    #[arg(long)]
+    evac_fee_base_msat: Option<u64>,
+    /// Proportional part of the evacuation fee cap, bps (0-10000). NOT YET ENFORCED —
+    /// --max-fee still bounds evacuation. Zero is allowed: a base-only cap.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(0..=10_000))]
+    evac_fee_bps: Option<u16>,
     /// Pin the spending federation (hex id). Default: auto-designate the best-ranked eligible fed.
     #[arg(long)]
     spending: Option<String>,
@@ -485,6 +501,8 @@ impl PolicyFlags {
             || self.standby_target.is_some()
             || self.max_fee.is_some()
             || self.max_fee_bps_of_move.is_some()
+            || self.evac_fee_base_msat.is_some()
+            || self.evac_fee_bps.is_some()
             || self.spending.is_some()
             || self.standby.is_some()
             || self.occurrence != 0
@@ -1909,6 +1927,12 @@ fn apply_policy_set(policy: &mut Policy, flags: &PolicySetFlags) -> Result<(), C
         // applies the override.
         policy.max_fee_bps_of_move = v;
     }
+    if let Some(v) = flags.evac_fee_base_msat {
+        policy.evac_fee_base_msat = Msat(v);
+    }
+    if let Some(v) = flags.evac_fee_bps {
+        policy.evac_fee_bps = v;
+    }
     if flags.clear_spending_fed {
         policy.spending_fed = None;
     }
@@ -2306,6 +2330,18 @@ fn build_tick_policy(
     if let Some(v) = flags.max_fee_bps_of_move {
         policy.max_fee_bps_of_move = v;
     }
+    if let Some(v) = flags.evac_fee_base_msat {
+        policy.evac_fee_base_msat = Msat(v);
+    }
+    if let Some(v) = flags.evac_fee_bps {
+        policy.evac_fee_bps = v;
+    }
+    // These overrides bypass `Policy::validate`, so reject the same zero pair on the result.
+    anyhow::ensure!(
+        !(policy.evac_fee_base_msat == Msat(0) && policy.evac_fee_bps == 0),
+        "{}",
+        PolicyValidationError::ZeroEvacFeeCap
+    );
     policy.occurrence = Occurrence(flags.occurrence);
     if let Some(gate) = gate_policy_override(flags) {
         policy.probe_gate_policy = gate;
@@ -3631,6 +3667,36 @@ mod tests {
             .expect("single pin is valid");
         assert_eq!(policy.spending_fed, Some(a));
         assert_eq!(policy.standby_fed, None);
+    }
+
+    #[test]
+    fn build_tick_policy_rejects_a_zero_evacuation_fee_cap() {
+        let flags = PolicyFlags {
+            evac_fee_base_msat: Some(0),
+            evac_fee_bps: Some(0),
+            ..PolicyFlags::default()
+        };
+        let err = build_tick_policy(&Policy::default(), &flags, &[], &[])
+            .expect_err("a zero evacuation cap must be rejected");
+        assert_eq!(
+            err.to_string(),
+            PolicyValidationError::ZeroEvacFeeCap.to_string(),
+            "{err}"
+        );
+
+        let base_only = build_tick_policy(
+            &Policy::default(),
+            &PolicyFlags {
+                evac_fee_base_msat: Some(150_000),
+                evac_fee_bps: Some(0),
+                ..PolicyFlags::default()
+            },
+            &[],
+            &[],
+        )
+        .expect("a base-only evacuation cap is legitimate");
+        assert_eq!(base_only.evac_fee_base_msat, Msat(150_000));
+        assert_eq!(base_only.evac_fee_bps, 0);
     }
 
     #[tokio::test]

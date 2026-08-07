@@ -19,11 +19,16 @@ macro_rules! fed {
 // Golden fixture bps for the proportional funding-move fee cap (br-ljj.2): 100 bps (1%), so a
 // move's `fee_cap` is `amount / 100` and the source `available` is `budget * 10000/10100`.
 const GOLDEN_MOVE_BPS: u16 = 100;
+// Golden fixture evacuation fee-cap knobs. Deliberately set to values that would produce a
+// DIFFERENT cap than the absolute `max_fee: 500` every `evacuate!` below asserts, so any
+// accidental enforcement of this pair breaks the evacuation goldens loudly.
+const GOLDEN_EVAC_FEE_BASE: Msat = Msat(7_000);
+const GOLDEN_EVAC_FEE_BPS: u16 = 250;
 macro_rules! snap {
     // `route_economics_by_pair` starts EMPTY — no pair priced — which is the permissive
     // `min_move`-only fallback, i.e. the pre-route-economics behavior every golden below asserts.
     // The `route_*` tests populate it explicitly.
-    ([$($fed:expr),*], $spending:expr, $standby:expr, $cap:expr, $target:expr, $standby_target:expr, $now:expr) => { AllocatorSnapshot { federations: vec![$($fed),*], spending_fed: $spending, standby_fed: $standby, per_fed_cap: msat!($cap), target_spending_balance: msat!($target), standby_target: msat!($standby_target), max_fee: msat!(500), max_fee_bps_of_move: GOLDEN_MOVE_BPS, min_move: Msat(0), route_economics_by_pair: BTreeMap::new(), reservations: Reservations::default(), now: $now } };
+    ([$($fed:expr),*], $spending:expr, $standby:expr, $cap:expr, $target:expr, $standby_target:expr, $now:expr) => { AllocatorSnapshot { federations: vec![$($fed),*], spending_fed: $spending, standby_fed: $standby, per_fed_cap: msat!($cap), target_spending_balance: msat!($target), standby_target: msat!($standby_target), max_fee: msat!(500), max_fee_bps_of_move: GOLDEN_MOVE_BPS, evac_fee_base_msat: GOLDEN_EVAC_FEE_BASE, evac_fee_bps: GOLDEN_EVAC_FEE_BPS, min_move: Msat(0), route_economics_by_pair: BTreeMap::new(), reservations: Reservations::default(), now: $now } };
 }
 macro_rules! decision {
     ($action:expr, $reason:expr, $occurrence:expr, $key:expr) => { vec![AllocatorDecision { action: $action, reason: $reason, occurrence: $occurrence, idempotency_key: $key }] };

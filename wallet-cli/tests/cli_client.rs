@@ -693,6 +693,10 @@ async fn policy_set_puts_the_edited_field() {
             "999000",
             "--max-fee-bps-of-move",
             "250",
+            "--evac-fee-base-msat",
+            "150000",
+            "--evac-fee-bps",
+            "0",
         ],
     )
     .await;
@@ -714,6 +718,16 @@ async fn policy_set_puts_the_edited_field() {
     // The proportional funding-move cap lands on its OWN field, not on the absolute `max_fee`.
     assert!(
         put.body.contains("\"max_fee_bps_of_move\":250"),
+        "put body: {}",
+        put.body
+    );
+    assert!(
+        put.body.contains("\"evac_fee_base_msat\":150000"),
+        "put body: {}",
+        put.body
+    );
+    assert!(
+        put.body.contains("\"evac_fee_bps\":0"),
         "put body: {}",
         put.body
     );

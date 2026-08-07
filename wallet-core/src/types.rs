@@ -89,9 +89,12 @@ pub struct AllocatorSnapshot {
     pub per_fed_cap: Msat,
     pub target_spending_balance: Msat,
     pub standby_target: Msat,
-    /// The ABSOLUTE per-move fee cap. Since br-ljj.2 this bounds ONLY `Evacuate` (a proportional
-    /// cap on a small dying-fed remnant would compute below any realistic base fee and refuse
-    /// the drain). Funding `Move`s use `max_fee_bps_of_move` instead.
+    /// The ABSOLUTE per-move fee cap. `decide()` currently copies it to emitted `Evacuate`
+    /// actions; funding `Move`s use `max_fee_bps_of_move`. A bare proportional cap on a small
+    /// dying-fed remnant could fall below any realistic base fee and refuse the drain, which is
+    /// why its replacement keeps a base term. The evacuation knobs below are not read by any
+    /// enforcement path yet. Once `br-evac-cap-enforce-vn6` moves `Evacuate` onto them, this field
+    /// will bound no emitted action.
     pub max_fee: Msat,
     /// The PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
     /// (1..=10000; Policy rejects 0). Funding-move sizing reserves `amount + amount*bps/10000`
@@ -102,6 +105,11 @@ pub struct AllocatorSnapshot {
     /// longer cliffs `available` to zero (the saturation bug); a sub-unit budget still floors to
     /// 0. The stamped `fee_cap` scales with the move. Does NOT bound `Evacuate` (see `max_fee`).
     pub max_fee_bps_of_move: u16,
+    /// BASE component of the evacuation fee cap, in millisatoshis.
+    pub evac_fee_base_msat: Msat,
+    /// PROPORTIONAL component of the evacuation fee cap, in basis points of the amount evacuated
+    /// (0..=10000).
+    pub evac_fee_bps: u16,
     /// The smallest fund/top-up move worth emitting, injected by the I/O layer from the
     /// protocol floor (lnv2 refuses incoming contracts below its 5-sat minimum). A top-up
     /// whose whole SHORTFALL is below this is dust — the destination is effectively at

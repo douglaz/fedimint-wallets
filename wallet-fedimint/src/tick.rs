@@ -50,6 +50,11 @@ const DEFAULT_MAX_FEE: Msat = Msat(50_000);
 /// cap with headroom over realistic gateway fees). Tighten with `--max-fee-bps-of-move`.
 const DEFAULT_MAX_FEE_BPS_OF_MOVE: u16 = 300;
 
+/// Default evacuation fee-cap base: 200 sats (200_000 msat).
+const DEFAULT_EVAC_FEE_BASE: Msat = Msat(200_000);
+/// Default evacuation fee-cap proportional part: 300 bps (3%) of the amount evacuated.
+const DEFAULT_EVAC_FEE_BPS: u16 = 300;
+
 /// The standing instruction for one orchestrator tick (ADR-0014). Sensible v1 defaults
 /// (see the module constants) are provided by [`Default`]; `wallet-cli` overrides any
 /// field from a flag.
@@ -67,6 +72,12 @@ pub struct TickPolicy {
     /// PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
     /// (1..=10000; Policy rejects 0). Sizing reserves `amount + amount*bps/10000` from the source budget.
     pub max_fee_bps_of_move: u16,
+    /// BASE component of the evacuation fee cap, in millisatoshis. Carried but not read by any
+    /// enforcement path yet; see `wallet_api::Policy`.
+    pub evac_fee_base_msat: Msat,
+    /// PROPORTIONAL component of the evacuation fee cap, in basis points of the amount evacuated
+    /// (0..=10000). Carried but not read by any enforcement path yet; see `wallet_api::Policy`.
+    pub evac_fee_bps: u16,
     /// The allocation epoch (T10) stamped into each decision's idempotency key.
     pub occurrence: Occurrence,
     /// Operator-pinned spending fed. `None` ⇒ auto-designate from the scored-eligible feds.
@@ -93,6 +104,8 @@ impl Default for TickPolicy {
             standby_target: DEFAULT_STANDBY_TARGET,
             max_fee: DEFAULT_MAX_FEE,
             max_fee_bps_of_move: DEFAULT_MAX_FEE_BPS_OF_MOVE,
+            evac_fee_base_msat: DEFAULT_EVAC_FEE_BASE,
+            evac_fee_bps: DEFAULT_EVAC_FEE_BPS,
             occurrence: Occurrence(0),
             spending_fed: None,
             standby_fed: None,
@@ -204,6 +217,8 @@ pub fn build_snapshot(
         standby_target: policy.standby_target,
         max_fee: policy.max_fee,
         max_fee_bps_of_move: policy.max_fee_bps_of_move,
+        evac_fee_base_msat: policy.evac_fee_base_msat,
+        evac_fee_bps: policy.evac_fee_bps,
         // lnv2's minimum incoming contract: a fund/top-up sized below this could only fail
         // at perform time, so the allocator treats a sub-floor shortfall as dust.
         min_move: Msat(crate::executor::MINIMUM_INCOMING_CONTRACT_MSAT),
