@@ -92,8 +92,10 @@ Per ADR-0028:
   hashing or backoff, so login attempts cannot starve authenticated requests. Exponential backoff
   after 5 consecutive failures, capped at 30s, reset on success.
 - **Failed logins and rate-limit engagement are logged at `warn`**, carrying no password material.
-  The password is the only control in front of `/v1/recover`, so an operator must be able to see a
-  brute-force attempt; silent absorption by the limiter means an attack leaves no trace at all.
+  The password is the only control in front of the whole money surface, so an operator must be able
+  to see a brute-force attempt; silent absorption by the limiter means an attack leaves no trace at
+  all. (§6c.3 removes `/v1/recover` from the sidecar, which lowers the ceiling on what a broken
+  password costs — it does not lower it to nothing, and does not make this logging optional.)
 - **Logout is `POST`** with CSRF, and clears the server-side entry.
 - Restarting the sidecar clears all sessions — the documented "revoke everything".
 
@@ -145,7 +147,16 @@ only. Everything the daemon does expose:
 | Money | `/v1/pay`, `/v1/receive`, `/v1/move`, `/v1/direct-inflow` |
 | Read | `/v1/balance`, `/v1/history`, `/v1/operations/{key}`, `/v1/federations`, `/v1/status`, `/v1/watch/status`, `/v1/health` |
 | Federation | `/v1/join`, `/v1/approve`, `/v1/candidates` |
-| Admin | `/v1/recover`, `/v1/reconcile`, `/v1/policy` (GET/PUT) |
+| Admin | `/v1/reconcile`, `/v1/policy` (GET/PUT) |
+
+**`/v1/recover` is deliberately absent from that table** — see the 2026-08-07 amendment to
+ADR-0028. The sidecar surfaces no route, no page and no confirmation flow for it; recovery stays
+`wallet-cli` only. Spending is bounded by the pilot ceiling and the per-federation cap, while
+`recover` is unbounded, irreversible, and the one capability a stolen session could use to lose
+everything at once. Omitting a route is a smaller mitigation than any auth mechanism and does not
+reintroduce the step-up ADR-0028 rejected. A reviewer finding that asks for a recover page is
+declined with this paragraph; a finding that notices `wallet-cli` can still do it has understood
+the design.
 
 `/v1/status`, `/v1/watch/status` and `/v1/health` are surfaced by a **diagnostics panel** on the
 Admin page (scheduler alive, watch state, daemon health). Naming them under "parity" without a page
@@ -156,7 +167,7 @@ and new policy fields ship `#[serde(default)]`, so a form that rebuilds `Policy`
 fields it knows would silently reset any field added later — including money caps. The UI must
 `GET` the current policy, merge the edited fields into that value, and `PUT` the result.
 
-Destructive/irreversible actions (`recover`, `approve`, `join`, policy edits) require an explicit
+Destructive/irreversible actions (`approve`, `join`, policy edits) require an explicit
 **confirmation step** on a separate page that names what will happen in plain language. This is a
 UI affordance, not an auth gate — ADR-0028 chose no step-up, and this does not smuggle one back in.
 
@@ -216,7 +227,8 @@ invoice + QR) · Activity (paginated history; the only filter is
 the operation status the daemon actually supports — outstanding versus all — since `HistoryQuery`
 exposes `limit`, `before_seq` and `status` and nothing else, so richer filtering would require a
 second daemon change this phase does not budget) · Operation detail · Federations (list, join,
-candidates, approve) · Policy (view + edit) · Admin (reconcile, recover, diagnostics) · Settings
+candidates, approve) · Policy (view + edit) · Admin (reconcile, diagnostics — **no recover**, per
+§6c.3) · Settings
 (**change password only** — the old password must be
 re-entered, and the NEW password is subject to every check `init` applies — confirmation entry,
 the 12-character minimum, and rejection above 1024 bytes before hashing; on success the config is

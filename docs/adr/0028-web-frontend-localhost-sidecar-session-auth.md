@@ -20,7 +20,8 @@ terminal. It is the everyday surface for a self-hosting user before the Android 
   so the session layer is built to accept a second credential type without rework.
 - **No step-up before spending.** One login gates the whole UI; sending does not prompt again.
 - **Parity with everything the daemon API exposes**, including `join`, `approve`, `recover`,
-  `reconcile`, and policy edits. This is deliberately *not* full `wallet-cli` parity: the agent
+  `reconcile`, and policy edits — but see the amendment below, which carves `recover` back out.
+  This is deliberately *not* full `wallet-cli` parity: the agent
   verbs (`discover`, `probe`, `tick`), `history --fed`, numeric `show`, and policy-override
   `status` have no daemon endpoint and are refused by `wallet-cli` in client mode too, so they stay
   CLI + `--standalone` only.
@@ -65,14 +66,37 @@ terminal. It is the everyday surface for a self-hosting user before the Android 
 - **Fail-closed provisioning** avoids the failure mode that owns self-hosted wallets: a default
   credential, or a first-load setup page that whoever reaches the listener first can claim.
 
+## Amendment (2026-08-07): `/v1/recover` stays CLI-only
+
+The parity decision above holds for every daemon route **except `/v1/recover`**, which the sidecar
+does not surface at all. No route, no page, no confirmation flow.
+
+The Consequences section below already identifies the worst case precisely: with no step-up, a
+stolen or unattended session can "spend the float *and* call `recover`", and the session timeout is
+"the only mitigation". Those two capabilities are not comparable. Spending the float is bounded by
+the pilot ceiling and by the per-federation cap; `recover` is bounded by nothing, is irreversible,
+and is the one operation whose blast radius is the entire wallet regardless of how little it holds.
+
+Omitting one route removes that worst case at close to zero cost. It is a single line missing from
+the route manifest — no new mechanism, no friction on any everyday verb, and specifically **not** a
+step-up gate, which this ADR rejected and this amendment does not reintroduce. The rest of the
+parity argument is untouched: if the auth layer is trusted for `pay`, it is trusted for `move`.
+
+Recovery remains available through `wallet-cli`, which is where an operator already is when they
+are rebuilding a wallet from a seed — a deliberate, rare, offline-ish act, not a thing anyone
+reaches for from a browser tab they left open. The reachability cost is therefore near zero, and it
+buys back the one outcome no session timeout can undo.
+
+Revisit alongside passkeys, as the Consequences section suggests for the parity trade generally.
+
 ## Consequences
 
-- **A live session is full wallet control.** With no step-up and full parity, an unattended
-  logged-in browser can spend the float *and* call `recover` or `approve`. The session timeout
+- **A live session is full wallet control.** With no step-up and near-full parity, an unattended
+  logged-in browser can spend the float *and* call `approve`. The session timeout
   is the only mitigation, which is why it is idle-based and absolutely capped. This is a
   deliberate trade of blast radius for the absence of friction; revisit it if the wallet ever
   holds more than the pilot ceiling, and treat passkeys as the upgrade that makes revisiting
-  cheap.
+  cheap. `recover` is excluded from this trade by the amendment above.
 - **The password protects seed-recovery-level capability**, so its strength is a real security
   parameter, not a formality. Rate limiting is required, not optional.
 - **Sessions do not survive a restart.** Restarting the sidecar is therefore a complete

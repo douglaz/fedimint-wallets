@@ -18,8 +18,13 @@ live and devimint-validated:
 - **Phase 2 sense + decide: complete.** Real federation probing feeds scoring,
   snapshot building, allocation decisions, and executor application through
   `wallet-cli tick` / `wallet-cli status`.
-- **Phase 3.A evacuation: complete.** Shutdown/degradation signals can trigger an
-  LN-only evacuation from a dying federation into an eligible healthy federation.
+- **Phase 3.A evacuation: built, not yet executable at real fee shapes.**
+  Shutdown/degradation signals can trigger an LN-only evacuation from a dying
+  federation into an eligible healthy federation, and that path is devimint-validated.
+  It is *not* production-ready: the evacuation still carries the flat absolute
+  `--max-fee` cap, which at real gateway prices can be far below the cost of draining a
+  full balance in one move, so a real evacuation can chunk-drain or stall. The fix is a
+  base + proportional cap (ADR-0029) and is the next money-path change.
 - **Phase 4 hardening + ledger: complete.** Review P1s are closed, per-federation
   caps are enforced, terminal stranded moves are explicit, and the append-only
   operation ledger is exposed through `wallet-cli history` / `wallet-cli show`.
@@ -37,7 +42,9 @@ live and devimint-validated:
   never blocks another operation (ADR-0024); the responsiveness gate holds
   `POST /v1/pay` to its first external call in <250 ms.
 - **Seed recovery: complete.** A wallet restores each federation's ecash balance from
-  the 12-word seed alone (fedimint recovery) — the SUCCESS path is live-validated on
+  the 12-word seed **plus the joined federation IDs/invites** — the backup unit settled by
+  [ADR-0025](./docs/adr/0025-recovery-fresh-partition-seed-is-the-backup-unit.md), not the
+  seed alone (fedimint recovery) — the SUCCESS path is live-validated on
   devimint (both the daemon and standalone front ends, including journal-only loss over an
   orphan partition). Complete-or-fail semantics (a failed module recovery terminalizes
   rather than hanging forever) are covered by unit tests, NOT by a live gate: faithfully
@@ -49,8 +56,14 @@ live and devimint-validated:
   sub-viable moves every tick.
 
 Recovery of ECASH from the seed is done; the remaining durability work — encryption of
-the seed at rest (kicked off in [ADR-0026](./docs/adr/0026-seed-at-rest-encryption-headless.md),
-build deferred) and an encrypted app-state/history backup — is Phase 7. The Android
+the seed at rest (decided in [ADR-0026](./docs/adr/0026-seed-at-rest-encryption-headless.md),
+build now tracked rather than merely deferred) and an encrypted app-state/history
+snapshot with a restore drill — is Phase 7. **The seed is still plaintext on disk**, so
+anyone who can read the data directory owns the funds; host full-disk encryption, strict
+single-user isolation, and the runbook's balance ceiling are the only controls in force,
+and they are interim by design. This is also the stated precondition in
+[ADR-0028](./docs/adr/0028-web-frontend-localhost-sidecar-session-auth.md) for exposing the
+web sidecar anywhere beyond loopback or a trusted overlay. The Android
 frontend (Phase 6b) and release hardening (Phase 8) are next. See
 [docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md).
 
