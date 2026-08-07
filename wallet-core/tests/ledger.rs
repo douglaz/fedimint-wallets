@@ -440,6 +440,7 @@ fn kind_from_action_mapping() {
             amount: Msat(40_000),
             fee_cap,
             gateway: None,
+            fee_cap_components: None,
         }),
         OperationKind::Move {
             from: FED,

@@ -202,6 +202,7 @@ fn reservation_projection_covers_every_phase6a_table_row() {
             amount: Msat(40),
             fee_cap: Msat(9),
             gateway: None,
+            fee_cap_components: None,
         },
         IntentStatus::Pending,
     );
@@ -459,6 +460,7 @@ async fn cross_operation_reservations_gate_source_and_destination_admission() {
             amount: Msat(40),
             fee_cap: Msat(50),
             gateway: None,
+            fee_cap_components: None,
         },
         ReasonCode::ShutdownNotice,
     );

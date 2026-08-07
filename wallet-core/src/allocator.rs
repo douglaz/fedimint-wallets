@@ -595,12 +595,18 @@ fn evacuate_decision(
                     want: None,
                     available: Some(Msat(src_available)),
                     source_spendable: Some(from.balance.spendable),
-                    // An evacuation does NOT pre-reserve `max_fee` (the executor sizes for it
+                    // An evacuation does NOT pre-reserve its fee cap (the executor sizes for it
                     // at perform time), so `available` here has no fee-cap term — record None
-                    // rather than imply a subtraction that did not happen.
+                    // rather than imply a subtraction that did not happen. It is also not the
+                    // ABSOLUTE `max_fee` any more (ADR-0029): an evacuation is capped by
+                    // `evac_fee_base_msat + evac_fee_bps`, so `max_fee` would name the wrong knob.
                     max_fee: None,
-                    // Evacuation sizes off the ABSOLUTE `max_fee`, not the proportional bps, so
-                    // `max_fee_bps` is not a funding constraint here (br-nsx): record None.
+                    // `max_fee_bps` means `max_fee_bps_of_move` — the FUNDING-move rate. An
+                    // evacuation is capped by `evac_fee_bps` instead, a different knob, so
+                    // recording the funding rate here would misattribute this refusal (br-nsx).
+                    // The evacuation's own components are on the emitted `Action::Evacuate`; this
+                    // refusal emits no action, and its cause is a drained SOURCE (`available` 0)
+                    // rather than any fee cap, so no cap figure describes it.
                     max_fee_bps: None,
                     cap_room: Some(Msat(cap_room)),
                     amount: Some(amount),
@@ -608,12 +614,23 @@ fn evacuate_decision(
                 };
                 return refuse_decision(from.id, reason, occurrence, diagnostics);
             }
+            // The evacuation fee cap is BASE + PROPORTIONAL (ADR-0029), not the absolute
+            // `snapshot.max_fee`: at the runbook's settings a full-balance drain costs ~27x that
+            // cap, which either chunk-drains the federation or refuses it outright. Both
+            // components are snapshotted onto the action so the executor can recompute the cap at
+            // the net it ACTUALLY executes; the `fee_cap` stamped here is the same formula at the
+            // PLANNED amount — the planning value, the per-tick reservation figure, and the
+            // pre-execution bound.
+            let fee_cap_components = EvacFeeCap {
+                base_msat: snapshot.evac_fee_base_msat,
+                bps: snapshot.evac_fee_bps,
+            };
             AllocatorDecision {
                 action: Action::Evacuate {
                     from: from.id,
                     to: to.id,
                     amount,
-                    fee_cap: snapshot.max_fee,
+                    fee_cap: fee_cap_components.at(amount),
                     // Route economics NEVER gates an evacuation — a dying federation must be
                     // drained even when the route prices badly, so `status` is not consulted
                     // here and there is no floor. The pair's gateway is carried when it happens
@@ -623,6 +640,7 @@ fn evacuate_decision(
                         .route_economics_by_pair
                         .get(&(from.id, to.id))
                         .and_then(|route| route.resolved_gateway.clone()),
+                    fee_cap_components: Some(fee_cap_components),
                 },
                 reason,
                 occurrence,
@@ -669,8 +687,10 @@ fn move_decision(
             from,
             to,
             amount,
-            // Proportional cap (br-ljj.2): scales with the move, unlike `Evacuate`'s absolute
-            // `snapshot.max_fee`. Sized to fit the source budget by `max_fundable` above.
+            // Proportional cap (br-ljj.2): scales with the move, and stays PURELY proportional
+            // where `Evacuate` gained a base term (ADR-0029) — routine rebalancing can safely
+            // decline and wait, so it needs no allowance for a small move's base fees. Sized to
+            // fit the source budget by `max_fundable` above.
             fee_cap: move_fee_cap(amount, snapshot.max_fee_bps_of_move),
             // The pair's cheapest both-ends gateway, i.e. the exact route the `min_viable_amount`
             // floor above was computed against — so planning and perform agree on the economics.

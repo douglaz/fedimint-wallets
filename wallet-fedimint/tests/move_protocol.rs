@@ -4,10 +4,10 @@
 //! RESUME invariants (no double-invoice, no double-pay, `DirectInflow` never pays) and
 //! the merge rule (never drop `fee_cap`, never blank an existing leg).
 
-use wallet_core::{FederationId, IdempotencyKey, Msat};
+use wallet_core::{EvacFeeCap, FederationId, IdempotencyKey, Msat};
 use wallet_fedimint::{
-    assemble_move_record, next_step, GatewayUrl, Invoice, Leg, MoveParams, MovePhase, MoveRecord,
-    MoveStep, OpArtifact, OperationId, Preimage,
+    assemble_move_record, next_step, GatewayUrl, Invoice, Leg, MoveMeta, MoveParams, MovePhase,
+    MoveRecord, MoveRole, MoveStep, OpArtifact, OperationId, Preimage,
 };
 
 const FED_A: FederationId = FederationId([0xAA; 32]);
@@ -120,6 +120,7 @@ fn resume_after_send_only_no_double_invoice_or_pay() {
         fee_cap: Msat(2_000),
         gateway: gateway(),
         send_required: true,
+        fee_cap_components: None,
     };
     let artifacts = vec![OpArtifact {
         move_id: k,
@@ -127,6 +128,7 @@ fn resume_after_send_only_no_double_invoice_or_pay() {
         op_id: SEND_OP,
         amount: Msat(100_000),
         invoice: None,
+        fee_cap: None,
     }];
 
     let rec = assemble_move_record(params, &artifacts, None);
@@ -153,6 +155,7 @@ fn manual_retry_does_not_recover_the_terminal_attempts_sdk_artifacts() {
         fee_cap: Msat(2_000),
         gateway: gateway(),
         send_required: true,
+        fee_cap_components: None,
     };
     let preceding_attempt = vec![OpArtifact {
         move_id: public_key.clone(),
@@ -160,6 +163,7 @@ fn manual_retry_does_not_recover_the_terminal_attempts_sdk_artifacts() {
         op_id: RECV_OP,
         amount: Msat(100_000),
         invoice: Some(stale_invoice()),
+        fee_cap: None,
     }];
 
     let rec = assemble_move_record(params, &preceding_attempt, None);
@@ -251,6 +255,7 @@ fn assemble_merges_both_legs() {
         fee_cap: Msat(2_345),
         gateway: gateway(),
         send_required: true,
+        fee_cap_components: None,
     };
     let artifacts = vec![
         OpArtifact {
@@ -259,6 +264,7 @@ fn assemble_merges_both_legs() {
             op_id: RECV_OP,
             amount: Msat(100_000),
             invoice: Some(invoice()),
+            fee_cap: None,
         },
         OpArtifact {
             move_id: k.clone(),
@@ -266,6 +272,7 @@ fn assemble_merges_both_legs() {
             op_id: SEND_OP,
             amount: Msat(100_000),
             invoice: None,
+            fee_cap: None,
         },
     ];
 
@@ -294,6 +301,7 @@ fn assemble_preserves_newest_duplicate_leg_artifacts() {
         fee_cap: Msat(4_321),
         gateway: gateway(),
         send_required: true,
+        fee_cap_components: None,
     };
     let artifacts = vec![
         OpArtifact {
@@ -302,6 +310,7 @@ fn assemble_preserves_newest_duplicate_leg_artifacts() {
             op_id: RECV_OP,
             amount: Msat(100_000),
             invoice: Some(invoice()),
+            fee_cap: None,
         },
         OpArtifact {
             move_id: k.clone(),
@@ -309,6 +318,7 @@ fn assemble_preserves_newest_duplicate_leg_artifacts() {
             op_id: STALE_RECV_OP,
             amount: Msat(100_000),
             invoice: Some(stale_invoice()),
+            fee_cap: None,
         },
         OpArtifact {
             move_id: k.clone(),
@@ -316,6 +326,7 @@ fn assemble_preserves_newest_duplicate_leg_artifacts() {
             op_id: SEND_OP,
             amount: Msat(100_000),
             invoice: None,
+            fee_cap: None,
         },
         OpArtifact {
             move_id: k,
@@ -323,6 +334,7 @@ fn assemble_preserves_newest_duplicate_leg_artifacts() {
             op_id: STALE_SEND_OP,
             amount: Msat(100_000),
             invoice: None,
+            fee_cap: None,
         },
     ];
 
@@ -366,6 +378,7 @@ fn assemble_does_not_blank_existing_leg() {
         fee_cap: Msat(999),
         gateway: gateway(),
         send_required: true,
+        fee_cap_components: None,
     };
 
     let rec = assemble_move_record(params, &[], Some(cached));
@@ -392,6 +405,7 @@ fn assemble_directinflow_receive_only() {
         fee_cap: Msat(500),
         gateway: gateway(),
         send_required: false,
+        fee_cap_components: None,
     };
     let artifacts = vec![OpArtifact {
         move_id: k.clone(),
@@ -399,6 +413,7 @@ fn assemble_directinflow_receive_only() {
         op_id: RECV_OP,
         amount: Msat(20_000),
         invoice: Some(invoice()),
+        fee_cap: None,
     }];
 
     let rec = assemble_move_record(params, &artifacts, None);
@@ -451,6 +466,7 @@ fn assemble_preserves_cached_terminal_phase() {
             fee_cap: Msat(777),
             gateway: gateway(),
             send_required: true,
+            fee_cap_components: None,
         };
 
         let rec = assemble_move_record(params, &[], Some(cached));
@@ -498,6 +514,7 @@ fn assemble_keeps_cached_preimage_and_fee_quotes() {
         fee_cap: Msat(2_000),
         gateway: gateway(),
         send_required: true,
+        fee_cap_components: None,
     };
     // A fresh backfill re-supplies both op legs but NOT the preimage/fee quotes.
     let artifacts = vec![
@@ -507,6 +524,7 @@ fn assemble_keeps_cached_preimage_and_fee_quotes() {
             op_id: RECV_OP,
             amount: Msat(100_000),
             invoice: Some(invoice()),
+            fee_cap: None,
         },
         OpArtifact {
             move_id: k,
@@ -514,6 +532,7 @@ fn assemble_keeps_cached_preimage_and_fee_quotes() {
             op_id: SEND_OP,
             amount: Msat(100_000),
             invoice: None,
+            fee_cap: None,
         },
     ];
 
@@ -545,6 +564,7 @@ fn assemble_keeps_cached_downsized_amount() {
         fee_cap: Msat(2_000),
         gateway: gateway(),
         send_required: true,
+        fee_cap_components: None,
     };
     // The pre-receive record: amount sized down to 95_000, no legs yet.
     let pre_op = MoveRecord {
@@ -573,6 +593,7 @@ fn assemble_keeps_cached_downsized_amount() {
         op_id: RECV_OP,
         amount: Msat(95_000),
         invoice: Some(invoice()),
+        fee_cap: None,
     }];
     let rec = assemble_move_record(params(), &artifacts, Some(pre_op.clone()));
     assert_eq!(rec.amount, Msat(95_000));
@@ -616,6 +637,7 @@ fn assemble_ignores_foreign_move_artifacts() {
         fee_cap: Msat(321),
         gateway: gateway(),
         send_required: true,
+        fee_cap_components: None,
     };
     let artifacts = vec![
         OpArtifact {
@@ -624,6 +646,7 @@ fn assemble_ignores_foreign_move_artifacts() {
             op_id: FOREIGN_OP,
             amount: Msat(100_000),
             invoice: Some(invoice()),
+            fee_cap: None,
         },
         OpArtifact {
             move_id: foreign,
@@ -631,6 +654,7 @@ fn assemble_ignores_foreign_move_artifacts() {
             op_id: SEND_OP,
             amount: Msat(100_000),
             invoice: None,
+            fee_cap: None,
         },
     ];
 
@@ -677,6 +701,7 @@ fn assemble_partial_backfill_send_leg_does_not_blank_receive() {
         fee_cap: Msat(1_234),
         gateway: gateway(),
         send_required: true,
+        fee_cap_components: None,
     };
     // Only the send leg comes back this pass (client A's op-log); it carries no invoice.
     let artifacts = vec![OpArtifact {
@@ -685,6 +710,7 @@ fn assemble_partial_backfill_send_leg_does_not_blank_receive() {
         op_id: SEND_OP,
         amount: Msat(100_000),
         invoice: None,
+        fee_cap: None,
     }];
 
     let rec = assemble_move_record(params, &artifacts, Some(cached));
@@ -716,6 +742,7 @@ fn assemble_receive_artifact_without_invoice_trips_contract() {
         fee_cap: Msat(2_000),
         gateway: gateway(),
         send_required: true,
+        fee_cap_components: None,
     };
     let artifacts = vec![OpArtifact {
         move_id: k,
@@ -723,6 +750,7 @@ fn assemble_receive_artifact_without_invoice_trips_contract() {
         op_id: RECV_OP,
         amount: Msat(100_000),
         invoice: None,
+        fee_cap: None,
     }];
 
     let _ = assemble_move_record(params, &artifacts, None);
@@ -747,6 +775,7 @@ fn assemble_invoice_less_receive_artifact_never_half_states() {
         fee_cap: Msat(2_000),
         gateway: gateway(),
         send_required: true,
+        fee_cap_components: None,
     };
     let bad_receive = || {
         vec![OpArtifact {
@@ -755,6 +784,7 @@ fn assemble_invoice_less_receive_artifact_never_half_states() {
             op_id: RECV_OP,
             amount: Msat(100_000),
             invoice: None,
+            fee_cap: None,
         }]
     };
 
@@ -792,4 +822,172 @@ fn assemble_invoice_less_receive_artifact_never_half_states() {
     assert_eq!(rec.invoice, Some(invoice()));
     assert_eq!(rec.fee_cap, Msat(2_000));
     assert_eq!(next_step(&rec), MoveStep::Pay);
+}
+
+// --- The evacuation fee cap survives a crash (ADR-0029) --------------------------------------
+//
+// The killpoint these pin is `before-move-record` (`executor.rs`): the receive op is committed in
+// the client DB with its `MoveMeta`, and the `MoveRecord` cache write has NOT happened. Resume
+// rebuilds from the intent's params plus whatever backfill recovers from the op-log — which is
+// exactly what `assemble_move_record` does here, with the cache dropped.
+
+/// The op artifact backfill produces from a committed receive op, built by encoding a real
+/// `MoveMeta` and decoding it back, so the durable JSON shape is inside the loop rather than
+/// assumed.
+fn recovered_receive_artifact(move_id: &IdempotencyKey, meta: MoveMeta) -> OpArtifact {
+    let decoded = MoveMeta::from_value(&meta.to_value()).expect("a MoveMeta round-trips");
+    assert_eq!(&decoded.move_id, move_id);
+    OpArtifact {
+        move_id: decoded.move_id,
+        leg: Leg::Receive,
+        op_id: RECV_OP,
+        amount: decoded.amount,
+        fee_cap: decoded.fee_cap,
+        invoice: Some(invoice()),
+    }
+}
+
+/// CRASH SAFETY. An evacuation planned at 75_000 sats (cap 2_450 sats) was sized down to 1_000
+/// sats (cap 230 sats) before minting. The cache is then lost. Reassembly must restore the
+/// RECOMPUTED cap from the committed op meta — never the planned-amount cap from `params`, which
+/// would authorise more than ten times what the executed net entitles.
+#[test]
+fn a_lost_cache_restores_the_recomputed_cap_not_the_planned_one() {
+    let k = key("evac:aa:bb:1");
+    let params = MoveParams {
+        key: k.clone(),
+        operation_key: k.clone(),
+        from: Some(FED_A),
+        to: FED_B,
+        // The intent's own figures: the FULL ask and the cap at that ask.
+        amount: Msat(75_000_000),
+        fee_cap: Msat(2_450_000),
+        fee_cap_components: Some(EvacFeeCap {
+            base_msat: Msat(200_000),
+            bps: 300,
+        }),
+        gateway: gateway(),
+        send_required: true,
+    };
+    let artifacts = vec![recovered_receive_artifact(
+        &k,
+        MoveMeta {
+            move_id: k.clone(),
+            role: MoveRole::Receive,
+            amount: Msat(1_000_000),
+            fee_cap: Some(Msat(230_000)),
+            from: Some(FED_A),
+            to: FED_B,
+        },
+    )];
+
+    // `cached: None` IS the crash: the record was never written.
+    let rec = assemble_move_record(params, &artifacts, None);
+
+    assert_eq!(
+        rec.amount,
+        Msat(1_000_000),
+        "the executed net, from the committed op"
+    );
+    assert_eq!(
+        rec.fee_cap,
+        Msat(230_000),
+        "and the cap recomputed at it — not the 2_450_000 planned cap"
+    );
+    assert_ne!(rec.fee_cap, Msat(2_450_000));
+    // The move resumes into `Pay`, where that cap is what gets re-checked.
+    assert_eq!(next_step(&rec), MoveStep::Pay);
+}
+
+/// LEGACY `MoveMeta`. A receive op committed BEFORE the cap was written into the meta decodes to
+/// `None`, falls back to the cap the intent was planned under, and the move COMPLETES. Reading an
+/// absent cap as a zero cap instead would make `pay_step_cap_verdict` terminally fail an
+/// in-flight pre-upgrade move whose receive is already committed.
+#[test]
+fn a_legacy_op_meta_without_a_cap_falls_back_to_the_planned_cap_and_completes() {
+    let k = key("move-legacy-cap");
+    let params = MoveParams {
+        key: k.clone(),
+        operation_key: k.clone(),
+        from: Some(FED_A),
+        to: FED_B,
+        amount: Msat(100_000),
+        fee_cap: Msat(2_000),
+        fee_cap_components: None,
+        gateway: gateway(),
+        send_required: true,
+    };
+    // A row written before the field existed: the key is simply absent from the JSON.
+    let legacy_value = serde_json::json!({
+        "move_id": k.0,
+        "role": "receive",
+        "amount": 100_000,
+        "from": vec![0xAAu8; 32],
+        "to": vec![0xBBu8; 32],
+    });
+    assert!(legacy_value.get("fee_cap").is_none());
+    let legacy = MoveMeta::from_value(&legacy_value).expect("a pre-change row must still decode");
+    assert_eq!(legacy.fee_cap, None, "ABSENT means None, never a zero cap");
+
+    let artifacts = vec![OpArtifact {
+        move_id: legacy.move_id,
+        leg: Leg::Receive,
+        op_id: RECV_OP,
+        amount: legacy.amount,
+        fee_cap: legacy.fee_cap,
+        invoice: Some(invoice()),
+    }];
+    let rec = assemble_move_record(params, &artifacts, None);
+
+    assert_eq!(
+        rec.fee_cap,
+        Msat(2_000),
+        "the cap this move was genuinely planned under"
+    );
+    assert_ne!(
+        rec.fee_cap,
+        Msat(0),
+        "a zero cap would terminally fail it at the Pay step"
+    );
+    assert_eq!(
+        next_step(&rec),
+        MoveStep::Pay,
+        "and it drives on to completion"
+    );
+}
+
+/// A `Move`'s cap behaviour is unchanged: it carries no components, its committed meta cap equals
+/// its planned cap, and reassembly yields that same value however the merge resolves it.
+#[test]
+fn a_funding_move_keeps_its_planned_cap_through_reassembly() {
+    let k = key("move:aa:bb:1");
+    let params = MoveParams {
+        key: k.clone(),
+        operation_key: k.clone(),
+        from: Some(FED_A),
+        to: FED_B,
+        amount: Msat(100_000),
+        fee_cap: Msat(3_000),
+        fee_cap_components: None,
+        gateway: gateway(),
+        send_required: true,
+    };
+    let artifacts = vec![recovered_receive_artifact(
+        &k,
+        MoveMeta {
+            move_id: k.clone(),
+            role: MoveRole::Receive,
+            amount: Msat(100_000),
+            fee_cap: Some(Msat(3_000)),
+            from: Some(FED_A),
+            to: FED_B,
+        },
+    )];
+
+    let rec = assemble_move_record(params.clone(), &artifacts, None);
+    assert_eq!(rec.fee_cap, Msat(3_000));
+    assert_eq!(rec.amount, Msat(100_000));
+    // ...and with no artifact at all, the planned cap still stands.
+    let bare = assemble_move_record(params, &[], None);
+    assert_eq!(bare.fee_cap, Msat(3_000));
 }

@@ -1217,6 +1217,7 @@ mod tests {
                 amount: Msat(1),
                 fee_cap: Msat(50_000),
                 gateway: None,
+                fee_cap_components: None,
             },
             reason: ReasonCode::ShutdownNotice,
             occurrence: Occurrence(0),

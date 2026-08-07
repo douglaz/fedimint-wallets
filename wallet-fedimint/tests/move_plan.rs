@@ -54,6 +54,7 @@ fn evacuate_maps_to_a_two_leg_plan() {
         amount: Msat(100_000),
         fee_cap: Msat(2_000),
         gateway: None,
+        fee_cap_components: None,
     };
     let plan = MovePlan::from_action(&action).expect("Evacuate is executable");
     assert_eq!(plan.from, Some(FED_A));
@@ -93,6 +94,7 @@ fn plan_send_required_always_agrees_with_from() {
             amount: Msat(1),
             fee_cap: Msat(1),
             gateway: None,
+            fee_cap_components: None,
         },
         Action::DirectInflow {
             to: FED_B,
