@@ -9,7 +9,8 @@ br-ucq, br-pfc, br-4yz), NOT br-2aa, NOT br-s0e, NOT the production canary.
 **Branch:** `feat/br-evac-cap-enforce-vn6`
 **Pending:** —
 **Gate:** `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
-· last green 2026-08-07 at `e9c38b6` (fmt 0, clippy 0, **774 passed / 0 failed**)
+· last green 2026-08-07 at `a4c943b` (fmt 0, clippy 0, **775 passed / 0 failed**)
+· live devimint gate re-run at the SAME commit: exit 0
 
 Supersedes the stranded-move drive, which was stopped for a retrospective and whose scope
 excluded these beads.
@@ -44,6 +45,19 @@ Round 2 (full panel, run in parallel) is COMPLETE:
 - **skeptic** — no money findings; traced every construct back to a `br-y2j` clause, and
   DEFERRED its own ten remaining round-1 items under the same reasoning that declined
   them.
+
+Round 3 (after CodeRabbit's P1 on PR #31) is COMPLETE:
+- **CodeRabbit** — P1: `evacuation_viability` returned early on a bare `shortfall > A`, skipping
+  the bounded probe. ADR-0029:134 forbids exactly that ("inconclusive, not proof"): `A` bounds ONE
+  fee jump, so two nearby note-count drops can each stay under it while together exceeding it,
+  leaving a serving candidate just below. Stable quotes reproduce the branch every tick — a dying
+  federation stranded with an executable evacuation available. **Fixed** (`a4c943b`), red-first.
+- **money reviewer** — no findings, and it RETRACTED its round-2 question on this same code
+  ("ADR-0029:134 does back CodeRabbit — my round-2 QUESTION read the operative requirement too
+  narrowly"). It checked all five `expect_refused` sites and proved the ECONOMIC VIABILITY AC
+  still holds, and re-derived every pinned number in the new fixture.
+- **codex** — P1: re-run both gates at HEAD, since the money path moved after the recorded
+  evidence. Correct; both re-run at `a4c943b` and green.
 
 **Declined with reason, recorded as follow-ups rather than churn:** two executor P3s
 (the pre-mint receive gate enforcing at the sized ask rather than the delivered net, and a
