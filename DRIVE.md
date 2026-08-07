@@ -51,7 +51,23 @@ sub-floor `desired` reported as an affordability failure). Both are quality-of-r
 neither loses money, and every further edit to money code invalidates the clearance the
 panel just gave.
 
-**Blocking merge:** the live devimint gate (PROVE). Not closable by unit tests.
+**PROVE: the live devimint gate PASSED** 2026-08-07 (exit 0), closing codex's P1. The new cap
+arithmetic is verified against live federations, not fixtures:
+
+    decision: evacuate 449998 msat A -> B (fee_cap 213499 msat, reason ShutdownNotice)
+    213499 == 200000 + floor(449998 * 300 / 10000)     EXACT
+
+and it differs from the old absolute `max_fee` of 200000, so the new formula is in force rather
+than falling back. A drained 499998 -> 35870 msat (~0); B netted 449918, a hair under, never over;
+a healthy fed correctly decided NO evacuate.
+
+The gate was RED first. It failed at funding with `Primary module not available` in ~0.4s, and a
+CONTROL RUN of the same diagnostic against merged `main` (`7d5e69f`) failed IDENTICALLY — that
+controlled comparison is what cleared this branch, not the error text sounding unrelated to fee
+caps. Root cause is environmental and pre-existing: devimint at our pin does not enable mint v1,
+which is `wallet-cli`'s primary module, and the runbook's documented invocation never sets it.
+Filed as `br-devimint-runbook-mint-na3` (P1) — following the runbook as written could not have
+produced a green run, so this gate was never being skipped.
 
 Known limitation carried forward, not hidden: the hair-under test pins the arithmetic but
 drives the sizing helper directly, so it would NOT go red if the bypass were reintroduced.
