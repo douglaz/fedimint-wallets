@@ -96,7 +96,7 @@ amount, plus runbook and README. Then `br-y2j` closes, which unblocks
 `br-recanary-y2j-ujs`.
 
 ## Open questions for the human
-- **`br-y2j`'s live devimint gate is outstanding.** It changes a money path on a daemon
-  holding real sats, and no amount of unit tests closes it. It needs the two-federation
-  devimint setup and is a separate operation from the code beads. Flagging rather than
-  quietly treating green unit tests as satisfying it.
+- none. (The live devimint gate is no longer outstanding — see the PROVE section above: it ran
+  at `a4c943b` and exited 0. What remains from that work is a filed defect, not an open gate:
+  `br-devimint-runbook-mint-na3`, because the runbook's documented invocation omits
+  `FM_ENABLE_MODULE_MINT=1` and every smoke dies at `Primary module not available`.)

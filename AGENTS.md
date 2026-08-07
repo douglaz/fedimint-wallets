@@ -34,7 +34,7 @@ grep for the result afterwards.
 is the last command's, and `tail` always succeeds, so a failing build reports
 exit 0. Redirect and capture the real code:
 
-```
+```sh
 <gate> > /tmp/gate.log 2>&1; echo "EXIT=$?"
 ```
 
@@ -87,13 +87,15 @@ branch without the panel or the devimint gate above.
 **Nothing lands on the default branch without review** — including bookkeeping. Beads
 closures and doc updates ride a branch and a PR like everything else.
 
+**The generated beads block below is deliberately EMPTY, and the markers are load-bearing.**
+`br agents --add` re-injects the generic block only when it finds no markers, so deleting them
+brings back a session protocol ending in `git commit && git push` — which here means unreviewed
+money-path code on a branch with no panel and no devimint gate. Keeping empty markers gives
+`br agents --update` something to update in place instead. This explanation lives OUTSIDE the
+markers on purpose: anything between them is `br`'s to overwrite, so a note kept inside would be
+destroyed by the regeneration it exists to warn about. If you do regenerate, read what it writes
+against the working agreement above before committing it.
+
 <!-- br-agent-instructions-v1 -->
-The generated beads block is deliberately EMPTY. These markers are kept so `br agents`
-has an in-place target: delete them and the next `br agents --add` sees no block and
-re-injects the generic one, whose session protocol ends in `git commit && git push` —
-which in this repo means unreviewed money-path code on a branch with no panel and no
-devimint gate. The repo-specific beads guidance is the paragraph directly above; the CLI
-reference it would add is available from `br --help`. If you regenerate this block, read
-what it writes against the working agreement above before committing it.
 <!-- end-br-agent-instructions -->
 
