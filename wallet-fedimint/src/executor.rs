@@ -2179,9 +2179,14 @@ where
 /// falls as `n` grows — but the top is not a proof. The real quote is not affine: two gateway
 /// fees, two federation fees and the per-note mint fee each floor independently and the note
 /// COUNT can change between adjacent amounts, so the fee can jump by more than the one-msat gain
-/// in `n`, and the top can fail while a slightly smaller candidate passes. When the top misses by
-/// at most the oscillation bound (`shortfall <= A`, EQUALITY INCLUDED — a `<` here refuses an
-/// executable evacuation at exactly `A`), the adjacent tier boundaries BELOW it are probed first.
+/// in `n`, and the top can fail while a slightly smaller candidate passes. The adjacent tier
+/// boundaries BELOW the top are therefore probed before any refusal — ALWAYS, whatever the
+/// shortfall's magnitude. ADR-0029 permits a refusal only when the shortfall exceeds the
+/// oscillation bound `A` **and that is an analytically proven structural refusal**; a bare
+/// shortfall over `A` is inconclusive, because `A` bounds ONE vertical fee jump and two nearby
+/// note-count drops can each stay under it while together exceeding it. Gating the probe on the
+/// magnitude stranded exactly the executable evacuations this function exists to find, and did so
+/// on every tick, because stable quotes reproduce the branch.
 ///
 /// A refusal here is INCONCLUSIVE about the route in general: `A` bounds ONE discontinuity, so
 /// several boundaries can cumulatively exceed it with a smaller viable amount still beyond them,
@@ -2203,16 +2208,15 @@ where
     if shortfall == 0 {
         return Ok(EvacuationSizing::Sized(net));
     }
-    if shortfall > oscillation {
-        return Ok(EvacuationSizing::Refused(format!(
-            "the largest chunk this route can carry costs more than it delivers ({} msat of fees \
-             against {} msat delivered); the route does not serve, so the balance is left where \
-             it is rather than burned. The shortfall exceeds one note-selection discontinuity \
-             ({oscillation} msat), so no adjacent amount was probed",
-            cost.total_fee().0,
-            net.0
-        )));
-    }
+    // The bounded probe runs REGARDLESS of how far the top missed. ADR-0029 permits a refusal
+    // only when the shortfall exceeds `A` **AND that is an analytically proven structural
+    // refusal**: "a bare shortfall over `A` is inconclusive, not proof". `A` bounds ONE vertical
+    // fee jump, so two nearby note-count drops can each be bounded by `A` while their cumulative
+    // reduction exceeds it, leaving a smaller candidate that satisfies both the cap and
+    // `fee <= net`. Returning early on the bare magnitude skipped those candidates and — because
+    // stable quotes take the same branch every tick — stranded a dying federation that had an
+    // executable evacuation available. That is the livelock this bead exists to remove, so the
+    // magnitude may colour the refusal MESSAGE but must not gate the probe.
     for candidate in note_boundaries_below(net.0, MINIMUM_INCOMING_CONTRACT_MSAT) {
         let CandidateQuote::Priced(cost) = quote(Msat(candidate)).await? else {
             continue;
@@ -2224,11 +2228,22 @@ where
             return Ok(EvacuationSizing::Sized(candidate));
         }
     }
+    // The magnitude is reported so an operator can tell a near-miss from a route that is far from
+    // serving, but it does NOT change the disposition: both cases stay `Retryable` and neither is
+    // proof, per ADR-0029.
+    let relation = if shortfall > oscillation {
+        format!(
+            "by more than one note-selection discontinuity ({shortfall} msat over {oscillation})"
+        )
+    } else {
+        format!("by at most one note-selection discontinuity ({shortfall} msat)")
+    };
     Ok(EvacuationSizing::Refused(format!(
         "the largest chunk this route can carry costs more than it delivers ({} msat of fees \
-         against {} msat delivered); the route does not serve, so the balance is left where it is \
-         rather than burned. The adjacent note-selection boundaries were probed and none served — \
-         a BOUNDED probe, so this is not proof that no viable amount exists",
+         against {} msat delivered, missing {relation}); the route does not serve, so the balance \
+         is left where it is rather than burned. The adjacent note-selection boundaries were \
+         probed and none served — a BOUNDED probe, so this is not proof that no viable amount \
+         exists",
         cost.total_fee().0,
         net.0
     )))
@@ -4545,6 +4560,74 @@ mod tests {
             served.total_fee().0 <= net.0,
             "and it delivers more than it costs"
         );
+    }
+
+    /// A shortfall LARGER than one oscillation bound must still probe below before refusing.
+    ///
+    /// ADR-0029: "Refuse only when the top fails by strictly MORE than `A` AND that is an
+    /// analytically proven structural refusal ... a bare shortfall over `A` is inconclusive, not
+    /// proof." `A` bounds ONE vertical fee jump, so two nearby note-count drops can each stay
+    /// under it while together exceeding it — leaving a serving candidate just below a top that
+    /// missed by more than `A`.
+    ///
+    /// RED-FIRST: an implementation that returns early on `shortfall > A` refuses here, and
+    /// because the quotes are stable it takes that same branch every tick — stranding a dying
+    /// federation that had an executable evacuation the whole time. That is the livelock this
+    /// bead exists to remove, reintroduced by its own refusal path.
+    #[tokio::test]
+    async fn a_shortfall_over_the_oscillation_bound_still_probes_below() {
+        // THREE levels, so the top fails by more than `A` and a LOWER boundary still serves:
+        //   >= 131_072  fee 500_000 — far over any cap, so the search cannot go here
+        //   >= 131_071  fee 150_000 — the top: cap-fitting and affordable, but costs MORE than it
+        //                             delivers, missing by 18_929 — MORE than one bound (16_306)
+        //   >= 131_000  fee 140_000 — one drop of 10_000, still costs more than it delivers
+        //   <  131_000  fee 130_000 — a second drop of 10_000; the route now serves
+        //
+        // Each drop alone is under `A`; only together do they exceed it. That is exactly the case
+        // a bare `shortfall > A` refusal discards, and both drops sit inside the bounded probe's
+        // reach (it walks tier-aligned boundaries within ~130 msat of the top, not distant tiers).
+        let route = TestRoute::new(gw(0, 0), gw(0, 0)).with_send_fed_fee(|outgoing| {
+            Msat(if outgoing.0 >= 131_072 {
+                500_000
+            } else if outgoing.0 >= 131_071 {
+                150_000
+            } else if outgoing.0 >= 131_000 {
+                140_000
+            } else {
+                130_000
+            })
+        });
+        let spendable = Msat(1_000_000);
+
+        let search = route.search(spendable, spendable, PILOT_CAP).await;
+        let (top, cost) = search.sized.expect("the cap admits the top");
+        assert_eq!(
+            top,
+            Msat(131_071),
+            "the largest cap-fitting, affordable net"
+        );
+        assert_eq!(cost.total_fee(), Msat(150_000));
+
+        // STRICTLY GREATER than one oscillation bound — the branch that used to refuse outright.
+        let shortfall = cost.total_fee().0 - top.0;
+        let bound = oscillation_bound(spendable);
+        assert!(
+            shortfall > bound,
+            "fixture must exercise the over-A branch: shortfall {shortfall} vs A {bound}"
+        );
+
+        // It must nonetheless probe down and find the serving candidate.
+        let net = route
+            .size(spendable, spendable, PILOT_CAP)
+            .await
+            .expect_sized();
+        assert_eq!(
+            net,
+            Msat(130_943),
+            "past the second drop the fee falls under the net and the route serves"
+        );
+        let served = route.cost_at(net, spendable).await;
+        assert!(served.total_fee().0 <= net.0);
     }
 
     /// NON-MONOTONE SIZING, INCREASING REGIME. Gateway bases 99 + 49 sats EXCEED this fixture's
