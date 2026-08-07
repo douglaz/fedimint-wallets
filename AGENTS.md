@@ -52,7 +52,7 @@ done.
 watch it go red against the unfixed code first. A test asserting behaviour that
 was already correct is indistinguishable from a test asserting nothing.
 
-Gate for this repo: `nix develop -c bash -c 'cargo clippy --all-targets -- -D warnings && cargo test'`
+Gate for this repo: `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
 <!-- end-agent-discipline -->
 
 ## Project-specific notes
@@ -86,3 +86,14 @@ branch without the panel or the devimint gate above.
 
 **Nothing lands on the default branch without review** — including bookkeeping. Beads
 closures and doc updates ride a branch and a PR like everything else.
+
+<!-- br-agent-instructions-v1 -->
+The generated beads block is deliberately EMPTY. These markers are kept so `br agents`
+has an in-place target: delete them and the next `br agents --add` sees no block and
+re-injects the generic one, whose session protocol ends in `git commit && git push` —
+which in this repo means unreviewed money-path code on a branch with no panel and no
+devimint gate. The repo-specific beads guidance is the paragraph directly above; the CLI
+reference it would add is available from `br --help`. If you regenerate this block, read
+what it writes against the working agreement above before committing it.
+<!-- end-br-agent-instructions -->
+
