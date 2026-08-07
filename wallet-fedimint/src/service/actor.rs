@@ -2421,6 +2421,8 @@ mod route_blocked_designation_tests {
             standby_target: Msat(0),
             max_fee: Msat(0),
             max_fee_bps_of_move: 100,
+            evac_fee_base_msat: Msat(200_000),
+            evac_fee_bps: 300,
             min_move: Msat(MIN_MOVE),
             route_economics_by_pair: route,
             reservations: Reservations::default(),

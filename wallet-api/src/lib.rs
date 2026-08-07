@@ -10,6 +10,17 @@ fn default_max_fee_bps_of_move() -> u16 {
     300
 }
 
+/// The shipped `evac_fee_base_msat` default (200 sats). Named so a missing stored field does not
+/// deserialize to numeric zero.
+fn default_evac_fee_base_msat() -> Msat {
+    Msat(200_000)
+}
+
+/// The shipped `evac_fee_bps` default (300 bps).
+fn default_evac_fee_bps() -> u16 {
+    300
+}
+
 /// The standing instruction's user-owned allocation and automation parameters.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,8 +28,11 @@ pub struct Policy {
     pub per_fed_cap: Msat,
     pub spending_target: Msat,
     pub standby_target: Msat,
-    /// ABSOLUTE per-move fee cap. Since br-ljj.2 this bounds only `Evacuate`; funding `Move`s
-    /// use `max_fee_bps_of_move`.
+    /// ABSOLUTE fee cap. It currently bounds allocator-emitted `Evacuate` actions; funding `Move`s
+    /// use `max_fee_bps_of_move`. The evacuation knobs below are not read by any enforcement path
+    /// yet. Once `br-evac-cap-enforce-vn6` moves `Evacuate` onto them, this will bound no
+    /// allocator-emitted action — but it stays load-bearing as the default `fee_cap` for
+    /// user-initiated pay/move/receive and as the probe leg cap, so it does NOT become dead.
     pub max_fee: Msat,
     /// PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
     /// (1..=10000; Policy rejects 0). Replaces the absolute `max_fee` for funding so sizing
@@ -31,6 +45,15 @@ pub struct Policy {
     /// path wired yet).
     #[serde(default = "default_max_fee_bps_of_move")]
     pub max_fee_bps_of_move: u16,
+    /// BASE component of the evacuation fee cap, in millisatoshis. The pair is propagated but not
+    /// enforced yet; see `max_fee`. The named serde default keeps older stored rows from decoding
+    /// this numeric field as zero.
+    #[serde(default = "default_evac_fee_base_msat")]
+    pub evac_fee_base_msat: Msat,
+    /// PROPORTIONAL component of the evacuation fee cap, in basis points of the amount evacuated
+    /// (0..=10000).
+    #[serde(default = "default_evac_fee_bps")]
+    pub evac_fee_bps: u16,
     pub spending_fed: Option<FederationId>,
     pub standby_fed: Option<FederationId>,
     pub probe_min_span_secs: u64,
@@ -67,6 +90,8 @@ impl Default for Policy {
             // the executor fee model's "realistic" 0.5% ppm/leg plus base + federation fees).
             // Tune DOWN once br-ljj.3's per-route economics yield precise per-move fee data.
             max_fee_bps_of_move: default_max_fee_bps_of_move(),
+            evac_fee_base_msat: default_evac_fee_base_msat(),
+            evac_fee_bps: default_evac_fee_bps(),
             spending_fed: None,
             standby_fed: None,
             // The verdict knobs and amount match wallet_core::ProbePolicy.
@@ -151,6 +176,15 @@ impl Policy {
             // sizing `amount <= budget * 10000/(10000+bps)` assumes a bounded bps.
             return Err(PolicyValidationError::MaxFeeBpsExceedsCeiling);
         }
+        if self.evac_fee_bps > 10_000 {
+            // Over 100% of the amount evacuated: nonsensical, same reasoning as the sibling knob.
+            return Err(PolicyValidationError::EvacFeeBpsExceedsCeiling);
+        }
+        // `evac_fee_bps == 0` is deliberately accepted, unlike `max_fee_bps_of_move`: a base-only
+        // evacuation cap is legitimate. Only the pair being zero is invalid.
+        if self.evac_fee_base_msat == Msat(0) && self.evac_fee_bps == 0 {
+            return Err(PolicyValidationError::ZeroEvacFeeCap);
+        }
         Ok(())
     }
 }
@@ -170,6 +204,9 @@ pub enum PolicyValidationError {
     ZeroProbeRetryBackoffSecs,
     MaxFeeBpsExceedsCeiling,
     ZeroMaxFeeBps,
+    EvacFeeBpsExceedsCeiling,
+    /// The `(evac_fee_base_msat, evac_fee_bps)` PAIR is zero. Either alone may be zero.
+    ZeroEvacFeeCap,
 }
 
 impl PolicyValidationError {
@@ -185,6 +222,8 @@ impl PolicyValidationError {
             Self::TargetExceedsPerFedCap => "spending_target/standby_target/per_fed_cap",
             Self::ZeroProbeRetryBackoffSecs => "probe_retry_backoff_secs",
             Self::MaxFeeBpsExceedsCeiling | Self::ZeroMaxFeeBps => "max_fee_bps_of_move",
+            Self::EvacFeeBpsExceedsCeiling => "evac_fee_bps",
+            Self::ZeroEvacFeeCap => "evac_fee_base_msat/evac_fee_bps",
         }
     }
 }
@@ -222,6 +261,16 @@ impl fmt::Display for PolicyValidationError {
             Self::MaxFeeBpsExceedsCeiling => write!(
                 formatter,
                 "{}: must not exceed 10000 (100% of the move)",
+                self.offending_field()
+            ),
+            Self::EvacFeeBpsExceedsCeiling => write!(
+                formatter,
+                "{}: must not exceed 10000 (100% of the amount evacuated)",
+                self.offending_field()
+            ),
+            Self::ZeroEvacFeeCap => write!(
+                formatter,
+                "{}: must not BOTH be zero (a zero evacuation cap never fits, so the evacuation would retry forever)",
                 self.offending_field()
             ),
         }
@@ -468,6 +517,8 @@ mod tests {
         assert_eq!(policy.standby_target, Msat(150_000_000));
         assert_eq!(policy.max_fee, Msat(200_000));
         assert_eq!(policy.max_fee_bps_of_move, 300);
+        assert_eq!(policy.evac_fee_base_msat, Msat(200_000));
+        assert_eq!(policy.evac_fee_bps, 300);
         assert_eq!(policy.spending_fed, None);
         assert_eq!(policy.standby_fed, None);
         assert_eq!(policy.probe_min_span_secs, 86_400);
@@ -514,6 +565,20 @@ mod tests {
         let decoded: Policy =
             serde_json::from_value(json).expect("old policy row (no bps field) still decodes");
         assert_eq!(decoded.max_fee_bps_of_move, 300);
+    }
+
+    #[test]
+    fn policy_missing_evac_fee_fields_decode_with_shipped_defaults() {
+        // A row written before these fields existed must receive the shipped values, not numeric
+        // zero from a bare serde default.
+        let mut json = serde_json::to_value(Policy::default()).expect("serialize");
+        let object = json.as_object_mut().expect("object");
+        object.remove("evac_fee_base_msat");
+        object.remove("evac_fee_bps");
+        let decoded: Policy = serde_json::from_value(json)
+            .expect("policy row without the evacuation fee fields still decodes");
+        assert_eq!(decoded.evac_fee_base_msat, Msat(200_000));
+        assert_eq!(decoded.evac_fee_bps, 300);
     }
 
     #[test]
@@ -606,12 +671,33 @@ mod tests {
                 },
                 PolicyValidationError::ZeroMaxFeeBps,
             ),
+            (
+                Policy {
+                    evac_fee_base_msat: Msat(0),
+                    evac_fee_bps: 0,
+                    ..Policy::default()
+                },
+                PolicyValidationError::ZeroEvacFeeCap,
+            ),
+            (
+                Policy {
+                    evac_fee_bps: 10_001,
+                    ..Policy::default()
+                },
+                PolicyValidationError::EvacFeeBpsExceedsCeiling,
+            ),
         ];
 
         for (policy, expected) in cases {
             assert_eq!(policy.validate(), Err(expected.clone()));
             assert!(expected.to_string().contains(expected.offending_field()));
         }
+        assert!(PolicyValidationError::ZeroEvacFeeCap
+            .offending_field()
+            .contains("evac_fee_base_msat"));
+        assert!(PolicyValidationError::ZeroEvacFeeCap
+            .offending_field()
+            .contains("evac_fee_bps"));
         assert_eq!(Policy::default().validate(), Ok(()));
         for policy in [
             Policy {
@@ -626,6 +712,18 @@ mod tests {
             // boundary itself must stay accepted.
             Policy {
                 max_fee_bps_of_move: 10_000,
+                ..Policy::default()
+            },
+            Policy {
+                evac_fee_bps: 0,
+                ..Policy::default()
+            },
+            Policy {
+                evac_fee_base_msat: Msat(0),
+                ..Policy::default()
+            },
+            Policy {
+                evac_fee_bps: 10_000,
                 ..Policy::default()
             },
         ] {
