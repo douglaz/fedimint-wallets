@@ -11,16 +11,8 @@ br-ucq, br-pfc, br-4yz), NOT br-2aa, NOT br-s0e, NOT the production canary.
 **Gate:** `nix develop -c bash -c 'cargo clippy --all-targets -- -D warnings && cargo test'`
 · last green 2026-08-07 (exit 0, 772 passed / 0 failed)
 
-## Why this file was rewritten
-
-The previous `DRIVE.md` described the stranded-move / lnv2-claim drive, which was
-STOPPED for a retrospective and whose own scope line explicitly excluded the evacuation
-beads. It is not stale bookkeeping for *this* goal — it is a different goal. Record
-overridden deliberately.
-
-It also claimed the sibling `fedimint` checkout's flake was required for the gate. That
-is wrong: this repo's own flake runs the full workspace clippy at exit 0. Corrected in
-`AGENTS.md`.
+Supersedes the stranded-move drive, which was stopped for a retrospective and whose scope
+excluded these beads.
 
 ## Done
 - `/v1/recover` carved out of the web sidecar (ADR-0028 amendment + plan §6c.3) — `9f1f23b`

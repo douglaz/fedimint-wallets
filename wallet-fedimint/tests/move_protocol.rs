@@ -991,3 +991,114 @@ fn a_funding_move_keeps_its_planned_cap_through_reassembly() {
     let bare = assemble_move_record(params, &[], None);
     assert_eq!(bare.fee_cap, Msat(3_000));
 }
+
+/// A cached record carrying a COMMITTED leg keeps its enforced cap when the op's `MoveMeta` will
+/// not decode.
+///
+/// `backfill_ops` warns and DROPS an artifact whose meta is undecodable, while the cached record
+/// still supplies `recv_op`. Resolving `amount` through the cache but `fee_cap` straight from the
+/// intent then pairs the executed net with the planned cap — and `has_move_artifact` is true by
+/// then, so `size_fresh_evacuation` never re-pairs them. That is the planned-vs-executed hole the
+/// sizing seam exists to close, reached through reassembly instead.
+///
+/// Red-first: this genuinely fails without the fix. Skipping the cache yields 2_450_000, and the
+/// assertion below demands 230_000.
+#[test]
+fn a_committed_leg_keeps_its_enforced_cap_when_the_op_meta_is_undecodable() {
+    let k = key("evac:aa:bb:2");
+    // The executor sized 75_000_000 down to 1_000_000 and wrote BOTH together.
+    let cached = MoveRecord {
+        key: k.clone(),
+        from: Some(FED_A),
+        to: FED_B,
+        amount: Msat(1_000_000),
+        fee_cap: Msat(230_000),
+        gateway: gateway(),
+        send_required: true,
+        invoice: Some(invoice()),
+        recv_op: Some(RECV_OP),
+        send_op: None,
+        phase: MovePhase::Invoiced,
+        outcome: None,
+        preimage: None,
+        receive_fee_quoted: None,
+        send_fee_quoted: None,
+    };
+    let params = MoveParams {
+        key: k.clone(),
+        operation_key: k.clone(),
+        from: Some(FED_A),
+        to: FED_B,
+        // The intent's planned figures, which must NOT win here.
+        amount: Msat(75_000_000),
+        fee_cap: Msat(2_450_000),
+        fee_cap_components: Some(EvacFeeCap {
+            base_msat: Msat(200_000),
+            bps: 300,
+        }),
+        gateway: gateway(),
+        send_required: true,
+    };
+
+    // NO artifacts: the op committed, but its meta would not decode, so backfill dropped it.
+    let rec = assemble_move_record(params, &[], Some(cached));
+
+    assert_eq!(
+        rec.amount,
+        Msat(1_000_000),
+        "the cached executed net survives, as it already did"
+    );
+    assert_eq!(
+        rec.fee_cap,
+        Msat(230_000),
+        "and its cap must survive WITH it — falling back to the intent's 2_450_000 would \
+         over-authorise the Pay step by more than ten times what the executed net entitles"
+    );
+    assert_ne!(rec.fee_cap, Msat(2_450_000));
+}
+
+/// The mirror: with NO committed leg the cached cap really is a superseded draft, because the
+/// executor re-sizes from the intent every pass until an op commits. The intent's cap wins.
+#[test]
+fn a_cached_record_with_no_committed_leg_still_defers_to_the_intent_cap() {
+    let k = key("evac:aa:bb:3");
+    let cached = MoveRecord {
+        key: k.clone(),
+        from: Some(FED_A),
+        to: FED_B,
+        amount: Msat(1_000_000),
+        fee_cap: Msat(230_000),
+        gateway: gateway(),
+        send_required: true,
+        invoice: None,
+        recv_op: None,
+        send_op: None,
+        phase: MovePhase::Created,
+        outcome: None,
+        preimage: None,
+        receive_fee_quoted: None,
+        send_fee_quoted: None,
+    };
+    let params = MoveParams {
+        key: k.clone(),
+        operation_key: k.clone(),
+        from: Some(FED_A),
+        to: FED_B,
+        amount: Msat(75_000_000),
+        fee_cap: Msat(2_450_000),
+        fee_cap_components: Some(EvacFeeCap {
+            base_msat: Msat(200_000),
+            bps: 300,
+        }),
+        gateway: gateway(),
+        send_required: true,
+    };
+
+    let rec = assemble_move_record(params, &[], Some(cached));
+
+    assert_eq!(
+        rec.fee_cap,
+        Msat(2_450_000),
+        "no leg committed, so the cached cap is a draft and the intent's cap stands"
+    );
+}

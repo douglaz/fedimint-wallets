@@ -409,6 +409,7 @@ pub fn assemble_move_record(
     // Cache fallback means a missing artifact never blanks an existing leg (a missing
     // leg here means "this client's op-log didn't see it", not "it doesn't exist").
     let cached_amount = cached.as_ref().map(|c| c.amount);
+    let cached_fee_cap = cached.as_ref().map(|c| c.fee_cap);
     let cached_invoice = cached.as_ref().and_then(|c| c.invoice.clone());
     let cached_recv_op = cached.as_ref().and_then(|c| c.recv_op);
     let cached_send_op = cached.as_ref().and_then(|c| c.send_op);
@@ -483,11 +484,27 @@ pub fn assemble_move_record(
         // contract above). If the cache is gone, recover the committed op metadata amount
         // before falling back to the intent's original amount.
         amount: artifact_amount.or(cached_amount).unwrap_or(params.amount),
-        // A committed op's cap is definitive (see the doc contract above); absent, the intent's
-        // planned cap stands. The CACHE is deliberately not consulted in between: before any op
-        // is committed the executor re-sizes from the intent every pass, so a cached cap there
-        // is a superseded draft, not a fact.
-        fee_cap: artifact_fee_cap.unwrap_or(params.fee_cap),
+        // A committed op's cap is definitive (see the doc contract above). Absent one, the cache
+        // is consulted ONLY when it carries a committed leg, and otherwise the intent's planned
+        // cap stands.
+        //
+        // The middle case is the one that matters and it must track `amount` above. Before any op
+        // is committed the executor re-sizes from the intent every pass, so a cached cap really is
+        // a superseded draft — but once a leg IS committed the cache holds the ENFORCED cap paired
+        // with the executed net. `backfill_ops` drops an artifact whose `MoveMeta` will not decode
+        // while the cached record still supplies `recv_op`, so skipping the cache there pairs the
+        // cached DOWNSIZED amount with the intent's PLANNED cap: a 75_000_000 msat evacuation
+        // clamped to 1_000_000 would replay at a 2_450_000 cap instead of 230_000 and over-
+        // authorise the Pay step. `has_move_artifact` is then true, so `size_fresh_evacuation`
+        // will not re-pair them. Same planned-vs-executed hole the sizing seam closes, reached
+        // through the reassembly door.
+        fee_cap: artifact_fee_cap
+            .or_else(|| {
+                (cached_recv_op.is_some() || cached_send_op.is_some())
+                    .then_some(cached_fee_cap)
+                    .flatten()
+            })
+            .unwrap_or(params.fee_cap),
         gateway: params.gateway,
         send_required: params.send_required,
         invoice,
