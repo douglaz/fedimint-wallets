@@ -106,6 +106,27 @@ struct FreshMoveCost {
 }
 
 impl FreshMoveCost {
+    /// The DELIVERED NET this quote actually credits the destination: the fixed invoice minus
+    /// the receive-side fee quoted against it (CONTEXT.md, "Delivered net").
+    ///
+    /// **This is the only amount a fee cap may be computed from.** The SIZED ASK — the candidate
+    /// the search is probing — is an intention; it is what we will request an invoice for, not
+    /// what arrives, and the two diverge whenever the gross-up settles a verified hair under.
+    /// Capping against the ask authorises a proportional fee on value nobody received.
+    ///
+    /// It is derived HERE, from the cost, so no caller can supply the wrong number. That is the
+    /// whole point: the same defect — a cap bound to the ask rather than the delivery — reached
+    /// five separate call sites while each one was free to pass its own idea of "the net".
+    ///
+    /// Well-defined for every quote the search can admit. `resolve_receive_gross_up` maintains
+    /// `invoice_amount - receive_quote == the verified delivered net` on every return path: an
+    /// exact solve returns it unchanged, and both the hair-under and bisection tails RESTATE
+    /// `receive_quote` as `invoice - predicted` precisely so this subtraction stays honest.
+    /// `CandidateQuote::Unquotable` carries no cost and never reaches a cap comparison.
+    fn delivered_net(self) -> Msat {
+        Msat(self.invoice_amount.0.saturating_sub(self.receive_quote.0))
+    }
+
     fn total_fee(self) -> Msat {
         Msat(self.receive_quote.0.saturating_add(self.send_quote.0))
     }
@@ -1397,10 +1418,24 @@ impl FedimintExecutor {
                     // explained in history (a derived-cache write; no money moves). It rides on
                     // every subsequent `put_move` below and is stored on the refusal path too.
                     rec.receive_fee_quoted = Some(grossed.receive_quote);
+                    // The DELIVERED net for this re-quote, and the cap it entitles. Derived HERE,
+                    // before the gate below, because the gate must not admit a receive fee that the
+                    // Pay step will then refuse: `rec.fee_cap` was computed at the SIZED ask, so
+                    // using it here enforces a cap the delivery never earned and pushes the refusal
+                    // past `mc.receive` — after the operation has committed and can only be left
+                    // orphaned. Nothing mutates `rec.amount`: lowering the cached ask before the
+                    // receive exists would make a crash retry mint a fresh invoice for less than
+                    // requested (see the §15.11 note below).
+                    let requote_delivered = grossed.delivered_net();
+                    let cap_rule = evacuation_cap_rule(plan.fee_cap_components, rec.fee_cap);
                     // Cap-check the receive side alone (spec §6/§7): for a `DirectInflow` this is
                     // the whole check; for a `Move` the send leg is re-checked at `Pay`. Over cap →
                     // persist the quote first (so the refusal is in history), then refuse terminally.
-                    if !fee::total_within_cap(grossed.receive_quote, Msat(0), rec.fee_cap) {
+                    if !fee::total_within_cap(
+                        grossed.receive_quote,
+                        Msat(0),
+                        cap_rule.at(requote_delivered),
+                    ) {
                         self.journal.put_move(&rec).await?;
                         return Err(ExecError::Permanent(
                             "fee over cap (receive side exceeds fee_cap)".into(),
@@ -1414,12 +1449,7 @@ impl FedimintExecutor {
                     // smaller cached amount over the intent's ask (`assemble_move_record`) and mint
                     // a fresh invoice for less than requested even though fees may have settled; a
                     // fresh attempt must re-quote from the intent's full ask.
-                    let delivered = Msat(
-                        grossed
-                            .invoice_amount
-                            .0
-                            .saturating_sub(grossed.receive_quote.0),
-                    );
+                    let delivered = requote_delivered;
                     // The net this move will actually deliver (== rec.amount for an exact solve),
                     // committed in the receive op's own MoveMeta below UNCONDITIONALLY (§15.11): the
                     // MoveMeta amount is documented as the honest crash-safe delivered amount, so a
@@ -1437,7 +1467,6 @@ impl FedimintExecutor {
                     // second door. For a non-evacuation move (and a legacy intent carrying no
                     // components) the rule is the stored cap as a CONSTANT, so `at()` returns it
                     // unchanged at any net and this is a no-op.
-                    let cap_rule = evacuation_cap_rule(plan.fee_cap_components, rec.fee_cap);
                     let delivered_fee_cap = cap_rule.at(net_amount);
                     // Persist the record BEFORE the non-idempotent receive call — for BOTH move
                     // shapes. If the process dies after B's receive op commits but before the
@@ -2004,23 +2033,37 @@ fn apply_evacuation_sizing(rec: &mut MoveRecord, cap: EvacFeeCap, net: Msat) {
     rec.fee_cap = cap.at(net);
 }
 
-/// Whether a candidate's quoted cost fits the cap AT that candidate's own net.
-fn fits_cap(net: Msat, cost: FreshMoveCost, cap: EvacFeeCap) -> bool {
-    fee::total_within_cap(cost.receive_quote, cost.send_quote, cap.at(net))
+/// Whether a candidate's quoted cost fits the cap at the net that quote actually DELIVERS.
+///
+/// It takes no caller-supplied amount on purpose. Admitting at `cap.at(sized_ask)` while the
+/// executor enforces `cap.at(delivered_net)` lets a quote in the band `cap.at(delivered)+1 ..=
+/// cap.at(sized)` pass sizing and then be refused at the Pay step — after the receive operation
+/// has already committed, leaving it orphaned and unclaimed. With stable quotes that repeats,
+/// so the admission side is the one that has to move.
+fn fits_cap(cost: FreshMoveCost, cap: EvacFeeCap) -> bool {
+    fee::total_within_cap(
+        cost.receive_quote,
+        cost.send_quote,
+        cap.at(cost.delivered_net()),
+    )
 }
 
-/// The COMBINED pass-2 predicate: affordability AND the cap, both at `amount`. The verdict's
-/// shortfall is the LARGER of the two gaps, so a candidate that misses both is only probed around
-/// when BOTH misses are within one discontinuity.
-fn combined_verdict(
-    amount: Msat,
-    quote: CandidateQuote,
-    cap: EvacFeeCap,
-    spendable: Msat,
-) -> ProbeVerdict {
+/// The COMBINED pass-2 predicate: affordability, and the cap at what the quote DELIVERS. The
+/// verdict's shortfall is the LARGER of the two gaps, so a candidate that misses both is only
+/// probed around when BOTH misses are within one discontinuity.
+///
+/// It takes no candidate amount at all, which is the point rather than an accident. Both halves
+/// read the QUOTE: affordability compares `invoice + send_quote` against the source's spendable
+/// balance, and the cap compares the fee against `invoice − receive_quote`. The candidate the
+/// search was probing is an intention; once a quote exists, every question worth asking is about
+/// the quote. Removing the parameter is what stops a caller reintroducing the ask as a cap basis.
+fn combined_verdict(quote: CandidateQuote, cap: EvacFeeCap, spendable: Msat) -> ProbeVerdict {
     let affordability = quote.affordability(spendable);
     let cap_gap = match quote {
-        CandidateQuote::Priced(cost) => cost.total_fee().0.saturating_sub(cap.at(amount).0),
+        CandidateQuote::Priced(cost) => cost
+            .total_fee()
+            .0
+            .saturating_sub(cap.at(cost.delivered_net()).0),
         // An unquotable candidate has no cost to compare against the cap; affordability alone
         // decides it.
         CandidateQuote::Unquotable { .. } => 0,
@@ -2106,7 +2149,7 @@ where
     if let CandidateQuote::Priced(cost) = top {
         if top_affordable {
             search.largest_affordable = Some((desired, cost));
-            if fits_cap(desired, cost, cap) {
+            if fits_cap(cost, cap) {
                 search.sized = Some((desired, cost));
                 return Ok(search);
             }
@@ -2133,7 +2176,7 @@ where
         return Ok(search);
     };
     search.largest_affordable = Some((Msat(pass1), pass1_cost));
-    if fits_cap(Msat(pass1), pass1_cost, cap) {
+    if fits_cap(pass1_cost, cap) {
         search.sized = Some((Msat(pass1), pass1_cost));
         return Ok(search);
     }
@@ -2143,14 +2186,7 @@ where
     // out from above.
     let pass2 = largest_fitting_amount(floor, pass1, oscillation, |amount| {
         let quoted = quote(Msat(amount));
-        async move {
-            Ok(combined_verdict(
-                Msat(amount),
-                quoted.await?,
-                cap,
-                spendable,
-            ))
-        }
+        async move { Ok(combined_verdict(quoted.await?, cap, spendable)) }
     })
     .await?;
     if let Some(pass2) = pass2 {
@@ -2204,7 +2240,11 @@ where
     Fut: std::future::Future<Output = Result<CandidateQuote, ExecError>>,
 {
     let (net, cost) = sized;
-    let shortfall = cost.total_fee().0.saturating_sub(net.0);
+    // Viability compares the fee against what the route DELIVERS, not against the ask — the
+    // Pay-step mirror of this check already reads the delivered net (`rec.amount` is the
+    // hair-under-adjusted value by then), so measuring the ask here would let a route pass
+    // sizing and fail execution over the same inequality.
+    let shortfall = cost.total_fee().0.saturating_sub(cost.delivered_net().0);
     if shortfall == 0 {
         return Ok(EvacuationSizing::Sized(net));
     }
@@ -2222,8 +2262,13 @@ where
             continue;
         };
         let candidate = Msat(candidate);
-        if evacuation_cost_fits(cost, cap.at(candidate), spendable)
-            && cost.total_fee().0 <= candidate.0
+        // Cap at what this candidate DELIVERS, matching `fits_cap` and the executor. The
+        // viability half (`total_fee <= delivered`) moves with it: a route "serves" when it
+        // delivers at least what it costs (CONTEXT.md, "Serves"), and the thing it delivers is
+        // the delivered net, not the amount we asked for.
+        let delivered = cost.delivered_net();
+        if evacuation_cost_fits(cost, cap.at(delivered), spendable)
+            && cost.total_fee().0 <= delivered.0
         {
             return Ok(EvacuationSizing::Sized(candidate));
         }
@@ -4098,6 +4143,67 @@ mod tests {
     // the same seam `resolve_receive_gross_up` is already tested through (§15.10).
 
     /// The shipped evacuation cap: 200 sats + 3%.
+    /// THE SEAM: a quote inside `cap.at(delivered)+1 ..= cap.at(sized_ask)` must be REFUSED.
+    ///
+    /// This band is the whole defect. The sizing search used to admit at `cap.at(sized_ask)`
+    /// while the executor enforced `cap.at(delivered_net)`, so a quote in between passed sizing,
+    /// minted and COMMITTED a receive operation, and was then refused at the Pay step — leaving
+    /// the receive orphaned and unclaimed. With stable quotes the next watch cycle did it again.
+    ///
+    /// The live devimint gate could not see this: it ran with 6.7% fee headroom and an 80 msat
+    /// hair-under, so the band was 2 msat wide and the real fee was nowhere near it. Neither
+    /// could the rest of the suite — converting the cap basis moved no existing test. A fixture
+    /// has to sit the fee STRICTLY INSIDE the band or it proves nothing about which net is used.
+    ///
+    /// Numbers are the live gate's, so the band is the one production actually produced:
+    /// sized ask 449_998, delivered 449_918, `cap.at(sized) = 213_499`, `cap.at(delivered) =
+    /// 213_497`. Every cost below delivers 449_918; only `total_fee` moves.
+    #[test]
+    fn a_quote_between_the_delivered_cap_and_the_sized_cap_is_refused() {
+        const DELIVERED: u64 = 449_918;
+        // A cost delivering DELIVERED whose two legs sum to `total_fee`.
+        let cost_with_total = |total_fee: u64| {
+            let receive_quote = total_fee - 200_000;
+            FreshMoveCost {
+                invoice_amount: Msat(DELIVERED + receive_quote),
+                receive_quote: Msat(receive_quote),
+                send_quote: Msat(200_000),
+            }
+        };
+
+        assert_eq!(PILOT_CAP.at(Msat(449_998)), Msat(213_499), "cap at the ask");
+        assert_eq!(
+            PILOT_CAP.at(Msat(DELIVERED)),
+            Msat(213_497),
+            "cap at delivery"
+        );
+
+        // Every fixture really does deliver DELIVERED — otherwise the band is not the band.
+        for total in [213_497, 213_498, 213_499] {
+            assert_eq!(cost_with_total(total).delivered_net(), Msat(DELIVERED));
+        }
+
+        // AT the delivered cap: admitted. `total_within_cap` compares `<=`, and moving the basis
+        // must not quietly turn the boundary into a refusal.
+        assert!(
+            fits_cap(cost_with_total(213_497), PILOT_CAP),
+            "a fee exactly at the delivered cap still executes"
+        );
+
+        // INSIDE the band: refused, though both fit the cap taken on the ask. RED-FIRST — the
+        // pre-fix predicate admits both of these, which is the bug.
+        assert!(
+            !fits_cap(cost_with_total(213_498), PILOT_CAP),
+            "one msat over the DELIVERED cap is refused, even though it is under the 213_499 \
+             cap the ask would have authorised"
+        );
+        assert!(
+            !fits_cap(cost_with_total(213_499), PILOT_CAP),
+            "and a fee landing exactly on the ASK's cap is refused too — that is the entire \
+             point: the ask never arrived, so it never entitled that fee"
+        );
+    }
+
     const PILOT_CAP: EvacFeeCap = EvacFeeCap {
         base_msat: Msat(200_000),
         bps: 300,
@@ -4315,8 +4421,14 @@ mod tests {
             Msat(230_000),
             "the cap is taken on the NET"
         );
+        assert_eq!(
+            cost.delivered_net(),
+            net,
+            "this fixture is an EXACT solve, so the delivered net IS the ask — which is what \
+             makes the pinned cap numbers below comparable to the ask at all"
+        );
         assert!(
-            fits_cap(net, cost, PILOT_CAP),
+            fits_cap(cost, PILOT_CAP),
             "a quote landing EXACTLY on the cap executes — total_within_cap compares `<=`"
         );
         assert_eq!(
@@ -4330,7 +4442,7 @@ mod tests {
         let over_cost = over.cost_at(net, spendable).await;
         assert_eq!(over_cost.total_fee(), Msat(230_001));
         assert!(
-            !fits_cap(net, over_cost, PILOT_CAP),
+            !fits_cap(over_cost, PILOT_CAP),
             "cap plus one msat is refused at this net"
         );
         let cap_taken_on_the_gross = PILOT_CAP.base_msat.0 + 1_100_000 * 300 / 10_000;
@@ -4345,7 +4457,7 @@ mod tests {
         let downsized = over.size(net, spendable, PILOT_CAP).await.expect_sized();
         assert!(downsized < net, "downsized to {downsized:?}");
         let downsized_cost = over.cost_at(downsized, spendable).await;
-        assert!(fits_cap(downsized, downsized_cost, PILOT_CAP));
+        assert!(fits_cap(downsized_cost, PILOT_CAP));
     }
 
     /// A FULL-BALANCE evacuation drains the source in ONE operation. "At full size" is
@@ -4668,7 +4780,7 @@ mod tests {
         let naive =
             largest_fitting_amount(MINIMUM_INCOMING_CONTRACT_MSAT, balance.0, 0, |amount| {
                 let quoted = route.quote(Msat(amount), balance);
-                async move { Ok(combined_verdict(Msat(amount), quoted.await?, cap, balance)) }
+                async move { Ok(combined_verdict(quoted.await?, cap, balance)) }
             })
             .await
             .expect("no fault");

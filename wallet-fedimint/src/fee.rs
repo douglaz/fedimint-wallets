@@ -67,6 +67,22 @@ pub struct GrossUp {
     pub receive_quote: Msat,
 }
 
+impl GrossUp {
+    /// The DELIVERED NET this solve credits the recipient (CONTEXT.md, "Delivered net").
+    ///
+    /// This type is where the invariant is MAINTAINED, which is why the definition lives here:
+    /// `receive_quote` is documented above as `invoice_amount − net`, and the executor's
+    /// hair-under and bisection tails RESTATE it to keep that true when the fixed point settles
+    /// under the requested amount. So the subtraction is exact by construction, not by luck.
+    ///
+    /// **Every fee cap is computed from this**, never from the amount that was asked for. The
+    /// two diverge on a verified hair-under settle, and a cap computed on the ask authorises a
+    /// proportional fee on value the recipient never got.
+    pub fn delivered_net(self) -> Msat {
+        Msat(self.invoice_amount.0.saturating_sub(self.receive_quote.0))
+    }
+}
+
 /// The gateway ppm rate at (or above) which the fixed point has NO solution: the gateway
 /// keeps 100% (or more) of every marginal msat, so the recipient can never net a positive
 /// amount however large the invoice. [`gross_up`] returns `None` at or above this rate rather
