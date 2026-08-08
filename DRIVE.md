@@ -9,8 +9,8 @@ br-ucq, br-pfc, br-4yz), NOT br-2aa, NOT br-s0e, NOT the production canary.
 **Branch:** `feat/br-evac-cap-enforce-vn6`
 **Pending:** —
 **Gate:** `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
-· last green 2026-08-07 at `a4c943b` (fmt 0, clippy 0, **775 passed / 0 failed**)
-· live devimint gate re-run at the SAME commit: exit 0
+· last green at `b18496c` (fmt 0, clippy 0, **777 passed / 0 failed**, EXIT=0)
+· live devimint gate re-run at the SAME commit: EXIT=0
 
 Supersedes the stranded-move drive, which was stopped for a retrospective and whose scope
 excluded these beads.
@@ -24,71 +24,39 @@ excluded these beads.
   panel, 742 tests, CodeRabbit no actionable comments.
 
 ## Now
-**2/3 `br-evac-cap-enforce-vn6`** — the money change. Committed (`dd6c46c`) and pushed.
+**2/3 `br-evac-cap-enforce-vn6`** — the money change. PR #31, HEAD `b18496c`.
 
-Review round 1 is COMPLETE (findings recorded on the bead):
-- codex found one P1 — the receive fixed point's hair-under settle kept the cap computed
-  at the larger sized ask. **Verified and fixed.**
-- the money reviewer found no P0/P1/P2; it reproduced 13 pinned fixtures exactly and
-  grep-confirmed the sizing seam is the only writer of `rec.amount`. Five P3s open.
-- the skeptic found 11 P2s; one taken (a behavioural no-op that added a hunk to a money
-  audit surface), the rest declined as load-bearing.
+FIVE review rounds. The per-round detail lives on the bead; what matters here is the shape:
+every round found a different consumer of ONE undefined concept — *which net does the cap bind
+to* — and round 2's fix caused round 4's finding. That is the cross-cutting tell, so round 5 is a
+DESIGN PASS rather than a fifth patch (`8c0831c`, `b18496c`):
 
-Round 2 (full panel, run in parallel) is COMPLETE:
-- **codex** — P1: the live devimint gate is outstanding and blocks merge, citing this
-  repo's own `AGENTS.md`. P2: `assemble_move_record` paired the cached executed amount
-  with the intent's planned cap when `backfill_ops` dropped an undecodable `MoveMeta`.
-  **Fixed** (`e9c38b6`), with a genuinely red-first test.
-- **money reviewer** — no P0/P1/P2. Confirms the round-1 hair-under fix "correct and
-  complete", verified the sizing seam is the only writer of `rec.amount`, and checked the
-  reassembly fix's final form. Five P3s.
-- **skeptic** — no money findings; traced every construct back to a `br-y2j` clause, and
-  DEFERRED its own ten remaining round-1 items under the same reasoning that declined
-  them.
+- Every fee cap now computes from the **delivered net** (`invoice − receive_quote`), derived on
+  `GrossUp::delivered_net` and `FreshMoveCost::delivered_net` — the types that maintain the
+  invariant. `fits_cap` and `combined_verdict` take no caller-supplied amount at all, which is
+  what stops a sixth site inventing its own answer.
+- `CONTEXT.md` now defines **sized ask** and **delivered net** and retires "executed net", which
+  read as the first to one author and the second to another. That ambiguity is the whole defect.
+- The structural-refusal slope was RE-DERIVED in delivered space (`dC/dD = bps/10_000` holds
+  there and only there), not substituted — codex predicted that trap and a reviewer confirmed I
+  had fallen into it.
 
-Round 3 (after CodeRabbit's P1 on PR #31) is COMPLETE:
-- **CodeRabbit** — P1: `evacuation_viability` returned early on a bare `shortfall > A`, skipping
-  the bounded probe. ADR-0029:134 forbids exactly that ("inconclusive, not proof"): `A` bounds ONE
-  fee jump, so two nearby note-count drops can each stay under it while together exceeding it,
-  leaving a serving candidate just below. Stable quotes reproduce the branch every tick — a dying
-  federation stranded with an executable evacuation available. **Fixed** (`a4c943b`), red-first.
-- **money reviewer** — no findings, and it RETRACTED its round-2 question on this same code
-  ("ADR-0029:134 does back CodeRabbit — my round-2 QUESTION read the operative requirement too
-  narrowly"). It checked all five `expect_refused` sites and proved the ECONOMIC VIABILITY AC
-  still holds, and re-derived every pinned number in the new fixture.
-- **codex** — P1: re-run both gates at HEAD, since the money path moved after the recorded
-  evidence. Correct; both re-run at `a4c943b` and green.
+Decision evidence: fable and codex analysed the sized-ask-vs-delivered-net question
+independently and both chose delivered, both said do not land without it.
 
-**Declined with reason, recorded as follow-ups rather than churn:** two executor P3s
-(the pre-mint receive gate enforcing at the sized ask rather than the delivered net, and a
-sub-floor `desired` reported as an affordability failure). Both are quality-of-refusal,
-neither loses money, and every further edit to money code invalidates the clearance the
-panel just gave.
+**Gates at `b18496c`:** workspace EXIT=0, 777 passed / 0 failed. Live two-federation devimint
+evacuation gate EXIT=0 (`performed=1 failed=0 retryable=0`, A 499998 → 35870, B netted 449918).
 
-**PROVE: the live devimint gate PASSED** 2026-08-07 (exit 0), closing codex's P1. The new cap
-arithmetic is verified against live federations, not fixtures:
+**What that live gate does NOT prove, stated because I claimed otherwise once.** The `fee_cap
+213499` it prints is the DECISION-time cap, computed at plan time on the planned amount —
+`decide()` has no quote yet, so no delivered net exists there. In that run sizing did not
+downsize, so the two candidate bases differed by 2 msat and the fee had 199,287 msat of headroom
+under either. The gate proves the knobs are in force and the path executes end to end; the seam
+invariant is proven by the unit test instead, red-first.
 
-    decision: evacuate 449998 msat A -> B (fee_cap 213499 msat, reason ShutdownNotice)
-    213499 == 200000 + floor(449998 * 300 / 10000)     EXACT
-
-and it differs from the old absolute `max_fee` of 200000, so the new formula is in force rather
-than falling back. A drained 499998 -> 35870 msat (~0); B netted 449918, a hair under, never over;
-a healthy fed correctly decided NO evacuate.
-
-The gate was RED first. It failed at funding with `Primary module not available` in ~0.4s, and a
-CONTROL RUN of the same diagnostic against merged `main` (`7d5e69f`) failed IDENTICALLY — that
-controlled comparison is what cleared this branch, not the error text sounding unrelated to fee
-caps. Root cause is environmental and pre-existing: devimint at our pin does not enable mint v1,
-which is `wallet-cli`'s primary module, and the runbook's documented invocation never sets it.
-Filed as `br-devimint-runbook-mint-na3` (P1) — following the runbook as written could not have
-produced a green run, so this gate was never being skipped.
-
-Known limitation carried forward, not hidden: the hair-under test pins the arithmetic but
-drives the sizing helper directly, so it would NOT go red if the bypass were reintroduced.
-Its own doc comment says so. A real guard needs a fixture driving `drive_intent_step`
-through a hair-under settle against a mocked multi-client. (The later reassembly test IS
-red-first — verified by reverting the fix: 21 passed, 1 failed, `left: Msat(2450000)`,
-`right: Msat(230000)`.)
+**Owed, not silently missing:** the pre-receive gate and the executor's recompute have no test
+pinning their basis — a driven `drive_intent_step` fixture against a mocked multi-client is what
+would cover them, and `br-4yz` is where that harness belongs.
 
 ## Next
 `br-evac-cap-ledger-x9k` (3/3) — the ledger reporting the enforced cap and executed
