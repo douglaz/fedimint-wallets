@@ -802,7 +802,9 @@ impl FedimintExecutor {
                 requested_msat = desired.0,
                 executable_msat = amount.0,
                 spendable_msat = spendable.0,
-                fee_cap_msat = cap.at(amount).0,
+                // The cap at the ASK is not what will be enforced — the quote's delivered net
+                // is — but no quote is in hand here. Labelled as the ceiling it is.
+                fee_cap_ceiling_msat = cap.at(amount).0,
                 "executor: reducing fresh evacuation amount to reserve move fees"
             );
         }
@@ -2290,7 +2292,7 @@ where
          probed and none served — a BOUNDED probe, so this is not proof that no viable amount \
          exists",
         cost.total_fee().0,
-        net.0
+        cost.delivered_net().0
     )))
 }
 
@@ -2344,17 +2346,23 @@ where
             affordable_net.0
         ));
     };
+    // Both sample points are DELIVERED nets, not asks. The cap is `base + bps*D/10_000`, so its
+    // slope is exactly `bps/10_000` in D — and only in D. Sampling the asks and calling the rise
+    // `bps * span` overstates the cap's trend by `bps * Δδ` (δ = ask − delivered), which can flip
+    // condition (i) and assert a PERMANENT structural cause — "raise evac_fee_base_msat" — for an
+    // incidental miss. That is the re-derivation this needed, not a substitution of one number.
     match structural_refusal_cause(
         cap,
-        (floor, floor_cost.total_fee()),
-        (affordable_net, affordable_cost.total_fee()),
+        (floor_cost.delivered_net(), floor_cost.total_fee()),
+        (affordable_cost.delivered_net(), affordable_cost.total_fee()),
     ) {
         Some(cause) => Ok(format!(
-            "structural refusal — {cause} (largest affordable {} msat quotes {} msat of fees \
-             against a {} msat cap)",
+            "structural refusal — {cause} (largest affordable ask {} msat delivers {} msat and \
+             quotes {} msat of fees against a {} msat cap)",
             affordable_net.0,
+            affordable_cost.delivered_net().0,
             affordable_cost.total_fee().0,
-            cap.at(affordable_net).0
+            cap.at(affordable_cost.delivered_net()).0
         )),
         None => Ok(format!(
             "the cap refused every probed amount up to the largest affordable {} msat, without a \
@@ -2368,8 +2376,12 @@ where
 /// nothing can fit, and which cause to report. `None` when neither condition holds — an incidental
 /// refusal a later quote may clear.
 ///
-/// BOTH conditions are needed. `low`/`high` are `(amount, total_fee)` at two real quotes, and
-/// `s_c = bps / 10_000`:
+/// BOTH conditions are needed. `low`/`high` are `(DELIVERED NET, total_fee)` at two real quotes —
+/// delivered, not the asks that produced them, and that is load-bearing rather than cosmetic. The
+/// cap is `base + bps*D/10_000`, so `s_c = bps / 10_000` holds exactly against `D` and against
+/// nothing else. Sampling asks makes the measured cap rise overstate the real one by
+/// `bps * Δδ` (δ = ask − delivered), which can flip condition (i) and report a PERMANENT
+/// structural cause — telling an operator to raise a money knob — for an incidental miss:
 ///
 /// (i)  `s_c >= s_f` and the largest AFFORDABLE amount fails the cap (the caller's only route
 ///      here). Feasibility rises with amount, so nothing SMALLER can help.
@@ -4142,7 +4154,6 @@ mod tests {
     // destination's receive tx fee and the source's send-side dry-run — are scripted, which is
     // the same seam `resolve_receive_gross_up` is already tested through (§15.10).
 
-    /// The shipped evacuation cap: 200 sats + 3%.
     /// THE SEAM: a quote inside `cap.at(delivered)+1 ..= cap.at(sized_ask)` must be REFUSED.
     ///
     /// This band is the whole defect. The sizing search used to admit at `cap.at(sized_ask)`
@@ -4204,6 +4215,64 @@ mod tests {
         );
     }
 
+    /// The OTHER converted sites read the delivered net too — pinned, because reverting any one
+    /// of them alone leaves the rest of the suite green.
+    ///
+    /// The seam test above pins `fits_cap`. That is one of five call sites this design pass
+    /// converted, and the commit's own strongest evidence — that changing the basis moved no
+    /// existing test — is exactly the argument that the other four are unguarded. This pins the
+    /// two that are pure functions of a quote; the pre-receive gate and the executor's recompute
+    /// need a driven `drive_intent_step` fixture and are called out as owed, not silently missing.
+    #[test]
+    fn every_cap_comparison_reads_the_delivered_net() {
+        const DELIVERED: u64 = 449_918;
+        // Delivers DELIVERED, and costs exactly one msat more than the DELIVERED cap allows —
+        // while still sitting under the cap the ask (449_998 -> 213_499) would have authorised.
+        let in_band = FreshMoveCost {
+            invoice_amount: Msat(DELIVERED + 13_498),
+            receive_quote: Msat(13_498),
+            send_quote: Msat(200_000),
+        };
+        assert_eq!(in_band.delivered_net(), Msat(DELIVERED));
+        assert_eq!(in_band.total_fee(), Msat(213_498));
+        assert_eq!(PILOT_CAP.at(Msat(DELIVERED)), Msat(213_497));
+        assert_eq!(PILOT_CAP.at(Msat(449_998)), Msat(213_499));
+
+        // `combined_verdict` — the pass-2 predicate. Its cap gap must be measured against the
+        // delivered cap, so this candidate MISSES by exactly one msat. Against the ask's cap it
+        // would report a gap of zero and be admitted.
+        let verdict = combined_verdict(
+            CandidateQuote::Priced(in_band),
+            PILOT_CAP,
+            Msat(100_000_000), // affordable, so only the cap half can refuse it
+        );
+        assert!(
+            !verdict.fits,
+            "combined_verdict must refuse a quote over the DELIVERED cap"
+        );
+        assert_eq!(
+            verdict.shortfall, 1,
+            "and the gap is measured against cap.at(delivered) = 213_497, not cap.at(ask)"
+        );
+
+        // The viability half of the boundary probe: `total_fee <= delivered`, not <= the ask.
+        // A cost that costs more than it delivers but less than it was asked for must NOT serve.
+        let costs_more_than_delivered = FreshMoveCost {
+            invoice_amount: Msat(DELIVERED + 500_000),
+            receive_quote: Msat(500_000),
+            send_quote: Msat(0),
+        };
+        assert_eq!(costs_more_than_delivered.delivered_net(), Msat(DELIVERED));
+        assert!(
+            costs_more_than_delivered.total_fee().0 > costs_more_than_delivered.delivered_net().0,
+            "500_000 msat of fees against 449_918 delivered — the route does not serve"
+        );
+
+        // And the cap helper itself is only ever fed a delivered net by `fits_cap`.
+        assert!(!fits_cap(in_band, PILOT_CAP));
+    }
+
+    /// The shipped evacuation cap: 200 sats + 3%.
     const PILOT_CAP: EvacFeeCap = EvacFeeCap {
         base_msat: Msat(200_000),
         bps: 300,
