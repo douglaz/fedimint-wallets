@@ -64,7 +64,7 @@ amount, plus runbook and README. Then `br-y2j` closes, which unblocks
 `br-recanary-y2j-ujs`.
 
 ## Open questions for the human
-- none. (The live devimint gate is no longer outstanding — see the PROVE section above: it ran
-  at `a4c943b` and exited 0. What remains from that work is a filed defect, not an open gate:
+- none. The live devimint gate is not outstanding: it ran at `b18496c` and exited 0 (see the
+  gate line at the top). What remains from that work is a filed defect, not an open gate —
   `br-devimint-runbook-mint-na3`, because the runbook's documented invocation omits
-  `FM_ENABLE_MODULE_MINT=1` and every smoke dies at `Primary module not available`.)
+  `FM_ENABLE_MODULE_MINT=1` and every smoke dies at `Primary module not available`.

@@ -66,17 +66,18 @@ pub struct TickPolicy {
     pub target_spending_balance: Msat,
     /// Target balance for the warm standby; below it, fund from the spending surplus.
     pub standby_target: Msat,
-    /// ABSOLUTE per-move fee cap. Since br-ljj.2 it bounds only `Evacuate`; funding `Move`s
-    /// use `max_fee_bps_of_move`.
+    /// ABSOLUTE per-move fee cap. It bounds NO allocator-emitted action: funding `Move`s use
+    /// `max_fee_bps_of_move` and `Evacuate` uses the `evac_fee_*` pair. It survives as the
+    /// default cap for the user-initiated money verbs and as the probe leg cap.
     pub max_fee: Msat,
     /// PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
     /// (1..=10000; Policy rejects 0). Sizing reserves `amount + amount*bps/10000` from the source budget.
     pub max_fee_bps_of_move: u16,
-    /// BASE component of the evacuation fee cap, in millisatoshis. Carried but not read by any
-    /// enforcement path yet; see `wallet_api::Policy`.
+    /// BASE component of the evacuation fee cap, in millisatoshis. ENFORCED, with `evac_fee_bps`,
+    /// against the DELIVERED net; see `wallet_api::Policy`.
     pub evac_fee_base_msat: Msat,
-    /// PROPORTIONAL component of the evacuation fee cap, in basis points of the amount evacuated
-    /// (0..=10000). Carried but not read by any enforcement path yet; see `wallet_api::Policy`.
+    /// PROPORTIONAL component of the evacuation fee cap, in basis points of the DELIVERED net —
+    /// not of the amount asked for (0..=10000); see `wallet_api::Policy`.
     pub evac_fee_bps: u16,
     /// The allocation epoch (T10) stamped into each decision's idempotency key.
     pub occurrence: Occurrence,

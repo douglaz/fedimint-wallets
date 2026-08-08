@@ -1443,6 +1443,27 @@ impl FedimintExecutor {
                             "fee over cap (receive side exceeds fee_cap)".into(),
                         ));
                     }
+                    // VIABILITY, checked here and not only at Pay. The Pay step terminalizes
+                    // `Permanent` when the receive fee exceeds what the move delivers, and by then
+                    // `mc.receive` has committed — so a gateway that raises its receive base
+                    // between sizing and this re-quote gets admitted (its fee still fits the cap),
+                    // mints, commits, and is then permanently refused, abandoning the drain with an
+                    // orphaned receive op. That is the opposite of the posture `size_fresh_
+                    // evacuation` takes: funds on a dying federation are left retryable, never
+                    // terminally abandoned. `fits_cap` makes the same argument — the admission side
+                    // is the one that has to move — and this is the admission side.
+                    //
+                    // Only the FIXED-invoice half moves forward. The send leg is re-quoted at Pay
+                    // and its `Retryable` disposition rightly stays there.
+                    if is_evacuate && grossed.receive_quote.0 > requote_delivered.0 {
+                        self.journal.put_move(&rec).await?;
+                        return Err(ExecError::Retryable(format!(
+                            "the receive leg now costs more than this move delivers ({} msat of \
+                             receive fee against {} msat delivered); refusing BEFORE minting so \
+                             the balance stays where it is and a later quote can still drain it",
+                            grossed.receive_quote.0, requote_delivered.0
+                        )));
+                    }
                     let invoice_amount = grossed.invoice_amount;
                     // A move may have accepted a verified hair-under solve: the DELIVERED net is
                     // invoice − receive_quote. The adjustment to `rec.amount` happens AFTER
@@ -2141,11 +2162,12 @@ where
         sized: None,
         largest_affordable: None,
     };
-    if desired.0 < floor {
-        return Ok(search);
-    }
-
     // FAST PATH: the full ask, which is what an evacuation wants whenever the source can fund it.
+    // It runs BEFORE the floor check on purpose. `floor` bounds the BISECTION RANGE, not
+    // executability: the incoming contract is `net + fed_fee`, so a net under the 5_000 msat
+    // protocol minimum can still mint a contract above it once the federation fee is added.
+    // Returning early without ever quoting strands exactly the dust remnant an evacuation exists
+    // to sweep — it would retry forever reporting "no fit" for an amount nothing ever priced.
     let top = quote(desired).await?;
     let top_affordable = top.affordability(spendable).fits;
     if let CandidateQuote::Priced(cost) = top {
@@ -2156,6 +2178,12 @@ where
                 return Ok(search);
             }
         }
+    }
+
+    // Below the floor there is no bisection range left: the fast path above was the only
+    // candidate this route has, and it did not serve.
+    if desired.0 < floor {
+        return Ok(search);
     }
 
     // PASS 1 — affordability alone. When the full ask was already affordable it IS pass 1's
@@ -2192,8 +2220,15 @@ where
     })
     .await?;
     if let Some(pass2) = pass2 {
+        // REVALIDATE. This is a fresh quote, not the one `combined_verdict` accepted inside the
+        // bisection: another intent can change the source's note inventory mid-search, so the
+        // re-quote can stay `Priced` while carrying a larger mint fee. Trusting the verdict here
+        // would let an over-cap evacuation reach invoice creation and be refused only at Pay —
+        // after the receive committed. Same seam, one function further along.
         if let CandidateQuote::Priced(cost) = quote(Msat(pass2)).await? {
-            search.sized = Some((Msat(pass2), cost));
+            if fits_cap(cost, cap) && cost.source_debit() <= spendable {
+                search.sized = Some((Msat(pass2), cost));
+            }
         }
     }
     Ok(search)
@@ -4215,8 +4250,8 @@ mod tests {
         );
     }
 
-    /// The OTHER converted sites read the delivered net too — pinned, because reverting any one
-    /// of them alone leaves the rest of the suite green.
+    /// `combined_verdict`'s cap gap reads the delivered net — pinned, because reverting it alone
+    /// leaves the rest of the suite green.
     ///
     /// The seam test above pins `fits_cap`. That is one of five call sites this design pass
     /// converted, and the commit's own strongest evidence — that changing the basis moved no
@@ -4224,7 +4259,7 @@ mod tests {
     /// two that are pure functions of a quote; the pre-receive gate and the executor's recompute
     /// need a driven `drive_intent_step` fixture and are called out as owed, not silently missing.
     #[test]
-    fn every_cap_comparison_reads_the_delivered_net() {
+    fn combined_verdict_measures_its_cap_gap_against_the_delivered_net() {
         const DELIVERED: u64 = 449_918;
         // Delivers DELIVERED, and costs exactly one msat more than the DELIVERED cap allows —
         // while still sitting under the cap the ask (449_998 -> 213_499) would have authorised.
@@ -4255,21 +4290,14 @@ mod tests {
             "and the gap is measured against cap.at(delivered) = 213_497, not cap.at(ask)"
         );
 
-        // The viability half of the boundary probe: `total_fee <= delivered`, not <= the ask.
-        // A cost that costs more than it delivers but less than it was asked for must NOT serve.
-        let costs_more_than_delivered = FreshMoveCost {
-            invoice_amount: Msat(DELIVERED + 500_000),
-            receive_quote: Msat(500_000),
-            send_quote: Msat(0),
-        };
-        assert_eq!(costs_more_than_delivered.delivered_net(), Msat(DELIVERED));
-        assert!(
-            costs_more_than_delivered.total_fee().0 > costs_more_than_delivered.delivered_net().0,
-            "500_000 msat of fees against 449_918 delivered — the route does not serve"
-        );
-
-        // And the cap helper itself is only ever fed a delivered net by `fits_cap`.
-        assert!(!fits_cap(in_band, PILOT_CAP));
+        // NOTE on what is NOT pinned here, so the name does not overclaim: the viability half of
+        // the boundary probe (`total_fee <= delivered`, executor.rs) and the pre-mint gate both
+        // read the delivered net too, but neither is reachable from a pure fixture — they need a
+        // driven quote stream. An earlier version of this test "covered" viability by asserting
+        // `500_000 > 449_918` on its own literals, which called no production code and stayed
+        // green against the ask-based version. That is the exact vacuity this suite exists to
+        // refuse, so it is deleted rather than left reading as coverage. `br-4yz`'s harness is
+        // where the driven fixture belongs.
     }
 
     /// The shipped evacuation cap: 200 sats + 3%.

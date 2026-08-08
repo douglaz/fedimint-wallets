@@ -28,11 +28,11 @@ pub struct Policy {
     pub per_fed_cap: Msat,
     pub spending_target: Msat,
     pub standby_target: Msat,
-    /// ABSOLUTE fee cap. It currently bounds allocator-emitted `Evacuate` actions; funding `Move`s
-    /// use `max_fee_bps_of_move`. The evacuation knobs below are not read by any enforcement path
-    /// yet. Once `br-evac-cap-enforce-vn6` moves `Evacuate` onto them, this will bound no
-    /// allocator-emitted action — but it stays load-bearing as the default `fee_cap` for
-    /// user-initiated pay/move/receive and as the probe leg cap, so it does NOT become dead.
+    /// ABSOLUTE fee cap. It bounds NO action the allocator emits: funding `Move`s use
+    /// `max_fee_bps_of_move`, and `Evacuate` uses the `evac_fee_*` pair below.
+    /// **In an evacuation incident this is not the knob to turn** — raise `evac_fee_base_msat`
+    /// or `evac_fee_bps`. It remains load-bearing elsewhere, as the default `fee_cap` for
+    /// user-initiated pay/move/receive and as the probe leg cap, so it is not dead.
     pub max_fee: Msat,
     /// PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
     /// (1..=10000; Policy rejects 0). Replaces the absolute `max_fee` for funding so sizing
@@ -45,9 +45,11 @@ pub struct Policy {
     /// path wired yet).
     #[serde(default = "default_max_fee_bps_of_move")]
     pub max_fee_bps_of_move: u16,
-    /// BASE component of the evacuation fee cap, in millisatoshis. The pair is propagated but not
-    /// enforced yet; see `max_fee`. The named serde default keeps older stored rows from decoding
-    /// this numeric field as zero.
+    /// BASE component of the evacuation fee cap, in millisatoshis. With `evac_fee_bps` it is the
+    /// cap actually ENFORCED on an evacuation, computed as `base + bps * delivered_net / 10_000`
+    /// against what the destination is credited — never against the amount that was asked for
+    /// (CONTEXT.md, "Delivered net"). The named serde default keeps older stored rows from
+    /// decoding this numeric field as zero.
     #[serde(default = "default_evac_fee_base_msat")]
     pub evac_fee_base_msat: Msat,
     /// PROPORTIONAL component of the evacuation fee cap, in basis points of the amount evacuated

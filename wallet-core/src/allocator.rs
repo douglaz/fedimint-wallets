@@ -415,8 +415,17 @@ fn push_and_reserve(
     };
     if push_decision(out, decision) {
         if let Some((from, to, amount, fee_cap)) = reservation {
-            *credited.entry(to).or_insert(0) += amount;
-            *debited.entry(from).or_insert(0) += amount + fee_cap;
+            // SATURATING, not `+`. `EvacFeeCap::at` saturates by design and `Policy::validate`
+            // puts no ceiling on `evac_fee_base_msat`, so a large-but-valid base yields a
+            // `fee_cap` near `u64::MAX` and `amount + fee_cap` overflows — a panic in debug, and
+            // in release a WRAP to a tiny number, which under-reserves and lets the same balance
+            // be spent twice. Saturating fails the other way: the source reads as fully spoken
+            // for and further decisions against it are refused, which is the safe direction for a
+            // reservation.
+            let credited_to = credited.entry(to).or_insert(0);
+            *credited_to = credited_to.saturating_add(amount);
+            let debited_from = debited.entry(from).or_insert(0);
+            *debited_from = debited_from.saturating_add(amount.saturating_add(fee_cap));
         }
     }
 }
