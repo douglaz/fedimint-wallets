@@ -2406,8 +2406,12 @@ where
 {
     let Some((affordable_net, affordable_cost)) = search.largest_affordable else {
         return Ok(
-            "no probed amount was affordable from the source balance (the source may have funds \
-             in flight; a later tick can succeed)"
+            // NOT "no probed amount was affordable" — an earlier probe may well have been, and
+            // then the final re-quote moved above budget, which is exactly the case that leaves
+            // no affordable sample recorded. Saying otherwise sends an operator looking for a
+            // balance problem when the balance was fine and the price moved.
+            "no affordable sample remained after the final re-quote (the source may have funds \
+             in flight, or a quote moved mid-search; a later tick can succeed)"
                 .to_string(),
         );
     };
@@ -4412,29 +4416,36 @@ mod tests {
         .await
         .expect("no fault");
 
-        if let Some((net, cost)) = search.sized {
-            assert!(
-                cost.source_debit().0 <= spendable.0,
-                "sized {net:?} on a re-quote debiting {} against {} spendable — admitted on the \
-                 cap alone, which mints and COMMITS a receive that Pay cannot fund",
-                cost.source_debit().0,
-                spendable.0
-            );
-        }
-        if let Some((_, cost)) = search.largest_affordable {
-            assert!(
-                cost.source_debit().0 <= spendable.0,
-                "largest_affordable holds an UNAFFORDABLE sample debiting {} — the refusal \
-                 diagnostics read it as affordable",
-                cost.source_debit().0
-            );
-        }
+        // UNCONDITIONAL. An `if let Some(..)` here would skip its own body on the passing path —
+        // the fix makes `sized` None — so the test would prove nothing about the code it names
+        // and would keep passing if drift stopped reaching the seam entirely.
+        assert_eq!(
+            search.sized.map(|(n, c)| (n.0, c.source_debit().0)),
+            None,
+            "the moved re-quote is unaffordable, so nothing may be sized on it"
+        );
+        assert_eq!(
+            search
+                .largest_affordable
+                .map(|(n, c)| (n.0, c.source_debit().0)),
+            None,
+            "and the unaffordable sample must not be recorded for the diagnostics either"
+        );
+        // And prove the seam was actually REACHED: the final re-quote is a SECOND sighting of the
+        // amount pass 1 settled on. Without this the two assertions above are satisfied by a
+        // search that never got there.
+        let sightings = seen.borrow();
+        assert!(
+            sightings.values().any(|&n| n >= 2),
+            "no amount was quoted twice — pass 1's final re-quote never happened, so this test \
+             asserts nothing about the admission it is named for: {sightings:?}"
+        );
     }
 
     /// PASS 2: its final re-quote must be revalidated too.
     ///
     /// Reaching pass 2 at all requires pass 1 to FAIL THE CAP at the largest affordable amount —
-    /// otherwise pass 1 admits and returns. So everything above 100_000 is priced over the cap,
+    /// otherwise pass 1 admits and returns. So everything above 340_000 is priced over the cap,
     /// and the affordable, cap-fitting amounts live in the bottom window pass 2 searches. The
     /// moved re-quote is again a LATER quote of the same amount: what the bisection accepted is
     /// not what the admission sees.
@@ -4482,15 +4493,18 @@ mod tests {
         .await
         .expect("no fault");
 
-        if let Some((net, cost)) = search.sized {
-            assert!(
-                cost.source_debit().0 <= spendable.0,
-                "pass 2 sized {net:?} on a re-quote debiting {} against {} spendable — admitted \
-                 without revalidating what the bisection had accepted",
-                cost.source_debit().0,
-                spendable.0
-            );
-        }
+        // UNCONDITIONAL, for the same reason as the pass-1 test: on the passing path `sized` is
+        // None, so a conditional assertion would never execute.
+        assert_eq!(
+            search.sized.map(|(n, c)| (n.0, c.source_debit().0)),
+            None,
+            "pass 2's final re-quote is unaffordable, so nothing may be sized on it"
+        );
+        let sightings = seen.borrow();
+        assert!(
+            sightings.values().any(|&n| n >= 2),
+            "no amount was quoted twice — pass 2's final re-quote never happened: {sightings:?}"
+        );
     }
 
     /// The shipped evacuation cap: 200 sats + 3%.
