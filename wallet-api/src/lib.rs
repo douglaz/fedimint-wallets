@@ -28,11 +28,15 @@ pub struct Policy {
     pub per_fed_cap: Msat,
     pub spending_target: Msat,
     pub standby_target: Msat,
-    /// ABSOLUTE fee cap. It currently bounds allocator-emitted `Evacuate` actions; funding `Move`s
-    /// use `max_fee_bps_of_move`. The evacuation knobs below are not read by any enforcement path
-    /// yet. Once `br-evac-cap-enforce-vn6` moves `Evacuate` onto them, this will bound no
-    /// allocator-emitted action — but it stays load-bearing as the default `fee_cap` for
-    /// user-initiated pay/move/receive and as the probe leg cap, so it does NOT become dead.
+    /// ABSOLUTE fee cap. It bounds NO action the allocator emits: funding `Move`s use
+    /// `max_fee_bps_of_move`, and `Evacuate` uses the `evac_fee_*` pair below.
+    /// **In an evacuation incident this is not the knob to turn** — the evacuation cap is
+    /// `evac_fee_base_msat` + `evac_fee_bps`. But raising those affects only evacuations DECIDED
+    /// AFTERWARDS: a pending one carries the pair `decide()` admitted it with, and while it keeps
+    /// retrying there is no supported way to replace it (br-n8o). So neither knob releases an
+    /// evacuation already in flight. `max_fee` remains load-bearing elsewhere, as the default
+    /// `fee_cap` for user-initiated pay/move/receive and as the probe leg cap, so it is not
+    /// dead.
     pub max_fee: Msat,
     /// PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
     /// (1..=10000; Policy rejects 0). Replaces the absolute `max_fee` for funding so sizing
@@ -45,13 +49,17 @@ pub struct Policy {
     /// path wired yet).
     #[serde(default = "default_max_fee_bps_of_move")]
     pub max_fee_bps_of_move: u16,
-    /// BASE component of the evacuation fee cap, in millisatoshis. The pair is propagated but not
-    /// enforced yet; see `max_fee`. The named serde default keeps older stored rows from decoding
-    /// this numeric field as zero.
+    /// BASE component of the evacuation fee cap, in millisatoshis. With `evac_fee_bps` it is the
+    /// cap actually ENFORCED on an evacuation, computed as `base + bps * delivered_net / 10_000`
+    /// against what the destination is credited — never against the amount that was asked for
+    /// (CONTEXT.md, "Delivered net"). The named serde default keeps older stored rows from
+    /// decoding this numeric field as zero.
     #[serde(default = "default_evac_fee_base_msat")]
     pub evac_fee_base_msat: Msat,
-    /// PROPORTIONAL component of the evacuation fee cap, in basis points of the amount evacuated
-    /// (0..=10000).
+    /// PROPORTIONAL component of the evacuation fee cap, in basis points of the net DELIVERED to
+    /// the destination — `invoice - receive_quote`, not the amount requested, which is larger
+    /// whenever the gross-up settles a hair under (CONTEXT.md, "Delivered net"). Applied with
+    /// integer FLOOR division, so `cap = base + floor(delivered * bps / 10_000)`. (0..=10000).
     #[serde(default = "default_evac_fee_bps")]
     pub evac_fee_bps: u16,
     pub spending_fed: Option<FederationId>,
@@ -177,7 +185,7 @@ impl Policy {
             return Err(PolicyValidationError::MaxFeeBpsExceedsCeiling);
         }
         if self.evac_fee_bps > 10_000 {
-            // Over 100% of the amount evacuated: nonsensical, same reasoning as the sibling knob.
+            // Over 100% of the net delivered: nonsensical, same reasoning as the sibling knob.
             return Err(PolicyValidationError::EvacFeeBpsExceedsCeiling);
         }
         // `evac_fee_bps == 0` is deliberately accepted, unlike `max_fee_bps_of_move`: a base-only
@@ -265,7 +273,7 @@ impl fmt::Display for PolicyValidationError {
             ),
             Self::EvacFeeBpsExceedsCeiling => write!(
                 formatter,
-                "{}: must not exceed 10000 (100% of the amount evacuated)",
+                "{}: must not exceed 10000 (100% of the net delivered)",
                 self.offending_field()
             ),
             Self::ZeroEvacFeeCap => write!(

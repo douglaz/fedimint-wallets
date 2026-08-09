@@ -94,6 +94,28 @@ secondarily by probes detecting degradation. The Allocator's core resilience
 action.
 _Avoid_: "sweep" (reserve for consolidating many inputs), "withdraw"
 
+**Sized ask**:
+The amount the sizing search committed to for a move — the largest candidate that fit the
+cap and the source's spendable balance. It is an INTENTION: the amount the executor will
+re-quote and request an invoice for. It is not what arrives.
+
+**Delivered net**:
+What the destination is actually credited: the fixed invoice amount minus the receive-side
+fee quoted against it. Always ≤ the **sized ask**, and strictly less whenever the gross-up
+fixed point settles a verified "hair under". It is a FACT about a specific quote, not a
+plan.
+**Every ENFORCED fee cap is computed from the delivered net**, never from the sized ask — a cap
+computed on an amount nobody received bounds nothing. "Enforced" is load-bearing: the allocator
+deliberately stamps a PLANNING cap at the planned amount when it decides an evacuation, because
+sizing has not run yet and there is no delivered net to compute from. That planned cap is
+superseded by the recomputed one as soon as sizing runs. Do not "correct" the planning half to the
+delivered net — it cannot be, and the replay design depends on the two being distinct. The two must be derived identically
+everywhere they are compared, or a move can be admitted under one and refused under the
+other after its receive leg has already committed.
+_Avoid_: "executed net" — it reads as the **sized ask** to one reader and the **delivered
+net** to another, and that ambiguity is exactly how the same defect reached five separate
+call sites. Say which one you mean.
+
 **Serves** (of a gateway, with respect to a route or a leg):
 A gateway **serves** when it is on the relevant **vetted list**, validates, and an
 ECONOMICALLY viable amount can be sized over it — one whose total fee does not exceed
@@ -173,7 +195,7 @@ re-resolved under the same fee cap. "Holds" is a membership-and-validation test,
 hold while its fee has risen above the cap; the re-resolution promised here must then actually
 happen BEFORE the route is used, not be discovered at the receive step (permanent) or the pay
 step (which retries the persisted route). Price the held hint against the cap first. For an `Evacuate` a holding hint is not automatically kept either: it is a
-starting point, and br-s0e re-selects WITHIN the same route class by largest sized executed net.
+starting point, and br-s0e re-selects WITHIN the same route class by largest **delivered net**.
 It does not change which class is tried — strict swap-first ordering is unaffected. The cap, never gateway identity, is the money
 backstop.
 

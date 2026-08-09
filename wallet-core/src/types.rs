@@ -89,12 +89,12 @@ pub struct AllocatorSnapshot {
     pub per_fed_cap: Msat,
     pub target_spending_balance: Msat,
     pub standby_target: Msat,
-    /// The ABSOLUTE per-move fee cap. `decide()` currently copies it to emitted `Evacuate`
-    /// actions; funding `Move`s use `max_fee_bps_of_move`. A bare proportional cap on a small
-    /// dying-fed remnant could fall below any realistic base fee and refuse the drain, which is
-    /// why its replacement keeps a base term. The evacuation knobs below are not read by any
-    /// enforcement path yet. Once `br-evac-cap-enforce-vn6` moves `Evacuate` onto them, this field
-    /// will bound no emitted action.
+    /// The ABSOLUTE per-move fee cap. It bounds NO action `decide()` emits: funding `Move`s use
+    /// `max_fee_bps_of_move` and `Evacuate` uses the `evac_fee_*` pair below (ADR-0029). It
+    /// remains the default fee cap for the user-initiated money verbs and the probe leg cap,
+    /// which do not come from `decide()` at all. A bare proportional cap on a small dying-fed
+    /// remnant could fall below any realistic base fee and refuse the drain, which is why the
+    /// evacuation cap that replaced it here keeps a base term.
     pub max_fee: Msat,
     /// The PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
     /// (1..=10000; Policy rejects 0). Funding-move sizing reserves `amount + amount*bps/10000`
@@ -170,6 +170,43 @@ pub enum RouteStatus {
     UneconomicAtAnySize,
 }
 
+/// The two components of an evacuation's fee cap: an absolute `base_msat` plus `bps` basis
+/// points of the amount actually evacuated (ADR-0029). A dying federation's full-balance drain
+/// cannot fit an absolute cap, and a bare proportional one computes below any real base fee on a
+/// small remnant — so the cap needs both terms.
+///
+/// `allocator::decide` SNAPSHOTS the pair onto [`Action::Evacuate`] as the admitted parameters
+/// they are; the executor then recomputes the cap at the net it actually executes
+/// ([`EvacFeeCap::at`]), so a downsized drain is bounded by what MOVED, not by what was planned.
+///
+/// Both components travel together in ONE value so a half-present pair — a base with no rate, or
+/// a rate with no base — is not representable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EvacFeeCap {
+    pub base_msat: Msat,
+    pub bps: u16,
+}
+
+impl EvacFeeCap {
+    /// The cap this pair authorises against an executed net of `net`:
+    /// `base_msat + floor(net * bps / 10_000)`.
+    ///
+    /// FLOOR, matching the proportional funding policy ([`crate::allocator::move_fee_cap`]): at
+    /// 1_000_001 msat and 300 bps the proportional part is 30_000, not 30_001, so against a
+    /// 200_000-msat base a 230_001-msat quote is REFUSED where a ceiling would have admitted it.
+    /// Computed in `u128` and SATURATED back into `u64`, so no (base, bps) pair can wrap around
+    /// into a small cap.
+    ///
+    /// `net` is the EXECUTED NET — deliberately NOT the base the SDK charges its own fees on (the
+    /// gateway's receive fee is charged on the gross invoice, its send fee on the outgoing
+    /// contract). Applying the rate to a gross amount would authorise more than the policy states.
+    pub fn at(&self, net: Msat) -> Msat {
+        let proportional = net.0 as u128 * self.bps as u128 / 10_000;
+        let cap = (self.base_msat.0 as u128).saturating_add(proportional);
+        Msat(cap.min(u64::MAX as u128) as u64)
+    }
+}
+
 /// A move A→B is a protocol (ADR-0022): B creates an invoice, A pays it via a shared
 /// gateway, B claims the contract. `Action` models this split between executable
 /// money-moves and advisory policy signals (T12).
@@ -217,6 +254,18 @@ pub enum Action {
         /// starting point, `None` whenever the pair was not priced.
         #[serde(default)]
         gateway: Option<GatewayUrl>,
+        /// The (base, bps) pair `fee_cap` above was computed from, snapshotted by `decide()` as
+        /// the admitted parameters (ADR-0029). The executor RECOMPUTES the cap from them at the
+        /// net it actually executes, so an evacuation downsized to what the dying federation can
+        /// afford is bounded by what MOVED rather than by what was planned.
+        ///
+        /// `#[serde(default)]` for the durable-format reason `gateway` carries, plus one specific
+        /// to money: `Action` is serde-persisted inside the durable `Intent`, and an intent
+        /// written before this field existed was planned under the ABSOLUTE cap. It decodes
+        /// `None` and KEEPS its stored `fee_cap` — it must NEVER retroactively adopt the current
+        /// policy's components, which would move the bound on an in-flight evacuation.
+        #[serde(default)]
+        fee_cap_components: Option<EvacFeeCap>,
     },
     /// Pay a user-supplied BOLT11 directly from one federation. The payment hash is the
     /// natural user-API idempotency anchor; all sizing fields remain in the intent so an
@@ -495,6 +544,11 @@ pub struct MoveRecord {
     pub from: Option<FederationId>,
     pub to: FederationId,
     pub amount: Msat,
+    /// The fee cap ACTUALLY ENFORCED on this move, by both the pre-mint receive check and the
+    /// Pay-step re-check. For a `Move`/`DirectInflow` it is the intent's planned cap verbatim.
+    /// For an `Evacuate` the executor RECOMPUTES it from the intent's snapshotted
+    /// [`EvacFeeCap`] at the net it sized down to, and writes the two together — so this field
+    /// and `amount` always describe the same executed move (ADR-0029).
     pub fee_cap: Msat,
     pub gateway: GatewayUrl,
     pub send_required: bool,

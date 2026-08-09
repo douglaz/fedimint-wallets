@@ -41,8 +41,11 @@ const DEFAULT_STANDBY_TARGET: Msat = Msat(100_000_000);
 /// Default per-fed balance cap (ADR-0018): 5M sats (0.05 BTC). Well above the two
 /// targets, so it bounds accumulation without fighting the standing targets.
 const DEFAULT_PER_FED_CAP: Msat = Msat(5_000_000_000);
-/// Default ABSOLUTE per-move fee cap: 50 sats (50_000 msat). Since br-ljj.2 this bounds only
-/// `Evacuate`; funding `Move`s use `DEFAULT_MAX_FEE_BPS_OF_MOVE`. Tighten with `--max-fee`.
+/// Default ABSOLUTE per-move fee cap: 50 sats (50_000 msat). It bounds NO allocator-emitted
+/// action: funding `Move`s use `DEFAULT_MAX_FEE_BPS_OF_MOVE`, and `Evacuate` uses the
+/// `evac_fee_base_msat` + `evac_fee_bps` pair. It survives as the default for the user-initiated
+/// money verbs and as the probe leg cap, which is what `--max-fee` tightens. Saying otherwise
+/// points an operator at a knob that cannot bound an evacuation at all.
 const DEFAULT_MAX_FEE: Msat = Msat(50_000);
 
 /// Default PROPORTIONAL funding-move fee cap: 300 bps (3%) of the amount moved. See
@@ -52,7 +55,7 @@ const DEFAULT_MAX_FEE_BPS_OF_MOVE: u16 = 300;
 
 /// Default evacuation fee-cap base: 200 sats (200_000 msat).
 const DEFAULT_EVAC_FEE_BASE: Msat = Msat(200_000);
-/// Default evacuation fee-cap proportional part: 300 bps (3%) of the amount evacuated.
+/// Default evacuation fee-cap proportional part: 300 bps (3%) of the net DELIVERED.
 const DEFAULT_EVAC_FEE_BPS: u16 = 300;
 
 /// The standing instruction for one orchestrator tick (ADR-0014). Sensible v1 defaults
@@ -66,17 +69,18 @@ pub struct TickPolicy {
     pub target_spending_balance: Msat,
     /// Target balance for the warm standby; below it, fund from the spending surplus.
     pub standby_target: Msat,
-    /// ABSOLUTE per-move fee cap. Since br-ljj.2 it bounds only `Evacuate`; funding `Move`s
-    /// use `max_fee_bps_of_move`.
+    /// ABSOLUTE per-move fee cap. It bounds NO allocator-emitted action: funding `Move`s use
+    /// `max_fee_bps_of_move` and `Evacuate` uses the `evac_fee_*` pair. It survives as the
+    /// default cap for the user-initiated money verbs and as the probe leg cap.
     pub max_fee: Msat,
     /// PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
     /// (1..=10000; Policy rejects 0). Sizing reserves `amount + amount*bps/10000` from the source budget.
     pub max_fee_bps_of_move: u16,
-    /// BASE component of the evacuation fee cap, in millisatoshis. Carried but not read by any
-    /// enforcement path yet; see `wallet_api::Policy`.
+    /// BASE component of the evacuation fee cap, in millisatoshis. ENFORCED, with `evac_fee_bps`,
+    /// against the DELIVERED net; see `wallet_api::Policy`.
     pub evac_fee_base_msat: Msat,
-    /// PROPORTIONAL component of the evacuation fee cap, in basis points of the amount evacuated
-    /// (0..=10000). Carried but not read by any enforcement path yet; see `wallet_api::Policy`.
+    /// PROPORTIONAL component of the evacuation fee cap, in basis points of the DELIVERED net —
+    /// not of the amount asked for (0..=10000); see `wallet_api::Policy`.
     pub evac_fee_bps: u16,
     /// The allocation epoch (T10) stamped into each decision's idempotency key.
     pub occurrence: Occurrence,
@@ -1217,6 +1221,7 @@ mod tests {
                 amount: Msat(1),
                 fee_cap: Msat(50_000),
                 gateway: None,
+                fee_cap_components: None,
             },
             reason: ReasonCode::ShutdownNotice,
             occurrence: Occurrence(0),

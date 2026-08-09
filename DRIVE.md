@@ -1,69 +1,111 @@
-# DRIVE — close out the stranded-move / lnv2-claim thread
+# DRIVE — make an evacuation executable at real fee shapes (br-y2j)
 
-**Status: STOPPED at the user's request for a retrospective.** Resume by sweeping this
-file into the next branch — do not commit it on its own (see the LAND rule added to the
-drive skill in douglaz/skills#16).
+**Scope:** the evacuation fee-cap thread ONLY — `br-y2j` and its three children
+`br-evac-cap-policy-r3n` (1/3), `br-evac-cap-enforce-vn6` (2/3),
+`br-evac-cap-ledger-x9k` (3/3). NOT the wallet-web epic (br-nfz, br-5om, br-t8f,
+br-ucq, br-pfc, br-4yz), NOT br-2aa, NOT br-s0e, NOT the production canary.
 
-**Scope:** the stranded-move thread only — PR #26 (landed) and
-`br-adopt-lnv2-claim-retry-d3d`. NOT the wallet-web epic, the evacuation beads
-(br-y2j, br-s0e), or the production canary (br-prod-canary-nab).
+**Phase:** HARDEN · **Bead:** `br-evac-cap-enforce-vn6` ·
+**Branch:** `feat/br-evac-cap-enforce-vn6`
+**Pending:** —
+**Gate:** `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
+· workspace gate green at `1da1981` (fmt 0, clippy 0, **789 passed / 0 failed**, EXIT=0)
+· live devimint evacuation gate green at `0cb6b2e`, EXIT=0 — a DIFFERENT commit, and the two
+  hashes are written out because they diverge. `1da1981` adds no logic: the "probed" qualification
+  on five diagnostic strings, this file, and a bead description. The live gate has run green at
+  seven commits on this branch, and NONE of them exercised the refusal diagnostics (see NOT proven).
 
-**Phase:** BUILD (evidence gathered, decision pending) · **Bead:**
-`br-adopt-lnv2-claim-retry-d3d` · **Branch:** none yet — work is in a scratch worktree
-**Gate:** `nix develop /home/master/p/fedimint -c bash -c '<cmd>'` — the flake path is
-required; bare `cargo` fails on missing cmake.
+Supersedes the stranded-move drive, which was stopped for a retrospective and whose scope
+excluded these beads.
 
 ## Done
-- PR #26 stranded diagnostics + operator procedure — squash-merged `4971b9f`.
-- Bead + first DRIVE.md — `25fc11f`, pushed direct to main. **This was the mistake**
-  that produced douglaz/skills#16: unreviewed commit on the default branch.
-- main verified healthy post-merge: fmt 0 / clippy 0 / test 0, **715 passed, 0 failed**.
-- fedimint#8935 cherry-picked onto our pin in a scratch worktree at
-  `<scratch>/fedimint-wt`, commit `eaa35c03067` on top of `72b1e5be`.
+- `/v1/recover` carved out of the web sidecar (ADR-0028 amendment + plan §6c.3) — `9f1f23b`
+- Five untracked gaps filed as beads; br-s0e and br-remove-gateway-pin-yjw demoted — `9f1f23b`
+- `br-y2j` decomposed along its deployability seam — `f107c5a`
+- **1/3 `br-evac-cap-policy-r3n`** Policy knobs + validation + propagation, no
+  enforcement — merged PR #30 (`7d5e69f`). rb-lite clean in 3 rounds, full 3-reviewer
+  panel, 742 tests, CodeRabbit no actionable comments.
 
-## Evidence gathered for br-adopt-lnv2-claim-retry-d3d
-- **Applies cleanly.** All three source files (`cli.rs`, `lib.rs`, `receive_sm.rs`) took
-  the cherry-pick with no conflict. The single conflict was an import line in
-  `modules/fedimint-lnv2-tests/tests/tests.rs`, caused by `InvoiceSendStatus` — a symbol
-  from unrelated upstream commit `c270a790569` that our pin predates. Its call sites are
-  in pre-existing upstream tests, not the ones #8935 adds, so dropping it from the import
-  list is the correct resolution rather than a workaround.
-- **Compiles at our pin.** `cargo check -p fedimint-lnv2-client` → 0;
-  `cargo check -p fedimint-lnv2-tests --all-targets` → 0. Zero errors. The 8 warnings are
-  pre-existing dead-code in `api.rs` (untouched by the cherry-pick) plus nix noise.
-- **The three tests #8935 adds pass at our pin**, all in-process, no devimint needed:
-  - `receive_sm::tests::decodes_legacy_receive_states` — ok (byte-for-byte legacy encoding)
-  - `funded_receive_is_claimed` — ok
-  - `reclaim_receive_recovers_parked_claim` — ok ← the retroactive-recovery claim, verified
+## Now
+**2/3 `br-evac-cap-enforce-vn6`** — the money change. PR #31.
+
+**The shape, since per-round detail lives on the bead.** Rounds 2–4 each found a different
+consumer of ONE undefined concept — *which net does the cap bind to* — and round 2's fix caused
+round 4's finding. Round 5 was therefore a DESIGN PASS rather than a fifth patch: every ENFORCED
+fee cap now computes from the **delivered net**, derived on the types that maintain the invariant
+(the allocator's PLANNING cap is deliberately at the planned amount — sizing has not run yet — and
+is superseded once it does), and
+`fits_cap`/`combined_verdict` take no caller-supplied amount at all.
+
+**Then it happened a second time, and the second time is the more instructive one.** Three
+consecutive rounds each found a different way for ONE cached value to go stale: a conditional
+write, an early return that skipped the write, and pass 2 re-probing the very amount the cache
+named. Each was fixed at its own site. The fourth site would have been found the same way, because
+the defect was never any single write: `no_fitting_amount_reason` measured a fee-vs-cap SLOPE
+between a floor quoted at diagnosis time and a high point quoted earlier during the search, and
+then used that slope to recommend moving a real-money knob. A slope across two epochs is not a
+trend, and no amount of write-site discipline makes two epochs contemporaneous.
+
+The fix (`7167ed8`) deletes the cache rather than guarding it: `largest_affordable` became
+`largest_affordable_hint: Option<Msat>`, carrying an amount and no cost, and the diagnostic quotes
+BOTH points back to back. A stale hint is now harmless by construction. The framing that settled
+it: the execution path already refuses to act on anything but a fresh quote, so holding the
+operator-facing diagnosis to a WEAKER freshness standard than the money path holds itself to was
+the actual defect.
+
+**PANEL HEALTH — the last four rounds were codex-only.** The Claude Fable reviewer produced its
+last verdict at `7167ed8`; three attempts since then failed without reviewing (twice wedged with no
+output for 20–50 minutes, once `error_during_execution` after two turns), including one with a
+deliberately shortened prompt, so it is not prompt size. Those rounds are DEGRADED: one reviewer is
+not a panel, and nothing here should be read as two independent reads. What the single reviewer did
+establish is recorded below.
+
+### Proven, and by what
+- The cap is evaluated at the delivered net: direct unit tests on `fits_cap` and
+  `combined_verdict`.
+- Both search admissions revalidate their final re-quote: `pass_one_revalidates_its_final_requote`
+  and `pass_two_revalidates_its_final_requote`, each red against its own guard alone.
+- The reservation cannot overflow a saturating cap: the allocator golden, red with
+  "attempt to add with overflow".
+- No fee-knob recommendation can rest on evidence from an earlier epoch: the cached cost is gone
+  from the type, so the property holds structurally rather than by write-site discipline. Each
+  diagnostic guard has its own emitted reason and its own test.
+- The path executes end to end on two live federations including a hair-under delivery: the
+  devimint evacuation gate, EXIT=0.
+
+### NOT proven, stated so nobody infers otherwise
+- The **pre-mint gate** and the **executor recompute** have no test pinning their delivered-net
+  basis. Owner: `br-evac-cap-driven-basis-v07` (NOT `br-4yz` — that is the wallet-web route
+  manifest bead, and a reviewer caught me misattributing this debt to it twice).
+- The **live gate cannot distinguish the delivered-net basis from the ask basis**: in that
+  fixture the two caps differ by 2 msat against ~199_287 msat of headroom, so it passes under
+  either. It proves execution, not the basis.
+- **The live gate does not exercise the refusal diagnostics at all.** Every diagnostic change on
+  this branch lives on paths the smoke never enters, because the smoke drives a SUCCESSFUL
+  evacuation. Its green is a regression check, not evidence for those changes.
+- `TestRoute` has no `with_recv_fed_fee`, so **no composed async fixture can produce
+  `delivered != ask`** at all. Same owner.
+- **The live gate cannot detect a regression to the OLD absolute cap either.** The smoke sets
+  `MAX_FEE=1_000_000` msat while the total move fee it asserts is under 50_000, so an evacuation
+  that went back to sizing off the absolute `max_fee` would still pass it. Owner: `br-vvo`.
+- Two diagnostic branches are unpinned: the arm reached when pass 2 finds an amount and LOSES it on
+  revalidation (its test deliberately avoids pass 2), and the receive-side arm of the ppm envelope
+  warning, despite a test comment claiming "both halves". Owner: `br-vvo`.
+
+### Two properties a future editor cannot infer from the tests themselves
+- The seam coverage is a property of the **pair**: drift deleting the pass-1 admission would
+  still satisfy the 449_999 sightings pin, because pass 2's bisection also touches it; that shape
+  is caught by `the_increasing_regime_finds_the_top_window` instead.
+- The pinned amounts (449_999, 339_997) are coupled to `largest_fitting_amount`'s mid arithmetic.
+  If the stepping changes these fail with the sightings map printed — that means "re-derive the
+  settled amount", not "the guard broke".
 
 ## Next
-Nothing below is authorized until the fork-patch question is answered. The two paths
-differ in what gets pinned, not in what gets verified:
-
-- **If we wait for upstream merge (preferred):** bump the pin to the upstream commit that
-  contains #8935, then run the verification list.
-- **If we adopt before merge:** carry `eaa35c03067` as a fourth fork-only patch on the pin
-  branch, then run the same verification list.
-
-Verification list, either way — this is the bead's, not a shortened version of it. The
-three in-process tests already recorded do **not** substitute for the first two:
-1. the full lnv2 integration suite, run by us;
-2. a devimint exercise that parks a receive on a rejected claim and recovers it with
-   `reclaim-receive`, against a record written by the OLD client (this is what proves the
-   retroactive path end to end);
-3. the wallet gate on the bumped pin;
-4. teach the executor to read the recorded receive SM state;
-5. rewrite the runbook's stranded entry.
+`br-evac-cap-ledger-x9k` (3/3) — the ledger reporting the enforced cap and executed
+amount, plus runbook and README. Then `br-y2j` closes, which unblocks
+`br-recanary-y2j-ujs`.
 
 ## Open questions for the human
-- **fedimint#8935 is OPEN, not merged** (observed 2026-08-02). Adopting now means a FOURTH
-  fork-only patch on money-path receive code. The evidence above bounds only part of the
-  risk: cherry-pick application and package-level validation are low risk and demonstrated.
-  End-to-end wallet risk is **unverified** — the wallet gate has not run against a bumped
-  pin, and the executor integration is unwritten. The cost of adopting early is divergence
-  from upstream, against br-jga. The bead's preferred resolution — wait for it to merge,
-  then one pin bump serves both — still looks right now that we know the cherry-pick is
-  clean and can be redone at will.
-- **The conflict is a staleness signal.** As of 2026-08-02, our pin `72b1e5be` is ~10
-  commits behind `4716374a` (#8935's branch tip), whose base is `fedimint/fedimint@master`.
-  That gap grows for as long as the pin stays put while upstream advances.
+- none. `br-devimint-runbook-mint-na3` is a filed defect, not an open gate: the runbook's
+  documented invocation omits `FM_ENABLE_MODULE_MINT=1` and every smoke dies at
+  `Primary module not available` without it.

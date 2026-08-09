@@ -77,22 +77,38 @@ pilot, 75k sats per fed is what makes the enforced caps imply a ~150k sat total:
 #   lower per-fed cap BEFORE joining, or the ceiling silently moves.
 # 50k sats float in the spending fed
 # 20k sats in standby
-# 50 sats absolute cap: evacuations + manual --fee-cap default
+# 50 sats absolute cap: the manual --fee-cap default and the probe leg cap. It does NOT
+#   bound evacuations — see the evac pair below.
 # 3% proportional cap on funding moves (top-up/standby)
+# 200 sats + 3% evacuation cap, computed from the net the DESTINATION IS CREDITED. These are
+#   the evacuation knobs; --max-fee is not. Raising them affects evacuations decided
+#   AFTERWARDS — a pending one carries the pair it was admitted with, so this is not a lever
+#   for releasing an evacuation that is already retrying.
 wallet-cli policy set \
   --per-fed-cap 75000000 \
   --spending-target 50000000 \
   --standby-target 20000000 \
   --max-fee 50000 \
-  --max-fee-bps-of-move 300
+  --max-fee-bps-of-move 300 \
+  --evac-fee-base-msat 200000 \
+  --evac-fee-bps 300
 wallet-cli policy get              # verify what is actually stored
 ```
 
 Keep `auto_join` off (the default) for the pilot: automatic federation discovery would raise
 the permitted total without an operator deciding to.
 
-(Values are msat, except `--max-fee-bps-of-move`, which is basis points, 1-10000. Raise
-them only after a clean first week.)
+(Values are msat, except the TWO basis-point flags — read this before tuning either, because a
+bps value entered as if it were msat silently widens the cap by orders of magnitude: `500` means
+5%, not 500 msat.
+
+  * `--max-fee-bps-of-move` — basis points of the amount moved, range **1-10000**. Zero is
+    rejected.
+  * `--evac-fee-bps` — basis points of the net DELIVERED to the destination, not of the amount
+    asked for, range **0-10000**. Zero IS accepted, and means a base-only evacuation cap; it is
+    only valid alongside a non-zero `--evac-fee-base-msat`.
+
+`--evac-fee-base-msat` is msat, like the rest. Raise any of them only after a clean first week.)
 
 ## Daily — the one-minute glance
 

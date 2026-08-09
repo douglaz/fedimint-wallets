@@ -19,11 +19,15 @@ macro_rules! fed {
 // Golden fixture bps for the proportional funding-move fee cap (br-ljj.2): 100 bps (1%), so a
 // move's `fee_cap` is `amount / 100` and the source `available` is `budget * 10000/10100`.
 const GOLDEN_MOVE_BPS: u16 = 100;
-// Golden fixture evacuation fee-cap knobs. Deliberately set to values that would produce a
-// DIFFERENT cap than the absolute `max_fee: 500` every `evacuate!` below asserts, so any
-// accidental enforcement of this pair breaks the evacuation goldens loudly.
+// Golden fixture evacuation fee-cap knobs (ADR-0029). Deliberately DIFFERENT from the absolute
+// `max_fee: 500`, which no longer bounds an evacuation, so a regression back onto `max_fee`
+// breaks every evacuation golden below loudly.
 const GOLDEN_EVAC_FEE_BASE: Msat = Msat(7_000);
 const GOLDEN_EVAC_FEE_BPS: u16 = 250;
+// The cap `evacuate!` asserts: `base + floor(amount * bps / 10_000)`, spelled out here rather
+// than taken from `EvacFeeCap::at` so the goldens pin the ARITHMETIC and not just agreement with
+// the implementation they are checking.
+macro_rules! golden_evac_cap { ($amount:expr) => { msat!(GOLDEN_EVAC_FEE_BASE.0 + $amount * GOLDEN_EVAC_FEE_BPS as u64 / 10_000) }; }
 macro_rules! snap {
     // `route_economics_by_pair` starts EMPTY — no pair priced — which is the permissive
     // `min_move`-only fallback, i.e. the pre-route-economics behavior every golden below asserts.
@@ -35,14 +39,17 @@ macro_rules! decision {
 }
 macro_rules! move_action {
     // A funding move's `fee_cap` is PROPORTIONAL (br-ljj.2): it follows from the amount rather
-    // than being the absolute `snapshot.max_fee`, which only `evacuate!` still carries. The
+    // than being the absolute `snapshot.max_fee`, which no allocator-emitted action carries now —
+    // `Evacuate` uses the `evac_fee_base_msat` + `evac_fee_bps` pair. The
     // 4-arg form asserts the preselected route stamped from the pair's `resolved_gateway`.
     ($from:expr, $to:expr, $amount:expr) => { move_action!($from, $to, $amount, None) };
     ($from:expr, $to:expr, $amount:expr, $gateway:expr) => { Action::Move { from: id!($from), to: id!($to), amount: msat!($amount), fee_cap: msat!($amount * GOLDEN_MOVE_BPS as u64 / 10_000), gateway: $gateway } };
 }
 macro_rules! evacuate {
+    // An evacuation's `fee_cap` is BASE + PROPORTIONAL, and its components ride the action so
+    // the executor can recompute the cap at the net it actually executes (ADR-0029).
     ($from:expr, $to:expr, $amount:expr) => { evacuate!($from, $to, $amount, None) };
-    ($from:expr, $to:expr, $amount:expr, $gateway:expr) => { Action::Evacuate { from: id!($from), to: id!($to), amount: msat!($amount), fee_cap: msat!(500), gateway: $gateway } };
+    ($from:expr, $to:expr, $amount:expr, $gateway:expr) => { Action::Evacuate { from: id!($from), to: id!($to), amount: msat!($amount), fee_cap: golden_evac_cap!($amount), gateway: $gateway, fee_cap_components: Some(EvacFeeCap { base_msat: GOLDEN_EVAC_FEE_BASE, bps: GOLDEN_EVAC_FEE_BPS }) } };
 }
 macro_rules! gateway { ($url:expr) => { Some(GatewayUrl($url.to_owned())) }; }
 macro_rules! route {
@@ -490,26 +497,109 @@ fn funding_move_fee_cap_fits_the_source_budget() {
 }
 
 #[test]
-fn evacuate_keeps_absolute_cap_and_still_drains_a_small_remnant() {
-    // Evacuate MUST keep the ABSOLUTE `max_fee` (br-ljj.2). A tiny dying-fed remnant far below
-    // that cap is still evacuated — a proportional cap would compute below any base fee (here
-    // 100*100/10000 = 1 msat) and refuse the drain, losing the remnant.
+fn a_small_evacuation_is_admitted_by_the_base_component_a_percentage_would_refuse() {
+    // A tiny dying-fed remnant whose legitimate fee is a large PERCENTAGE of it must still be
+    // evacuated. That is what the BASE component buys: a percentage-only cap computes
+    // 100 * 250/10_000 = 2 msat here — three orders of magnitude below any real base fee — and
+    // would refuse the drain, losing the remnant. The absolute `max_fee` is irrelevant to the
+    // outcome now, so the fixture sets it to a value that would be visible if it leaked back in.
     let mut snapshot = snap!([fed!(1, 100, true, true, true), fed!(2, 30_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 100_000, 0, 40_003);
     snapshot.max_fee = Msat(50_000);
-    let (amount, fee_cap) = decide(&snapshot, occ(1))
+    let (amount, fee_cap, components) = decide(&snapshot, occ(1))
         .iter()
         .find_map(|d| match &d.action {
             Action::Evacuate {
                 from,
                 amount,
                 fee_cap,
+                fee_cap_components,
                 ..
-            } if *from == id!(1) => Some((amount.0, fee_cap.0)),
+            } if *from == id!(1) => Some((amount.0, fee_cap.0, *fee_cap_components)),
             _ => None,
         })
         .expect("an evacuation of the small remnant");
     assert_eq!(amount, 100); // the full remnant
-    assert_eq!(fee_cap, 50_000); // ABSOLUTE max_fee, NOT proportional (which would be 1 msat)
+
+    // The red half of the criterion: the percentage part alone is 2 msat, while the CHEAPEST
+    // fee any real route charges is the gateway's own base — 2 sats (2_000 msat) at the lnv2
+    // gateway default, before the federation and mint fees. A percentage-only cap therefore
+    // refuses this evacuation outright; only the base component admits it.
+    let percentage_only = amount * GOLDEN_EVAC_FEE_BPS as u64 / 10_000;
+    assert_eq!(percentage_only, 2);
+    assert!(percentage_only < 2_000, "a percentage-only cap sits under the gateway base fee alone, so it refuses this evacuation");
+    assert_eq!(fee_cap, GOLDEN_EVAC_FEE_BASE.0 + percentage_only);
+    assert_ne!(fee_cap, 50_000, "the absolute max_fee no longer bounds an evacuation");
+
+    // The components travel so the executor can recompute the cap at the net it executes.
+    assert_eq!(components, Some(EvacFeeCap { base_msat: GOLDEN_EVAC_FEE_BASE, bps: GOLDEN_EVAC_FEE_BPS }));
+}
+
+#[test]
+fn evacuation_cap_is_floor_of_base_plus_proportional() {
+    // The exact §1b arithmetic, pinned independently of any fixture: FLOOR, not ceiling.
+    let cap = EvacFeeCap { base_msat: Msat(200_000), bps: 300 };
+    assert_eq!(cap.at(Msat(1_000_001)), Msat(230_000));
+    assert_ne!(cap.at(Msat(1_000_001)), Msat(230_001), "a ceiling would admit a 230_001 msat quote");
+    // Exact multiples land exactly; a zero rate is a legitimate base-only cap.
+    assert_eq!(cap.at(Msat(75_000_000)), Msat(2_450_000));
+    assert_eq!(EvacFeeCap { base_msat: Msat(200_000), bps: 0 }.at(Msat(75_000_000)), Msat(200_000));
+    // Saturating, never wrapping: a colossal net cannot wrap the cap around to a small one.
+    assert_eq!(EvacFeeCap { base_msat: Msat(u64::MAX), bps: 10_000 }.at(Msat(u64::MAX)), Msat(u64::MAX));
+}
+
+/// A saturating cap must not overflow the RESERVATION arithmetic downstream of it.
+///
+/// `EvacFeeCap::at` saturates by design (asserted directly above) and `Policy::validate` puts no
+/// ceiling on `evac_fee_base_msat`, so a policy that validates can hand `push_and_reserve` a
+/// `fee_cap` of `u64::MAX`. It reserved `amount + fee_cap` with plain `+`: a panic in debug, and
+/// in release a WRAP to a tiny reservation, which under-reserves and lets the same balance be
+/// committed twice.
+///
+/// RED-FIRST: against the `+` version this test PANICS in debug with
+/// "attempt to add with overflow" inside `push_and_reserve`.
+#[test]
+fn a_saturating_evacuation_cap_cannot_overflow_the_reservation() {
+    // A dying fed with a real balance, and a cap base large enough that `at()` saturates.
+    let mut snapshot = snap!([fed!(1, 100_000, true, true, true), fed!(2, 30_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 100_000, 0, 40_003);
+    snapshot.evac_fee_base_msat = Msat(u64::MAX);
+    snapshot.evac_fee_bps = 10_000;
+
+    // Reaching a decision at all means the reservation arithmetic did not overflow; `decide`
+    // runs `push_and_reserve` for every emitted action.
+    let decisions = decide(&snapshot, occ(1));
+
+    // REQUIRE the evacuation, so fixture drift cannot make this test silently vacuous: a loop
+    // that finds no `Evacuate` would pass while proving nothing about the reservation path.
+    let evac_cap = decisions
+        .iter()
+        .find_map(|d| match &d.action {
+            Action::Evacuate { fee_cap, .. } => Some(*fee_cap),
+            _ => None,
+        })
+        .expect("the dying fed must still emit an Evacuate — without one this pins nothing");
+    assert_eq!(
+        evac_cap,
+        Msat(u64::MAX),
+        "a u64::MAX base must saturate the cap, never wrap it small — a wrapped cap is the \
+         dangerous direction, because it would look affordable"
+    );
+}
+
+#[test]
+fn move_cap_stays_purely_proportional() {
+    // `Move` is deliberately NOT on the evacuation shape: no base term, so its cap is unchanged
+    // by ADR-0029. The fixture's evacuation base (7_000) is far larger than this move's whole
+    // cap, so any leak of the evacuation shape into `Move` shows up here.
+    let snapshot = snap!([fed!(1, 500_000, true, false, true), fed!(2, 0, true, false, true)], Some(id!(2)), Some(id!(1)), 1_000_000, 100_000, 0, 40_004);
+    let (amount, fee_cap) = decide(&snapshot, occ(1))
+        .iter()
+        .find_map(|d| match &d.action {
+            Action::Move { amount, fee_cap, .. } => Some((amount.0, fee_cap.0)),
+            _ => None,
+        })
+        .expect("a top-up move into the spending fed");
+    assert_eq!(fee_cap, amount * GOLDEN_MOVE_BPS as u64 / 10_000);
+    assert!(fee_cap < GOLDEN_EVAC_FEE_BASE.0, "a Move must carry no base component");
 }
 
 #[test]
@@ -585,8 +675,8 @@ fn evacuation_drained_source_refusal_records_source_figures_without_max_fee() {
     assert_eq!(diag.cap_room, Some(Msat(70_000)));
     assert_eq!(diag.amount, Some(Msat(0)));
     assert_eq!(diag.max_fee, None);
-    // An evacuation sizes off the ABSOLUTE `max_fee`, not the proportional bps, so a bps
-    // figure would not describe this refusal — None (br-nsx).
+    // An evacuation's cap is the `evac_fee_*` pair, not the funding move's proportional bps, so
+    // a bps figure would not describe this refusal — None (br-nsx).
     assert_eq!(diag.max_fee_bps, None);
     assert_eq!(diag.want, None);
     assert_eq!(diag.min_move, None);

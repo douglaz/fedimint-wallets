@@ -21,7 +21,7 @@
 //! lives here.
 
 use crate::types::{GatewayUrl, Invoice, OperationId};
-use wallet_core::{Action, FederationId, IdempotencyKey, Msat};
+use wallet_core::{Action, EvacFeeCap, FederationId, IdempotencyKey, Msat};
 
 pub use wallet_core::{MovePhase, MoveRecord};
 
@@ -62,6 +62,11 @@ pub struct OpArtifact {
     /// if the journal cache is lost, the recovered receive op still tells the Pay-step cap
     /// check which net amount the fixed invoice was intended to deliver.
     pub amount: Msat,
+    /// The fee cap committed in the op's [`MoveMeta`] — the cap the operation was actually
+    /// authorised under, which for an evacuation is recomputed at the sized-down net. `None`
+    /// for an op committed before the field existed; the merge then falls back to the intent's
+    /// planned cap (see [`assemble_move_record`]). NEVER read an absent cap as zero.
+    pub fee_cap: Option<Msat>,
     /// The `Receive` leg carries the invoice; the `Send` leg leaves this `None`.
     pub invoice: Option<Invoice>,
 }
@@ -78,7 +83,16 @@ pub struct MoveParams {
     pub from: Option<FederationId>,
     pub to: FederationId,
     pub amount: Msat,
+    /// The PLANNED fee cap, and the pre-execution bound. For an evacuation it is
+    /// `fee_cap_components` evaluated at the PLANNED amount, so it is superseded by the
+    /// recomputed cap as soon as sizing runs — see [`assemble_move_record`], which prefers a
+    /// cap committed in op metadata over this one.
     pub fee_cap: Msat,
+    /// The evacuation cap's (base, bps) components, carried from `Action::Evacuate` so the
+    /// executor can recompute the cap at the net it executes. `None` for a `Move`/`DirectInflow`
+    /// (their cap does not depend on the amount) and for a LEGACY evacuation intent planned
+    /// before the components existed, which keeps `fee_cap` as a constant absolute cap.
+    pub fee_cap_components: Option<EvacFeeCap>,
     pub gateway: GatewayUrl,
     pub send_required: bool,
 }
@@ -97,6 +111,9 @@ pub struct MovePlan {
     /// The NET credit the destination must end up with (spec §6).
     pub amount: Msat,
     pub fee_cap: Msat,
+    /// The evacuation cap's (base, bps) components, projected straight off `Action::Evacuate`;
+    /// `None` for every other shape, and for a legacy evacuation intent (see [`MoveParams`]).
+    pub fee_cap_components: Option<EvacFeeCap>,
     /// `Move` = true (pay a send leg), `DirectInflow` = false (receive-only). Always agrees
     /// with `from.is_some()`.
     pub send_required: bool,
@@ -128,18 +145,30 @@ impl MovePlan {
                 amount,
                 fee_cap,
                 ..
-            }
-            | Action::Evacuate {
+            } => Some(MovePlan {
+                from: Some(*from),
+                to: *to,
+                amount: *amount,
+                fee_cap: *fee_cap,
+                // A funding `Move`'s cap does not depend on the executed amount: the allocator
+                // sized the move and its proportional cap together, and `perform` never
+                // downsizes one. Only `Evacuate` carries components.
+                fee_cap_components: None,
+                send_required: true,
+            }),
+            Action::Evacuate {
                 from,
                 to,
                 amount,
                 fee_cap,
+                fee_cap_components,
                 ..
             } => Some(MovePlan {
                 from: Some(*from),
                 to: *to,
                 amount: *amount,
                 fee_cap: *fee_cap,
+                fee_cap_components: *fee_cap_components,
                 send_required: true,
             }),
             Action::DirectInflow {
@@ -151,6 +180,7 @@ impl MovePlan {
                 to: *to,
                 amount: *amount,
                 fee_cap: *fee_cap,
+                fee_cap_components: None,
                 send_required: false,
             }),
             // These actions do not use the two-leg move protocol. Raw operations have their
@@ -195,6 +225,21 @@ pub struct MoveMeta {
     /// is committed with the op so full journal-loss recovery keeps the fixed invoice's fee-cap
     /// accounting honest.
     pub amount: Msat,
+    /// The fee cap this operation was AUTHORISED under — for an evacuation, the cap recomputed
+    /// at the sized-down net, committed here beside that net so the two can never come back
+    /// apart. Reassembly PREFERS it over the intent's planned cap: without it, a crash between
+    /// the receive commit and the `MoveRecord` write lets replay restore the PLANNED-amount cap
+    /// and authorise a fee far above what the executed net entitles.
+    ///
+    /// `Option<Msat>` and `#[serde(default)]`, ABSENT meaning `None` and never a zero cap: this
+    /// meta rides committed SDK op metas and the journal, both live stores whose existing rows
+    /// carry no such key, and unlike a policy row a move record cannot be re-created by re-running
+    /// a command. A `cap: Msat` with a plain default would decode every pre-change row to a
+    /// 0-msat cap, which `pay_step_cap_verdict` classifies as a PERMANENT failure — terminally
+    /// killing an in-flight pre-upgrade move with a committed receive. `None` falls back to the
+    /// planned cap, which is exactly what such a move was planned under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_cap: Option<Msat>,
     /// The move's source federation (`None` for a `DirectInflow`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<FederationId>,
@@ -298,11 +343,17 @@ pub fn next_step(rec: &MoveRecord) -> MoveStep {
 
 /// Assemble a [`MoveRecord`] by merging three sources (spec §5), newest-known wins:
 ///
-/// 1. `params` — AUTHORITATIVE for the move's parameters (from/to/**fee_cap**/gateway/
-///    send_required). These come from the durable Intent and are NEVER dropped.
+/// 1. `params` — AUTHORITATIVE for the move's parameters (from/to/gateway/send_required), and
+///    the PLANNING value for `fee_cap`. These come from the durable Intent and are never dropped.
 /// 2. `artifacts` — the op-log entries for this `move_id`: a `Receive` leg fills
 ///    `recv_op` (and `invoice`), a `Send` leg fills `send_op`, and either leg can recover
-///    the move's net amount from committed `MoveMeta`. Authoritative for op-ids.
+///    the move's net amount AND the fee cap it was authorised under from committed `MoveMeta`.
+///    Authoritative for op-ids, and PREFERRED for `fee_cap`: an evacuation's cap is recomputed
+///    at the net it was sized down to, and a committed op carries that recomputed pair, so
+///    taking `params.fee_cap` here would resurrect the planned-amount cap after a cache loss and
+///    authorise a fee the executed net never entitled. An artifact with NO committed cap (an op
+///    written before the field existed) falls back to `params.fee_cap` — the cap that move was
+///    genuinely planned under — and never to zero.
 /// 3. `cached` — the previously-known `MoveRecord`, the fallback for any leg an artifact
 ///    does not (re)supply. For `amount` the preference is: RECOVERED OP METADATA first
 ///    (a committed op's `MoveMeta` amount is definitive — the invoice was fixed at that
@@ -317,7 +368,7 @@ pub fn next_step(rec: &MoveRecord) -> MoveStep {
 ///
 /// The merge **never blanks an existing leg**: a missing artifact cannot erase an op-id
 /// already known from `cached` (a one-client backfill only sees one leg), and `fee_cap`
-/// is always taken from `params` so it is never dropped. `phase` is re-derived from
+/// always resolves to a committed or planned cap, never to nothing. `phase` is re-derived from
 /// which fields are set, EXCEPT that a terminal phase already recorded in `cached` (the
 /// settlement outcome, which op artifacts do not carry) is preserved.
 ///
@@ -358,6 +409,7 @@ pub fn assemble_move_record(
     // Cache fallback means a missing artifact never blanks an existing leg (a missing
     // leg here means "this client's op-log didn't see it", not "it doesn't exist").
     let cached_amount = cached.as_ref().map(|c| c.amount);
+    let cached_fee_cap = cached.as_ref().map(|c| c.fee_cap);
     let cached_invoice = cached.as_ref().and_then(|c| c.invoice.clone());
     let cached_recv_op = cached.as_ref().and_then(|c| c.recv_op);
     let cached_send_op = cached.as_ref().and_then(|c| c.send_op);
@@ -370,6 +422,7 @@ pub fn assemble_move_record(
     let cached_receive_fee_quoted = cached.as_ref().and_then(|c| c.receive_fee_quoted);
     let cached_send_fee_quoted = cached.as_ref().and_then(|c| c.send_fee_quoted);
     let mut artifact_amount = None;
+    let mut artifact_fee_cap = None;
 
     for artifact in artifacts
         .iter()
@@ -377,6 +430,12 @@ pub fn assemble_move_record(
     {
         if artifact_amount.is_none() {
             artifact_amount = Some(artifact.amount);
+        }
+        // The first artifact that CARRIES a cap wins. A legacy op contributes `None` and must
+        // not shadow a newer leg that does carry one, so this skips absent caps rather than
+        // latching the first artifact unconditionally the way `amount` does.
+        if artifact_fee_cap.is_none() {
+            artifact_fee_cap = artifact.fee_cap;
         }
         match artifact.leg {
             Leg::Receive => {
@@ -425,7 +484,27 @@ pub fn assemble_move_record(
         // contract above). If the cache is gone, recover the committed op metadata amount
         // before falling back to the intent's original amount.
         amount: artifact_amount.or(cached_amount).unwrap_or(params.amount),
-        fee_cap: params.fee_cap,
+        // A committed op's cap is definitive (see the doc contract above). Absent one, the cache
+        // is consulted ONLY when it carries a committed leg, and otherwise the intent's planned
+        // cap stands.
+        //
+        // The middle case is the one that matters and it must track `amount` above. Before any op
+        // is committed the executor re-sizes from the intent every pass, so a cached cap really is
+        // a superseded draft — but once a leg IS committed the cache holds the ENFORCED cap paired
+        // with the executed net. `backfill_ops` drops an artifact whose `MoveMeta` will not decode
+        // while the cached record still supplies `recv_op`, so skipping the cache there pairs the
+        // cached DOWNSIZED amount with the intent's PLANNED cap: a 75_000_000 msat evacuation
+        // clamped to 1_000_000 would replay at a 2_450_000 cap instead of 230_000 and over-
+        // authorise the Pay step. `has_move_artifact` is then true, so `size_fresh_evacuation`
+        // will not re-pair them. Same planned-vs-executed hole the sizing seam closes, reached
+        // through the reassembly door.
+        fee_cap: artifact_fee_cap
+            .or_else(|| {
+                (cached_recv_op.is_some() || cached_send_op.is_some())
+                    .then_some(cached_fee_cap)
+                    .flatten()
+            })
+            .unwrap_or(params.fee_cap),
         gateway: params.gateway,
         send_required: params.send_required,
         invoice,

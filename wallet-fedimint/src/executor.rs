@@ -14,7 +14,10 @@
 //! is resume-safe: `assemble_record` reattaches a replayed move to its existing invoice/recv_op/
 //! send_op (the send op-id is deterministic; a re-`pay` returns `AlreadyInFlight`),
 //! so a crash never re-mints or re-pays. `Evacuate` (Phase 3.A) maps to the SAME send-required
-//! plan as `Move` (`MovePlan::from_action`), so it drives the identical validated two-leg path —
+//! plan as `Move` (`MovePlan::from_action`), so it drives the SAME validated two-leg path — not
+//! an identical code path: an evacuation additionally sizes itself, clamps to the destination's
+//! cap room, is exempt from that cap's refusal, keeps its refusals Retryable, and runs a viability
+//! post-check that a funding move does not —
 //! the money engine can now flee a dying federation, not just top up a standby. Do not read
 //! the absence of a happy-path unit test here as untested logic: the pure decisions are
 //! golden-tested above, and the live two-leg drive is exercised by `smoke_move_devimint.sh`
@@ -45,8 +48,8 @@ use std::collections::BTreeMap;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use wallet_core::{
-    Action, Actor, ExecError, Executor, FederationId, Intent, Journal, Msat, OperationId,
-    PerformOutcome,
+    Action, Actor, EvacFeeCap, ExecError, Executor, FederationId, Intent, Journal, Msat,
+    OperationId, PerformOutcome,
 };
 
 /// Pinned lnv2 requires the gateway-reduced incoming contract to be at least 5 sats
@@ -71,6 +74,33 @@ const FED_FEE_REQUOTE_PASSES: u32 = 3;
 /// backstop for a single slow round-trip.
 const FALLBACK_MOVE_ROUTE_BUDGET_MS: u64 = 10_000;
 
+/// The mint's per-input/per-output BASE fee at the pin: 100 msat, and non-configurable —
+/// `FeeConsensus::new` hard-codes it (`fedimint-mint-common/src/config.rs`).
+const MINT_FEE_BASE_MSAT: u64 = 100;
+
+/// The mint's per-note PROPORTIONAL fee CEILING at the pin: `FeeConsensus::new` REFUSES a
+/// federation configuring more than 1_000 ppm. The live rate is not readable through any seam the
+/// sizing search has, so the oscillation bound uses this ceiling — erring LARGE, which only makes
+/// the search probe more, where erring small would refuse an executable evacuation unprobed.
+const MINT_FEE_PPM_CEILING: u64 = 1_000;
+
+/// How many note-selection boundaries the robustness probe visits per direction. DELIBERATELY
+/// BOUNDED, not complete: the oscillation bound `A` bounds ONE vertical fee jump and says nothing
+/// about how many boundaries separate a failing probe from a feasible window, so a window beyond
+/// this many boundaries is MISSED and the evacuation keeps retrying. ADR-0029 accepts that
+/// residual explicitly — the consequence is a retry, not a burn.
+const NOTE_BOUNDARY_PROBES: usize = 8;
+
+/// The per-leg gateway ppm envelope gateways are INTENDED to advertise (`SEND_FEE_LIMIT` 1.5%,
+/// `RECEIVE_FEE_LIMIT` 0.5%). Nothing ENFORCES it at our pin: `PaymentFee` derives a lexicographic
+/// `PartialOrd` over (base, parts_per_million) and the limit check is a single `.le(..)`, so a
+/// compliant base admits an arbitrary ppm. Crossing it WARNS and never rejects — our fee cap is the
+/// only real bound and already refuses a route it cannot afford, whereas a second, stricter
+/// admissibility test could refuse an evacuation over the only live route and strand the funds
+/// (ADR-0029).
+const SEND_PPM_ENVELOPE: u64 = 15_000;
+const RECEIVE_PPM_ENVELOPE: u64 = 5_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FreshMoveCost {
     invoice_amount: Msat,
@@ -79,12 +109,93 @@ struct FreshMoveCost {
 }
 
 impl FreshMoveCost {
+    /// The DELIVERED NET this quote actually credits the destination: the fixed invoice minus
+    /// the receive-side fee quoted against it (CONTEXT.md, "Delivered net").
+    ///
+    /// **This is the only amount a fee cap may be computed from.** The SIZED ASK — the candidate
+    /// the search is probing — is an intention; it is what we will request an invoice for, not
+    /// what arrives, and the two diverge whenever the gross-up settles a verified hair under.
+    /// Capping against the ask authorises a proportional fee on value nobody received.
+    ///
+    /// It is derived HERE, from the cost, so no caller can supply the wrong number. That is the
+    /// whole point: the same defect — a cap bound to the ask rather than the delivery — reached
+    /// five separate call sites while each one was free to pass its own idea of "the net".
+    ///
+    /// Well-defined for every quote the search can admit. `resolve_receive_gross_up` maintains
+    /// `invoice_amount - receive_quote == the verified delivered net` on every return path: an
+    /// exact solve returns it unchanged, and both the hair-under and bisection tails RESTATE
+    /// `receive_quote` as `invoice - predicted` precisely so this subtraction stays honest.
+    /// `CandidateQuote::Unquotable` carries no cost and never reaches a cap comparison.
+    fn delivered_net(self) -> Msat {
+        Msat(self.invoice_amount.0.saturating_sub(self.receive_quote.0))
+    }
+
     fn total_fee(self) -> Msat {
         Msat(self.receive_quote.0.saturating_add(self.send_quote.0))
     }
 
     fn source_debit(self) -> Msat {
         Msat(self.invoice_amount.0.saturating_add(self.send_quote.0))
+    }
+}
+
+/// What one probed evacuation amount costs, from the sizing search's point of view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateQuote {
+    /// The candidate priced: its full two-leg cost.
+    Priced(FreshMoveCost),
+    /// The candidate cannot be quoted at all — its gateway-reduced contract is below the lnv2
+    /// minimum, or the source's note inventory cannot fund the probed outgoing contract.
+    /// `source_shortfall` is how far the source fell short WHEN THE MINT MEASURED IT
+    /// (`InsufficientBalanceError` carries both figures); `None` when the candidate failed for a
+    /// reason with no measurable gap. The gap matters because a note-selection boundary can make
+    /// a LARGER amount fundable again, and only a measured, small gap licenses probing above.
+    Unquotable { source_shortfall: Option<u64> },
+}
+
+impl CandidateQuote {
+    /// The affordability verdict for this candidate: whether the source can fund the whole
+    /// `source_debit`, and by how much it missed when it cannot.
+    fn affordability(self, spendable: Msat) -> ProbeVerdict {
+        match self {
+            CandidateQuote::Priced(cost) => match cost.source_debit().0.checked_sub(spendable.0) {
+                Some(0) | None => ProbeVerdict::fits(),
+                Some(shortfall) => ProbeVerdict::missed_by(shortfall),
+            },
+            CandidateQuote::Unquotable { source_shortfall } => match source_shortfall {
+                Some(shortfall) => ProbeVerdict::missed_by(shortfall),
+                None => ProbeVerdict::missed_immeasurably(),
+            },
+        }
+    }
+}
+
+/// One probed amount's verdict for [`largest_fitting_amount`]. `shortfall` is how far the
+/// candidate missed by in msat, and is what licenses a boundary probe above it;
+/// [`u64::MAX`] means the miss was not measurable, which never licenses one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProbeVerdict {
+    fits: bool,
+    shortfall: u64,
+}
+
+impl ProbeVerdict {
+    fn fits() -> Self {
+        Self {
+            fits: true,
+            shortfall: 0,
+        }
+    }
+
+    fn missed_by(shortfall: u64) -> Self {
+        Self {
+            fits: false,
+            shortfall,
+        }
+    }
+
+    fn missed_immeasurably() -> Self {
+        Self::missed_by(u64::MAX)
     }
 }
 
@@ -268,6 +379,7 @@ impl FedimintExecutor {
             to: plan.to,
             amount: plan.amount,
             fee_cap: plan.fee_cap,
+            fee_cap_components: plan.fee_cap_components,
             gateway,
             send_required: plan.send_required,
         };
@@ -419,11 +531,11 @@ impl FedimintExecutor {
                 .quote_fresh_send_required_cost(&from, &plan.to, plan.amount, gateway_fees)
                 .await
             {
-                Ok(Some(cost)) => {
+                Ok(CandidateQuote::Priced(cost)) => {
                     priced_any = true;
                     cost.total_fee()
                 }
-                Ok(None) => continue,
+                Ok(CandidateQuote::Unquotable { .. }) => continue,
                 Err(error) => {
                     tracing::debug!(
                         gateway = %gateway.0,
@@ -596,13 +708,16 @@ impl FedimintExecutor {
     /// so a resume after the invoice is minted keeps the Pay-step cap re-check honest.
     ///
     /// "Nothing evacuable fits" is `Retryable`, NOT `Permanent` (same convention as
-    /// `resolve_gateway`): the `None` can come from a TRANSIENT shortfall — the source's funds are
+    /// `resolve_gateway`): the refusal can come from a TRANSIENT shortfall — the source's funds are
     /// momentarily in flight (the send dry-run hits `InsufficientBalanceError`, treated as unfit),
     /// or a fee quote ticked up between attempts — and this runs BEFORE any side effect, on every
     /// pre-receive resume. Terminally `Failed`-ing here would abandon funds on a dying federation
     /// the wallet could have drained one tick later, defeating the whole point of a flee. Leaving
     /// the intent `Pending` lets the next tick retry once the shortfall clears; a source holding
     /// only sub-minimum dust simply keeps retrying harmlessly (nothing meaningful is stranded).
+    /// A refusal the diagnostic finds EVIDENCE for still stays `Retryable`, but says so — a silent
+    /// indefinite retry is not something an operator can act on. Evidence, never proof: the slopes
+    /// are fitted to two samples of a non-monotone fee curve.
     async fn size_fresh_evacuation(
         &self,
         action: &Action,
@@ -613,7 +728,9 @@ impl FedimintExecutor {
         // happened yet) must start over from the intent so a fee drop between retries can
         // still evacuate the full desired amount.
         let &Action::Evacuate {
-            amount: desired, ..
+            amount: desired,
+            fee_cap_components,
+            ..
         } = action
         else {
             return Ok(());
@@ -626,43 +743,82 @@ impl FedimintExecutor {
                 "Evacuate record requires a send leg but has no source federation".into(),
             )
         })?;
+        let to = rec.to;
+        let gateway = rec.gateway.clone();
         // §15.2: an evacuation must not push its DESTINATION over the hard per-fed cap. Clamp the
         // desired net to the destination's remaining cap room BEFORE costing; a destination already
         // at/above the cap yields zero room, a LOUD terminal refusal (never a 0-msat move, never a
         // wrapped-around huge room). This runs only for a FRESH evacuation (`has_move_artifact`
         // returned early above), so a resumed, already-minted evacuation is never refused here.
+        // The search is bounded ABOVE by this clamped ask: evacuations are exempt from
+        // `enforce_destination_cap`, so nothing downstream would catch a larger size.
         let desired = self.clamp_desired_to_cap_room(rec, desired).await?;
         let spendable = self.mc.balance(&from).await.map_err(retryable)?;
-        let Some(amount) = self
-            .max_affordable_evacuation_net(
-                &from,
-                &rec.to,
-                &rec.gateway,
-                desired,
-                rec.fee_cap,
-                spendable,
-            )
-            .await?
-        else {
-            return Err(ExecError::Retryable(format!(
-                "no evacuable amount fits: desired {} msat cannot reserve move fees within source \
-                 balance {} msat and fee_cap {} msat (retrying — a later tick may succeed once \
-                 in-flight funds settle or the fee quote eases)",
-                desired.0, spendable.0, rec.fee_cap.0
-            )));
+        // The cap RULE this evacuation is enforced against — components when the allocator
+        // snapshotted them, else the stored absolute cap as a constant (see
+        // [`evacuation_cap_rule`]).
+        let cap = evacuation_cap_rule(fee_cap_components, rec.fee_cap);
+        // ONE gateway-fee snapshot for the WHOLE search — two HTTP fetches, one per leg — reused
+        // by both sizing passes and every boundary probe. Re-fetching between passes would let
+        // the slope move after a pass had already fixed its bound. Only the per-candidate quotes
+        // below are repeated, and those are local: `fee_quote` opens a DB transaction and runs
+        // the input/output builder against it with no federation request.
+        let gateway_fees = self
+            .fresh_send_required_gateway_fees(&from, &to, &gateway)
+            .await?;
+        if let Some(warning) = ppm_envelope_warning(gateway_fees) {
+            tracing::warn!(
+                from = %from.to_hex(),
+                to = %to.to_hex(),
+                gateway = %gateway.0,
+                "executor: {warning}"
+            );
+        }
+        let sizing = size_evacuation(desired, spendable, cap, |amount| {
+            self.quote_fresh_send_required_cost(&from, &to, amount, gateway_fees)
+        })
+        .await?;
+        let amount = match sizing {
+            EvacuationSizing::Sized(amount) => amount,
+            EvacuationSizing::Refused(reason) => {
+                tracing::warn!(
+                    from = %from.to_hex(),
+                    to = %to.to_hex(),
+                    requested_msat = desired.0,
+                    spendable_msat = spendable.0,
+                    cap_base_msat = cap.base_msat.0,
+                    cap_bps = cap.bps,
+                    "executor: no evacuable amount fits — {reason}"
+                );
+                // State the PARAMETERS and let `reason` carry the observed cause. This wrapper
+                // used to assert one — "cannot reserve move fees within source balance under an
+                // evacuation fee cap" — for every refusal, but `Refused` also comes from the
+                // viability post-check, where a candidate has already PASSED affordability and the
+                // cap and fails because the chunk costs more than it delivers. Naming fees and the
+                // cap there sends the operator after relief for a failure that did not happen.
+                return Err(ExecError::Retryable(format!(
+                    "no evacuable amount fits: desired {} msat, source balance {} msat, \
+                     evacuation fee cap {} msat + {} bps (retrying — a later tick may succeed \
+                     once in-flight funds settle or the quote moves); {reason}",
+                    desired.0, spendable.0, cap.base_msat.0, cap.bps
+                )));
+            }
         };
         if amount < desired {
             tracing::warn!(
                 from = %from.to_hex(),
-                to = %rec.to.to_hex(),
+                to = %to.to_hex(),
                 requested_msat = desired.0,
                 executable_msat = amount.0,
                 spendable_msat = spendable.0,
-                fee_cap_msat = rec.fee_cap.0,
-                "executor: reducing fresh evacuation amount to reserve move fees"
+                // The cap at the ASK is not what will be enforced — the quote's delivered net
+                // is — but no quote is in hand here. Labelled as the ceiling it is.
+                fee_cap_ceiling_msat = cap.at(amount).0,
+                "executor: reducing fresh evacuation amount to what the source can fund \
+                 within the evacuation cap"
             );
         }
-        rec.amount = amount;
+        apply_evacuation_sizing(rec, cap, amount);
         Ok(())
     }
 
@@ -712,63 +868,6 @@ impl FedimintExecutor {
         Ok(())
     }
 
-    /// The largest net amount (≤ `desired`) the source can fund under `fee_cap`, or `None`
-    /// when nothing evacuable fits.
-    ///
-    /// `evacuation_candidate_fits` is NOT monotone over the full `[0, desired]` range: it is
-    /// false BELOW the lnv2 minimum-incoming-contract threshold as well as above the budget
-    /// ceiling, so an unclamped bisection can probe into the too-small region and skip a
-    /// feasible window entirely (e.g. desired 500_000 with only ~5_500 msat affordable). The
-    /// §6 gross-up guarantees `contract_amount = net + fed_fee ≥ net`, so every net at or
-    /// above [`MINIMUM_INCOMING_CONTRACT_MSAT`] clears the contract minimum and the predicate
-    /// is monotone (fits-then-doesn't) on `[MINIMUM_INCOMING_CONTRACT_MSAT, desired]` — the
-    /// search is clamped to that range. A net that would only fit BELOW the floor (< 5 sats,
-    /// with the contract lifted over the minimum by the federation fee alone) is reported as
-    /// not evacuable; the fast path still handles a small `desired` asked for outright.
-    ///
-    /// Resilience note (accepted trade-off): a transient error on ANY of the ~log2(desired)
-    /// sizing probes aborts the whole sizing as `Retryable`, discarding bisection progress —
-    /// the next tick restarts it from scratch. On a genuinely flaky federation this can fail
-    /// to converge for a while; mitigated by the 24h evacuation lead (guardians are usually
-    /// still healthy when the signal fires) and by retry-on-every-tick. Per-probe retries
-    /// can be added later without changing the search's shape.
-    async fn max_affordable_evacuation_net(
-        &self,
-        from: &FederationId,
-        to: &FederationId,
-        gateway: &GatewayUrl,
-        desired: Msat,
-        fee_cap: Msat,
-        spendable: Msat,
-    ) -> Result<Option<Msat>, ExecError> {
-        let gateway_fees = self
-            .fresh_send_required_gateway_fees(from, to, gateway)
-            .await?;
-        if self
-            .evacuation_candidate_fits(from, to, desired, fee_cap, spendable, gateway_fees)
-            .await?
-        {
-            return Ok(Some(desired));
-        }
-
-        let found = largest_fitting_amount(
-            MINIMUM_INCOMING_CONTRACT_MSAT,
-            desired.0.saturating_sub(1),
-            |amount| {
-                self.evacuation_candidate_fits(
-                    from,
-                    to,
-                    Msat(amount),
-                    fee_cap,
-                    spendable,
-                    gateway_fees,
-                )
-            },
-        )
-        .await?;
-        Ok(found.map(Msat))
-    }
-
     /// Phase 5 §5.0.5 sizing seam: the largest net a probe's leg OUT (`from` = the
     /// candidate, `to` = the probing source) can redeem within `budget` — leg IN's
     /// DELIVERED net, NOT the candidate's live balance — and the per-leg `fee_cap`. This
@@ -780,6 +879,11 @@ impl FedimintExecutor {
     /// gateway first, else the destination's registered set). `Ok(None)` = no out move
     /// whose CONTRACT clears the lnv2 floor is affordable from this budget (the caller's
     /// §5.0.5 step-4 local abort).
+    ///
+    /// A probe leg keeps the ABSOLUTE per-leg cap it is given — expressed here as the same
+    /// cap shape with a ZERO rate, so `cap.at(n)` is constant — and does NOT take the
+    /// evacuation viability post-check: a probe deliberately moves a tiny amount whose fee is a
+    /// large fraction of it, which is the point of the probe, not a route that fails to serve.
     pub(crate) async fn size_probe_leg_out(
         &self,
         from: FederationId,
@@ -788,8 +892,19 @@ impl FedimintExecutor {
         fee_cap: Msat,
     ) -> Result<Option<Msat>, ExecError> {
         let gateway = self.resolve_gateway(&to, Some(from)).await?;
-        self.max_affordable_evacuation_net(&from, &to, &gateway, budget, fee_cap, budget)
-            .await
+        let gateway_fees = self
+            .fresh_send_required_gateway_fees(&from, &to, &gateway)
+            .await?;
+        let cap = EvacFeeCap {
+            base_msat: fee_cap,
+            bps: 0,
+        };
+        let search =
+            search_evacuation_net(budget, budget, cap, oscillation_bound(budget), |amount| {
+                self.quote_fresh_send_required_cost(&from, &to, amount, gateway_fees)
+            })
+            .await?;
+        Ok(search.sized.map(|(net, _)| net))
     }
 
     async fn fresh_send_required_gateway_fees(
@@ -811,39 +926,28 @@ impl FedimintExecutor {
         Ok(FreshSendRequiredGatewayFees { receive, send })
     }
 
-    async fn evacuation_candidate_fits(
-        &self,
-        from: &FederationId,
-        to: &FederationId,
-        amount: Msat,
-        fee_cap: Msat,
-        spendable: Msat,
-        gateway_fees: FreshSendRequiredGatewayFees,
-    ) -> Result<bool, ExecError> {
-        let Some(cost) = self
-            .quote_fresh_send_required_cost(from, to, amount, gateway_fees)
-            .await?
-        else {
-            return Ok(false);
-        };
-        Ok(evacuation_cost_fits(cost, fee_cap, spendable))
-    }
-
     async fn quote_fresh_send_required_cost(
         &self,
         from: &FederationId,
         to: &FederationId,
         amount: Msat,
         gateway_fees: FreshSendRequiredGatewayFees,
-    ) -> Result<Option<FreshMoveCost>, ExecError> {
+    ) -> Result<CandidateQuote, ExecError> {
         if amount.0 == 0 {
-            return Ok(None);
+            return Ok(CandidateQuote::Unquotable {
+                source_shortfall: None,
+            });
         }
         let grossed = self
             .quote_receive_gross_up_with_gateway_fee(to, amount, gateway_fees.receive)
             .await?;
         if grossed.contract_amount.0 < MINIMUM_INCOMING_CONTRACT_MSAT {
-            return Ok(None);
+            // Too SMALL for lnv2, not too large for the source: no shortfall exists to measure,
+            // and probing larger amounts on this candidate's account would be probing on a gap
+            // that was never there.
+            return Ok(CandidateQuote::Unquotable {
+                source_shortfall: None,
+            });
         }
 
         let send_gateway_quote = gateway_fees.send.on(grossed.invoice_amount);
@@ -867,11 +971,19 @@ impl FedimintExecutor {
             // sizing search keeps probing smaller amounts. Without this, a fresh full-balance
             // evacuation (`desired == spendable`, the common shutdown case) errors `Retryable`
             // on its very FIRST probe — invoice + gateway fee already exceed the balance — and
-            // the downsizing search never runs.
-            Err(e) if is_insufficient_balance(&e) => return Ok(None),
-            Err(e) => return Err(retryable(e)),
+            // the downsizing search never runs. The mint reports the GAP as well as the refusal,
+            // and the sizing search needs it: a note-selection boundary can make a larger amount
+            // fundable again, so a small measured gap licenses probing above this candidate.
+            Err(e) => {
+                return match insufficient_balance_shortfall(&e) {
+                    Some(shortfall) => Ok(CandidateQuote::Unquotable {
+                        source_shortfall: Some(shortfall),
+                    }),
+                    None => Err(retryable(e)),
+                }
+            }
         };
-        Ok(Some(FreshMoveCost {
+        Ok(CandidateQuote::Priced(FreshMoveCost {
             invoice_amount: grossed.invoice_amount,
             receive_quote: grossed.receive_quote,
             send_quote: Msat(send_gateway_quote.0.saturating_add(send_tx_fee.0)),
@@ -1318,14 +1430,69 @@ impl FedimintExecutor {
                     // explained in history (a derived-cache write; no money moves). It rides on
                     // every subsequent `put_move` below and is stored on the refusal path too.
                     rec.receive_fee_quoted = Some(grossed.receive_quote);
+                    // The DELIVERED net for this re-quote, and the cap it entitles. Derived HERE,
+                    // before the gate below, because the gate must not admit a receive fee that the
+                    // Pay step will then refuse: `rec.fee_cap` was computed at the SIZED ask, so
+                    // using it here enforces a cap the delivery never earned and pushes the refusal
+                    // past `mc.receive` — after the operation has committed and can only be left
+                    // orphaned. Nothing mutates `rec.amount`: lowering the cached ask before the
+                    // receive exists would make a crash retry mint a fresh invoice for less than
+                    // requested (see the §15.11 note below).
+                    let requote_delivered = grossed.delivered_net();
+                    let cap_rule = evacuation_cap_rule(plan.fee_cap_components, rec.fee_cap);
                     // Cap-check the receive side alone (spec §6/§7): for a `DirectInflow` this is
                     // the whole check; for a `Move` the send leg is re-checked at `Pay`. Over cap →
-                    // persist the quote first (so the refusal is in history), then refuse terminally.
-                    if !fee::total_within_cap(grossed.receive_quote, Msat(0), rec.fee_cap) {
+                    // persist the quote first, so the refusal is in history either way.
+                    //
+                    // The DISPOSITION splits by shape, and only for an evacuation. Nothing has
+                    // committed here — `mc.receive` is still below — so a fee that drifted up
+                    // between sizing and this re-quote is a transient fact about one quote, not a
+                    // property of the move. Terminalizing it strands a dying federation's balance
+                    // until a fresh occurrence is emitted, when re-running `size_fresh_evacuation`
+                    // would simply re-size against the new prices. That is the same reasoning the
+                    // viability gate directly below already applies; having the two disagree was
+                    // the file contradicting itself. For a `Move`/`DirectInflow` the ask is the
+                    // user's own and `Permanent` remains right: there is no dying federation to
+                    // drain and no reason to keep retrying a request that no longer prices.
+                    if !fee::total_within_cap(
+                        grossed.receive_quote,
+                        Msat(0),
+                        cap_rule.at(requote_delivered),
+                    ) {
                         self.journal.put_move(&rec).await?;
-                        return Err(ExecError::Permanent(
-                            "fee over cap (receive side exceeds fee_cap)".into(),
-                        ));
+                        let over_cap = format!(
+                            "fee over cap (receive side {} msat exceeds the {} msat cap at the \
+                             {} msat this would deliver)",
+                            grossed.receive_quote.0,
+                            cap_rule.at(requote_delivered).0,
+                            requote_delivered.0
+                        );
+                        return Err(if is_evacuate {
+                            ExecError::Retryable(over_cap)
+                        } else {
+                            ExecError::Permanent(over_cap)
+                        });
+                    }
+                    // VIABILITY, checked here and not only at Pay. The Pay step terminalizes
+                    // `Permanent` when the receive fee exceeds what the move delivers, and by then
+                    // `mc.receive` has committed — so a gateway that raises its receive base
+                    // between sizing and this re-quote gets admitted (its fee still fits the cap),
+                    // mints, commits, and is then permanently refused, abandoning the drain with an
+                    // orphaned receive op. That is the opposite of the posture `size_fresh_
+                    // evacuation` takes: funds on a dying federation are left retryable, never
+                    // terminally abandoned. `fits_cap` makes the same argument — the admission side
+                    // is the one that has to move — and this is the admission side.
+                    //
+                    // Only the FIXED-invoice half moves forward. The send leg is re-quoted at Pay
+                    // and its `Retryable` disposition rightly stays there.
+                    if is_evacuate && grossed.receive_quote.0 > requote_delivered.0 {
+                        self.journal.put_move(&rec).await?;
+                        return Err(ExecError::Retryable(format!(
+                            "the receive leg now costs more than this move delivers ({} msat of \
+                             receive fee against {} msat delivered); refusing BEFORE minting so \
+                             the balance stays where it is and a later quote can still drain it",
+                            grossed.receive_quote.0, requote_delivered.0
+                        )));
                     }
                     let invoice_amount = grossed.invoice_amount;
                     // A move may have accepted a verified hair-under solve: the DELIVERED net is
@@ -1335,12 +1502,7 @@ impl FedimintExecutor {
                     // smaller cached amount over the intent's ask (`assemble_move_record`) and mint
                     // a fresh invoice for less than requested even though fees may have settled; a
                     // fresh attempt must re-quote from the intent's full ask.
-                    let delivered = Msat(
-                        grossed
-                            .invoice_amount
-                            .0
-                            .saturating_sub(grossed.receive_quote.0),
-                    );
+                    let delivered = requote_delivered;
                     // The net this move will actually deliver (== rec.amount for an exact solve),
                     // committed in the receive op's own MoveMeta below UNCONDITIONALLY (§15.11): the
                     // MoveMeta amount is documented as the honest crash-safe delivered amount, so a
@@ -1350,6 +1512,15 @@ impl FedimintExecutor {
                     // the intent's ask) — the Pay-step cap re-check can never be weakened by a stale
                     // higher amount.
                     let net_amount = delivered_move_amount(delivered, rec.amount);
+                    // The cap RULE, so a hair-under settle re-derives its cap from what is
+                    // actually delivered. `rec.fee_cap` was computed by `apply_evacuation_sizing`
+                    // AT `rec.amount`; when `net_amount` comes in under that, keeping it would
+                    // enforce a cap the executed net never entitled — the same planned-vs-executed
+                    // hole `apply_evacuation_sizing` closes at the sizing seam, reachable through a
+                    // second door. For a non-evacuation move (and a legacy intent carrying no
+                    // components) the rule is the stored cap as a CONSTANT, so `at()` returns it
+                    // unchanged at any net and this is a no-op.
+                    let delivered_fee_cap = cap_rule.at(net_amount);
                     // Persist the record BEFORE the non-idempotent receive call — for BOTH move
                     // shapes. If the process dies after B's receive op commits but before the
                     // invoice/op-id cache write below, backfill recovers the op from the op-log but
@@ -1363,6 +1534,16 @@ impl FedimintExecutor {
                         move_id: intent.operation_correlation_key(),
                         role: MoveRole::Receive,
                         amount: net_amount,
+                        // Commit the ENFORCED cap beside the net it was computed at — which is
+                        // `net_amount`, NOT `rec.amount`: a hair-under settle delivers less than
+                        // the sized ask, and `rec.fee_cap` still holds the cap computed at that
+                        // larger ask. Committing that here would pair a smaller `amount` with a
+                        // larger cap in the one record replay trusts. This is the crash-safe half
+                        // of the clamp fix: the killpoint below sits between this op committing and
+                        // the `MoveRecord` write, and without the cap here replay would rebuild
+                        // `fee_cap` from the intent's PLANNED amount and authorise a fee the
+                        // executed net never entitled.
+                        fee_cap: Some(delivered_fee_cap),
                         from: rec.from,
                         to: rec.to,
                     };
@@ -1410,9 +1591,14 @@ impl FedimintExecutor {
                         tracing::warn!(
                             requested_msat = rec.amount.0,
                             delivered_msat = net_amount.0,
+                            enforced_fee_cap_msat = delivered_fee_cap.0,
                             "executor: fee fixed point settled a hair under; adjusting move net"
                         );
-                        rec.amount = net_amount;
+                        // Through the sizing seam, so the amount and its cap move TOGETHER here
+                        // exactly as they do at `size_fresh_evacuation`. Assigning `rec.amount`
+                        // alone would leave `fee_cap` at the larger ask's value, and the Pay-step
+                        // re-check below would then admit a fee this net never entitled.
+                        apply_evacuation_sizing(&mut rec, cap_rule, net_amount);
                     }
                     self.journal.put_move(&rec).await?;
                     // KILLPOINT: the MoveRecord (recv_op + invoice) is persisted and the receive
@@ -1489,11 +1675,24 @@ impl FedimintExecutor {
                     // expiry belt bounds the retry horizon), so a transient spike never terminally
                     // strands funds on a dying fed mid-evacuation.
                     pay_step_cap_verdict(receive_quote, send_quote, rec.fee_cap)?;
+                    // ADR-0029: a route that costs more than it delivers does not SERVE, and
+                    // sizing's post-check is re-run here for the same reason the cap is — the
+                    // send leg is re-quoted each attempt and can have moved since sizing. Only
+                    // an evacuation takes it: it is the shape that chunk-drains on its own
+                    // remainder, while a funding `Move`'s proportional cap already keeps its fee
+                    // far under its amount and the user verbs deliberately allow a small receive
+                    // to cost a large fraction of itself.
+                    if is_evacuate {
+                        evacuation_viability_verdict(receive_quote, send_quote, rec.amount)?;
+                    }
 
                     let meta = MoveMeta {
                         move_id: intent.operation_correlation_key(),
                         role: MoveRole::Send,
                         amount: rec.amount,
+                        // The same enforced cap as the receive leg's meta: whichever leg backfill
+                        // recovers, reassembly gets the cap this move was authorised under.
+                        fee_cap: Some(rec.fee_cap),
                         from: rec.from,
                         to: rec.to,
                     };
@@ -1618,8 +1817,8 @@ fn action_gateway(action: &Action) -> Option<&GatewayUrl> {
 /// routes may be judged against `fee_cap` at that amount.
 ///
 /// False for an `Evacuate` alone: `assemble_record` (and so gateway resolution) runs BEFORE
-/// `size_fresh_evacuation`, which downsizes the drain until the quoted cost fits the absolute
-/// `max_fee` cap. A cap verdict taken at the pre-sizing ask would refuse the evacuation
+/// `size_fresh_evacuation`, which downsizes the drain until the quoted cost fits the evacuation
+/// cap (`evac_fee_base_msat` + `evac_fee_bps` at the delivered net). A cap verdict taken at the pre-sizing ask would refuse the evacuation
 /// (`Retryable`, every tick) without the downsizing search ever running — stranding a dying
 /// federation's balance, which is exactly what that search exists to prevent. Route economics
 /// never gates an evacuation (`wallet-core`'s `evacuate_decision`), and this is where that
@@ -1657,19 +1856,47 @@ impl Executor for FedimintExecutor {
     }
 }
 
-/// The largest `amount` in `[floor, hi]` for which `fits` holds, by bisection. `None` when
-/// the range is empty or nothing in it fits. The CALLER owns the monotonicity argument:
-/// `fits` must be fits-then-doesn't as the amount grows over `[floor, hi]` (see
-/// `max_affordable_evacuation_net` — the floor is what makes its predicate monotone).
+/// The largest `amount` in `[floor, hi]` that PROBES as fitting, by a ROBUST bisection.
 /// Requires `floor ≥ 1`.
+///
+/// CONTRACT — this replaces the former monotonicity requirement, which an amount-dependent fee
+/// cap genuinely breaks. `cap(a) = base + bps*a` is not monotone against a real fee curve:
+/// writing `fee(a) − cap(a) = (bases − base) + (ppm_total − bps_rate)*a`, the slope can go either
+/// way, so the feasible set is a TOP window (bases above the cap base, rate below it) or a BOTTOM
+/// one — and every term floors independently (both gateway fees, both federation fees, and the
+/// per-note MINT fee), so near the crossing the verdict genuinely oscillates msat to msat.
+///
+/// So: **returns a probed-fitting amount at least as large as every amount the BOUNDED probe
+/// reaches.** That is BEST-EFFORT, NOT "every amount that fits with `2A` msat of slack": `A`
+/// bounds ONE vertical fee jump and says nothing about how many note-selection boundaries
+/// separate a failing probe from a feasible window, nor their spacing, so a window beyond
+/// [`NOTE_BOUNDARY_PROBES`] boundaries is MISSED and the evacuation keeps retrying. ADR-0029
+/// accepts that residual: the consequence is a retry, not a burn. `None` only when no such amount
+/// exists.
+///
+/// Where a plain bisection collapses `hi` the moment a candidate fails, this one first asks
+/// whether the miss is within the oscillation bound `A` (`shortfall <= A`, EQUALITY INCLUDED —
+/// the boundary belongs to the probe, not the refusal), and if so probes the note-selection
+/// boundaries ABOVE the failing candidate before discarding everything above it. That is what
+/// finds a TOP window: a discontinuity can make a LARGER amount fit again, and one false probe
+/// below the window would otherwise throw the whole window away — the exact livelock the
+/// amount-dependent cap would have reintroduced.
+///
+/// Structural windows are found by this search (or by its caller's second pass). What it does NOT
+/// chase is the OSCILLATION near the crossing, where floor jitter flips the verdict msat to msat:
+/// there every fitting amount fits with ~zero slack, and a zero-slack fit buys no margin against
+/// the Pay-step re-quote. It is not a weakening of the search — it names the residue the search is
+/// not obliged to chase. Zero-slack amounts remain perfectly USABLE: `fee::total_within_cap`
+/// compares with `<=`, so an exact-cap candidate is admitted and survives an unchanged re-quote.
 async fn largest_fitting_amount<F, Fut>(
     floor: u64,
     mut hi: u64,
-    mut fits: F,
+    oscillation: u64,
+    mut probe: F,
 ) -> Result<Option<u64>, ExecError>
 where
     F: FnMut(u64) -> Fut,
-    Fut: std::future::Future<Output = Result<bool, ExecError>>,
+    Fut: std::future::Future<Output = Result<ProbeVerdict, ExecError>>,
 {
     debug_assert!(floor > 0, "a zero floor would underflow the sentinel below");
     if hi < floor {
@@ -1677,17 +1904,827 @@ where
     }
     // `lo` trails the largest amount VERIFIED to fit; it starts one below the floor as the
     // "nothing verified yet" sentinel and only ever advances to probed-true amounts, so the
-    // loop never evaluates `fits` outside `[floor, hi]`.
+    // loop never evaluates `probe` outside `[floor, hi]`.
     let mut lo = floor - 1;
     while lo < hi {
         let mid = lo + (hi - lo).div_ceil(2);
-        if fits(mid).await? {
+        let verdict = probe(mid).await?;
+        if verdict.fits {
             lo = mid;
-        } else {
-            hi = mid - 1;
+            continue;
         }
+        if verdict.shortfall <= oscillation {
+            // Every candidate here is > `mid`, so `lo` still advances and the range still
+            // shrinks: the loop terminates exactly as the plain bisection does.
+            if let Some(found) =
+                first_fitting_boundary(note_boundaries_above(mid, hi), &mut probe).await?
+            {
+                lo = found;
+                continue;
+            }
+        }
+        hi = mid - 1;
     }
     Ok((lo >= floor).then_some(lo))
+}
+
+/// Probe `candidates` in order and return the FIRST that fits, or `None` when none does. The
+/// order is the caller's, and this helper imposes none — the production caller supplies them
+/// LARGEST first (see `note_boundaries_above`, which documents why), so "first that fits" means
+/// the largest fitting boundary there, not the nearest.
+async fn first_fitting_boundary<F, Fut>(
+    candidates: Vec<u64>,
+    probe: &mut F,
+) -> Result<Option<u64>, ExecError>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<ProbeVerdict, ExecError>>,
+{
+    for candidate in candidates {
+        if probe(candidate).await?.fits {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+/// The note-selection boundaries adjacent to `amount` and ABOVE it, at most `ceiling`, at most
+/// [`NOTE_BOUNDARY_PROBES`] of them, and ordered LARGEST FIRST.
+///
+/// The pinned mint's denominations are POWERS OF TWO msat (`Tiered::gen_denominations` with
+/// `DEFAULT_DENOMINATION_BASE = 2` in fedimint-mint-server), and the mint charges per input and
+/// per output — so which notes a transaction selects, and hence its fee, can only change where
+/// the amount crosses a multiple of a tier. These are those crossings, DERIVED from the
+/// denominations rather than guessed offsets: `A` bounds the VERTICAL fee jump and says nothing
+/// about the HORIZONTAL distance to the next discontinuity, so an offset-guessing probe can obey
+/// "a bounded number of candidates" and still miss every executable amount.
+///
+/// LARGEST FIRST for two reasons that agree: the caller wants the largest amount that fits, and
+/// the crossing of a LARGER tier is the more significant discontinuity — the mint's per-note fee
+/// scales with the denomination crossed, so that is where a jump big enough to have caused the
+/// failure lives. Probing the nearest 1-, 2- and 4-msat crossings instead would spend the whole
+/// budget within a few hundred msat of a candidate that already failed.
+///
+/// One honest limitation: the tiers are read off the NET, while the fee is charged on the invoice
+/// and the outgoing contract, which sit a gateway base and ppm away. The offset is near-constant
+/// across a search, so a large-tier crossing in the net still lands close to the corresponding one
+/// in the contract, but this is a bounded best-effort probe — as its contract says — and not an
+/// exact enumeration of the fee curve's discontinuities.
+fn note_boundaries_above(amount: u64, ceiling: u64) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::new();
+    for k in (0..u64::BITS).rev() {
+        // The next multiple of this tier STRICTLY above `amount`. NON-INCREASING as `k` falls
+        // (every multiple of `2^k` is one of `2^(k-1)`), so the list comes out sorted descending
+        // and equal neighbours dedup in one step. A tier whose crossing is out of range is
+        // skipped rather than terminating the scan: the smaller tiers below it are still in range.
+        let candidate = ((amount >> k) as u128 + 1) << k;
+        if candidate > u128::from(ceiling) {
+            continue;
+        }
+        let candidate = candidate as u64;
+        if out.last() != Some(&candidate) {
+            out.push(candidate);
+        }
+        if out.len() == NOTE_BOUNDARY_PROBES {
+            break;
+        }
+    }
+    out
+}
+
+/// The mirror of [`note_boundaries_above`]: the last amount before each tier crossing that
+/// `amount` sits above, at least `floor`, and — by the same "largest candidate first" rule —
+/// NEAREST first, which below the amount IS largest first.
+///
+/// Nearest-first is also right on its own terms here: the caller reaches this list because the
+/// top just failed, and the crossing that raised its fee is the one immediately below it. The
+/// list still widens geometrically (each tier's crossing is at least twice as far), so a top
+/// sitting well above the crossing that broke it is still reached.
+fn note_boundaries_below(amount: u64, floor: u64) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::new();
+    for k in 0..u64::BITS {
+        let step = 1u128 << k;
+        let boundary = (u128::from(amount) / step) * step;
+        // Non-increasing in `k`, so the list is sorted descending and `break` is safe.
+        let Some(candidate) = boundary.checked_sub(1) else {
+            break;
+        };
+        if candidate < u128::from(floor) {
+            break;
+        }
+        let candidate = candidate as u64;
+        if out.last() != Some(&candidate) {
+            out.push(candidate);
+        }
+        if out.len() == NOTE_BOUNDARY_PROBES {
+            break;
+        }
+    }
+    out
+}
+
+/// The OSCILLATION BOUND `A`: how far ONE note-selection discontinuity can move the quoted cost.
+/// It decides only whether a failing probe is close enough to be worth probing the adjacent tier
+/// boundaries before a range is discarded — it is NEVER a safety margin on the cap itself, which
+/// keeps comparing exactly (`fee::total_within_cap`).
+///
+/// `A ≈ 6 + 2*(300*tiers + 100) + 2_100 + 2*ceil(v_max * mint_ppm / 1e6)`: the two legs'
+/// consolidation bound over the mint's tier count, the fixed lnv2/mint terms, and — the term that
+/// must not be dropped — the mint's PROPORTIONAL per-note fee, which scales with the DENOMINATION
+/// crossed. A tier-count-only bound can be smaller than a real jump by orders of magnitude, and
+/// the `shortfall <= A` rules would then refuse an executable evacuation without probing a nearby
+/// viable amount, which is the failure they exist to prevent.
+///
+/// `v_max` bounds the value of one selected input or change note. Neither it nor the live mint
+/// rate is readable through this seam, so both are taken at their pinned worst case: the source's
+/// own spendable balance bounds any note it can hold, and [`MINT_FEE_PPM_CEILING`] is the highest
+/// rate `FeeConsensus::new` will accept. Both err LARGE deliberately — an over-estimate only
+/// probes more, an under-estimate refuses unprobed.
+fn oscillation_bound(v_max: Msat) -> u64 {
+    let tiers = u128::from(u64::BITS - v_max.0.max(1).leading_zeros());
+    let per_note_proportional =
+        (u128::from(v_max.0) * u128::from(MINT_FEE_PPM_CEILING)).div_ceil(1_000_000);
+    let bound = 6u128
+        + 2 * (300 * tiers + u128::from(MINT_FEE_BASE_MSAT))
+        + 2_100
+        + 2 * per_note_proportional;
+    bound.min(u128::from(u64::MAX)) as u64
+}
+
+/// The cap RULE a fresh evacuation is sized and enforced under: the components the allocator
+/// snapshotted onto the action, or — for a LEGACY intent planned before they existed — the
+/// stored absolute cap expressed as the same shape with a ZERO rate, which makes `cap.at(n)`
+/// constant at that stored value.
+///
+/// A legacy evacuation therefore keeps exactly the bound it was admitted under. It must NOT adopt
+/// the current policy's components: an in-flight evacuation's cap is an admitted parameter, and
+/// silently moving it is the same hazard as re-deriving every cap from a live `Policy` at
+/// execution time (which is why that design was rejected — an operator's `policy set` could
+/// shrink an in-flight cap, and `pay_step_cap_verdict` is PERMANENT when the fixed receive quote
+/// alone exceeds it, so a routine edit could terminally kill an evacuation whose invoice is
+/// already minted).
+fn evacuation_cap_rule(components: Option<EvacFeeCap>, planned_cap: Msat) -> EvacFeeCap {
+    components.unwrap_or(EvacFeeCap {
+        base_msat: planned_cap,
+        bps: 0,
+    })
+}
+
+/// Commit a completed sizing onto the record: the executed net AND the cap recomputed at it.
+///
+/// The two are written TOGETHER, and ONLY through this function, so a downsized drain can never
+/// keep the planned-amount cap — the money hole this is the seam for. Plan 75_000 sats and clamp to
+/// 1_000, and the enforced cap moves from 2_450 sats to 230; leaving `fee_cap` alone would authorise
+/// a fee more than ten times what the executed net entitles.
+///
+/// There are TWO callers, because the net drops in two places: `size_fresh_evacuation` (the search
+/// picks a smaller net than desired) and the receive fixed point (a verified hair-under settle
+/// delivers less than the sized ask). The second is the easier one to miss — it looks like a
+/// cosmetic amount correction — so route any future amount change through here rather than
+/// assigning `rec.amount` directly.
+fn apply_evacuation_sizing(rec: &mut MoveRecord, cap: EvacFeeCap, net: Msat) {
+    rec.amount = net;
+    rec.fee_cap = cap.at(net);
+}
+
+/// Whether a candidate's quoted cost fits the cap at the net that quote actually DELIVERS.
+///
+/// It takes no caller-supplied amount on purpose. Admitting at `cap.at(sized_ask)` while the
+/// executor enforces `cap.at(delivered_net)` lets a quote in the band `cap.at(delivered)+1 ..=
+/// cap.at(sized)` pass sizing and then be refused at the Pay step — after the receive operation
+/// has already committed, leaving it orphaned and unclaimed. With stable quotes that repeats,
+/// so the admission side is the one that has to move.
+fn fits_cap(cost: FreshMoveCost, cap: EvacFeeCap) -> bool {
+    fee::total_within_cap(
+        cost.receive_quote,
+        cost.send_quote,
+        cap.at(cost.delivered_net()),
+    )
+}
+
+/// The COMBINED pass-2 predicate: affordability, and the cap at what the quote DELIVERS. The
+/// verdict's shortfall is the LARGER of the two gaps, so a candidate that misses both is only
+/// probed around when BOTH misses are within one discontinuity.
+///
+/// It takes no candidate amount at all, which is the point rather than an accident. Both halves
+/// read the QUOTE: affordability compares `invoice + send_quote` against the source's spendable
+/// balance, and the cap compares the fee against `invoice − receive_quote`. The candidate the
+/// search was probing is an intention; once a quote exists, every question worth asking is about
+/// the quote. Removing the parameter is what stops a caller reintroducing the ask as a cap basis.
+fn combined_verdict(quote: CandidateQuote, cap: EvacFeeCap, spendable: Msat) -> ProbeVerdict {
+    let affordability = quote.affordability(spendable);
+    let cap_gap = match quote {
+        CandidateQuote::Priced(cost) => cost
+            .total_fee()
+            .0
+            .saturating_sub(cap.at(cost.delivered_net()).0),
+        // An unquotable candidate has no cost to compare against the cap; affordability alone
+        // decides it.
+        CandidateQuote::Unquotable { .. } => 0,
+    };
+    if affordability.fits && cap_gap == 0 {
+        return ProbeVerdict::fits();
+    }
+    ProbeVerdict::missed_by(affordability.shortfall.max(cap_gap))
+}
+
+/// The complete sizing decision for one fresh evacuation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EvacuationSizing {
+    /// The net to execute. The caller recomputes the enforced cap at it
+    /// ([`apply_evacuation_sizing`]).
+    Sized(Msat),
+    /// Nothing executable was found. The reason names a structural refusal only when two points
+    /// quoted AT DIAGNOSIS TIME give evidence for it, and otherwise names the specific condition
+    /// it observed instead. There are no "analytic slopes" here: every slope is fitted to two
+    /// samples of a fee curve that is not monotone, so probe exhaustion is INCONCLUSIVE, never
+    /// proof, and no branch that lacks two currently-affordable points recommends a fee change.
+    Refused(String),
+}
+
+/// The result of the two-pass sizing search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EvacuationSearch {
+    /// The largest probed net that fits BOTH affordability and the cap, with its quoted cost.
+    sized: Option<(Msat, FreshMoveCost)>,
+    /// The largest probed net the SOURCE could afford, cap ignored — pass 1's own result. A HINT
+    /// ONLY: which amount the refusal diagnostic should re-quote as its high point.
+    ///
+    /// It deliberately carries NO cost. An earlier revision cached the `FreshMoveCost` here and
+    /// three separate review rounds found three different ways for that cost to go stale before
+    /// the diagnostic read it — a conditional write, an early return that skipped the write, and
+    /// pass 2 re-probing this very amount without refreshing it. Each was fixed at its own site,
+    /// and the fourth site would have been found the same way, because the defect was never any
+    /// one write: `structural_refusal_cause` measured a fee-vs-cap SLOPE between a floor quoted at
+    /// diagnosis time and a high point quoted during the search. A slope across two epochs is not
+    /// a trend, and a perfectly maintained cache is still the wrong epoch. So the cost is gone and
+    /// the diagnostic quotes BOTH points back to back; a stale AMOUNT is then harmless by
+    /// construction, because the re-quote either confirms it or degrades to the transient message.
+    largest_affordable_hint: Option<Msat>,
+}
+
+/// TWO PASSES, because a single bisection on the combined predicate is not sufficient (§2c(a)).
+///
+/// PASS 1 bisects the AFFORDABILITY constraint ALONE over `[MINIMUM_INCOMING_CONTRACT_MSAT, T]`
+/// and then checks BOTH constraints at the result. PASS 2 runs whenever that combined check
+/// fails — which is the cap in the regime this was designed for, but also an affordability miss
+/// when the fresh re-quote moved, so do not rely on "the cap failed" as a premise here. It
+/// bisects
+/// the COMBINED predicate over `[MINIMUM_INCOMING_CONTRACT_MSAT, pass1]` — in the regime that
+/// reaches it, `fee − cap` is increasing in the amount, so the combined predicate really is
+/// fits-then-doesn't and the bottom window is found. Nothing is refused until BOTH fail.
+///
+/// A single combined bisection is what the worked case defeats: with gateway bases 99 + 49 sats
+/// against a configured 20-sat cap base, a combined ppm under the cap rate and a 10_000-sat
+/// balance, the full ask fails on AFFORDABILITY, a combined bisection then probes ~5_002 sats,
+/// fails on the CAP, collapses `hi` to 5_001 and discards the feasible window [~5_120, ~9_802]
+/// entirely — returning to the very livelock the base+proportional cap exists to kill. The window
+/// is missed STRUCTURALLY, not for want of slack (at 9_000 sats the fee is ~193 against a ~290
+/// cap, ~97 sats of room). Pass 1's affordability-only bisection finds it regardless.
+///
+/// Affordability is NOT strictly monotone either: mint fees are per input and per output, so the
+/// note COUNT enters the source debit, and raising the ask can cross a note-selection boundary
+/// that REDUCES the input/change count and so LOWERS the debit. Pass 1 therefore carries the same
+/// robustness treatment as pass 2 — see [`largest_fitting_amount`], whose boundary probes are the
+/// mirror of pass 2's, because here a LARGER amount can fit.
+///
+/// Both passes are bounded above by `desired`, which the caller has already clamped to the
+/// destination's remaining cap room: evacuations are exempt from `enforce_destination_cap`, so an
+/// unbounded search could size one clean over the ADR-0018 hard cap with nothing downstream to
+/// catch it.
+async fn search_evacuation_net<F, Fut>(
+    desired: Msat,
+    spendable: Msat,
+    cap: EvacFeeCap,
+    oscillation: u64,
+    mut quote: F,
+) -> Result<EvacuationSearch, ExecError>
+where
+    F: FnMut(Msat) -> Fut,
+    Fut: std::future::Future<Output = Result<CandidateQuote, ExecError>>,
+{
+    let floor = MINIMUM_INCOMING_CONTRACT_MSAT;
+    let mut search = EvacuationSearch {
+        sized: None,
+        largest_affordable_hint: None,
+    };
+    // FAST PATH: the full ask, which is what an evacuation wants whenever the source can fund it.
+    // It runs BEFORE the floor check on purpose. `floor` bounds the BISECTION RANGE, not
+    // executability: the incoming contract is `net + fed_fee`, so a net under the 5_000 msat
+    // protocol minimum can still mint a contract above it once the federation fee is added.
+    // Returning early without ever quoting strands exactly the dust remnant an evacuation exists
+    // to sweep — it would retry forever reporting "no fit" for an amount nothing ever priced.
+    let top = quote(desired).await?;
+    let top_affordable = top.affordability(spendable).fits;
+    if let CandidateQuote::Priced(cost) = top {
+        if top_affordable {
+            search.largest_affordable_hint = Some(desired);
+            if fits_cap(cost, cap) {
+                search.sized = Some((desired, cost));
+                return Ok(search);
+            }
+        }
+    }
+
+    // Below the floor there is no bisection range left: the fast path above was the only
+    // candidate this route has, and it did not serve.
+    if desired.0 < floor {
+        return Ok(search);
+    }
+
+    // PASS 1 — affordability alone. When the full ask was already affordable it IS pass 1's
+    // answer (nothing larger is in range), so only the cap can have refused it.
+    let pass1 = if top_affordable {
+        Some(desired.0)
+    } else {
+        largest_fitting_amount(floor, desired.0, oscillation, |amount| {
+            let quoted = quote(Msat(amount));
+            async move { Ok(quoted.await?.affordability(spendable)) }
+        })
+        .await?
+    };
+    let Some(pass1) = pass1 else {
+        return Ok(search);
+    };
+    let CandidateQuote::Priced(pass1_cost) = quote(Msat(pass1)).await? else {
+        // A deterministic quote stream cannot un-price an amount it just priced; a
+        // non-deterministic one simply gets no sizing this pass and retries. The hint may now name
+        // an amount that will not price — which is harmless, and deliberately not special-cased
+        // here: the diagnostic re-quotes it and degrades to its transient message. An earlier
+        // revision cleared a cached COST on this path because leaving it let a stale cost reach
+        // the trend measurement; with no cost cached there is nothing to go stale.
+        return Ok(search);
+    };
+    // ASSIGN the hint from this fresh re-quote — set when affordable, cleared when not. With only
+    // an amount stored this is no longer load-bearing for correctness (the diagnostic re-quotes
+    // whatever it names), but it still points at the better amount, and pass 2 below can move the
+    // truth again without touching it. That last part is exactly why no write site here can be
+    // trusted to keep a COST honest, and why none is asked to.
+    let pass1_verdict = combined_verdict(CandidateQuote::Priced(pass1_cost), cap, spendable);
+    search.largest_affordable_hint =
+        (pass1_cost.source_debit() <= spendable).then_some(Msat(pass1));
+    // BOTH constraints on the fresh quote, through the one predicate — not the cap alone. This
+    // re-quote is not the one the bisection accepted, and the hole is live precisely when it
+    // moved: in the `top_affordable` branch the fast path's quote already failed the cap, so
+    // reaching here REQUIRES the price to have changed. `Priced` does not imply affordable —
+    // `source_debit` carries the send tx fee on top of what the mint dry-run funded — so a
+    // cap-only check can size an amount the source cannot fund, mint, commit the receive, and
+    // strand it when `Pay` cannot pay. Round 6 guarded this seam at pass 2 and left pass 1; the
+    // shared predicate is what stops there being a third.
+    if pass1_verdict.fits {
+        search.sized = Some((Msat(pass1), pass1_cost));
+        return Ok(search);
+    }
+
+    // PASS 2 — the combined check failed at pass 1's amount, so any feasible set is a BOTTOM
+    // window. Usually that is the cap failing, which is the regime this was designed for; it can
+    // also be an affordability miss when the fresh re-quote moved, so do not rely on "the cap
+    // failed" as a premise. In the INCREASING regime this finds nothing, harmlessly: pass 1
+    // already ruled it out from above.
+    let pass2 = largest_fitting_amount(floor, pass1, oscillation, |amount| {
+        let quoted = quote(Msat(amount));
+        async move { Ok(combined_verdict(quoted.await?, cap, spendable)) }
+    })
+    .await?;
+    if let Some(pass2) = pass2 {
+        // REVALIDATE. This is a fresh quote, not the one `combined_verdict` accepted inside the
+        // bisection: another intent can change the source's note inventory mid-search, so the
+        // re-quote can stay `Priced` while carrying a larger mint fee. Trusting the verdict here
+        // would let an over-cap evacuation reach invoice creation and be refused only at Pay —
+        // after the receive committed. Same seam, one function further along.
+        let requote = quote(Msat(pass2)).await?;
+        if let CandidateQuote::Priced(cost) = requote {
+            if combined_verdict(requote, cap, spendable).fits {
+                search.sized = Some((Msat(pass2), cost));
+            }
+        }
+    }
+    Ok(search)
+}
+
+/// The ECONOMIC-VIABILITY POST-CHECK (ADR-0029): a route only SERVES when the chunk it can carry
+/// delivers at least what it costs, `total_fee <= net`.
+///
+/// Without it the cap's amount-independent base is a burn licence: at the 5-sat lnv2 contract
+/// floor a 200-sat base cap admits a chunk that burns ~200 sats to move ~5, and the remainder
+/// re-emits every watch cycle with no minimum-progress guard, no attempt budget and no fee
+/// accounting — a 75_000-sat balance drains in ~365 such chunks, delivering ~1_953 sats and
+/// burning ~73_047, a ~97.4% loss. That is the evacuation destroying the balance it exists to
+/// rescue.
+///
+/// It is a POST-check on the search RESULT, never a term inside the fits predicate: `fee(n) <= n`
+/// is false at small `n` and true above `base/(1 − rate)`, so folding it in would re-break the
+/// fits-then-doesn't shape the bisection depends on.
+///
+/// The TOP is checked FIRST, because for the affine model efficiency `fee(n)/n = base/n + rate`
+/// falls as `n` grows — but the top is not a proof. The real quote is not affine: two gateway
+/// fees, two federation fees and the per-note mint fee each floor independently and the note
+/// COUNT can change between adjacent amounts, so the fee can jump by more than the one-msat gain
+/// in `n`, and the top can fail while a slightly smaller candidate passes. The adjacent tier
+/// boundaries BELOW the top are therefore probed before any refusal — ALWAYS, whatever the
+/// shortfall's magnitude. ADR-0029 permits a refusal only when the shortfall exceeds the
+/// oscillation bound `A` **and that is an analytically proven structural refusal**; a bare
+/// shortfall over `A` is inconclusive, because `A` bounds ONE vertical fee jump and two nearby
+/// note-count drops can each stay under it while together exceeding it. Gating the probe on the
+/// magnitude stranded exactly the executable evacuations this function exists to find, and did so
+/// on every tick, because stable quotes reproduce the branch.
+///
+/// A refusal here is INCONCLUSIVE about the route in general: `A` bounds ONE discontinuity, so
+/// several boundaries can cumulatively exceed it with a smaller viable amount still beyond them,
+/// and the probe is deliberately bounded. The caller stays `Retryable` and must not mark the route
+/// unavailable — stranding rather than burning, the posture ADR-0018 already accepts.
+async fn evacuation_viability<F, Fut>(
+    sized: (Msat, FreshMoveCost),
+    spendable: Msat,
+    cap: EvacFeeCap,
+    oscillation: u64,
+    mut quote: F,
+) -> Result<EvacuationSizing, ExecError>
+where
+    F: FnMut(Msat) -> Fut,
+    Fut: std::future::Future<Output = Result<CandidateQuote, ExecError>>,
+{
+    let (net, cost) = sized;
+    // Viability compares the fee against what the route DELIVERS, not against the ask — the
+    // Pay-step mirror of this check already reads the delivered net (`rec.amount` is the
+    // hair-under-adjusted value by then), so measuring the ask here would let a route pass
+    // sizing and fail execution over the same inequality.
+    let shortfall = cost.total_fee().0.saturating_sub(cost.delivered_net().0);
+    if shortfall == 0 {
+        return Ok(EvacuationSizing::Sized(net));
+    }
+    // The bounded probe runs REGARDLESS of how far the top missed. ADR-0029 permits a refusal
+    // only when the shortfall exceeds `A` **AND that is an analytically proven structural
+    // refusal**: "a bare shortfall over `A` is inconclusive, not proof". `A` bounds ONE vertical
+    // fee jump, so two nearby note-count drops can each be bounded by `A` while their cumulative
+    // reduction exceeds it, leaving a smaller candidate that satisfies both the cap and
+    // `fee <= net`. Returning early on the bare magnitude skipped those candidates and — because
+    // stable quotes take the same branch every tick — stranded a dying federation that had an
+    // executable evacuation available. That is the livelock this bead exists to remove, so the
+    // magnitude may colour the refusal MESSAGE but must not gate the probe.
+    for candidate in note_boundaries_below(net.0, MINIMUM_INCOMING_CONTRACT_MSAT) {
+        let CandidateQuote::Priced(cost) = quote(Msat(candidate)).await? else {
+            continue;
+        };
+        let candidate = Msat(candidate);
+        // Cap at what this candidate DELIVERS, matching `fits_cap` and the executor. The
+        // viability half (`total_fee <= delivered`) moves with it: a route "serves" when it
+        // delivers at least what it costs (CONTEXT.md, "Serves"), and the thing it delivers is
+        // the delivered net, not the amount we asked for.
+        let delivered = cost.delivered_net();
+        if evacuation_cost_fits(cost, cap.at(delivered), spendable)
+            && cost.total_fee().0 <= delivered.0
+        {
+            return Ok(EvacuationSizing::Sized(candidate));
+        }
+    }
+    // The magnitude is reported so an operator can tell a near-miss from a route that is far from
+    // serving, but it does NOT change the disposition: both cases stay `Retryable` and neither is
+    // proof, per ADR-0029.
+    let relation = if shortfall > oscillation {
+        format!(
+            "by more than one note-selection discontinuity ({shortfall} msat over {oscillation})"
+        )
+    } else {
+        format!("by at most one note-selection discontinuity ({shortfall} msat)")
+    };
+    Ok(EvacuationSizing::Refused(format!(
+        "the largest chunk this route can carry costs more than it delivers ({} msat of fees \
+         against {} msat delivered, missing {relation}); the route does not serve, so the balance \
+         is left where it is rather than burned. The adjacent note-selection boundaries were \
+         probed and none served — a BOUNDED probe, so this is not proof that no viable amount \
+         exists",
+        cost.total_fee().0,
+        cost.delivered_net().0
+    )))
+}
+
+/// Size a fresh evacuation end to end: the two-pass search, then the economic-viability
+/// post-check, then the structural-refusal diagnostic when nothing survives.
+async fn size_evacuation<F, Fut>(
+    desired: Msat,
+    spendable: Msat,
+    cap: EvacFeeCap,
+    mut quote: F,
+) -> Result<EvacuationSizing, ExecError>
+where
+    F: FnMut(Msat) -> Fut,
+    Fut: std::future::Future<Output = Result<CandidateQuote, ExecError>>,
+{
+    // `v_max` — the largest single note that can be selected or returned as change — is bounded
+    // by the source's own balance.
+    let oscillation = oscillation_bound(spendable);
+    let search = search_evacuation_net(desired, spendable, cap, oscillation, &mut quote).await?;
+    let Some(sized) = search.sized else {
+        return Ok(EvacuationSizing::Refused(
+            no_fitting_amount_reason(cap, spendable, &search, &mut quote).await?,
+        ));
+    };
+    evacuation_viability(sized, spendable, cap, oscillation, &mut quote).await
+}
+
+/// Why the search found nothing, and — when two freshly quoted points give EVIDENCE for it — that
+/// the refusal looks structural rather than incidental. A silent indefinite retry is the failure
+/// this whole change exists to kill; a refusal an operator can act on is not.
+///
+/// BOTH sample points are quoted HERE, back to back, and that is the point of this function's
+/// shape. The trend it measures is the operator's evidence that a refusal is structural rather
+/// than incidental — it does NOT recommend changing a knob, because a policy change cannot release
+/// an already-admitted evacuation (see the structural message, and `br-n8o`) — so it must not be
+/// computed from a cost cached earlier in the search: the execution path already refuses to act on anything but a fresh quote (the pass-1
+/// re-quote and the pass-2 revalidation exist because another intent can move the source's note
+/// inventory mid-search), and it would be incoherent to hold the operator-facing diagnosis to a
+/// WEAKER freshness standard than the money path holds itself to.
+///
+/// This is one diagnosis EPOCH, not an atomic snapshot: the two quotes are separate dry-runs and
+/// inventory can still move between them. That is the same freshness class the pass-2 revalidation
+/// already accepts as sufficient, and it is the best available — which is exactly why the emitted
+/// text says "evidence, not proof" rather than claiming a global bound.
+///
+/// Re-quoting can SUPPRESS a true structural warning for one tick, when the condition is real but
+/// the quote dips at diagnosis time. That is the correct direction to fail: the refusal stays
+/// `Retryable`, so a persistent condition reproduces on the next tick, whereas the cached-cost
+/// version could emit a FALSE recommendation to move a money knob — a delayed true positive beats
+/// a false one that drives operator action.
+async fn no_fitting_amount_reason<F, Fut>(
+    cap: EvacFeeCap,
+    spendable: Msat,
+    search: &EvacuationSearch,
+    mut quote: F,
+) -> Result<String, ExecError>
+where
+    F: FnMut(Msat) -> Fut,
+    Fut: std::future::Future<Output = Result<CandidateQuote, ExecError>>,
+{
+    // EVERY early return below states WHICH condition it observed, and none of them names a fee
+    // knob. Two reasons. First, they are genuinely different situations for an operator — "it will
+    // not price", "the source cannot fund it", and "it fits now" call for different next moves,
+    // and one shared string threw that away. Second, they are what the tests assert on: with a
+    // single shared message a fixture could drift to a different guard and stay green, so the
+    // distinct text is what makes each test a pin on its own branch rather than on the function's
+    // general mood.
+    let Some(hint) = search.largest_affordable_hint else {
+        // NOT "no amount was ever observed affordable" — that is false. Pass 1 CLEARS the hint
+        // when its fresh re-quote at the same amount is no longer affordable, so an earlier probe
+        // may well have been affordable and then moved above budget. Saying otherwise sends an
+        // operator looking for a balance that was never the problem.
+        return Ok(
+            "no affordable amount survived to the end of the search (one may have been \
+             affordable earlier and then re-quoted above budget; the source may also have funds \
+             in flight, and a later tick can succeed)"
+                .to_string(),
+        );
+    };
+    // THE HIGH POINT FIRST, before anything is concluded from the floor. The search refused at
+    // this amount, so it is the sample the refusal is actually about, and every question below is
+    // only meaningful once it is known to still hold.
+    let high_quote = quote(hint).await?;
+    let CandidateQuote::Priced(high_cost) = high_quote else {
+        // Carry the mint's measured gap when it reported one: production reports a source that
+        // cannot fund a candidate HERE, as `Unquotable { source_shortfall }`, rather than as a
+        // priced cost over `spendable` — so this is the arm a drained source actually takes, and
+        // the shortfall is the number an operator wants.
+        let gap = match high_quote {
+            CandidateQuote::Unquotable {
+                source_shortfall: Some(shortfall),
+            } => format!(", short by {shortfall} msat"),
+            _ => String::new(),
+        };
+        return Ok(format!(
+            "the largest PROBED affordable amount {} msat no longer prices at all{gap} (a quote moved \
+             mid-search; a later tick can succeed)",
+            hint.0
+        ));
+    };
+    if high_cost.source_debit() > spendable {
+        return Ok(format!(
+            "the largest PROBED affordable amount {} msat is no longer fundable ({} msat needed against \
+             {} msat spendable; a later tick can succeed)",
+            hint.0,
+            high_cost.source_debit().0,
+            spendable.0
+        ));
+    }
+    // The high point now FITS the cap: the refusal itself has gone stale, and a later tick will
+    // simply succeed. Say exactly that — the sample DID hold up, it was the cap refusal that did
+    // not, and the transient wording would have been literally false here. Do NOT try to salvage a
+    // sizing from it either: this function returns a diagnostic string, and sizing from the
+    // refusal path would be new money handling in the one place built on the assumption that
+    // nothing is being committed.
+    if fits_cap(high_cost, cap) {
+        return Ok(format!(
+            "the cap no longer refuses {} msat — the quote eased after the search; a later tick \
+             can succeed",
+            hint.0
+        ));
+    }
+    let floor = Msat(MINIMUM_INCOMING_CONTRACT_MSAT);
+    let floor_quote = quote(floor).await?;
+    let CandidateQuote::Priced(floor_cost) = floor_quote else {
+        // NOT "the cap refused every probed amount": this quote was never compared with the cap at
+        // all, so claiming a cap refusal asserts something unmeasured. Report what was observed —
+        // the low point cannot be priced, so there is no second point to measure a trend from.
+        let gap = match floor_quote {
+            CandidateQuote::Unquotable {
+                source_shortfall: Some(shortfall),
+            } => format!(", short by {shortfall} msat"),
+            _ => String::new(),
+        };
+        return Ok(format!(
+            "{} msat is affordable and over the cap, but the {} msat protocol minimum does not \
+             price at all{gap}, so there is no second point to measure a trend from",
+            hint.0, floor.0
+        ));
+    };
+    // The slope needs two CURRENTLY affordable points, so an unfundable floor withholds it. What
+    // this must NOT do is call that a balance condition rather than a fee-cap one: affordability
+    // is explicitly non-monotone here (a note-selection boundary can make a LARGER amount fundable
+    // again), and the high point directly above is affordable and over cap — so an unfundable
+    // floor is not evidence that the cap is fine, and asserting a cause would repeat the
+    // over-claim this diagnostic was just corrected for. Report both measured facts, recommend
+    // nothing.
+    if floor_cost.source_debit() > spendable {
+        return Ok(format!(
+            "mixed state: the largest probed affordable {} msat is affordable and over the cap, \
+             but the {} msat protocol \
+             minimum is not currently fundable ({} msat needed against {} msat spendable), so \
+             there are not two affordable points to measure a trend between; no fee change is \
+             recommended on this evidence",
+            hint.0,
+            floor.0,
+            floor_cost.source_debit().0,
+            spendable.0
+        ));
+    }
+    // Both sample points are DELIVERED nets, not asks. The cap is `base + bps*D/10_000`, so its
+    // slope is exactly `bps/10_000` in D — and only in D. Sampling the asks and calling the rise
+    // `bps * span` overstates the cap's trend by `bps * Δδ` (δ = ask − delivered), which can flip
+    // condition (i) and assert a structural cause for an incidental miss. That is the
+    // re-derivation this needed, not a substitution of one number.
+    match structural_refusal_cause(
+        cap,
+        (floor_cost.delivered_net(), floor_cost.total_fee()),
+        (high_cost.delivered_net(), high_cost.total_fee()),
+    ) {
+        Some(cause) => Ok(format!(
+            "structural refusal (measured, not proven) — {cause} (largest probed affordable ask {} msat \
+             delivers {} msat and quotes {} msat of fees against a {} msat cap, both points \
+             re-quoted at diagnosis time). NOTE raising evac_fee_base_msat or evac_fee_bps will \
+             NOT release THIS evacuation: it carries the cap parameters `decide()` admitted it \
+             with, and a policy change only affects evacuations decided afterwards. While this \
+             one keeps retrying there is currently no supported way to replace it",
+            hint.0,
+            high_cost.delivered_net().0,
+            high_cost.total_fee().0,
+            cap.at(high_cost.delivered_net()).0
+        )),
+        // Every clause here is a CLAIM, and the search keeps no probe history to support most of
+        // the ones prose invites. Four consecutive review rounds found an unsupported assertion in
+        // this message, each introduced while correcting the previous one — so it now says only
+        // what `sized == None` and the two diagnosis-time quotes establish, and nothing about how
+        // individual probes failed. Shorten it before extending it.
+        None => Ok(format!(
+            "the bounded search produced no amount that still satisfied BOTH affordability and \
+             the cap when re-quoted — pass 2 may have found one and lost it on revalidation — up \
+             to the largest PROBED affordable {} msat, and the two points re-quoted at diagnosis \
+             time show \
+             no trend indicating a structural cause — which is not the same as there being none, \
+             on a fee curve that is not monotone. The refusal may clear on a later quote",
+            hint.0
+        )),
+    }
+}
+
+/// The structural half of the refusal diagnostic: whether the measured fee trend is EVIDENCE that
+/// nothing can fit, and which cause to report. `None` when neither condition holds — an incidental
+/// refusal a later quote may clear.
+///
+/// Neither condition proves anything, and both messages say so. Both are two-point measurements on
+/// a fee curve that is explicitly non-monotone (per-note mint fees drop at note-selection
+/// boundaries — the reason the bounded probe exists at all), so both endpoints can miss the cap
+/// while an unprobed middle window serves. ADR-0029:137 reserves the strong claim for an
+/// analytically proven structural refusal and requires probe exhaustion alone to stay `Retryable`;
+/// the caller honors that by returning `Retryable` either way, and this text must not contradict
+/// it. What the operator gets is a measured trend to act on, not a verdict on the route.
+///
+/// BOTH conditions are needed. `low`/`high` are `(DELIVERED NET, total_fee)` at two real quotes —
+/// delivered, not the asks that produced them, and that is load-bearing rather than cosmetic. The
+/// cap is `base + bps*D/10_000`, so `s_c = bps / 10_000` holds exactly against `D` and against
+/// nothing else. Sampling asks makes the measured cap rise overstate the real one by
+/// `bps * Δδ` (δ = ask − delivered), which can flip condition (i) and report a structural cause
+/// for what is an incidental miss:
+///
+/// (i)  `s_c >= s_f` and the largest AFFORDABLE amount fails the cap (the caller's only route
+///      here). Feasibility rises with amount, so nothing SMALLER can help.
+/// (ii) `s_f >= s_c` and the COMPLETE minimum fixed intercept exceeds the cap's BASE — not the
+///      gateway bases alone: the intercept also carries the fixed lnv2 federation fees and the
+///      per-note mint component, so gateway bases UNDER the cap base can still sum with those to
+///      an intercept above it, at which point `fee(a) − cap(a) > 0` at every amount ON THE MEASURED
+///      LINE and the gap only widens. That last qualifier is the honest one: the line is fitted to
+///      two points, so this is the same kind of evidence as (i) and merely stronger, not a global
+///      bound. Wording it as "the gateways' bases alone" would report a false cause.
+///
+/// Condition (i) alone cannot fire in the livelock case — a low configured cap base with a zero
+/// rate, where the fixed component alone sinks every amount — which is why an earlier revision
+/// carrying only (i) left that case silent.
+///
+/// `s_f` and the intercept are MEASURED from the two quotes rather than reassembled from the two
+/// gateway ppms and the four federation ppms: the composed slope is exactly what these points
+/// bracket, and the federation and per-note mint components are not separately readable here — so
+/// measuring is both the honest and the more complete way to get the very intercept (ii) is
+/// stated in terms of. Condition (ii) additionally requires the floor quote to have FAILED the cap
+/// as measured, so the cause can never be reported off an extrapolation alone.
+fn structural_refusal_cause(
+    cap: EvacFeeCap,
+    low: (Msat, Msat),
+    high: (Msat, Msat),
+) -> Option<String> {
+    let (low_amount, low_fee) = (i128::from(low.0 .0), i128::from(low.1 .0));
+    let (high_amount, high_fee) = (i128::from(high.0 .0), i128::from(high.1 .0));
+    let span = high_amount - low_amount;
+    if span <= 0 {
+        // One point cannot establish a trend.
+        return None;
+    }
+    let rise = high_fee - low_fee;
+    let cap_rise = i128::from(cap.bps) * span;
+    let fee_rise = rise * 10_000;
+
+    let mut causes = Vec::new();
+    if cap_rise >= fee_rise {
+        // NEITHER condition is a proof, and an earlier revision of this comment claimed condition
+        // (ii) was one — "with no sampling involved". That was wrong on its own terms: (ii)'s
+        // intercept is EXTRAPOLATED from these very two samples (see the `intercept` line below),
+        // so it inherits exactly the same non-monotonicity caveat. The affine argument it rests on
+        // — intercept over base and `s_f >= s_c` imply `fee(a) - cap(a) > 0` everywhere — holds
+        // for an affine fee, and this fee is explicitly not affine. Both messages now disclose
+        // that; only the STRENGTH of the evidence differs, not its kind.
+        //
+        // TWO SAMPLES CANNOT PROVE THIS, and the wording no longer pretends otherwise. The fee
+        // curve is explicitly non-monotone — per-note mint fees DROP at note-selection
+        // boundaries, which is the whole reason the bounded probe exists — so both endpoints can
+        // miss the cap while an unprobed middle window fits. ADR-0029 is explicit that probe
+        // exhaustion alone stays inconclusive and must not mark the route unavailable. Reported
+        // as a measured trend the operator can act on, not as proof that no amount can ever fit;
+        // a complete boundary proof or a global bound is what would license the stronger claim,
+        // and neither is computed here.
+        causes.push(
+            "the FEE rises no faster than the CAP across the two amounts probed, so nothing \
+             SMALLER is likely to fit either. NOTE this is a two-point measurement on a fee curve \
+             that is NOT monotone — evidence, not proof, since an unprobed amount between them \
+             may still serve"
+                .to_string(),
+        );
+    }
+    // The fixed component of the measured line: `fee(a) − s_f*a` at the low point.
+    let intercept = low_fee - rise * low_amount / span;
+    if fee_rise >= cap_rise && intercept > i128::from(cap.base_msat.0) && low.1 > cap.at(low.0) {
+        causes.push(format!(
+            "the fixed component alone — both gateways' bases plus the fixed federation and \
+             per-note mint fees, ~{intercept} msat — exceeds the cap base {} msat, and the fee \
+             rises at least as fast as the cap, so ON THE SAMPLED LINE the gap only widens with \
+             size. NOTE this intercept is EXTRAPOLATED from the same two samples \
+             on a fee curve that is NOT monotone — evidence, not proof, since a per-note fee drop \
+             at an unprobed boundary can still let an intermediate amount serve",
+            cap.base_msat.0
+        ));
+    }
+    (!causes.is_empty()).then(|| causes.join("; "))
+}
+
+/// §2d: WARN when a gateway advertises a fee RATE outside the envelope the SDK's own limits were
+/// meant to express, and never reject on it.
+///
+/// Returned rather than logged so the check is exercised directly; the caller logs it. Rejecting
+/// would contradict ADR-0029: our cap is the only real bound at this pin, it already admits or
+/// refuses a route on price, and a second, stricter admissibility test can refuse an evacuation
+/// over the ONLY live route — zero bases with a 15_001-ppm send leg is a route the 200-sat + 3%
+/// cap happily admits, and a ppm rejection would strand those funds. The warning is how an
+/// operator learns why a route prices the way it does; honest defaults are nowhere near it (the
+/// gateway default is 2 sats + 3_000 ppm).
+fn ppm_envelope_warning(fees: FreshSendRequiredGatewayFees) -> Option<String> {
+    let mut out = Vec::new();
+    if fees.send.ppm > SEND_PPM_ENVELOPE {
+        out.push(format!(
+            "send {} ppm (intended envelope {SEND_PPM_ENVELOPE})",
+            fees.send.ppm
+        ));
+    }
+    if fees.receive.ppm > RECEIVE_PPM_ENVELOPE {
+        out.push(format!(
+            "receive {} ppm (intended envelope {RECEIVE_PPM_ENVELOPE})",
+            fees.receive.ppm
+        ));
+    }
+    (!out.is_empty()).then(|| {
+        format!(
+            "gateway advertises an out-of-envelope fee rate: {} — the SDK's fee limits do not \
+             bound the ppm at this pin (PaymentFee compares base first), and NOTHING here bounds \
+             the RATE: our cap bounds the total quoted fee at the delivered net, which a high rate \
+             reaches sooner at larger amounts. The route is NOT refused on this",
+            out.join(", ")
+        )
+    })
 }
 
 /// The §6 receive-side gross-up loop (spec §15.10), extracted generic over an async
@@ -1897,17 +2934,28 @@ fn retryable(e: anyhow::Error) -> ExecError {
     ExecError::Retryable(e.to_string())
 }
 
-/// Whether an SDK error is the mint's `InsufficientBalanceError` — the send-side fee-quote
-/// dry-run's way of saying the source cannot fund the probed outgoing contract at all
-/// (verified against the pinned source: the mint's funding selection propagates it
-/// `?`-converted, so it sits in the `anyhow` chain un-wrapped). The evacuation sizing search
-/// reads it as "this candidate does not fit", never as a transport fault.
-fn is_insufficient_balance(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| {
-        cause
-            .downcast_ref::<fedimint_mint_client::InsufficientBalanceError>()
-            .is_some()
-    })
+/// How far the source fell SHORT of funding the probed outgoing contract, when the failure was
+/// the mint's `InsufficientBalanceError` — the send-side fee-quote dry-run's way of saying the
+/// source cannot fund this candidate at all (verified against the pinned source: the mint's
+/// funding selection propagates it `?`-converted, so it sits in the `anyhow` chain un-wrapped).
+/// `Some` is the evacuation sizing search's "this candidate does not fit"; `None` is any other
+/// error, which stays a transport fault and therefore `Retryable`.
+///
+/// The GAP, not just the fact, because the error carries both the requested and the available
+/// figure: it is what lets the search tell a candidate that missed by one note-selection boundary
+/// from one that missed by half the balance. Only the former is worth probing ABOVE, since a
+/// LARGER amount can cross a boundary that reduces the input/change count and become fundable
+/// again. The classifier walks the whole `anyhow` chain so an added `.context(..)` wrap cannot
+/// silently break it.
+fn insufficient_balance_shortfall(e: &anyhow::Error) -> Option<u64> {
+    e.chain()
+        .find_map(|cause| cause.downcast_ref::<fedimint_mint_client::InsufficientBalanceError>())
+        .map(|insufficient| {
+            insufficient
+                .requested_amount
+                .msats
+                .saturating_sub(insufficient.total_amount.msats)
+        })
 }
 
 /// Crash-smoke deterministic hook (spec §5/§10): abort the process at the named killpoint IFF
@@ -2016,6 +3064,34 @@ fn pay_step_cap_verdict(
         return Err(ExecError::Retryable(format!(
             "send fee quote over cap this attempt (receive {} + send {} > fee_cap {} msat); retrying",
             receive_quote.0, send_quote.0, fee_cap.0
+        )));
+    }
+    Ok(())
+}
+
+/// The Pay-step re-check of the ECONOMIC-VIABILITY rule (ADR-0029): an evacuation chunk must
+/// deliver at least what it costs. Classified exactly as [`pay_step_cap_verdict`] classifies its
+/// own check, deliberately inventing no third verdict class:
+///   - `Permanent` when the FIXED receive quote alone already exceeds the net (the invoice is
+///     minted, so no send re-quote can rescue it);
+///   - `Retryable` when the total does (a later attempt may re-quote the send leg lower).
+fn evacuation_viability_verdict(
+    receive_quote: Msat,
+    send_quote: Msat,
+    net: Msat,
+) -> Result<(), ExecError> {
+    if receive_quote.0 > net.0 {
+        return Err(ExecError::Permanent(format!(
+            "route does not serve: the fixed receive quote {} msat alone exceeds the {} msat this \
+             evacuation would deliver",
+            receive_quote.0, net.0
+        )));
+    }
+    if receive_quote.0.saturating_add(send_quote.0) > net.0 {
+        return Err(ExecError::Retryable(format!(
+            "route does not serve this attempt (receive {} + send {} > the {} msat delivered); \
+             retrying rather than burning more than the chunk moves",
+            receive_quote.0, send_quote.0, net.0
         )));
     }
     Ok(())
@@ -2183,6 +3259,7 @@ mod tests {
             amount: Msat(50_000),
             fee_cap: Msat(1_000),
             gateway: None,
+            fee_cap_components: None,
         };
         assert_eq!(pre_fund_endpoints(&action), None);
     }
@@ -2263,6 +3340,7 @@ mod tests {
             amount: Msat(50_000),
             fee_cap: Msat(10_000),
             gateway: None,
+            fee_cap_components: None,
         };
         let plan = MovePlan::from_action(&action).expect("Evacuate must map to a plan");
         assert_eq!(plan.from, Some(FED_A));
@@ -2367,29 +3445,44 @@ mod tests {
     /// where fits-then-doesn't holds, and finds the window.
     #[tokio::test]
     async fn downsizing_search_finds_a_feasible_window_above_the_contract_floor() {
-        let affordable = |amount: u64| async move { Ok(amount <= 5_500) };
-        let found = largest_fitting_amount(MINIMUM_INCOMING_CONTRACT_MSAT, 499_999, affordable)
-            .await
-            .expect("probes never fail");
+        let found = largest_fitting_amount(
+            MINIMUM_INCOMING_CONTRACT_MSAT,
+            499_999,
+            0,
+            |amount| async move { Ok(verdict(amount <= 5_500)) },
+        )
+        .await
+        .expect("probes never fail");
         assert_eq!(found, Some(5_500));
+    }
+
+    /// A plain fits/doesn't probe with NO measurable miss: the robustness rule must not fire on
+    /// it (an immeasurable shortfall never licenses a boundary probe), so these cases pin the
+    /// bisection's unchanged behaviour.
+    fn verdict(fits: bool) -> ProbeVerdict {
+        if fits {
+            ProbeVerdict::fits()
+        } else {
+            ProbeVerdict::missed_immeasurably()
+        }
     }
 
     #[tokio::test]
     async fn downsizing_search_edge_cases() {
         // Nothing in range fits → None (the genuinely-infeasible evacuation).
-        let none = largest_fitting_amount(5_000, 100_000, |_| async { Ok(false) })
+        let none = largest_fitting_amount(5_000, 100_000, 0, |_| async { Ok(verdict(false)) })
             .await
             .expect("probes never fail");
         assert_eq!(none, None);
 
         // Everything fits → the top of the range.
-        let all = largest_fitting_amount(5_000, 100_000, |_| async { Ok(true) })
+        let all = largest_fitting_amount(5_000, 100_000, 0, |_| async { Ok(verdict(true)) })
             .await
             .expect("probes never fail");
         assert_eq!(all, Some(100_000));
 
         // An empty range (desired below the floor) is None without probing.
-        let empty = largest_fitting_amount(5_000, 4_999, |_| async {
+        let empty = largest_fitting_amount(5_000, 4_999, 0, |_| async {
             panic!("an empty range must not be probed")
         })
         .await
@@ -2397,10 +3490,11 @@ mod tests {
         assert_eq!(empty, None);
 
         // Exactly the floor fitting is found, one msat under the floor is out of scope.
-        let at_floor =
-            largest_fitting_amount(5_000, 100_000, |amount| async move { Ok(amount <= 5_000) })
-                .await
-                .expect("probes never fail");
+        let at_floor = largest_fitting_amount(5_000, 100_000, 0, |amount| async move {
+            Ok(verdict(amount <= 5_000))
+        })
+        .await
+        .expect("probes never fail");
         assert_eq!(at_floor, Some(5_000));
     }
 
@@ -2408,7 +3502,9 @@ mod tests {
     /// with the mint's `InsufficientBalanceError` when a probed candidate cannot be funded, and
     /// the sizing search must classify that as "does not fit" (keep probing smaller amounts) —
     /// never as a `Retryable` transport fault that aborts the search. The classifier walks the
-    /// whole anyhow chain so an added `.context(...)` wrap cannot silently break it.
+    /// whole anyhow chain so an added `.context(...)` wrap cannot silently break it, and it
+    /// recovers the GAP as well, which is what licenses probing a larger amount across a
+    /// note-selection boundary.
     #[test]
     fn insufficient_balance_is_classified_as_unfit_not_transport_failure() {
         let root = fedimint_mint_client::InsufficientBalanceError {
@@ -2416,13 +3512,16 @@ mod tests {
             total_amount: fedimint_core::Amount::from_msats(60_000),
         };
         let plain = anyhow::Error::from(root.clone());
-        assert!(is_insufficient_balance(&plain));
+        assert!(insufficient_balance_shortfall(&plain).is_some());
+        assert_eq!(insufficient_balance_shortfall(&plain), Some(40_000));
 
         let wrapped = anyhow::Error::from(root).context("quoting send fee for evacuation probe");
-        assert!(is_insufficient_balance(&wrapped));
+        assert!(insufficient_balance_shortfall(&wrapped).is_some());
+        assert_eq!(insufficient_balance_shortfall(&wrapped), Some(40_000));
 
-        assert!(
-            !is_insufficient_balance(&anyhow::anyhow!("connection reset by peer")),
+        assert_eq!(
+            insufficient_balance_shortfall(&anyhow::anyhow!("connection reset by peer")),
+            None,
             "an ordinary transport error must stay Retryable"
         );
     }
@@ -2609,6 +3708,7 @@ mod tests {
                 amount: Msat(50_000),
                 fee_cap: Msat(1_000),
                 gateway: Some(planned.clone()),
+                fee_cap_components: None,
             }),
             Some(&planned)
         );
@@ -2639,6 +3739,7 @@ mod tests {
             amount: Msat(50_000),
             fee_cap: Msat(1_000),
             send_required: true,
+            fee_cap_components: None,
         };
         let planned = GatewayUrl("https://planned.example".into());
 
@@ -2674,7 +3775,7 @@ mod tests {
     #[test]
     fn a_fresh_evacuation_is_routed_before_its_amount_is_final() {
         // The evacuation ordering trap: `assemble_record` resolves the gateway, and only THEN
-        // does `size_fresh_evacuation` downsize the drain to what fits the absolute `max_fee`.
+        // does `size_fresh_evacuation` downsize the drain to what fits the evacuation cap.
         // A dying fed holding 10_000_000 msat whose destination has 8_000_000 of cap room emits
         // `Evacuate { amount: 8_000_000, fee_cap: max_fee }` — an amount the source CAN afford,
         // so the send dry-run prices it fine and the quote simply lands over the cap. Judging
@@ -2686,6 +3787,7 @@ mod tests {
             amount: Msat(8_000_000),
             fee_cap: Msat(1_000),
             gateway: None,
+            fee_cap_components: None,
         }));
         // Every other move shape carries the amount it will actually move, so its routes ARE
         // comparable against the cap.
@@ -2805,6 +3907,7 @@ mod tests {
             amount: Msat(50_000),
             fee_cap: Msat(1_000),
             send_required: false,
+            fee_cap_components: None,
         };
         let artifacts = vec![OpArtifact {
             move_id: key.clone(),
@@ -2812,6 +3915,7 @@ mod tests {
             op_id: crate::types::OperationId([0x42; 32]),
             amount: Msat(50_000),
             invoice: Some(Invoice("lnbc1recover".into())),
+            fee_cap: None,
         }];
 
         assert_eq!(
@@ -2839,6 +3943,7 @@ mod tests {
             amount: Msat(50_000),
             fee_cap: Msat(1_000),
             send_required: false,
+            fee_cap_components: None,
         };
         let mut cached = MoveRecord {
             key: key.clone(),
@@ -3244,5 +4349,1827 @@ mod tests {
             delivered_move_amount(Msat(50_001), Msat(50_000)),
             Msat(50_000)
         );
+    }
+
+    /// A hair-under settle must recompute the cap at the DELIVERED net, not keep the one computed
+    /// at the sized ask.
+    ///
+    /// This is the CLAMP-SAFETY invariant reached through the second door. `size_fresh_evacuation`
+    /// writes `amount` and `fee_cap` together at the sized net; the receive fixed point can then
+    /// deliver a hair under that, and an implementation that adjusts only `amount` leaves a cap
+    /// belonging to the larger ask sitting on the record the Pay-step re-check and replay both
+    /// trust.
+    ///
+    /// HONEST LIMIT OF THIS TEST: it pins the ARITHMETIC of the paired write and documents the
+    /// invariant, but it drives `apply_evacuation_sizing` directly rather than the receive fixed
+    /// point. The defect it was written for was not wrong arithmetic — the helper was always
+    /// correct — it was the receive path assigning `rec.amount` WITHOUT going through the helper.
+    /// So this test would NOT go red if that bypass were reintroduced. Catching that needs a
+    /// fixture driving `drive_intent_step` through a hair-under settle against a mocked
+    /// multi-client, which does not exist yet; until it does, the guard is the doc comment on
+    /// `apply_evacuation_sizing` naming both callers.
+    #[test]
+    fn a_hair_under_settle_recomputes_the_cap_at_the_delivered_net() {
+        let cap = EvacFeeCap {
+            base_msat: Msat(200_000),
+            bps: 300,
+        };
+        let mut rec = evacuation_record(Msat(75_000_000), Msat(50_000));
+        // The sizing seam: 75_000 sats sized, cap = 200_000 + 3% of 75_000_000 = 2_450_000 msat.
+        apply_evacuation_sizing(&mut rec, cap, Msat(75_000_000));
+        assert_eq!(rec.amount, Msat(75_000_000));
+        assert_eq!(rec.fee_cap, Msat(2_450_000));
+
+        // The receive fixed point settles a hair under.
+        let delivered = delivered_move_amount(Msat(74_000_000), rec.amount);
+        assert_eq!(delivered, Msat(74_000_000));
+        apply_evacuation_sizing(&mut rec, cap, delivered);
+
+        // The cap MOVED with the amount: 200_000 + 3% of 74_000_000 = 2_420_000.
+        assert_eq!(rec.amount, Msat(74_000_000));
+        assert_eq!(
+            rec.fee_cap,
+            Msat(2_420_000),
+            "the cap must be recomputed at the delivered net; keeping 2_450_000 would authorise \
+             30_000 msat the executed net never entitled"
+        );
+
+        // A non-evacuation move carries no components: the rule is the stored cap as a CONSTANT,
+        // so the same recompute at a lower net leaves it untouched.
+        let constant = evacuation_cap_rule(None, Msat(50_000));
+        assert_eq!(constant.at(Msat(75_000_000)), Msat(50_000));
+        assert_eq!(constant.at(Msat(1_000)), Msat(50_000));
+    }
+
+    // --- Evacuation fee cap: sizing, enforcement, diagnostics (ADR-0029) ----------------------
+    //
+    // MOST fixtures below run the PRODUCTION composition — but not all, and the exceptions are
+    // deliberate: the direct `fits_cap` / `combined_verdict` tests construct a `FreshMoveCost` by
+    // hand precisely so the predicate is exercised without a search around it. Read each fixture
+    // before citing it as production-path coverage; the driven sites are still unpinned
+    // (br-evac-cap-driven-basis-v07). Where a fixture DOES run the composition it is: the real §6
+    // gross-up loop
+    // (`resolve_receive_gross_up`), the real contract floor, the real cost assembly, the real
+    // two-pass search and post-check. Only the two answers a live federation would give — the
+    // destination's receive tx fee and the source's send-side dry-run — are scripted, which is
+    // the same seam `resolve_receive_gross_up` is already tested through (§15.10).
+
+    /// THE SEAM: a quote inside `cap.at(delivered)+1 ..= cap.at(sized_ask)` must be REFUSED.
+    ///
+    /// This band is the whole defect. The sizing search used to admit at `cap.at(sized_ask)`
+    /// while the executor enforced `cap.at(delivered_net)`, so a quote in between passed sizing,
+    /// minted and COMMITTED a receive operation, and was then refused at the Pay step — leaving
+    /// the receive orphaned and unclaimed. With stable quotes the next watch cycle did it again.
+    ///
+    /// The live devimint gate could not see this: it ran with 6.7% fee headroom and an 80 msat
+    /// hair-under, so the band was 2 msat wide and the real fee was nowhere near it. Neither
+    /// could the rest of the suite — converting the cap basis moved no existing test. A fixture
+    /// has to sit the fee STRICTLY INSIDE the band or it proves nothing about which net is used.
+    ///
+    /// Numbers are the live gate's, so the band is the one production actually produced:
+    /// sized ask 449_998, delivered 449_918, `cap.at(sized) = 213_499`, `cap.at(delivered) =
+    /// 213_497`. Every cost below delivers 449_918; only `total_fee` moves.
+    #[test]
+    fn a_quote_between_the_delivered_cap_and_the_sized_cap_is_refused() {
+        const DELIVERED: u64 = 449_918;
+        // A cost delivering DELIVERED whose two legs sum to `total_fee`.
+        let cost_with_total = |total_fee: u64| {
+            let receive_quote = total_fee - 200_000;
+            FreshMoveCost {
+                invoice_amount: Msat(DELIVERED + receive_quote),
+                receive_quote: Msat(receive_quote),
+                send_quote: Msat(200_000),
+            }
+        };
+
+        assert_eq!(PILOT_CAP.at(Msat(449_998)), Msat(213_499), "cap at the ask");
+        assert_eq!(
+            PILOT_CAP.at(Msat(DELIVERED)),
+            Msat(213_497),
+            "cap at delivery"
+        );
+
+        // Every fixture really does deliver DELIVERED — otherwise the band is not the band.
+        for total in [213_497, 213_498, 213_499] {
+            assert_eq!(cost_with_total(total).delivered_net(), Msat(DELIVERED));
+        }
+
+        // AT the delivered cap: admitted. `total_within_cap` compares `<=`, and moving the basis
+        // must not quietly turn the boundary into a refusal.
+        assert!(
+            fits_cap(cost_with_total(213_497), PILOT_CAP),
+            "a fee exactly at the delivered cap still executes"
+        );
+
+        // INSIDE the band: refused, though both fit the cap taken on the ask. RED-FIRST — the
+        // pre-fix predicate admits both of these, which is the bug.
+        assert!(
+            !fits_cap(cost_with_total(213_498), PILOT_CAP),
+            "one msat over the DELIVERED cap is refused, even though it is under the 213_499 \
+             cap the ask would have authorised"
+        );
+        assert!(
+            !fits_cap(cost_with_total(213_499), PILOT_CAP),
+            "and a fee landing exactly on the ASK's cap is refused too — that is the entire \
+             point: the ask never arrived, so it never entitled that fee"
+        );
+    }
+
+    /// `combined_verdict`'s cap gap reads the delivered net — pinned, because reverting it alone
+    /// leaves the rest of the suite green. ONE site, not two: the viability half was deleted from
+    /// this test when it turned out to assert only on its own literals, and the NOTE below says
+    /// what remains uncovered.
+    ///
+    /// The seam test above pins `fits_cap`. That is one of five call sites this design pass
+    /// converted, and the commit's own strongest evidence — that changing the basis moved no
+    /// existing test — is exactly the argument that the other four are unguarded. This pins the
+    /// two that are pure functions of a quote; the pre-receive gate and the executor's recompute
+    /// need a driven `drive_intent_step` fixture and are called out as owed, not silently missing.
+    #[test]
+    fn combined_verdict_measures_its_cap_gap_against_the_delivered_net() {
+        const DELIVERED: u64 = 449_918;
+        // Delivers DELIVERED, and costs exactly one msat more than the DELIVERED cap allows —
+        // while still sitting under the cap the ask (449_998 -> 213_499) would have authorised.
+        let in_band = FreshMoveCost {
+            invoice_amount: Msat(DELIVERED + 13_498),
+            receive_quote: Msat(13_498),
+            send_quote: Msat(200_000),
+        };
+        assert_eq!(in_band.delivered_net(), Msat(DELIVERED));
+        assert_eq!(in_band.total_fee(), Msat(213_498));
+        assert_eq!(PILOT_CAP.at(Msat(DELIVERED)), Msat(213_497));
+        assert_eq!(PILOT_CAP.at(Msat(449_998)), Msat(213_499));
+
+        // `combined_verdict` — the pass-2 predicate. Its cap gap must be measured against the
+        // delivered cap, so this candidate MISSES by exactly one msat. Against the ask's cap it
+        // would report a gap of zero and be admitted.
+        let verdict = combined_verdict(
+            CandidateQuote::Priced(in_band),
+            PILOT_CAP,
+            Msat(100_000_000), // affordable, so only the cap half can refuse it
+        );
+        assert!(
+            !verdict.fits,
+            "combined_verdict must refuse a quote over the DELIVERED cap"
+        );
+        assert_eq!(
+            verdict.shortfall, 1,
+            "and the gap is measured against cap.at(delivered) = 213_497, not cap.at(ask)"
+        );
+
+        // NOTE on what is NOT pinned here, so the name does not overclaim: the viability half of
+        // the boundary probe (`total_fee <= delivered`, executor.rs) and the pre-mint gate both
+        // read the delivered net too, but neither is reachable from a pure fixture — they need a
+        // driven quote stream. An earlier version of this test "covered" viability by asserting
+        // `500_000 > 449_918` on its own literals, which called no production code and stayed
+        // green against the ask-based version. That is the exact vacuity this suite exists to
+        // refuse, so it is deleted rather than left reading as coverage. `br-evac-cap-driven-basis-v07` owns that fixture;
+        // where the driven fixture belongs.
+    }
+
+    /// PASS 1: the final re-quote must be revalidated, not admitted on the cap alone.
+    ///
+    /// The seam is only reachable when the BISECTION picks `pass1 != desired`. With
+    /// `top_affordable` true, `pass1 == desired`, and one net cannot be both
+    /// affordable-and-over-cap (the fast path's condition, `cap(N) < S-N`) and
+    /// cap-fitting-and-unaffordable (the re-quote's, `S-N < fee <= cap(N)`) — those are direct
+    /// contradictions. So the fast path here is UNAFFORDABLE, which sends the search into pass 1's
+    /// bisection.
+    ///
+    /// Prices move the way they actually move: the FIRST quote of an amount is what the bisection
+    /// saw, and a LATER quote of the SAME amount is the moved one — which is exactly the
+    /// "the re-quote is not the one the bisection accepted" hazard the guard exists for.
+    #[tokio::test]
+    async fn pass_one_revalidates_its_final_requote() {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        let spendable = Msat(500_000);
+        let desired = Msat(450_000);
+        let seen: RefCell<HashMap<u64, u32>> = RefCell::new(HashMap::new());
+        let quote = |net: Msat| {
+            let nth = {
+                let mut m = seen.borrow_mut();
+                let c = m.entry(net.0).or_insert(0);
+                *c += 1;
+                *c
+            };
+            async move {
+                // First sighting: cheap, affordable, cap-fitting — what the bisection accepts.
+                // Later sighting of the SAME amount: the price moved. Still under the cap
+                // (fee 150_000 <= cap.at(450_000) = 213_500) but the source can no longer fund
+                // it (debit 450_000 + 150_000 = 600_000 > 500_000).
+                let (receive_quote, send_quote) = if net.0 == 450_000 && nth == 1 {
+                    // The FAST PATH's quote: unaffordable, so the search does not return there
+                    // and `top_affordable` is false — which is what sends it into pass 1's
+                    // bisection and makes `pass1 != desired`, the only shape this seam has.
+                    (Msat(1_000), Msat(400_000))
+                } else if nth == 1 {
+                    (Msat(1_000), Msat(1_000))
+                } else {
+                    (Msat(1_000), Msat(149_000))
+                };
+                Ok(CandidateQuote::Priced(FreshMoveCost {
+                    invoice_amount: Msat(net.0 + receive_quote.0),
+                    receive_quote,
+                    send_quote,
+                }))
+            }
+        };
+
+        let search = search_evacuation_net(
+            desired,
+            spendable,
+            PILOT_CAP,
+            oscillation_bound(spendable),
+            quote,
+        )
+        .await
+        .expect("no fault");
+
+        // UNCONDITIONAL. An `if let Some(..)` here would skip its own body on the passing path —
+        // the fix makes `sized` None — so the test would prove nothing about the code it names
+        // and would keep passing if drift stopped reaching the seam entirely.
+        assert_eq!(
+            search.sized.map(|(n, c)| (n.0, c.source_debit().0)),
+            None,
+            "the moved re-quote is unaffordable, so nothing may be sized on it"
+        );
+        assert_eq!(
+            search.largest_affordable_hint.map(|n| n.0),
+            None,
+            "and the unaffordable re-quote must clear the hint for the diagnostics too"
+        );
+        // And prove the seam was actually REACHED: the final re-quote is a SECOND sighting of the
+        // amount pass 1 settled on. Without this the two assertions above are satisfied by a
+        // search that never got there.
+        // Prove the seam was REACHED, by the amount pass 1 actually settles on — not by "some
+        // amount somewhere was quoted twice", which is satisfied incidentally: the fast path and
+        // the bisection both probe 450_000, so that weaker form passes whether or not the final
+        // re-quote ever runs. 449_999 is what the bisection returns here, and its SECOND sighting
+        // is the re-quote at the admission this test is named for.
+        let sightings = seen.borrow();
+        assert!(
+            sightings.get(&449_999).copied().unwrap_or(0) >= 2,
+            "449_999 was not re-quoted, so pass 1's admission was never reached and the \
+             assertions above prove nothing about it: {sightings:?}"
+        );
+    }
+
+    /// The hint follows the freshest evidence about the amount it names.
+    ///
+    /// The fast path records `largest_affordable_hint` when its quote is affordable but over the
+    /// cap (executor.rs, the `top_affordable` branch). `pass1` is then that same amount, and its
+    /// re-quote can come back unfundable, at which point the hint is cleared rather than left
+    /// pointing at an amount already known unfundable.
+    ///
+    /// This is HINT QUALITY, not a safety property — it was the latter when the field cached a
+    /// cost, and the diagnostic measured a trend against whatever the field held. The diagnostic
+    /// now re-quotes the amount it is given, so a stale hint costs a wasted dry-run and nothing
+    /// else. Keeping the test is still worth it: pointing the diagnostic at a foregone answer
+    /// spends its high-point quote for nothing.
+    ///
+    /// The pass-1 revalidation test cannot cover this: its fixture makes the fast path
+    /// UNAFFORDABLE in order to reach the bisection, so nothing is ever recorded there.
+    #[tokio::test]
+    async fn a_stale_affordable_sample_is_cleared_by_an_unaffordable_requote() {
+        use std::cell::Cell;
+        let spendable = Msat(500_000);
+        let desired = Msat(200_000);
+        let calls = Cell::new(0_u32);
+        let quote = |net: Msat| {
+            let n = calls.get();
+            calls.set(n + 1);
+            async move {
+                // Call 0 — the fast path: AFFORDABLE (debit 450_000) but over cap.at(200_000) =
+                // 206_000, so it records `largest_affordable_hint` and falls through with
+                // `top_affordable` true, making `pass1 == desired`.
+                // Call 1+ — the re-quote at that same amount, now unfundable (debit 601_000).
+                let (receive_quote, send_quote) = if n == 0 {
+                    (Msat(125_000), Msat(125_000))
+                } else {
+                    (Msat(1_000), Msat(400_000))
+                };
+                Ok(CandidateQuote::Priced(FreshMoveCost {
+                    invoice_amount: Msat(net.0 + receive_quote.0),
+                    receive_quote,
+                    send_quote,
+                }))
+            }
+        };
+
+        let search = search_evacuation_net(
+            desired,
+            spendable,
+            PILOT_CAP,
+            oscillation_bound(spendable),
+            quote,
+        )
+        .await
+        .expect("no fault");
+
+        assert_eq!(
+            search.largest_affordable_hint.map(|n| n.0),
+            None,
+            "the fast path's hint is superseded by the fresh re-quote at the SAME amount, which \
+             the source cannot fund — pointing the diagnostic at an amount already known \
+             unfundable wastes its high-point quote on a foregone answer"
+        );
+    }
+
+    /// A STALE HINT MUST NEVER PRODUCE A FEE-KNOB RECOMMENDATION — the property that replaced
+    /// three separate "the cached sample is cleared at site X" tests.
+    ///
+    /// `largest_affordable_hint` carries no cost, so there is no longer any internal field whose
+    /// staleness a test could assert on. What matters is observable: when the amount the hint
+    /// names no longer holds up at diagnosis time, the emitted reason must be the transient one
+    /// and must NOT recommend moving `evac_fee_base_msat` / `evac_fee_bps`.
+    ///
+    /// All three fixtures below share one shape, so each isolates exactly one guard:
+    ///   * call 0 at `desired` — the fast path: affordable (debit 450_000 <= 500_000) but over
+    ///     `cap.at(200_000) == 206_000` (fee 250_000). Records the hint, `top_affordable` true.
+    ///   * call 1 at `desired` — pass 1's re-quote comes back `Unquotable`, so the search RETURNS
+    ///     EARLY with `sized: None` and the hint still naming 200_000. Pass 2 never runs, which is
+    ///     what makes call 2 at `desired` unambiguously the diagnostic's high-point re-quote.
+    ///   * every other amount (including the 5_000 floor) — affordable and over cap, so the floor
+    ///     guard passes and nothing else can be sized.
+    ///
+    /// Only call 2's answer differs between the three tests.
+    fn hint_fixture_with_other(
+        at_diagnosis: CandidateQuote,
+        other: (Msat, Msat),
+    ) -> impl Fn(Msat) -> std::future::Ready<Result<CandidateQuote, ExecError>> {
+        use std::cell::Cell;
+        let desired_hits = Cell::new(0_u32);
+        move |net: Msat| {
+            let priced = |receive_quote: Msat, send_quote: Msat| {
+                CandidateQuote::Priced(FreshMoveCost {
+                    invoice_amount: Msat(net.0 + receive_quote.0),
+                    receive_quote,
+                    send_quote,
+                })
+            };
+            if net.0 != 200_000 {
+                return std::future::ready(Ok(priced(other.0, other.1)));
+            }
+            let n = desired_hits.get();
+            desired_hits.set(n + 1);
+            std::future::ready(Ok(match n {
+                0 => priced(Msat(125_000), Msat(125_000)),
+                1 => CandidateQuote::Unquotable {
+                    source_shortfall: Some(101_000),
+                },
+                _ => at_diagnosis,
+            }))
+        }
+    }
+
+    /// The default non-hint cost: affordable (debit <= 256_000) and over cap at every probed
+    /// amount, since fee 251_000 exceeds `cap.at(5_000) == 200_150`.
+    fn hint_fixture(
+        at_diagnosis: CandidateQuote,
+    ) -> impl Fn(Msat) -> std::future::Ready<Result<CandidateQuote, ExecError>> {
+        hint_fixture_with_other(at_diagnosis, (Msat(1_000), Msat(250_000)))
+    }
+
+    /// No refusal branch that withholds the trend may name a money knob. Asserted on EVERY such
+    /// branch rather than once, because "does not recommend raising a fee" is the property the
+    /// whole diagnostic exists to get right, and a future branch that quietly starts recommending
+    /// one would otherwise only be caught by whichever test happened to cover it.
+    fn assert_recommends_no_fee_change(reason: &str) {
+        for forbidden in [
+            "structural refusal",
+            "evac_fee_base_msat",
+            "evac_fee_bps",
+            "raise",
+        ] {
+            assert!(
+                !reason.contains(forbidden),
+                "this branch has no two currently-affordable points to measure, so it must not \
+                 say {forbidden:?}: {reason}"
+            );
+        }
+    }
+
+    /// GUARD 1 — the high re-quote does not price at all, which is the arm a drained source
+    /// actually takes in production (`InsufficientBalanceError` becomes `Unquotable`, never a
+    /// priced cost over `spendable`). The mint's measured gap must reach the operator.
+    #[tokio::test]
+    async fn a_hint_that_will_not_requote_reports_that_and_no_fee_change() {
+        let reason = size_evacuation(
+            Msat(200_000),
+            Msat(500_000),
+            PILOT_CAP,
+            hint_fixture(CandidateQuote::Unquotable {
+                source_shortfall: Some(101_000),
+            }),
+        )
+        .await
+        .expect("no fault");
+        let reason = reason.expect_refused();
+        assert_recommends_no_fee_change(reason);
+        assert!(
+            reason.contains("no longer prices at all"),
+            "the operator must be pointed at the quote, not the fee knobs: {reason}"
+        );
+        assert!(
+            reason.contains("short by 101000 msat"),
+            "the mint measured the gap; withholding it makes the operator go and measure it \
+             again: {reason}"
+        );
+    }
+
+    /// GUARD 2 — the high re-quote prices but the source can no longer fund it. This is INSTANCE 3
+    /// of the old staleness class (pass 2 re-probing `pass1` and moving the truth under a cached
+    /// cost), now unreachable as a defect because the cost is re-quoted rather than remembered.
+    #[tokio::test]
+    async fn a_hint_the_source_can_no_longer_fund_reports_that_and_no_fee_change() {
+        let reason = size_evacuation(
+            Msat(200_000),
+            Msat(500_000),
+            PILOT_CAP,
+            // debit 201_000 + 400_000 = 601_000 > 500_000 spendable.
+            hint_fixture(CandidateQuote::Priced(FreshMoveCost {
+                invoice_amount: Msat(201_000),
+                receive_quote: Msat(1_000),
+                send_quote: Msat(400_000),
+            })),
+        )
+        .await
+        .expect("no fault");
+        let reason = reason.expect_refused();
+        assert_recommends_no_fee_change(reason);
+        assert!(
+            reason.contains("no longer fundable"),
+            "a cost the source cannot fund is evidence about the BALANCE, not the cap: {reason}"
+        );
+    }
+
+    /// GUARD 3 — the high re-quote now FITS the cap, so the refusal itself has gone stale.
+    ///
+    /// The message must say THAT, not "no affordable sample held up": the sample held up perfectly
+    /// well, it was the cap refusal that stopped describing the present, and the transient wording
+    /// was literally false here.
+    ///
+    /// Note what this test also forbids: `no_fitting_amount_reason` must not try to salvage a
+    /// sizing from this. It returns a diagnostic string, and sizing from the refusal path would
+    /// put money handling in the one function written on the assumption nothing is committed.
+    #[tokio::test]
+    async fn a_hint_that_now_fits_the_cap_says_the_cap_no_longer_refuses_it() {
+        let reason = size_evacuation(
+            Msat(200_000),
+            Msat(500_000),
+            PILOT_CAP,
+            // fee 2_000 against cap.at(200_000) == 206_000, debit 202_000 <= 500_000.
+            hint_fixture(CandidateQuote::Priced(FreshMoveCost {
+                invoice_amount: Msat(201_000),
+                receive_quote: Msat(1_000),
+                send_quote: Msat(1_000),
+            })),
+        )
+        .await
+        .expect("no fault");
+        let reason = reason.expect_refused();
+        assert_recommends_no_fee_change(reason);
+        assert!(
+            reason.contains("the cap no longer refuses"),
+            "the sample held up; it was the cap refusal that went stale, and the transient \
+             wording would be false here: {reason}"
+        );
+    }
+
+    /// GUARD 4 — the floor is not currently fundable, so there are not two affordable points.
+    ///
+    /// This guard shipped UNTESTED in the commit that introduced it, and a reviewer found it by
+    /// asking the right question: deleting it left the whole suite green, because every other
+    /// fixture returns an affordable floor. A near-drained source is evacuation's most ordinary
+    /// customer, so this is plausibly the most-hit new branch in production.
+    ///
+    /// It also pins the wording, which was wrong on its first attempt: an unfundable floor is NOT
+    /// evidence that the cap is fine. Affordability is non-monotone (a note-selection boundary can
+    /// make a LARGER amount fundable again) and the high point here is BOTH affordable and over
+    /// cap, so calling this "a balance condition, not a fee-cap one" asserted a cause the two
+    /// measurements do not support.
+    #[tokio::test]
+    async fn an_unfundable_floor_withholds_the_trend_without_blaming_the_balance() {
+        let reason = size_evacuation(
+            Msat(200_000),
+            Msat(500_000),
+            PILOT_CAP,
+            hint_fixture_with_other(
+                // The high point stays affordable (debit 450_000) and over cap (fee 250_000 vs
+                // 206_000), so the floor is the ONLY thing standing between here and a trend.
+                CandidateQuote::Priced(FreshMoveCost {
+                    invoice_amount: Msat(325_000),
+                    receive_quote: Msat(125_000),
+                    send_quote: Msat(125_000),
+                }),
+                // At the 5_000 floor: debit 6_000 + 550_000 = 556_000 > 500_000 spendable.
+                (Msat(1_000), Msat(550_000)),
+            ),
+        )
+        .await
+        .expect("no fault");
+        let reason = reason.expect_refused();
+        assert_recommends_no_fee_change(reason);
+        assert!(
+            reason.contains("mixed state"),
+            "both measured facts must be reported: {reason}"
+        );
+        assert!(
+            reason.contains("not currently fundable"),
+            "the floor's unaffordability is the reason the trend is withheld: {reason}"
+        );
+    }
+
+    /// GUARD 0 — nothing affordable survived the search.
+    ///
+    /// The message must NOT say no amount was ever observed affordable: pass 1 CLEARS the hint
+    /// when its fresh re-quote at the same amount is unaffordable, so an earlier probe may have
+    /// been affordable and then moved above budget. The old wording sent an operator after a
+    /// balance that was never the problem.
+    #[tokio::test]
+    async fn no_surviving_affordable_amount_does_not_claim_none_was_ever_seen() {
+        use std::cell::Cell;
+        let calls = Cell::new(0_u32);
+        // Call 0 at the ask: affordable (debit 450_000) but over cap, so the hint is recorded and
+        // `pass1 == desired`. Call 1+: the same amount is no longer fundable (debit 601_000), so
+        // pass 1's assignment CLEARS the hint and the diagnostic runs with none.
+        let quote = move |net: Msat| {
+            let n = calls.get();
+            calls.set(n + 1);
+            let (receive_quote, send_quote) = if n == 0 {
+                (Msat(125_000), Msat(125_000))
+            } else {
+                (Msat(1_000), Msat(400_000))
+            };
+            std::future::ready(Ok(CandidateQuote::Priced(FreshMoveCost {
+                invoice_amount: Msat(net.0 + receive_quote.0),
+                receive_quote,
+                send_quote,
+            })))
+        };
+        let reason = size_evacuation(Msat(200_000), Msat(500_000), PILOT_CAP, quote)
+            .await
+            .expect("no fault");
+        let reason = reason.expect_refused();
+        assert_recommends_no_fee_change(reason);
+        assert!(
+            reason.contains("no affordable amount survived"),
+            "expected the survival wording: {reason}"
+        );
+        assert!(
+            !reason.contains("was ever observed affordable"),
+            "one WAS observed affordable and then re-quoted above budget; claiming otherwise \
+             misdirects the operator: {reason}"
+        );
+    }
+
+    /// GUARD 5 — the FLOOR no longer prices.
+    ///
+    /// The old message said "the cap refused every probed amount", but this quote was never
+    /// compared with the cap at all, so that asserted something unmeasured. It must report the
+    /// measured fact and carry the mint's shortfall.
+    #[tokio::test]
+    async fn an_unpriceable_floor_does_not_claim_the_cap_refused_it() {
+        use std::cell::Cell;
+        let desired_hits = Cell::new(0_u32);
+        let quote = move |net: Msat| {
+            if net.0 != 200_000 {
+                // The floor cannot be priced at all.
+                return std::future::ready(Ok(CandidateQuote::Unquotable {
+                    source_shortfall: Some(7_777),
+                }));
+            }
+            let n = desired_hits.get();
+            desired_hits.set(n + 1);
+            std::future::ready(Ok(match n {
+                // Affordable and over cap, so the hint is set and pass 1 hands off to the
+                // diagnostic; the third answer keeps the high point affordable and over cap so
+                // the floor is the only thing left to check.
+                1 => CandidateQuote::Unquotable {
+                    source_shortfall: Some(101_000),
+                },
+                _ => CandidateQuote::Priced(FreshMoveCost {
+                    invoice_amount: Msat(325_000),
+                    receive_quote: Msat(125_000),
+                    send_quote: Msat(125_000),
+                }),
+            }))
+        };
+        let reason = size_evacuation(Msat(200_000), Msat(500_000), PILOT_CAP, quote)
+            .await
+            .expect("no fault");
+        let reason = reason.expect_refused();
+        assert_recommends_no_fee_change(reason);
+        assert!(
+            reason.contains("does not price at all"),
+            "expected the measured fact about the floor: {reason}"
+        );
+        assert!(
+            reason.contains("short by 7777 msat"),
+            "the mint measured the floor's gap; it must reach the operator: {reason}"
+        );
+        assert!(
+            !reason.contains("cap refused every probed amount"),
+            "the floor was never compared with the cap, so no cap refusal may be claimed of \
+             it: {reason}"
+        );
+    }
+
+    /// A structural refusal must NOT promise that raising a fee knob releases THIS evacuation.
+    ///
+    /// It cannot. The pending `Action` carries the `(base, bps)` pair `decide()` admitted it with
+    /// and the executor recomputes from those, so a policy change only reaches evacuations decided
+    /// afterwards. Meanwhile the refusal stays `Retryable`, nothing terminalizes it, and watch
+    /// skips ticks while retryable work remains — so the intent retries the old cap indefinitely
+    /// and no fresh decision is ever taken. An operator following the old advice would believe
+    /// they had released stranded funds.
+    ///
+    /// Owner for the missing mechanism: `br-n8o` (no operator action releases a structural
+    /// refusal) and `br-p93` (one retryable intent suppresses ticks for every federation).
+    #[tokio::test]
+    async fn a_structural_refusal_says_a_policy_change_will_not_release_this_evacuation() {
+        let route = TestRoute::new(gw(49_000, 2_500), gw(99_000, 2_500));
+        let cap = EvacFeeCap {
+            base_msat: Msat(100_000),
+            bps: 0,
+        };
+        let reason = route.size(Msat(75_000_000), Msat(75_000_000), cap).await;
+        let reason = reason.expect_refused();
+        assert!(
+            reason.contains("structural refusal"),
+            "fixture must reach the structural diagnostic: {reason}"
+        );
+        assert!(
+            reason.contains("will NOT release THIS evacuation"),
+            "the recommendation must not promise an action that cannot work: {reason}"
+        );
+        assert!(
+            reason.contains("no supported way to replace it"),
+            "and must say plainly that no replacement path exists yet: {reason}"
+        );
+    }
+
+    /// THE FINAL ARM — both points measured, neither structural condition fires.
+    ///
+    /// The old message said "the cap refused every probed amount", which asserts more than the
+    /// search establishes: probes that came back Unquotable or unfundable were never compared with
+    /// the cap at all, and the floor re-quoted here may even FIT it (as it does in this fixture).
+    /// What `sized == None` actually establishes is that no amount satisfied BOTH constraints.
+    ///
+    /// Fixture arithmetic, so the arm is reached deliberately rather than by luck. `PILOT_CAP` is
+    /// 200_000 + 300 bps, span is 200_000 - 5_000 = 195_000, so `cap_rise == 58_500_000`.
+    ///   * floor (1_000, 1_000): fee 2_000, debit 7_000 — affordable, and it FITS the cap.
+    ///   * high (1_000, 250_000): fee 251_000, debit 451_000 — affordable, and over the 206_000
+    ///     cap, so guard 3 passes and the trend is actually measured.
+    ///   * `fee_rise == (251_000 - 2_000) * 10_000 == 2_490_000_000 > cap_rise`, so condition (i)
+    ///     cannot fire; the intercept is `2_000 - 249_000*5_000/195_000 ≈ -4_384`, far below the
+    ///     200_000 cap base, so condition (ii) cannot either.
+    /// Pass 2 never runs (pass 1's re-quote is Unquotable), so the cheap floor cost is only ever
+    /// the diagnostic's own low-point quote and can never be sized.
+    #[tokio::test]
+    async fn a_measured_pair_with_no_trend_does_not_claim_the_cap_refused_everything() {
+        let reason = size_evacuation(
+            Msat(200_000),
+            Msat(500_000),
+            PILOT_CAP,
+            hint_fixture_with_other(
+                CandidateQuote::Priced(FreshMoveCost {
+                    invoice_amount: Msat(201_000),
+                    receive_quote: Msat(1_000),
+                    send_quote: Msat(250_000),
+                }),
+                (Msat(1_000), Msat(1_000)),
+            ),
+        )
+        .await
+        .expect("no fault");
+        let reason = reason.expect_refused();
+        assert!(
+            reason.contains("no amount that still satisfied BOTH affordability and the cap"),
+            "the arm must report what the search established — including that pass 2 may have \
+             found an amount and lost it on revalidation, which 'found no amount' denied: {reason}"
+        );
+        assert!(
+            !reason.contains("the cap refused every probed amount"),
+            "some probes were never cap-compared, and this fixture's floor FITS the cap — \
+             claiming a universal cap refusal sends the operator after the wrong cause: {reason}"
+        );
+        assert!(
+            !reason.contains("structural refusal"),
+            "neither condition fired, so no structural cause may be named: {reason}"
+        );
+        // The search keeps no probe history, so the message may not characterise HOW individual
+        // probes failed. An earlier revision said "some could not be priced or funded at all",
+        // which the code cannot know — every probe may have priced and been fundable while simply
+        // missing the cap.
+        for unsupported in [
+            "could not be priced",
+            "funded at all",
+            "every probed amount",
+        ] {
+            assert!(
+                !reason.contains(unsupported),
+                "no probe history exists to support {unsupported:?}: {reason}"
+            );
+        }
+    }
+
+    /// PASS 2: its final re-quote must be revalidated too.
+    ///
+    /// Reaching pass 2 at all requires pass 1 to FAIL THE CAP at the largest affordable amount —
+    /// otherwise pass 1 admits and returns. So everything above 340_000 is priced over the cap,
+    /// and the affordable, cap-fitting amounts live in the bottom window pass 2 searches. The
+    /// moved re-quote is again a LATER quote of the same amount: what the bisection accepted is
+    /// not what the admission sees.
+    #[tokio::test]
+    async fn pass_two_revalidates_its_final_requote() {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        let spendable = Msat(500_000);
+        let desired = Msat(400_000);
+        let seen: RefCell<HashMap<u64, u32>> = RefCell::new(HashMap::new());
+        let quote = |net: Msat| {
+            let nth = {
+                let mut m = seen.borrow_mut();
+                let c = m.entry(net.0).or_insert(0);
+                *c += 1;
+                *c
+            };
+            async move {
+                // Above 340_000 every sighting is dear, so the fast path is unaffordable and
+                // pass 1's bisection settles just under that. A FIRST sighting anywhere below is
+                // cheap — what both bisections accept. A LATER sighting is the moved price, and
+                // it is dear enough to be BOTH over the cap and unfundable, which is what makes
+                // pass 1 fail the cap (so the search reaches pass 2) and what pass 2's final
+                // re-quote must then reject.
+                let (receive_quote, send_quote) = if net.0 > 340_000 || nth > 1 {
+                    (Msat(1_000), Msat(260_000))
+                } else {
+                    (Msat(1_000), Msat(1_000))
+                };
+                Ok(CandidateQuote::Priced(FreshMoveCost {
+                    invoice_amount: Msat(net.0 + receive_quote.0),
+                    receive_quote,
+                    send_quote,
+                }))
+            }
+        };
+
+        let search = search_evacuation_net(
+            desired,
+            spendable,
+            PILOT_CAP,
+            oscillation_bound(spendable),
+            quote,
+        )
+        .await
+        .expect("no fault");
+
+        // UNCONDITIONAL, for the same reason as the pass-1 test: on the passing path `sized` is
+        // None, so a conditional assertion would never execute.
+        assert_eq!(
+            search.sized.map(|(n, c)| (n.0, c.source_debit().0)),
+            None,
+            "pass 2's final re-quote is unaffordable, so nothing may be sized on it"
+        );
+        // Same, for the amount pass 2 settles on. The weaker "any amount twice" form is
+        // satisfied by the pass-1 probes that precede this and proves nothing here.
+        let sightings = seen.borrow();
+        assert!(
+            sightings.get(&339_997).copied().unwrap_or(0) >= 2,
+            "339_997 was not re-quoted, so pass 2's admission was never reached: {sightings:?}"
+        );
+    }
+
+    /// The shipped evacuation cap: 200 sats + 3%.
+    const PILOT_CAP: EvacFeeCap = EvacFeeCap {
+        base_msat: Msat(200_000),
+        bps: 300,
+    };
+
+    /// The runbook's ABSOLUTE `--max-fee`, expressed as the same cap shape with a zero rate —
+    /// which is exactly what the code did before ADR-0029, and what a LEGACY intent still gets.
+    /// Fixtures use it as the red-first baseline.
+    const OLD_ABSOLUTE_CAP: EvacFeeCap = EvacFeeCap {
+        base_msat: Msat(50_000),
+        bps: 0,
+    };
+
+    fn gw(base_msat: u64, ppm: u64) -> fee::GatewayFee {
+        fee::GatewayFee {
+            base_msat: Msat(base_msat),
+            ppm,
+        }
+    }
+
+    type FedFee = Box<dyn Fn(Msat) -> Msat>;
+
+    struct TestRoute {
+        receive_gateway: fee::GatewayFee,
+        send_gateway: fee::GatewayFee,
+        /// The DESTINATION federation's receive tx fee, quoted on the contract amount.
+        recv_fed_fee: FedFee,
+        /// The SOURCE's send-side fee, quoted on the outgoing contract: the lnv2 module fee plus
+        /// the per-note MINT fee. This is where a note-count discontinuity enters, exactly as it
+        /// does live.
+        send_fed_fee: FedFee,
+    }
+
+    impl TestRoute {
+        /// A route with the given gateway fees and negligible federation/mint fees — the
+        /// PRECONDITION the pinned aggregates in the viability fixture are computed under.
+        fn new(receive_gateway: fee::GatewayFee, send_gateway: fee::GatewayFee) -> Self {
+            Self {
+                receive_gateway,
+                send_gateway,
+                recv_fed_fee: Box::new(|_| Msat(0)),
+                send_fed_fee: Box::new(|_| Msat(0)),
+            }
+        }
+
+        fn with_send_fed_fee(mut self, quote: impl Fn(Msat) -> Msat + 'static) -> Self {
+            self.send_fed_fee = Box::new(quote);
+            self
+        }
+
+        /// The same composition `FedimintExecutor::quote_fresh_send_required_cost` performs.
+        async fn quote(&self, net: Msat, spendable: Msat) -> Result<CandidateQuote, ExecError> {
+            if net.0 == 0 {
+                return Ok(CandidateQuote::Unquotable {
+                    source_shortfall: None,
+                });
+            }
+            let grossed =
+                resolve_receive_gross_up(net, self.receive_gateway, |contract| async move {
+                    Ok((self.recv_fed_fee)(contract))
+                })
+                .await?;
+            if grossed.contract_amount.0 < MINIMUM_INCOMING_CONTRACT_MSAT {
+                return Ok(CandidateQuote::Unquotable {
+                    source_shortfall: None,
+                });
+            }
+            let send_gateway_quote = self.send_gateway.on(grossed.invoice_amount);
+            let outgoing = Msat(grossed.invoice_amount.0 + send_gateway_quote.0);
+            let send_tx_fee = (self.send_fed_fee)(outgoing);
+            // The mint's dry-run: the source must fund the whole outgoing contract plus its fee,
+            // and reports the GAP when it cannot (`InsufficientBalanceError`).
+            let required = outgoing.0 + send_tx_fee.0;
+            if required > spendable.0 {
+                return Ok(CandidateQuote::Unquotable {
+                    source_shortfall: Some(required - spendable.0),
+                });
+            }
+            Ok(CandidateQuote::Priced(FreshMoveCost {
+                invoice_amount: grossed.invoice_amount,
+                receive_quote: grossed.receive_quote,
+                send_quote: Msat(send_gateway_quote.0 + send_tx_fee.0),
+            }))
+        }
+
+        async fn size(&self, desired: Msat, spendable: Msat, cap: EvacFeeCap) -> EvacuationSizing {
+            size_evacuation(desired, spendable, cap, |net| self.quote(net, spendable))
+                .await
+                .expect("the scripted route never faults")
+        }
+
+        async fn search(
+            &self,
+            desired: Msat,
+            spendable: Msat,
+            cap: EvacFeeCap,
+        ) -> EvacuationSearch {
+            search_evacuation_net(
+                desired,
+                spendable,
+                cap,
+                oscillation_bound(spendable),
+                |net| self.quote(net, spendable),
+            )
+            .await
+            .expect("the scripted route never faults")
+        }
+
+        async fn cost_at(&self, net: Msat, spendable: Msat) -> FreshMoveCost {
+            match self.quote(net, spendable).await.expect("no fault") {
+                CandidateQuote::Priced(cost) => cost,
+                other => panic!("expected {net:?} to price, got {other:?}"),
+            }
+        }
+    }
+
+    impl EvacuationSizing {
+        fn expect_sized(&self) -> Msat {
+            match self {
+                EvacuationSizing::Sized(net) => *net,
+                EvacuationSizing::Refused(reason) => {
+                    panic!("expected a sized evacuation: {reason}")
+                }
+            }
+        }
+
+        fn expect_refused(&self) -> &str {
+            match self {
+                EvacuationSizing::Sized(net) => panic!("expected a refusal, got {net:?}"),
+                EvacuationSizing::Refused(reason) => reason,
+            }
+        }
+    }
+
+    /// The gateway shape measured on the pilot: at a 1_000_000 msat net the receive leg costs
+    /// exactly 8_900 msat and the send leg exactly 8_948 — the 17_848 msat (1.7848%) figure
+    /// ADR-0029 records. The ppms are chosen so the fixture reproduces those two numbers
+    /// EXACTLY at that amount (asserted below), rather than approximating them.
+    fn pilot_route() -> TestRoute {
+        TestRoute::new(gw(2_000, 6_840), gw(2_000, 6_887))
+    }
+
+    #[tokio::test]
+    async fn the_pilot_fixture_reproduces_the_measured_swap_cost() {
+        let route = pilot_route();
+        let cost = route.cost_at(Msat(1_000_000), Msat(u64::MAX)).await;
+        assert_eq!(cost.receive_quote, Msat(8_900), "measured receive leg");
+        assert_eq!(cost.send_quote, Msat(8_948), "measured send leg");
+        assert_eq!(cost.total_fee(), Msat(17_848));
+    }
+
+    /// CLAMP SAFETY — the money hole this bead exists to close, and the one an implementation can
+    /// leave open while passing everything else. The allocator plans 75_000 sats and stamps the
+    /// cap at THAT amount (2_450 sats); the executor can only afford 1_000 sats, so the cap it
+    /// enforces must be 230 sats — base + 3% of what MOVED, not of what was planned.
+    #[tokio::test]
+    async fn the_enforced_cap_follows_the_executed_net_not_the_planned_amount() {
+        let route = TestRoute::new(gw(2_000, 3_000), gw(2_000, 3_000));
+        let desired = Msat(75_000_000);
+        // Exactly the source debit of a 1_000_000 msat net over this route (invoice 1_005_015 +
+        // a 5_015 send quote), so the affordability search lands on 1_000_000 and not a msat
+        // more: one msat of net needs one more msat of invoice, which the balance cannot cover.
+        let spendable = Msat(1_010_030);
+
+        let net = route
+            .size(desired, spendable, PILOT_CAP)
+            .await
+            .expect_sized();
+        assert_eq!(net, Msat(1_000_000), "clamped by what the source can fund");
+
+        let mut rec = evacuation_record(desired, PILOT_CAP.at(desired));
+        assert_eq!(
+            rec.fee_cap,
+            Msat(2_450_000),
+            "the PLANNED cap, at the planned amount"
+        );
+        apply_evacuation_sizing(&mut rec, PILOT_CAP, net);
+        assert_eq!(rec.amount, Msat(1_000_000));
+        assert_eq!(
+            rec.fee_cap,
+            Msat(230_000),
+            "200_000 base + floor(1_000_000 * 300 / 10_000) — of the EXECUTED net"
+        );
+        assert_ne!(
+            rec.fee_cap,
+            Msat(2_450_000),
+            "keeping the planned cap would authorise more than 10x the entitlement"
+        );
+    }
+
+    /// CAP ARITHMETIC. The cap is computed on the NET while each charged fee is computed on its
+    /// own real SDK base — the receive fee on the GROSS invoice, the send fee on the invoice. At
+    /// a 1_000_000 msat net this route's invoice is 1_100_000, so a cap taken on the gross would
+    /// be 233_000 instead of 230_000. Exact-cap executes (`total_within_cap` compares `<=`);
+    /// one msat more is refused, and it is refused at 230_001 — under the 233_000 a gross-based
+    /// cap would have allowed.
+    #[tokio::test]
+    async fn exact_cap_is_admitted_and_cap_plus_one_msat_is_refused() {
+        let net = Msat(1_000_000);
+        let spendable = Msat(10_000_000);
+        // Receive: 44_997 base + ~5% of the GROSS invoice, a rate whose floor does not step at
+        // 1_100_000 — so the minimal invoice that nets exactly 1_000_000 IS 1_100_000, the
+        // amount ADR-0029's own worked example uses. Send: a flat base.
+        let exact = TestRoute::new(gw(44_997, 50_003), gw(130_000, 0));
+        let cost = exact.cost_at(net, spendable).await;
+        assert_eq!(cost.invoice_amount, Msat(1_100_000));
+        assert_eq!(
+            cost.receive_quote,
+            Msat(100_000),
+            "charged on the 1_100_000 gross"
+        );
+        assert_eq!(cost.total_fee(), Msat(230_000));
+        assert_eq!(
+            PILOT_CAP.at(net),
+            Msat(230_000),
+            "the cap is taken on the NET"
+        );
+        assert_eq!(
+            cost.delivered_net(),
+            net,
+            "this fixture is an EXACT solve, so the delivered net IS the ask — which is what \
+             makes the pinned cap numbers below comparable to the ask at all"
+        );
+        assert!(
+            fits_cap(cost, PILOT_CAP),
+            "a quote landing EXACTLY on the cap executes — total_within_cap compares `<=`"
+        );
+        assert_eq!(
+            exact.size(net, spendable, PILOT_CAP).await.expect_sized(),
+            net,
+            "so the whole ask is evacuated in one operation"
+        );
+
+        // One msat more, and the SAME net is refused.
+        let over = TestRoute::new(gw(44_997, 50_003), gw(130_001, 0));
+        let over_cost = over.cost_at(net, spendable).await;
+        assert_eq!(over_cost.total_fee(), Msat(230_001));
+        assert!(
+            !fits_cap(over_cost, PILOT_CAP),
+            "cap plus one msat is refused at this net"
+        );
+        let cap_taken_on_the_gross = PILOT_CAP.base_msat.0 + 1_100_000 * 300 / 10_000;
+        assert_eq!(cap_taken_on_the_gross, 233_000);
+        assert!(
+            230_001 < cap_taken_on_the_gross,
+            "230_001 sits UNDER a cap taken on the 1_100_000 GROSS invoice, so refusing it is \
+             exactly what pins the cap to the NET rather than to what the SDK charges on"
+        );
+        // The search then downsizes rather than giving up — correct, and not in tension with the
+        // above: what it must never do is EXECUTE at a net whose quote broke the cap.
+        let downsized = over.size(net, spendable, PILOT_CAP).await.expect_sized();
+        assert!(downsized < net, "downsized to {downsized:?}");
+        let downsized_cost = over.cost_at(downsized, spendable).await;
+        assert!(fits_cap(downsized_cost, PILOT_CAP));
+    }
+
+    /// A FULL-BALANCE evacuation drains the source in ONE operation. "At full size" is
+    /// impossible — `source_debit = invoice + send_quote` and `invoice = net + receive_quote`, so
+    /// any positive fee makes the debit exceed the net — the claim is that the executed net is
+    /// the MAXIMAL amount whose net plus both fee legs fits spendable, and that this is one
+    /// operation rather than the ~27 chunks the absolute cap produced.
+    #[tokio::test]
+    async fn a_full_balance_evacuation_drains_in_one_operation() {
+        let route = pilot_route();
+        let balance = Msat(75_000_000);
+
+        let net = route.size(balance, balance, PILOT_CAP).await.expect_sized();
+        let cost = route.cost_at(net, balance).await;
+        // Pinned for this fixture: the exact maximal net and its exact source debit.
+        assert_eq!(net, Msat(73_973_545));
+        assert_eq!(
+            cost.source_debit(),
+            Msat(75_000_000),
+            "the balance, to the msat"
+        );
+        assert!(cost.source_debit() <= balance, "never overdraws");
+        // One msat more does not fit — this is the maximum, not merely a large amount.
+        assert!(
+            !matches!(
+                route.quote(Msat(net.0 + 1), balance).await.expect("no fault"),
+                CandidateQuote::Priced(cost) if cost.source_debit() <= balance
+            ),
+            "the executed net is the MAXIMAL affordable one"
+        );
+        // ADR-0029 quotes ~73_685 sats by applying the measured 1.7848% flat rate to the whole
+        // balance. That over-charges, because the 2-sat bases do not scale with the amount: the
+        // exact figure sits a little above it. Both agree to well under a percent.
+        let flat_rate_estimate = 73_685_000f64;
+        assert!(
+            ((net.0 as f64 - flat_rate_estimate) / flat_rate_estimate).abs() < 0.005,
+            "within half a percent of ADR-0029's flat-rate estimate: {net:?}"
+        );
+
+        // RED-FIRST: the OLD absolute 50_000 msat cap over the SAME route sizes a chunk of a few
+        // thousand sats — the ~1/27th chunk-drain the fee cap was changed to end.
+        let chunk = route
+            .size(balance, balance, OLD_ABSOLUTE_CAP)
+            .await
+            .expect_sized();
+        assert_eq!(
+            chunk,
+            Msat(3_326_248),
+            "~3_326 sats — a 22nd of the balance"
+        );
+        assert!(
+            net.0 / chunk.0 >= 20,
+            "at least twenty operations where the new cap needs one"
+        );
+        // ADR-0029 quotes ~27 chunks, from the measured 1.7848% applied flat to the whole
+        // balance against the 50-sat cap. The exact figure here is ~22 for the same reason the
+        // delivered net is a little higher than its estimate: the 2-sat bases do not scale, so
+        // the effective rate at 75_000 sats is below the rate measured at 1_000.
+    }
+
+    /// ECONOMIC VIABILITY — the largest money-loss hole. A gateway with COMPLIANT bases (send 99
+    /// sats, receive 49) and a hostile, SEND-HEAVY ppm split (send 940_000, receive 10_000): the
+    /// largest cap-fitting chunk delivers ~5.35 sats for a ~200-sat fee, so the balance would
+    /// drain in ~365 chunks, delivering ~1_953 sats and burning ~73_047. The route does not
+    /// serve, and the evacuation must NOT proceed over it.
+    ///
+    /// The split matters and a combined figure would be wrong: solvability is governed by the
+    /// RECEIVE ppm alone (it shrinks the contract directly), so the hostile load has to sit on
+    /// the SEND leg. Both ppms are therefore pinned separately.
+    fn burning_route() -> TestRoute {
+        TestRoute::new(gw(49_000, 10_000), gw(99_000, 940_000))
+    }
+
+    #[tokio::test]
+    async fn a_route_that_costs_more_than_it_delivers_does_not_serve() {
+        let route = burning_route();
+        let balance = Msat(75_000_000);
+
+        let refusal = route.size(balance, balance, PILOT_CAP).await;
+        let reason = refusal.expect_refused();
+        assert!(
+            reason.contains("costs more than it delivers"),
+            "the refusal must name the viability rule: {reason}"
+        );
+
+        // The chunk the search WOULD have taken without the post-check, and what it costs.
+        let search = route.search(balance, balance, PILOT_CAP).await;
+        let (chunk, cost) = search
+            .sized
+            .expect("the cap admits a chunk; only viability refuses it");
+        assert_eq!(
+            chunk,
+            Msat(5_357),
+            "the largest cap-fitting net, ~5.36 sats"
+        );
+        assert_eq!(
+            cost.total_fee(),
+            Msat(200_160),
+            "~200 sats of fees to move ~5.4"
+        );
+        assert_eq!(
+            PILOT_CAP.at(chunk),
+            Msat(200_160),
+            "sitting exactly at the cap"
+        );
+        assert!(cost.total_fee() > chunk, "it burns more than it delivers");
+    }
+
+    /// The red half of the viability criterion: WITHOUT the post-check the same route drains the
+    /// balance in ~365 chunks, delivering ~1_953 sats while burning ~73_047. Driven through the
+    /// real search, one chunk per round, exactly as the watch cycle would re-emit them.
+    #[tokio::test]
+    async fn without_the_viability_check_the_same_route_burns_the_balance() {
+        let route = burning_route();
+        let mut remaining = Msat(75_000_000);
+        let mut delivered = 0u64;
+        let mut chunks = 0u32;
+        while let Some((net, cost)) = route.search(remaining, remaining, PILOT_CAP).await.sized {
+            delivered += net.0;
+            remaining = Msat(remaining.0 - cost.source_debit().0);
+            chunks += 1;
+            assert!(chunks < 1_000, "the drain must terminate");
+        }
+        let burned = 75_000_000 - delivered;
+        assert!((360..=370).contains(&chunks), "~365 chunks, got {chunks}");
+        assert!(
+            (1_940_000..=1_970_000).contains(&delivered),
+            "~1_953 sats delivered, got {delivered} msat"
+        );
+        assert!(
+            (73_030_000..=73_060_000).contains(&burned),
+            "~73_047 sats burned, got {burned} msat"
+        );
+        assert!(
+            burned * 100 / 75_000_000 > 95,
+            "a ~97% loss — the evacuation destroying the balance it exists to rescue"
+        );
+    }
+
+    /// The viability rule is a POST-CHECK, never a term in the fits predicate: the search returns
+    /// the same `n*` either way, and the check is applied to THAT result. Folding `fee <= n` into
+    /// the predicate would re-break the fits-then-doesn't shape the bisection needs — and would
+    /// change `n*`, which this pins against.
+    #[tokio::test]
+    async fn the_viability_check_is_a_post_check_on_the_search_result() {
+        let route = burning_route();
+        let balance = Msat(75_000_000);
+        let search = route.search(balance, balance, PILOT_CAP).await;
+        let (n_star, cost) = search
+            .sized
+            .expect("the search itself finds a cap-fitting chunk");
+        assert_eq!(n_star, Msat(5_357));
+
+        // The post-check, applied to that result, is what refuses.
+        let verdict = evacuation_viability(
+            (n_star, cost),
+            balance,
+            PILOT_CAP,
+            oscillation_bound(balance),
+            |net| route.quote(net, balance),
+        )
+        .await
+        .expect("no fault");
+        verdict.expect_refused();
+
+        // And the full pipeline's search result is unchanged by the post-check being there.
+        let full = route.search(balance, balance, PILOT_CAP).await;
+        assert_eq!(full.sized.map(|(net, _)| net), Some(n_star));
+    }
+
+    /// NOTE-COUNT DISCONTINUITY. The search's top fails the viability check by a few hundred msat
+    /// ONLY because crossing a 2^17 msat tier raised the mint's per-note fee; one note-selection
+    /// boundary below, the same route serves. It must EVACUATE, not refuse.
+    #[tokio::test]
+    async fn a_note_count_discontinuity_at_the_top_probes_below_instead_of_refusing() {
+        // Zero gateway fees, so the net, the invoice and the outgoing contract coincide and the
+        // discontinuity sits exactly on the tier it names.
+        let route = TestRoute::new(gw(0, 0), gw(0, 0)).with_send_fed_fee(|outgoing| {
+            Msat(if outgoing.0 >= 131_072 {
+                132_000
+            } else {
+                130_000
+            })
+        });
+        let spendable = Msat(263_100);
+
+        let search = route.search(spendable, spendable, PILOT_CAP).await;
+        let (top, cost) = search.sized.expect("the cap admits the top");
+        assert_eq!(
+            top,
+            Msat(131_100),
+            "the largest affordable, cap-fitting net"
+        );
+        assert_eq!(cost.total_fee(), Msat(132_000));
+        // RED-FIRST: a top-only implementation refuses here — the top costs more than it delivers.
+        assert!(
+            cost.total_fee() > top,
+            "the top fails the viability check by 900 msat"
+        );
+
+        let net = route
+            .size(spendable, spendable, PILOT_CAP)
+            .await
+            .expect_sized();
+        assert_eq!(
+            net,
+            Msat(131_071),
+            "one tier boundary below, under the fee jump, the route serves"
+        );
+        let served = route.cost_at(net, spendable).await;
+        assert!(
+            served.total_fee().0 <= net.0,
+            "and it delivers more than it costs"
+        );
+    }
+
+    /// A shortfall LARGER than one oscillation bound must still probe below before refusing.
+    ///
+    /// ADR-0029: "Refuse only when the top fails by strictly MORE than `A` AND that is an
+    /// analytically proven structural refusal ... a bare shortfall over `A` is inconclusive, not
+    /// proof." `A` bounds ONE vertical fee jump, so two nearby note-count drops can each stay
+    /// under it while together exceeding it — leaving a serving candidate just below a top that
+    /// missed by more than `A`.
+    ///
+    /// RED-FIRST: an implementation that returns early on `shortfall > A` refuses here, and
+    /// because the quotes are stable it takes that same branch every tick — stranding a dying
+    /// federation that had an executable evacuation the whole time. That is the livelock this
+    /// bead exists to remove, reintroduced by its own refusal path.
+    #[tokio::test]
+    async fn a_shortfall_over_the_oscillation_bound_still_probes_below() {
+        // THREE levels, so the top fails by more than `A` and a LOWER boundary still serves:
+        //   >= 131_072  fee 500_000 — far over any cap, so the search cannot go here
+        //   >= 131_071  fee 150_000 — the top: cap-fitting and affordable, but costs MORE than it
+        //                             delivers, missing by 18_929 — MORE than one bound (16_306)
+        //   >= 131_000  fee 140_000 — one drop of 10_000, still costs more than it delivers
+        //   <  131_000  fee 130_000 — a second drop of 10_000; the route now serves
+        //
+        // Each drop alone is under `A`; only together do they exceed it. That is exactly the case
+        // a bare `shortfall > A` refusal discards, and both drops sit inside the bounded probe's
+        // reach (it walks tier-aligned boundaries within ~130 msat of the top, not distant tiers).
+        let route = TestRoute::new(gw(0, 0), gw(0, 0)).with_send_fed_fee(|outgoing| {
+            Msat(if outgoing.0 >= 131_072 {
+                500_000
+            } else if outgoing.0 >= 131_071 {
+                150_000
+            } else if outgoing.0 >= 131_000 {
+                140_000
+            } else {
+                130_000
+            })
+        });
+        let spendable = Msat(1_000_000);
+
+        let search = route.search(spendable, spendable, PILOT_CAP).await;
+        let (top, cost) = search.sized.expect("the cap admits the top");
+        assert_eq!(
+            top,
+            Msat(131_071),
+            "the largest cap-fitting, affordable net"
+        );
+        assert_eq!(cost.total_fee(), Msat(150_000));
+
+        // STRICTLY GREATER than one oscillation bound — the branch that used to refuse outright.
+        let shortfall = cost.total_fee().0 - top.0;
+        let bound = oscillation_bound(spendable);
+        assert!(
+            shortfall > bound,
+            "fixture must exercise the over-A branch: shortfall {shortfall} vs A {bound}"
+        );
+
+        // It must nonetheless probe down and find the serving candidate.
+        let net = route
+            .size(spendable, spendable, PILOT_CAP)
+            .await
+            .expect_sized();
+        assert_eq!(
+            net,
+            Msat(130_943),
+            "past the second drop the fee falls under the net and the route serves"
+        );
+        let served = route.cost_at(net, spendable).await;
+        assert!(served.total_fee().0 <= net.0);
+    }
+
+    /// NON-MONOTONE SIZING, INCREASING REGIME. Gateway bases 99 + 49 sats EXCEED this fixture's
+    /// CONFIGURED 20-sat cap base (no executable gateway base can exceed the 200-sat default, so
+    /// stating it against the default would make the regime untestable), while the combined ppm
+    /// (5_000) sits BELOW the 300 bps cap rate. Feasibility therefore RISES with the amount: the
+    /// feasible set is a TOP window, and the evacuation still proceeds.
+    #[tokio::test]
+    async fn the_increasing_regime_finds_the_top_window() {
+        let route = TestRoute::new(gw(49_000, 2_500), gw(99_000, 2_500));
+        let cap = EvacFeeCap {
+            base_msat: Msat(20_000),
+            bps: 300,
+        };
+        let balance = Msat(10_000_000);
+
+        let net = route.size(balance, balance, cap).await.expect_sized();
+        assert_eq!(net, Msat(9_802_620), "the top of the window, ~9_802 sats");
+        let cost = route.cost_at(net, balance).await;
+        assert!(
+            cost.total_fee() <= cap.at(net),
+            "fee {:?} against cap {:?}",
+            cost.total_fee(),
+            cap.at(net)
+        );
+
+        // The window bottom is ~5_123 sats, comfortably clear of the ~5_002 sats a combined
+        // bisection probes first, so the miss below is STRUCTURAL and not a matter of slack.
+        let bottom_cost = route.cost_at(Msat(5_002_500), balance).await;
+        assert!(
+            bottom_cost.total_fee() > cap.at(Msat(5_002_500)),
+            "the first combined probe fails the cap"
+        );
+
+        // RED-FIRST: the strict single bisection on the COMBINED predicate — the search this code
+        // had, whose contract required monotonicity — probes ~5_002 sats, fails on the cap,
+        // collapses `hi` and discards the whole feasible window.
+        let naive =
+            largest_fitting_amount(MINIMUM_INCOMING_CONTRACT_MSAT, balance.0, 0, |amount| {
+                let quoted = route.quote(Msat(amount), balance);
+                async move { Ok(combined_verdict(quoted.await?, cap, balance)) }
+            })
+            .await
+            .expect("no fault");
+        assert_eq!(
+            naive, None,
+            "a combined bisection returns to the exact livelock this change exists to kill"
+        );
+    }
+
+    /// NON-MONOTONE SIZING, DECREASING REGIME — the mirror. A zero-base gateway with a combined
+    /// 400 bps rate ABOVE the cap's 300: feasibility FALLS with the amount, so the feasible set
+    /// is a BOTTOM window that pass 2 finds, and a cap-compliant amount drains.
+    #[tokio::test]
+    async fn the_decreasing_regime_finds_the_bottom_window() {
+        let route = TestRoute::new(gw(0, 20_000), gw(0, 20_000));
+        let balance = Msat(75_000_000);
+
+        let net = route.size(balance, balance, PILOT_CAP).await.expect_sized();
+        assert!(
+            net.0 <= 20_000_000,
+            "a cap-compliant amount, not the whole balance: {net:?}"
+        );
+        assert_eq!(net, Msat(18_490_738));
+        let cost = route.cost_at(net, balance).await;
+        assert!(cost.total_fee() <= PILOT_CAP.at(net));
+        // One msat more breaks the cap: this is the top of the bottom window.
+        let over = route.cost_at(Msat(net.0 + 1), balance).await;
+        assert!(over.total_fee() > PILOT_CAP.at(Msat(net.0 + 1)));
+    }
+
+    /// SIZING NEVER EXCEEDS `desired`. The caller has already clamped `desired` to the
+    /// destination's remaining ADR-0018 cap room, and evacuations are EXEMPT from
+    /// `enforce_destination_cap`, so nothing downstream would catch a larger size. Both passes
+    /// are bounded above by it even when the source could fund far more.
+    #[tokio::test]
+    async fn sizing_never_exceeds_the_destination_cap_room() {
+        let route = TestRoute::new(gw(49_000, 2_500), gw(99_000, 2_500));
+        let cap = EvacFeeCap {
+            base_msat: Msat(20_000),
+            bps: 300,
+        };
+        let balance = Msat(75_000_000);
+        let cap_room = Msat(10_000_000);
+
+        let clamped = route.size(cap_room, balance, cap).await.expect_sized();
+        assert!(
+            clamped <= cap_room,
+            "sized {clamped:?} over {cap_room:?} of cap room"
+        );
+
+        // Unclamped, the same source funds a far larger drain — so the bound is what constrains
+        // it, not the route.
+        let unclamped = route.size(balance, balance, cap).await.expect_sized();
+        assert!(
+            unclamped.0 > cap_room.0 * 5,
+            "the source could fund {unclamped:?}, which is what makes the bound load-bearing"
+        );
+    }
+
+    /// LIVELOCK / GENUINE REFUSAL. A gateway whose summed two-leg quote strictly exceeds the cap
+    /// at EVERY amount — bases 99 + 49 sats against a configured 100-sat cap base with a ZERO
+    /// rate — stays `Retryable` AND says why. Red-first: without the diagnostic it retries
+    /// silently forever, which is the failure this change exists to kill.
+    #[tokio::test]
+    async fn a_fixed_component_above_the_cap_base_refuses_with_a_structural_diagnostic() {
+        let route = TestRoute::new(gw(49_000, 2_500), gw(99_000, 2_500));
+        let cap = EvacFeeCap {
+            base_msat: Msat(100_000),
+            bps: 0,
+        };
+        let balance = Msat(75_000_000);
+
+        let reason = route.size(balance, balance, cap).await;
+        let reason = reason.expect_refused();
+        assert!(
+            reason.contains("structural refusal"),
+            "a silent indefinite retry fails this criterion: {reason}"
+        );
+        assert!(
+            reason.contains("fixed component alone"),
+            "the cause must be the complete intercept, not the cap trend: {reason}"
+        );
+        // With a ZERO cap rate the cap-trend condition CANNOT fire, which is exactly why the
+        // intercept condition has to exist.
+        assert!(
+            !reason.contains("the FEE rises no faster than the CAP"),
+            "condition (i) cannot fire here: {reason}"
+        );
+        // ...which makes this an assertion about condition (ii) SPECIFICALLY. Its intercept is
+        // measured from two samples on a curve this module itself calls non-monotone, so the
+        // message must disclose that rather than assert a global bound. ADR-0029:137 reserves the
+        // stronger claim for an analytically proven structural refusal; probe exhaustion alone
+        // "stays `Retryable` and must not mark the route unavailable" — which the caller honors by
+        // returning `Retryable`, and which the operator-facing text must not contradict.
+        assert!(
+            reason.contains("evidence, not proof"),
+            "the two-point intercept must not be reported as a proof that nothing can ever \
+             fit: {reason}"
+        );
+        // REJECT the old global-proof phrasing rather than merely requiring a caveat somewhere in
+        // the string: an appended disclaimer can coexist with an unqualified claim, and then the
+        // assertion above passes while the operator still reads "the gap only widens with size"
+        // as a fact about every amount. The qualifier has to be ON the widening claim.
+        assert!(
+            reason.contains("ON THE SAMPLED LINE the gap only widens"),
+            "the widening claim itself must be scoped to the fitted line: {reason}"
+        );
+    }
+
+    /// A fee above base + proportional is still REFUSED — the cap must bound a hostile gateway,
+    /// not merely stop refusing. Here the source could comfortably afford the move; only the cap
+    /// stands in the way.
+    #[tokio::test]
+    async fn a_fee_above_base_plus_proportional_is_still_refused() {
+        let route = TestRoute::new(gw(5_000_000, 0), gw(0, 0));
+        let balance = Msat(75_000_000);
+        // Affordable at every size, and far over the cap at every size.
+        let cost = route.cost_at(Msat(1_000_000), balance).await;
+        assert!(cost.source_debit() <= balance, "the source can afford it");
+        assert!(
+            cost.total_fee() > PILOT_CAP.at(Msat(1_000_000)),
+            "but the cap refuses it"
+        );
+
+        route
+            .size(balance, balance, PILOT_CAP)
+            .await
+            .expect_refused();
+    }
+
+    /// Base fees above the OLD absolute cap no longer livelock. The refusal half IS assertable —
+    /// under the 50_000 msat absolute cap the 148_000 msat of bases alone never fit at any size.
+    #[tokio::test]
+    async fn base_fees_above_the_old_absolute_cap_no_longer_livelock() {
+        let route = TestRoute::new(gw(49_000, 2_500), gw(99_000, 2_500));
+        let balance = Msat(75_000_000);
+
+        let old = route.size(balance, balance, OLD_ABSOLUTE_CAP).await;
+        assert!(
+            old.expect_refused().contains("structural refusal"),
+            "the absolute cap refuses at every size — the livelock"
+        );
+
+        let net = route.size(balance, balance, PILOT_CAP).await.expect_sized();
+        assert!(
+            net.0 > 70_000_000,
+            "base + proportional admits the same route: {net:?}"
+        );
+    }
+
+    /// STRUCTURAL REFUSAL IS DIAGNOSABLE, on the adversarial knife-edge fixture: policy
+    /// (base 100_000 msat, bps 300), gateway receive (base 3, ppm 0), send (base 99_999, ppm
+    /// 29_999). `None` is deliberately NOT asserted as the required outcome — `total_within_cap`
+    /// admits an exact-cap candidate, so if the search happens to probe a fitting amount,
+    /// returning it is CORRECT. What is required is that a REFUSAL is never silent.
+    #[tokio::test]
+    async fn the_knife_edge_fixture_is_never_refused_silently() {
+        let route = TestRoute::new(gw(3, 0), gw(99_999, 29_999));
+        let cap = EvacFeeCap {
+            base_msat: Msat(100_000),
+            bps: 300,
+        };
+        // Sized so the largest affordable net is 1_000_000 msat, below the ~2_090_000 msat where
+        // this route's fee finally falls under the cap.
+        let spendable = Msat(1_130_002);
+
+        match route.size(spendable, spendable, cap).await {
+            EvacuationSizing::Sized(net) => {
+                let cost = route.cost_at(net, spendable).await;
+                assert!(
+                    cost.total_fee() <= cap.at(net),
+                    "returning a fitting amount is correct, but it must actually fit"
+                );
+            }
+            EvacuationSizing::Refused(reason) => {
+                assert!(
+                    reason.contains("structural refusal"),
+                    "a refusal here must carry the diagnostic: {reason}"
+                );
+                assert!(
+                    reason.contains("the FEE rises no faster than the CAP"),
+                    "and must name the measured trend, in the direction the condition actually \
+                     tests — `cap_rise >= fee_rise` means the CAP rises at least as fast, which \
+                     is what makes 'nothing smaller helps' follow: {reason}"
+                );
+            }
+        }
+    }
+
+    /// THE PPM WARNING FIRES, AND DOES NOT GATE. Both halves: the warning is produced for a send
+    /// ppm of 29_999 under a sub-limit base, and the very same route is still ADMITTED when the
+    /// cap admits it. Rejecting on ppm would contradict ADR-0029 and could strand funds behind
+    /// the only live route.
+    #[tokio::test]
+    async fn an_out_of_envelope_ppm_warns_without_gating_the_route() {
+        let fees = FreshSendRequiredGatewayFees {
+            receive: gw(3, 0),
+            send: gw(99_999, 29_999),
+        };
+        let warning =
+            ppm_envelope_warning(fees).expect("29_999 ppm is outside the 15_000 envelope");
+        assert!(warning.contains("send 29999 ppm"));
+        assert!(
+            warning.contains("NOT refused"),
+            "the warning states it does not gate"
+        );
+
+        // Honest defaults (the lnv2 gateway default is 2 sats + 3_000 ppm) stay silent.
+        assert_eq!(
+            ppm_envelope_warning(FreshSendRequiredGatewayFees {
+                receive: gw(2_000, 3_000),
+                send: gw(2_000, 3_000),
+            }),
+            None
+        );
+
+        // ...and the flagged route is still sized, because the cap admits it.
+        let route = TestRoute::new(fees.receive, fees.send);
+        let cap = EvacFeeCap {
+            base_msat: Msat(100_000),
+            bps: 300,
+        };
+        let balance = Msat(10_000_000);
+        let net = route.size(balance, balance, cap).await.expect_sized();
+        assert!(net.0 > 9_000_000, "not refused on ppm alone: {net:?}");
+    }
+
+    /// Pass 1's affordability bisection is NOT strictly monotone either: mint fees are per input
+    /// and per output, so raising the ask can cross a note-selection boundary that REDUCES the
+    /// input/change count and LOWERS the source debit. Here the affordable set is
+    /// `[5_000, 110_000] ∪ [131_072, 140_000]`, and the naive bisection collapses onto the gap.
+    #[tokio::test]
+    async fn pass_one_probes_across_a_note_count_boundary_instead_of_collapsing() {
+        let route = TestRoute::new(gw(0, 0), gw(0, 0)).with_send_fed_fee(|outgoing| {
+            Msat(if outgoing.0 >= 131_072 {
+                20_000
+            } else {
+                50_000
+            })
+        });
+        let spendable = Msat(160_000);
+        let desired = Msat(140_000);
+
+        // RED-FIRST: the strict bisection stops at the bottom interval.
+        let naive =
+            largest_fitting_amount(MINIMUM_INCOMING_CONTRACT_MSAT, desired.0, 0, |amount| {
+                let quoted = route.quote(Msat(amount), spendable);
+                async move { Ok(quoted.await?.affordability(spendable)) }
+            })
+            .await
+            .expect("no fault");
+        assert_eq!(
+            naive,
+            Some(110_000),
+            "the naive bisection discards the feasible upper interval"
+        );
+
+        // The robust one probes the tier boundary above the failing candidate and finds it.
+        let net = route
+            .size(desired, spendable, PILOT_CAP)
+            .await
+            .expect_sized();
+        assert_eq!(
+            net, desired,
+            "the whole ask is affordable across the boundary"
+        );
+    }
+
+    /// A LEGACY evacuation intent — one journaled before the cap components existed — keeps the
+    /// ABSOLUTE cap it was admitted under, and never retroactively adopts the current policy's.
+    #[test]
+    fn a_legacy_evacuation_intent_keeps_its_stored_absolute_cap() {
+        let stored = Msat(50_000);
+        let cap = evacuation_cap_rule(None, stored);
+        assert_eq!(cap.base_msat, stored);
+        assert_eq!(
+            cap.bps, 0,
+            "a zero rate makes the cap constant at the stored value"
+        );
+        assert_eq!(cap.at(Msat(1_000_000)), stored);
+        assert_eq!(
+            cap.at(Msat(75_000_000)),
+            stored,
+            "and it does not grow with the amount"
+        );
+        assert_ne!(cap.at(Msat(1_000_000)), PILOT_CAP.at(Msat(1_000_000)));
+
+        // A journaled `Action::Evacuate` written before the field existed decodes with no
+        // components, so it takes exactly that path.
+        let legacy: Action = serde_json::from_value(serde_json::json!({
+            "Evacuate": {
+                "from": vec![0xAAu8; 32],
+                "to": vec![0xBBu8; 32],
+                "amount": 75_000_000,
+                "fee_cap": 50_000,
+            }
+        }))
+        .expect("a legacy Evacuate row must still decode");
+        let Action::Evacuate {
+            fee_cap,
+            fee_cap_components,
+            ..
+        } = legacy
+        else {
+            panic!("expected an Evacuate")
+        };
+        assert_eq!(fee_cap_components, None);
+        assert_eq!(
+            evacuation_cap_rule(fee_cap_components, fee_cap).at(Msat(1_000)),
+            Msat(50_000)
+        );
+    }
+
+    /// A fresh evacuation carries its components, so the cap tracks the executed net.
+    #[test]
+    fn a_planned_evacuation_carries_its_cap_components_into_the_plan() {
+        let action = Action::Evacuate {
+            from: FED_A,
+            to: FED_B,
+            amount: Msat(75_000_000),
+            fee_cap: PILOT_CAP.at(Msat(75_000_000)),
+            gateway: None,
+            fee_cap_components: Some(PILOT_CAP),
+        };
+        let plan = MovePlan::from_action(&action).expect("Evacuate maps to a plan");
+        assert_eq!(plan.fee_cap_components, Some(PILOT_CAP));
+        assert_eq!(plan.fee_cap, Msat(2_450_000));
+        assert_eq!(
+            evacuation_cap_rule(plan.fee_cap_components, plan.fee_cap).at(Msat(1_000_000)),
+            Msat(230_000)
+        );
+
+        // A funding `Move` carries none: its cap does not depend on the executed amount.
+        let funding = Action::Move {
+            from: FED_A,
+            to: FED_B,
+            amount: Msat(1_000_000),
+            fee_cap: Msat(30_000),
+            gateway: None,
+        };
+        let plan = MovePlan::from_action(&funding).expect("Move maps to a plan");
+        assert_eq!(plan.fee_cap_components, None);
+        assert_eq!(
+            evacuation_cap_rule(plan.fee_cap_components, plan.fee_cap).at(Msat(75_000_000)),
+            Msat(30_000),
+            "a Move's cap is its planned cap at every amount"
+        );
+    }
+
+    /// The Pay-step re-check of the viability rule classifies exactly as the cap re-check does,
+    /// and applies to evacuations only (its caller gates it) — no third verdict class.
+    #[test]
+    fn the_pay_step_viability_recheck_mirrors_the_cap_verdict() {
+        // Fits: the fee is under what the chunk delivers.
+        assert!(evacuation_viability_verdict(Msat(100), Msat(200), Msat(1_000)).is_ok());
+        // Exactly break-even still serves (`<=`, the same boundary as the cap).
+        assert!(evacuation_viability_verdict(Msat(400), Msat(600), Msat(1_000)).is_ok());
+        // A send-side breach a fresh attempt could clear stays Retryable.
+        assert!(matches!(
+            evacuation_viability_verdict(Msat(400), Msat(601), Msat(1_000)),
+            Err(ExecError::Retryable(_))
+        ));
+        // The FIXED receive quote alone breaking it is terminal — no re-quote can rescue it.
+        assert!(matches!(
+            evacuation_viability_verdict(Msat(1_001), Msat(0), Msat(1_000)),
+            Err(ExecError::Permanent(_))
+        ));
+    }
+
+    /// The oscillation bound must include the mint's PROPORTIONAL per-note term: a tier-count-only
+    /// bound can be smaller than a real jump by orders of magnitude, and the `shortfall <= A`
+    /// rules would then refuse an executable evacuation without probing.
+    #[test]
+    fn the_oscillation_bound_scales_with_the_denominations_at_risk() {
+        // Calibration point from the derivation: eleven tiers, no proportional term, gives
+        // 2A ≈ 18_000 msat.
+        assert_eq!(
+            oscillation_bound(Msat(1_024)),
+            6 + 2 * (300 * 11 + 100) + 2_100 + 2 * 2
+        );
+        // A 75_000-sat balance can hold a note whose per-note proportional fee dwarfs the
+        // tier-count terms.
+        let large = oscillation_bound(Msat(75_000_000));
+        assert_eq!(large, 168_506);
+        let tier_terms_only = 6 + 2 * (300 * 27 + 100) + 2_100;
+        assert_eq!(tier_terms_only, 18_506);
+        assert_eq!(
+            large - tier_terms_only,
+            150_000,
+            "the per-note proportional term is EIGHT TIMES the tier-count terms here — dropping \
+             it would shrink the bound by ~89% and refuse an executable evacuation unprobed"
+        );
+    }
+
+    /// The probe schedule is derived from the mint's power-of-two denominations, LARGEST
+    /// candidate first, and is bounded.
+    #[test]
+    fn note_boundaries_follow_the_mint_tiers_largest_first() {
+        let above = note_boundaries_above(123_125, 140_000);
+        assert_eq!(
+            above.first(),
+            Some(&131_072),
+            "2^17, the largest tier crossing in range"
+        );
+        assert!(above.len() <= NOTE_BOUNDARY_PROBES);
+        assert!(
+            above.windows(2).all(|w| w[0] > w[1]),
+            "sorted, descending: {above:?}"
+        );
+        assert!(above.iter().all(|c| *c > 123_125 && *c <= 140_000));
+
+        let below = note_boundaries_below(131_100, MINIMUM_INCOMING_CONTRACT_MSAT);
+        assert_eq!(
+            below.first(),
+            Some(&131_099),
+            "nearest below is largest below"
+        );
+        assert!(
+            below.contains(&131_071),
+            "and the 2^17 crossing is reached: {below:?}"
+        );
+        assert!(below.len() <= NOTE_BOUNDARY_PROBES);
+        assert!(
+            below.windows(2).all(|w| w[0] > w[1]),
+            "sorted, descending: {below:?}"
+        );
+
+        // A range with no room above yields nothing rather than probing out of bounds.
+        assert!(note_boundaries_above(140_000, 140_000).is_empty());
+        assert!(note_boundaries_below(5_000, MINIMUM_INCOMING_CONTRACT_MSAT).is_empty());
+    }
+
+    /// A minimal fresh-evacuation record, as `assemble_record` would build it before sizing runs.
+    fn evacuation_record(amount: Msat, fee_cap: Msat) -> MoveRecord {
+        MoveRecord {
+            key: wallet_core::IdempotencyKey("evac:test".into()),
+            from: Some(FED_A),
+            to: FED_B,
+            amount,
+            fee_cap,
+            gateway: GatewayUrl("https://gw.example".into()),
+            send_required: true,
+            invoice: None,
+            recv_op: None,
+            send_op: None,
+            phase: MovePhase::Created,
+            outcome: None,
+            preimage: None,
+            receive_fee_quoted: None,
+            send_fee_quoted: None,
+        }
     }
 }

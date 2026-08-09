@@ -1256,6 +1256,10 @@ fn op_artifact_from_meta(
         leg,
         op_id,
         amount: move_meta.amount,
+        // Carried through verbatim, `None` included: an op committed before the cap was written
+        // into `MoveMeta` has no cap, and reassembly must see that absence (and fall back to the
+        // planned cap) rather than a fabricated zero.
+        fee_cap: move_meta.fee_cap,
         invoice,
     }))
 }
