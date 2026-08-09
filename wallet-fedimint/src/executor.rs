@@ -2225,15 +2225,20 @@ where
         // non-deterministic one simply gets no sizing this pass and retries.
         return Ok(search);
     };
-    // `largest_affordable` is recorded ONLY if this fresh re-quote is still affordable. Its
-    // contract says it names the largest AFFORDABLE amount, and the refusal diagnostics read it
-    // as one — storing an unaffordable sample here would let the structural cause be measured
-    // against a cost the source could never have funded, and told to an operator as a reason to
-    // raise a money knob.
+    // `largest_affordable` is ASSIGNED from this fresh re-quote — set when it is affordable and
+    // CLEARED when it is not. Recording conditionally is not enough: when the fast path was
+    // affordable-but-over-cap it already stored a sample at this same amount (:2195), and a
+    // conditional write would leave that stale sample standing while the fresh quote at the same
+    // amount says the source can no longer fund it. `no_fitting_amount_reason` then measures a
+    // cap trend on a superseded cost and can tell an operator to raise a money knob for what is
+    // really a transient price or balance movement. The freshest evidence about an amount wins,
+    // including when it is negative.
+    //
+    // When `pass1` came from the bisection instead, nothing was recorded at :2195 (that write is
+    // gated on `top_affordable`), so clearing is a no-op and the assignment is still correct.
     let pass1_verdict = combined_verdict(CandidateQuote::Priced(pass1_cost), cap, spendable);
-    if pass1_cost.source_debit() <= spendable {
-        search.largest_affordable = Some((Msat(pass1), pass1_cost));
-    }
+    search.largest_affordable =
+        (pass1_cost.source_debit() <= spendable).then_some((Msat(pass1), pass1_cost));
     // BOTH constraints on the fresh quote, through the one predicate — not the cap alone. This
     // re-quote is not the one the bisection accepted, and the hole is live precisely when it
     // moved: in the `top_affordable` branch the fast path's quote already failed the cap, so
@@ -4444,6 +4449,67 @@ mod tests {
             sightings.get(&449_999).copied().unwrap_or(0) >= 2,
             "449_999 was not re-quoted, so pass 1's admission was never reached and the \
              assertions above prove nothing about it: {sightings:?}"
+        );
+    }
+
+    /// A stale affordable sample must be CLEARED when the fresh re-quote says otherwise.
+    ///
+    /// The fast path records `largest_affordable` when its quote is affordable but over the cap
+    /// (executor.rs, the `top_affordable` branch). `pass1` is then that same amount, and its
+    /// re-quote can come back unfundable. A merely CONDITIONAL record leaves the earlier sample
+    /// standing, and `no_fitting_amount_reason` goes on to measure a cap trend against a cost the
+    /// source can no longer fund — telling an operator to raise `evac_fee_base_msat` for what is
+    /// really a transient price movement.
+    ///
+    /// The pass-1 revalidation test cannot cover this: its fixture makes the fast path
+    /// UNAFFORDABLE in order to reach the bisection, so nothing is ever recorded there.
+    ///
+    /// RED-FIRST against a conditional write instead of an assignment.
+    #[tokio::test]
+    async fn a_stale_affordable_sample_is_cleared_by_an_unaffordable_requote() {
+        use std::cell::Cell;
+        let spendable = Msat(500_000);
+        let desired = Msat(200_000);
+        let calls = Cell::new(0_u32);
+        let quote = |net: Msat| {
+            let n = calls.get();
+            calls.set(n + 1);
+            async move {
+                // Call 0 — the fast path: AFFORDABLE (debit 450_000) but over cap.at(200_000) =
+                // 206_000, so it records `largest_affordable` and falls through with
+                // `top_affordable` true, making `pass1 == desired`.
+                // Call 1+ — the re-quote at that same amount, now unfundable (debit 601_000).
+                let (receive_quote, send_quote) = if n == 0 {
+                    (Msat(125_000), Msat(125_000))
+                } else {
+                    (Msat(1_000), Msat(400_000))
+                };
+                Ok(CandidateQuote::Priced(FreshMoveCost {
+                    invoice_amount: Msat(net.0 + receive_quote.0),
+                    receive_quote,
+                    send_quote,
+                }))
+            }
+        };
+
+        let search = search_evacuation_net(
+            desired,
+            spendable,
+            PILOT_CAP,
+            oscillation_bound(spendable),
+            quote,
+        )
+        .await
+        .expect("no fault");
+
+        assert_eq!(
+            search
+                .largest_affordable
+                .map(|(n, c)| (n.0, c.source_debit().0)),
+            None,
+            "the fast path's sample is superseded by the fresh re-quote at the SAME amount, which \
+             the source cannot fund — leaving it would let the refusal diagnostics measure a cap \
+             trend on a cost that no longer holds"
         );
     }
 
