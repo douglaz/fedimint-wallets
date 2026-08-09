@@ -712,8 +712,9 @@ impl FedimintExecutor {
     /// the wallet could have drained one tick later, defeating the whole point of a flee. Leaving
     /// the intent `Pending` lets the next tick retry once the shortfall clears; a source holding
     /// only sub-minimum dust simply keeps retrying harmlessly (nothing meaningful is stranded).
-    /// A refusal that the analytic slopes prove STRUCTURAL still stays `Retryable`, but says so —
-    /// a silent indefinite retry is not something an operator can act on.
+    /// A refusal the diagnostic finds EVIDENCE for still stays `Retryable`, but says so — a silent
+    /// indefinite retry is not something an operator can act on. Evidence, never proof: the slopes
+    /// are fitted to two samples of a non-monotone fee curve.
     async fn size_fresh_evacuation(
         &self,
         action: &Action,
