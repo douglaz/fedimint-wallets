@@ -41,8 +41,11 @@ const DEFAULT_STANDBY_TARGET: Msat = Msat(100_000_000);
 /// Default per-fed balance cap (ADR-0018): 5M sats (0.05 BTC). Well above the two
 /// targets, so it bounds accumulation without fighting the standing targets.
 const DEFAULT_PER_FED_CAP: Msat = Msat(5_000_000_000);
-/// Default ABSOLUTE per-move fee cap: 50 sats (50_000 msat). Since br-ljj.2 this bounds only
-/// `Evacuate`; funding `Move`s use `DEFAULT_MAX_FEE_BPS_OF_MOVE`. Tighten with `--max-fee`.
+/// Default ABSOLUTE per-move fee cap: 50 sats (50_000 msat). It bounds NO allocator-emitted
+/// action: funding `Move`s use `DEFAULT_MAX_FEE_BPS_OF_MOVE`, and `Evacuate` uses the
+/// `evac_fee_base_msat` + `evac_fee_bps` pair. It survives as the default for the user-initiated
+/// money verbs and as the probe leg cap, which is what `--max-fee` tightens. Saying otherwise
+/// points an operator at a knob that cannot bound an evacuation at all.
 const DEFAULT_MAX_FEE: Msat = Msat(50_000);
 
 /// Default PROPORTIONAL funding-move fee cap: 300 bps (3%) of the amount moved. See

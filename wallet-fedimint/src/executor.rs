@@ -1808,8 +1808,8 @@ fn action_gateway(action: &Action) -> Option<&GatewayUrl> {
 /// routes may be judged against `fee_cap` at that amount.
 ///
 /// False for an `Evacuate` alone: `assemble_record` (and so gateway resolution) runs BEFORE
-/// `size_fresh_evacuation`, which downsizes the drain until the quoted cost fits the absolute
-/// `max_fee` cap. A cap verdict taken at the pre-sizing ask would refuse the evacuation
+/// `size_fresh_evacuation`, which downsizes the drain until the quoted cost fits the evacuation
+/// cap (`evac_fee_base_msat` + `evac_fee_bps` at the delivered net). A cap verdict taken at the pre-sizing ask would refuse the evacuation
 /// (`Retryable`, every tick) without the downsizing search ever running — stranding a dying
 /// federation's balance, which is exactly what that search exists to prevent. Route economics
 /// never gates an evacuation (`wallet-core`'s `evacuate_decision`), and this is where that
@@ -3758,7 +3758,7 @@ mod tests {
     #[test]
     fn a_fresh_evacuation_is_routed_before_its_amount_is_final() {
         // The evacuation ordering trap: `assemble_record` resolves the gateway, and only THEN
-        // does `size_fresh_evacuation` downsize the drain to what fits the absolute `max_fee`.
+        // does `size_fresh_evacuation` downsize the drain to what fits the evacuation cap.
         // A dying fed holding 10_000_000 msat whose destination has 8_000_000 of cap room emits
         // `Evacuate { amount: 8_000_000, fee_cap: max_fee }` — an amount the source CAN afford,
         // so the send dry-run prices it fine and the quote simply lands over the cap. Judging

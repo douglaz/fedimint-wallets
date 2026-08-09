@@ -39,7 +39,8 @@ macro_rules! decision {
 }
 macro_rules! move_action {
     // A funding move's `fee_cap` is PROPORTIONAL (br-ljj.2): it follows from the amount rather
-    // than being the absolute `snapshot.max_fee`, which only `evacuate!` still carries. The
+    // than being the absolute `snapshot.max_fee`, which no allocator-emitted action carries now —
+    // `Evacuate` uses the `evac_fee_base_msat` + `evac_fee_bps` pair. The
     // 4-arg form asserts the preselected route stamped from the pair's `resolved_gateway`.
     ($from:expr, $to:expr, $amount:expr) => { move_action!($from, $to, $amount, None) };
     ($from:expr, $to:expr, $amount:expr, $gateway:expr) => { Action::Move { from: id!($from), to: id!($to), amount: msat!($amount), fee_cap: msat!($amount * GOLDEN_MOVE_BPS as u64 / 10_000), gateway: $gateway } };
@@ -674,8 +675,8 @@ fn evacuation_drained_source_refusal_records_source_figures_without_max_fee() {
     assert_eq!(diag.cap_room, Some(Msat(70_000)));
     assert_eq!(diag.amount, Some(Msat(0)));
     assert_eq!(diag.max_fee, None);
-    // An evacuation sizes off the ABSOLUTE `max_fee`, not the proportional bps, so a bps
-    // figure would not describe this refusal — None (br-nsx).
+    // An evacuation's cap is the `evac_fee_*` pair, not the funding move's proportional bps, so
+    // a bps figure would not describe this refusal — None (br-nsx).
     assert_eq!(diag.max_fee_bps, None);
     assert_eq!(diag.want, None);
     assert_eq!(diag.min_move, None);

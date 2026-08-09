@@ -115,7 +115,9 @@ CAP_HEADROOM=50000     # 50 sat left UNCAPPED in A so it can pay the move's fees
                        # A's balance so A retains enough to cover the grossed-up invoice + send fee
                        # (a full-balance evacuate would be short by exactly the fees). A single tick
                        # therefore drains A to ~CAP_HEADROOM-minus-fees, i.e. ~0.
-MAX_FEE=1000000        # 1000 sat: a generous per-move fee cap so the cap-check never bites on devimint
+MAX_FEE=1000000        # 1000 sat: the ABSOLUTE per-move cap. It does NOT bound the evacuation —
+                       # that uses evac_fee_base_msat + evac_fee_bps — it is the default for the
+                       # user-initiated verbs this smoke also drives (direct-inflow).
 RECV_SLACK=1000        # 1 sat — bounds lnv2 receive-fee-quote under-estimate on B (per the other smokes)
 A_FEE_HEADROOM=50000   # 50 sat — generous upper bound on the TOTAL move fee A pays on top of the move
 
