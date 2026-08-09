@@ -2476,14 +2476,14 @@ where
             _ => String::new(),
         };
         return Ok(format!(
-            "the largest affordable amount {} msat no longer prices at all{gap} (a quote moved \
+            "the largest PROBED affordable amount {} msat no longer prices at all{gap} (a quote moved \
              mid-search; a later tick can succeed)",
             hint.0
         ));
     };
     if high_cost.source_debit() > spendable {
         return Ok(format!(
-            "the largest affordable amount {} msat is no longer fundable ({} msat needed against \
+            "the largest PROBED affordable amount {} msat is no longer fundable ({} msat needed against \
              {} msat spendable; a later tick can succeed)",
             hint.0,
             high_cost.source_debit().0,
@@ -2530,7 +2530,8 @@ where
     // nothing.
     if floor_cost.source_debit() > spendable {
         return Ok(format!(
-            "mixed state: {} msat is affordable and over the cap, but the {} msat protocol \
+            "mixed state: the largest probed affordable {} msat is affordable and over the cap, \
+             but the {} msat protocol \
              minimum is not currently fundable ({} msat needed against {} msat spendable), so \
              there are not two affordable points to measure a trend between; no fee change is \
              recommended on this evidence",
@@ -2551,7 +2552,7 @@ where
         (high_cost.delivered_net(), high_cost.total_fee()),
     ) {
         Some(cause) => Ok(format!(
-            "structural refusal (measured, not proven) — {cause} (largest affordable ask {} msat \
+            "structural refusal (measured, not proven) — {cause} (largest probed affordable ask {} msat \
              delivers {} msat and quotes {} msat of fees against a {} msat cap, both points \
              re-quoted at diagnosis time). NOTE raising evac_fee_base_msat or evac_fee_bps will \
              NOT release THIS evacuation: it carries the cap parameters `decide()` admitted it \
@@ -2569,7 +2570,8 @@ where
         // individual probes failed. Shorten it before extending it.
         None => Ok(format!(
             "the bounded search found no amount satisfying BOTH affordability and the cap, up to \
-             the largest affordable {} msat, and the two points re-quoted at diagnosis time show \
+             the largest PROBED affordable {} msat, and the two points re-quoted at diagnosis \
+             time show \
              no trend indicating a structural cause — which is not the same as there being none, \
              on a fee curve that is not monotone. The refusal may clear on a later quote",
             hint.0

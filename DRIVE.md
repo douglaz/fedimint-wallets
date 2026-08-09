@@ -9,8 +9,8 @@ br-ucq, br-pfc, br-4yz), NOT br-2aa, NOT br-s0e, NOT the production canary.
 **Branch:** `feat/br-evac-cap-enforce-vn6`
 **Pending:** —
 **Gate:** `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
-· last green at `0d1f881` (fmt 0, clippy 0, **780 passed / 0 failed**, EXIT=0)
-· live devimint gate re-run at the SAME commit: EXIT=0
+· last green at the tip below (fmt 0, clippy 0, **789 passed / 0 failed**, EXIT=0)
+· live devimint evacuation gate re-run at the SAME commit: EXIT=0
 
 Supersedes the stranded-move drive, which was stopped for a retrospective and whose scope
 excluded these beads.
@@ -24,16 +24,36 @@ excluded these beads.
   panel, 742 tests, CodeRabbit no actionable comments.
 
 ## Now
-**2/3 `br-evac-cap-enforce-vn6`** — the money change. PR #31, reviewed HEAD `0d1f881`.
-**TEN review rounds. Nine money defects found and fixed, none of which the test suite caught.**
-Both reviewers returned MERGE NOW on the frozen tip, with no P0/P1/P2 code findings.
+**2/3 `br-evac-cap-enforce-vn6`** — the money change. PR #31.
 
-The shape, since the per-round detail lives on the bead: rounds 2–4 each found a different
+**The shape, since per-round detail lives on the bead.** Rounds 2–4 each found a different
 consumer of ONE undefined concept — *which net does the cap bind to* — and round 2's fix caused
 round 4's finding. Round 5 was therefore a DESIGN PASS rather than a fifth patch: every fee cap
 now computes from the **delivered net**, derived on the types that maintain the invariant, and
-`fits_cap`/`combined_verdict` take no caller-supplied amount at all. Rounds 6–10 were that design
-absorbing its stragglers, plus repeated repair of my own test-shape mistakes.
+`fits_cap`/`combined_verdict` take no caller-supplied amount at all.
+
+**Then it happened a second time, and the second time is the more instructive one.** Three
+consecutive rounds each found a different way for ONE cached value to go stale: a conditional
+write, an early return that skipped the write, and pass 2 re-probing the very amount the cache
+named. Each was fixed at its own site. The fourth site would have been found the same way, because
+the defect was never any single write: `no_fitting_amount_reason` measured a fee-vs-cap SLOPE
+between a floor quoted at diagnosis time and a high point quoted earlier during the search, and
+then used that slope to recommend moving a real-money knob. A slope across two epochs is not a
+trend, and no amount of write-site discipline makes two epochs contemporaneous.
+
+The fix (`7167ed8`) deletes the cache rather than guarding it: `largest_affordable` became
+`largest_affordable_hint: Option<Msat>`, carrying an amount and no cost, and the diagnostic quotes
+BOTH points back to back. A stale hint is now harmless by construction. The framing that settled
+it: the execution path already refuses to act on anything but a fresh quote, so holding the
+operator-facing diagnosis to a WEAKER freshness standard than the money path holds itself to was
+the actual defect.
+
+**PANEL HEALTH — the last four rounds were codex-only.** The Claude Fable reviewer produced its
+last verdict at `7167ed8`; three attempts since then failed without reviewing (twice wedged with no
+output for 20–50 minutes, once `error_during_execution` after two turns), including one with a
+deliberately shortened prompt, so it is not prompt size. Those rounds are DEGRADED: one reviewer is
+not a panel, and nothing here should be read as two independent reads. What the single reviewer did
+establish is recorded below.
 
 ### Proven, and by what
 - The cap is evaluated at the delivered net: direct unit tests on `fits_cap` and
@@ -42,6 +62,9 @@ absorbing its stragglers, plus repeated repair of my own test-shape mistakes.
   and `pass_two_revalidates_its_final_requote`, each red against its own guard alone.
 - The reservation cannot overflow a saturating cap: the allocator golden, red with
   "attempt to add with overflow".
+- No fee-knob recommendation can rest on evidence from an earlier epoch: the cached cost is gone
+  from the type, so the property holds structurally rather than by write-site discipline. Each
+  diagnostic guard has its own emitted reason and its own test.
 - The path executes end to end on two live federations including a hair-under delivery: the
   devimint evacuation gate, EXIT=0.
 
@@ -52,6 +75,9 @@ absorbing its stragglers, plus repeated repair of my own test-shape mistakes.
 - The **live gate cannot distinguish the delivered-net basis from the ask basis**: in that
   fixture the two caps differ by 2 msat against ~199_287 msat of headroom, so it passes under
   either. It proves execution, not the basis.
+- **The live gate does not exercise the refusal diagnostics at all.** Every diagnostic change on
+  this branch lives on paths the smoke never enters, because the smoke drives a SUCCESSFUL
+  evacuation. Its green is a regression check, not evidence for those changes.
 - `TestRoute` has no `with_recv_fed_fee`, so **no composed async fixture can produce
   `delivered != ask`** at all. Same owner.
 
@@ -69,7 +95,6 @@ amount, plus runbook and README. Then `br-y2j` closes, which unblocks
 `br-recanary-y2j-ujs`.
 
 ## Open questions for the human
-- none. The live devimint gate is not outstanding: it ran at `b18496c` and exited 0 (see the
-  gate line at the top). What remains from that work is a filed defect, not an open gate —
-  `br-devimint-runbook-mint-na3`, because the runbook's documented invocation omits
-  `FM_ENABLE_MODULE_MINT=1` and every smoke dies at `Primary module not available`.
+- none. `br-devimint-runbook-mint-na3` is a filed defect, not an open gate: the runbook's
+  documented invocation omits `FM_ENABLE_MODULE_MINT=1` and every smoke dies at
+  `Primary module not available` without it.
