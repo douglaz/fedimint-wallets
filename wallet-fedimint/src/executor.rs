@@ -2413,9 +2413,10 @@ where
 /// this whole change exists to kill; a refusal an operator can act on is not.
 ///
 /// BOTH sample points are quoted HERE, back to back, and that is the point of this function's
-/// shape. The trend it measures drives a recommendation to raise `evac_fee_base_msat` or
-/// `evac_fee_bps` — real money knobs — so it must not be computed from a cost cached earlier in
-/// the search: the execution path already refuses to act on anything but a fresh quote (the pass-1
+/// shape. The trend it measures is the operator's evidence that a refusal is structural rather
+/// than incidental — it does NOT recommend changing a knob, because a policy change cannot release
+/// an already-admitted evacuation (see the structural message, and `br-n8o`) — so it must not be
+/// computed from a cost cached earlier in the search: the execution path already refuses to act on anything but a fresh quote (the pass-1
 /// re-quote and the pass-2 revalidation exist because another intent can move the source's note
 /// inventory mid-search), and it would be incoherent to hold the operator-facing diagnosis to a
 /// WEAKER freshness standard than the money path holds itself to.
@@ -2562,10 +2563,12 @@ where
             cap.at(high_cost.delivered_net()).0
         )),
         None => Ok(format!(
-            "the cap refused every probed amount up to the largest affordable {} msat, and the \
-             two points measured show no trend indicating a structural cause — which is not the \
-             same as there being none, on a fee curve this is not monotone; the refusal may clear \
-             on a later quote",
+            "the bounded search found no amount satisfying BOTH affordability and the cap, up to \
+             the largest affordable {} msat. NOT every probed amount was compared with the cap — \
+             some could not be priced or funded at all — and the two points re-quoted at \
+             diagnosis time show no trend indicating a structural cause, which is not the same as \
+             there being none on a fee curve that is not monotone. The refusal may clear on a \
+             later quote",
             hint.0
         )),
     }
@@ -2587,8 +2590,8 @@ where
 /// delivered, not the asks that produced them, and that is load-bearing rather than cosmetic. The
 /// cap is `base + bps*D/10_000`, so `s_c = bps / 10_000` holds exactly against `D` and against
 /// nothing else. Sampling asks makes the measured cap rise overstate the real one by
-/// `bps * Δδ` (δ = ask − delivered), which can flip condition (i) and report a PERMANENT
-/// structural cause — telling an operator to raise a money knob — for an incidental miss:
+/// `bps * Δδ` (δ = ask − delivered), which can flip condition (i) and report a structural cause
+/// for what is an incidental miss:
 ///
 /// (i)  `s_c >= s_f` and the largest AFFORDABLE amount fails the cap (the caller's only route
 ///      here). Feasibility rises with amount, so nothing SMALLER can help.
@@ -4977,6 +4980,56 @@ mod tests {
         assert!(
             reason.contains("no supported way to replace it"),
             "and must say plainly that no replacement path exists yet: {reason}"
+        );
+    }
+
+    /// THE FINAL ARM — both points measured, neither structural condition fires.
+    ///
+    /// The old message said "the cap refused every probed amount", which asserts more than the
+    /// search establishes: probes that came back Unquotable or unfundable were never compared with
+    /// the cap at all, and the floor re-quoted here may even FIT it (as it does in this fixture).
+    /// What `sized == None` actually establishes is that no amount satisfied BOTH constraints.
+    ///
+    /// Fixture arithmetic, so the arm is reached deliberately rather than by luck. `PILOT_CAP` is
+    /// 200_000 + 300 bps, span is 200_000 - 5_000 = 195_000, so `cap_rise == 58_500_000`.
+    ///   * floor (1_000, 1_000): fee 2_000, debit 7_000 — affordable, and it FITS the cap.
+    ///   * high (1_000, 250_000): fee 251_000, debit 451_000 — affordable, and over the 206_000
+    ///     cap, so guard 3 passes and the trend is actually measured.
+    ///   * `fee_rise == (251_000 - 2_000) * 10_000 == 2_490_000_000 > cap_rise`, so condition (i)
+    ///     cannot fire; the intercept is `2_000 - 249_000*5_000/195_000 ≈ -4_384`, far below the
+    ///     200_000 cap base, so condition (ii) cannot either.
+    /// Pass 2 never runs (pass 1's re-quote is Unquotable), so the cheap floor cost is only ever
+    /// the diagnostic's own low-point quote and can never be sized.
+    #[tokio::test]
+    async fn a_measured_pair_with_no_trend_does_not_claim_the_cap_refused_everything() {
+        let reason = size_evacuation(
+            Msat(200_000),
+            Msat(500_000),
+            PILOT_CAP,
+            hint_fixture_with_other(
+                CandidateQuote::Priced(FreshMoveCost {
+                    invoice_amount: Msat(201_000),
+                    receive_quote: Msat(1_000),
+                    send_quote: Msat(250_000),
+                }),
+                (Msat(1_000), Msat(1_000)),
+            ),
+        )
+        .await
+        .expect("no fault");
+        let reason = reason.expect_refused();
+        assert!(
+            reason.contains("no amount satisfying BOTH affordability and the cap"),
+            "the arm must report what the search established: {reason}"
+        );
+        assert!(
+            !reason.contains("the cap refused every probed amount"),
+            "some probes were never cap-compared, and this fixture's floor FITS the cap — \
+             claiming a universal cap refusal sends the operator after the wrong cause: {reason}"
+        );
+        assert!(
+            !reason.contains("structural refusal"),
+            "neither condition fired, so no structural cause may be named: {reason}"
         );
     }
 
