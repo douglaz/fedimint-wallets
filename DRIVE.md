@@ -9,8 +9,11 @@ br-ucq, br-pfc, br-4yz), NOT br-2aa, NOT br-s0e, NOT the production canary.
 **Branch:** `feat/br-evac-cap-enforce-vn6`
 **Pending:** —
 **Gate:** `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
-· last green at the tip below (fmt 0, clippy 0, **789 passed / 0 failed**, EXIT=0)
-· live devimint evacuation gate re-run at the SAME commit: EXIT=0
+· workspace gate green at `1da1981` (fmt 0, clippy 0, **789 passed / 0 failed**, EXIT=0)
+· live devimint evacuation gate green at `0cb6b2e`, EXIT=0 — a DIFFERENT commit, and the two
+  hashes are written out because they diverge. `1da1981` adds no logic: the "probed" qualification
+  on five diagnostic strings, this file, and a bead description. The live gate has run green at
+  seven commits on this branch, and NONE of them exercised the refusal diagnostics (see NOT proven).
 
 Supersedes the stranded-move drive, which was stopped for a retrospective and whose scope
 excluded these beads.
