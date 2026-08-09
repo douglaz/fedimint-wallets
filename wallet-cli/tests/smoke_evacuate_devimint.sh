@@ -202,7 +202,9 @@ fi
 
 # Bound the evacuate BELOW A's balance so A keeps enough for fees: per-fed cap = A0 - headroom, so
 # cap_room(B) = per_fed_cap - B0 = A0 - CAP_HEADROOM, and the allocator's
-# amount = min(A0, cap_room(B)) = A0 - CAP_HEADROOM. That is the exact NET B must end up with.
+# amount = min(A0, cap_room(B)) = A0 - CAP_HEADROOM. That is the net B is ASKED to end up with —
+# the gate below accepts a hair-under settle (RECV_SLACK) and only forbids delivering OVER, so do
+# not tighten this to equality.
 PER_FED_CAP=$(( A0 - CAP_HEADROOM ))
 EXPECTED_EVAC=$PER_FED_CAP   # == cap_room(B) since B starts empty
 

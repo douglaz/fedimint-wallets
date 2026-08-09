@@ -30,9 +30,13 @@ pub struct Policy {
     pub standby_target: Msat,
     /// ABSOLUTE fee cap. It bounds NO action the allocator emits: funding `Move`s use
     /// `max_fee_bps_of_move`, and `Evacuate` uses the `evac_fee_*` pair below.
-    /// **In an evacuation incident this is not the knob to turn** — raise `evac_fee_base_msat`
-    /// or `evac_fee_bps`. It remains load-bearing elsewhere, as the default `fee_cap` for
-    /// user-initiated pay/move/receive and as the probe leg cap, so it is not dead.
+    /// **In an evacuation incident this is not the knob to turn** — the evacuation cap is
+    /// `evac_fee_base_msat` + `evac_fee_bps`. But raising those affects only evacuations DECIDED
+    /// AFTERWARDS: a pending one carries the pair `decide()` admitted it with, and while it keeps
+    /// retrying there is no supported way to replace it (br-n8o). So neither knob releases an
+    /// evacuation already in flight. `max_fee` remains load-bearing elsewhere, as the default
+    /// `fee_cap` for user-initiated pay/move/receive and as the probe leg cap, so it is not
+    /// dead.
     pub max_fee: Msat,
     /// PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
     /// (1..=10000; Policy rejects 0). Replaces the absolute `max_fee` for funding so sizing

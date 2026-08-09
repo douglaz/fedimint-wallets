@@ -787,11 +787,16 @@ impl FedimintExecutor {
                     cap_bps = cap.bps,
                     "executor: no evacuable amount fits — {reason}"
                 );
+                // State the PARAMETERS and let `reason` carry the observed cause. This wrapper
+                // used to assert one — "cannot reserve move fees within source balance under an
+                // evacuation fee cap" — for every refusal, but `Refused` also comes from the
+                // viability post-check, where a candidate has already PASSED affordability and the
+                // cap and fails because the chunk costs more than it delivers. Naming fees and the
+                // cap there sends the operator after relief for a failure that did not happen.
                 return Err(ExecError::Retryable(format!(
-                    "no evacuable amount fits: desired {} msat cannot reserve move fees within \
-                     source balance {} msat under an evacuation fee cap of {} msat + {} bps \
-                     (retrying — a later tick may succeed once in-flight funds settle or the fee \
-                     quote eases); {reason}",
+                    "no evacuable amount fits: desired {} msat, source balance {} msat, \
+                     evacuation fee cap {} msat + {} bps (retrying — a later tick may succeed \
+                     once in-flight funds settle or the quote moves); {reason}",
                     desired.0, spendable.0, cap.base_msat.0, cap.bps
                 )));
             }
@@ -2156,7 +2161,10 @@ struct EvacuationSearch {
 /// TWO PASSES, because a single bisection on the combined predicate is not sufficient (§2c(a)).
 ///
 /// PASS 1 bisects the AFFORDABILITY constraint ALONE over `[MINIMUM_INCOMING_CONTRACT_MSAT, T]`
-/// and then checks the cap at the result. PASS 2 runs only when the cap fails there, and bisects
+/// and then checks BOTH constraints at the result. PASS 2 runs whenever that combined check
+/// fails — which is the cap in the regime this was designed for, but also an affordability miss
+/// when the fresh re-quote moved, so do not rely on "the cap failed" as a premise here. It
+/// bisects
 /// the COMBINED predicate over `[MINIMUM_INCOMING_CONTRACT_MSAT, pass1]` — in the regime that
 /// reaches it, `fee − cap` is increasing in the amount, so the combined predicate really is
 /// fits-then-doesn't and the bottom window is found. Nothing is refused until BOTH fail.
@@ -4386,7 +4394,12 @@ mod tests {
 
     // --- Evacuation fee cap: sizing, enforcement, diagnostics (ADR-0029) ----------------------
     //
-    // Every fixture below runs the PRODUCTION composition: the real §6 gross-up loop
+    // MOST fixtures below run the PRODUCTION composition — but not all, and the exceptions are
+    // deliberate: the direct `fits_cap` / `combined_verdict` tests construct a `FreshMoveCost` by
+    // hand precisely so the predicate is exercised without a search around it. Read each fixture
+    // before citing it as production-path coverage; the driven sites are still unpinned
+    // (br-evac-cap-driven-basis-v07). Where a fixture DOES run the composition it is: the real §6
+    // gross-up loop
     // (`resolve_receive_gross_up`), the real contract floor, the real cost assembly, the real
     // two-pass search and post-check. Only the two answers a live federation would give — the
     // destination's receive tx fee and the source's send-side dry-run — are scripted, which is

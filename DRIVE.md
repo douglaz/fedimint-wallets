@@ -31,8 +31,10 @@ excluded these beads.
 
 **The shape, since per-round detail lives on the bead.** Rounds 2–4 each found a different
 consumer of ONE undefined concept — *which net does the cap bind to* — and round 2's fix caused
-round 4's finding. Round 5 was therefore a DESIGN PASS rather than a fifth patch: every fee cap
-now computes from the **delivered net**, derived on the types that maintain the invariant, and
+round 4's finding. Round 5 was therefore a DESIGN PASS rather than a fifth patch: every ENFORCED
+fee cap now computes from the **delivered net**, derived on the types that maintain the invariant
+(the allocator's PLANNING cap is deliberately at the planned amount — sizing has not run yet — and
+is superseded once it does), and
 `fits_cap`/`combined_verdict` take no caller-supplied amount at all.
 
 **Then it happened a second time, and the second time is the more instructive one.** Three

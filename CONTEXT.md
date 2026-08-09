@@ -104,8 +104,12 @@ What the destination is actually credited: the fixed invoice amount minus the re
 fee quoted against it. Always ≤ the **sized ask**, and strictly less whenever the gross-up
 fixed point settles a verified "hair under". It is a FACT about a specific quote, not a
 plan.
-**Every fee cap is computed from the delivered net**, never from the sized ask — a cap
-computed on an amount nobody received bounds nothing. The two must be derived identically
+**Every ENFORCED fee cap is computed from the delivered net**, never from the sized ask — a cap
+computed on an amount nobody received bounds nothing. "Enforced" is load-bearing: the allocator
+deliberately stamps a PLANNING cap at the planned amount when it decides an evacuation, because
+sizing has not run yet and there is no delivered net to compute from. That planned cap is
+superseded by the recomputed one as soon as sizing runs. Do not "correct" the planning half to the
+delivered net — it cannot be, and the replay design depends on the two being distinct. The two must be derived identically
 everywhere they are compared, or a move can be admitted under one and refused under the
 other after its receive leg has already committed.
 _Avoid_: "executed net" — it reads as the **sized ask** to one reader and the **delivered
