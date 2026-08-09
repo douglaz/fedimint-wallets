@@ -14,7 +14,10 @@
 //! is resume-safe: `assemble_record` reattaches a replayed move to its existing invoice/recv_op/
 //! send_op (the send op-id is deterministic; a re-`pay` returns `AlreadyInFlight`),
 //! so a crash never re-mints or re-pays. `Evacuate` (Phase 3.A) maps to the SAME send-required
-//! plan as `Move` (`MovePlan::from_action`), so it drives the identical validated two-leg path —
+//! plan as `Move` (`MovePlan::from_action`), so it drives the SAME validated two-leg path — not
+//! an identical code path: an evacuation additionally sizes itself, clamps to the destination's
+//! cap room, is exempt from that cap's refusal, keeps its refusals Retryable, and runs a viability
+//! post-check that a funding move does not —
 //! the money engine can now flee a dying federation, not just top up a standby. Do not read
 //! the absence of a happy-path unit test here as untested logic: the pure decisions are
 //! golden-tested above, and the live two-leg drive is exercised by `smoke_move_devimint.sh`
@@ -811,7 +814,8 @@ impl FedimintExecutor {
                 // The cap at the ASK is not what will be enforced — the quote's delivered net
                 // is — but no quote is in hand here. Labelled as the ceiling it is.
                 fee_cap_ceiling_msat = cap.at(amount).0,
-                "executor: reducing fresh evacuation amount to reserve move fees"
+                "executor: reducing fresh evacuation amount to what the source can fund \
+                 within the evacuation cap"
             );
         }
         apply_evacuation_sizing(rec, cap, amount);
@@ -1925,8 +1929,9 @@ where
 }
 
 /// Probe `candidates` in order and return the FIRST that fits, or `None` when none does. The
-/// order is the caller's: nearest boundary first, so the bisection resumes from the closest
-/// verified fit rather than jumping past intermediate ones.
+/// order is the caller's, and this helper imposes none — the production caller supplies them
+/// LARGEST first (see `note_boundaries_above`, which documents why), so "first that fits" means
+/// the largest fitting boundary there, not the nearest.
 async fn first_fitting_boundary<F, Fut>(
     candidates: Vec<u64>,
     probe: &mut F,
@@ -2271,9 +2276,11 @@ where
         return Ok(search);
     }
 
-    // PASS 2 — the cap failed at the largest affordable amount, so any feasible set is a BOTTOM
-    // window. In the INCREASING regime this finds nothing, harmlessly: pass 1 already ruled it
-    // out from above.
+    // PASS 2 — the combined check failed at pass 1's amount, so any feasible set is a BOTTOM
+    // window. Usually that is the cap failing, which is the regime this was designed for; it can
+    // also be an affordability miss when the fresh re-quote moved, so do not rely on "the cap
+    // failed" as a premise. In the INCREASING regime this finds nothing, harmlessly: pass 1
+    // already ruled it out from above.
     let pass2 = largest_fitting_amount(floor, pass1, oscillation, |amount| {
         let quoted = quote(Msat(amount));
         async move { Ok(combined_verdict(quoted.await?, cap, spendable)) }
@@ -2577,8 +2584,9 @@ where
         // what `sized == None` and the two diagnosis-time quotes establish, and nothing about how
         // individual probes failed. Shorten it before extending it.
         None => Ok(format!(
-            "the bounded search found no amount satisfying BOTH affordability and the cap, up to \
-             the largest PROBED affordable {} msat, and the two points re-quoted at diagnosis \
+            "the bounded search produced no amount that still satisfied BOTH affordability and \
+             the cap when re-quoted — pass 2 may have found one and lost it on revalidation — up \
+             to the largest PROBED affordable {} msat, and the two points re-quoted at diagnosis \
              time show \
              no trend indicating a structural cause — which is not the same as there being none, \
              on a fee curve that is not monotone. The refusal may clear on a later quote",
@@ -2711,8 +2719,9 @@ fn ppm_envelope_warning(fees: FreshSendRequiredGatewayFees) -> Option<String> {
     (!out.is_empty()).then(|| {
         format!(
             "gateway advertises an out-of-envelope fee rate: {} — the SDK's fee limits do not \
-             bound the ppm at this pin (PaymentFee compares base first), so only our fee cap \
-             does; the route is NOT refused on this",
+             bound the ppm at this pin (PaymentFee compares base first), and NOTHING here bounds \
+             the RATE: our cap bounds the total quoted fee at the delivered net, which a high rate \
+             reaches sooner at larger amounts. The route is NOT refused on this",
             out.join(", ")
         )
     })
@@ -5037,8 +5046,9 @@ mod tests {
         .expect("no fault");
         let reason = reason.expect_refused();
         assert!(
-            reason.contains("no amount satisfying BOTH affordability and the cap"),
-            "the arm must report what the search established: {reason}"
+            reason.contains("no amount that still satisfied BOTH affordability and the cap"),
+            "the arm must report what the search established — including that pass 2 may have \
+             found an amount and lost it on revalidation, which 'found no amount' denied: {reason}"
         );
         assert!(
             !reason.contains("the cap refused every probed amount"),

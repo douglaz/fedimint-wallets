@@ -85,6 +85,12 @@ establish is recorded below.
   evacuation. Its green is a regression check, not evidence for those changes.
 - `TestRoute` has no `with_recv_fed_fee`, so **no composed async fixture can produce
   `delivered != ask`** at all. Same owner.
+- **The live gate cannot detect a regression to the OLD absolute cap either.** The smoke sets
+  `MAX_FEE=1_000_000` msat while the total move fee it asserts is under 50_000, so an evacuation
+  that went back to sizing off the absolute `max_fee` would still pass it. Owner: `br-vvo`.
+- Two diagnostic branches are unpinned: the arm reached when pass 2 finds an amount and LOSES it on
+  revalidation (its test deliberately avoids pass 2), and the receive-side arm of the ppm envelope
+  warning, despite a test comment claiming "both halves". Owner: `br-vvo`.
 
 ### Two properties a future editor cannot infer from the tests themselves
 - The seam coverage is a property of the **pair**: drift deleting the pass-1 admission would
