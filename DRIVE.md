@@ -5,15 +5,15 @@
 `br-evac-cap-ledger-x9k` (3/3). NOT the wallet-web epic (br-nfz, br-5om, br-t8f,
 br-ucq, br-pfc, br-4yz), NOT br-2aa, NOT br-s0e, NOT the production canary.
 
-**Phase:** HARDEN · **Bead:** `br-evac-cap-enforce-vn6` ·
-**Branch:** `feat/br-evac-cap-enforce-vn6`
+**Phase:** BUILD · **Bead:** `br-evac-cap-ledger-x9k` (3/3) ·
+**Branch:** `feat/br-evac-cap-ledger-x9k`
 **Pending:** —
 **Gate:** `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
-· workspace gate green at `1da1981` (fmt 0, clippy 0, **789 passed / 0 failed**, EXIT=0)
-· live devimint evacuation gate green at `0cb6b2e`, EXIT=0 — a DIFFERENT commit, and the two
-  hashes are written out because they diverge. `1da1981` adds no logic: the "probed" qualification
-  on five diagnostic strings, this file, and a bead description. The live gate has run green at
-  seven commits on this branch, and NONE of them exercised the refusal diagnostics (see NOT proven).
+· workspace gate green on `main` at `e9cc97d` — 2/3's squash-merge — fmt 0, clippy 0,
+  **789 passed / 0 failed**, EXIT=0
+· live devimint evacuation gate green nine consecutive times across 2/3's branch, last at its
+  final pre-merge tree. Those branch SHAs are NOT reachable from `main`: PR #31 was squash-merged,
+  so `e9cc97d` is the only hash a future reader can resolve. Do not cite the branch hashes.
 
 Supersedes the stranded-move drive, which was stopped for a retrospective and whose scope
 excluded these beads.
@@ -27,7 +27,19 @@ excluded these beads.
   panel, 742 tests, CodeRabbit no actionable comments.
 
 ## Now
-**2/3 `br-evac-cap-enforce-vn6`** — the money change. PR #31.
+**3/3 `br-evac-cap-ledger-x9k`** — the ledger must report the cap it ENFORCED and the amount it
+EXECUTED, not the pair it planned. After a clamp the row keeps the planned figures for life, so a
+post-incident audit against `wallet-cli history` validates fees the enforced cap would have refused.
+Seam: `refresh_from_move` (`wallet-fedimint/src/journal.rs`) copies op-ids, gateway and quoted fees
+but neither `fee_cap` nor the amount; `MoveRecord` already carries both.
+
+TWO of its three documentation criteria are ALREADY MET — the bot review on PR #31 pulled that work
+into 2/3, which is where it belonged, since the runbook was wrong the moment enforcement landed.
+Verify before redoing: the runbook's `policy set` sample carries the evac knobs and says `--max-fee`
+does not bound an evacuation, and README describes both caps' shapes, units and ranges.
+
+## Done — 2/3
+**`br-evac-cap-enforce-vn6`** — the money change. Merged as `e9cc97d` (PR #31).
 
 **The shape, since per-round detail lives on the bead.** Rounds 2–4 each found a different
 consumer of ONE undefined concept — *which net does the cap bind to* — and round 2's fix caused
