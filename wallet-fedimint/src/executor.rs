@@ -2562,13 +2562,16 @@ where
             high_cost.total_fee().0,
             cap.at(high_cost.delivered_net()).0
         )),
+        // Every clause here is a CLAIM, and the search keeps no probe history to support most of
+        // the ones prose invites. Four consecutive review rounds found an unsupported assertion in
+        // this message, each introduced while correcting the previous one — so it now says only
+        // what `sized == None` and the two diagnosis-time quotes establish, and nothing about how
+        // individual probes failed. Shorten it before extending it.
         None => Ok(format!(
             "the bounded search found no amount satisfying BOTH affordability and the cap, up to \
-             the largest affordable {} msat. NOT every probed amount was compared with the cap — \
-             some could not be priced or funded at all — and the two points re-quoted at \
-             diagnosis time show no trend indicating a structural cause, which is not the same as \
-             there being none on a fee curve that is not monotone. The refusal may clear on a \
-             later quote",
+             the largest affordable {} msat, and the two points re-quoted at diagnosis time show \
+             no trend indicating a structural cause — which is not the same as there being none, \
+             on a fee curve that is not monotone. The refusal may clear on a later quote",
             hint.0
         )),
     }
@@ -5031,6 +5034,20 @@ mod tests {
             !reason.contains("structural refusal"),
             "neither condition fired, so no structural cause may be named: {reason}"
         );
+        // The search keeps no probe history, so the message may not characterise HOW individual
+        // probes failed. An earlier revision said "some could not be priced or funded at all",
+        // which the code cannot know — every probe may have priced and been fundable while simply
+        // missing the cap.
+        for unsupported in [
+            "could not be priced",
+            "funded at all",
+            "every probed amount",
+        ] {
+            assert!(
+                !reason.contains(unsupported),
+                "no probe history exists to support {unsupported:?}: {reason}"
+            );
+        }
     }
 
     /// PASS 2: its final re-quote must be revalidated too.
