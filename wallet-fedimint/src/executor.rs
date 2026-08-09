@@ -2410,7 +2410,7 @@ where
             // then the final re-quote moved above budget, which is exactly the case that leaves
             // no affordable sample recorded. Saying otherwise sends an operator looking for a
             // balance problem when the balance was fine and the price moved.
-            "no affordable sample remained after the final re-quote (the source may have funds \
+            "no affordable sample remained at the end of the search (the source may have funds \
              in flight, or a quote moved mid-search; a later tick can succeed)"
                 .to_string(),
         );
