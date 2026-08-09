@@ -2464,9 +2464,17 @@ where
     }
 }
 
-/// The structural half of the refusal diagnostic: whether the measured fee trend proves that
+/// The structural half of the refusal diagnostic: whether the measured fee trend is EVIDENCE that
 /// nothing can fit, and which cause to report. `None` when neither condition holds — an incidental
 /// refusal a later quote may clear.
+///
+/// Neither condition proves anything, and both messages say so. Both are two-point measurements on
+/// a fee curve that is explicitly non-monotone (per-note mint fees drop at note-selection
+/// boundaries — the reason the bounded probe exists at all), so both endpoints can miss the cap
+/// while an unprobed middle window serves. ADR-0029:137 reserves the strong claim for an
+/// analytically proven structural refusal and requires probe exhaustion alone to stay `Retryable`;
+/// the caller honors that by returning `Retryable` either way, and this text must not contradict
+/// it. What the operator gets is a measured trend to act on, not a verdict on the route.
 ///
 /// BOTH conditions are needed. `low`/`high` are `(DELIVERED NET, total_fee)` at two real quotes —
 /// delivered, not the asks that produced them, and that is load-bearing rather than cosmetic. The
@@ -2480,8 +2488,10 @@ where
 /// (ii) `s_f >= s_c` and the COMPLETE minimum fixed intercept exceeds the cap's BASE — not the
 ///      gateway bases alone: the intercept also carries the fixed lnv2 federation fees and the
 ///      per-note mint component, so gateway bases UNDER the cap base can still sum with those to
-///      an intercept above it, at which point `fee(a) − cap(a) > 0` at every amount and the gap
-///      only widens. Wording it as "the gateways' bases alone" would report a false cause.
+///      an intercept above it, at which point `fee(a) − cap(a) > 0` at every amount ON THE MEASURED
+///      LINE and the gap only widens. That last qualifier is the honest one: the line is fitted to
+///      two points, so this is the same kind of evidence as (i) and merely stronger, not a global
+///      bound. Wording it as "the gateways' bases alone" would report a false cause.
 ///
 /// Condition (i) alone cannot fire in the livelock case — a low configured cap base with a zero
 /// rate, where the fixed component alone sinks every amount — which is why an earlier revision
@@ -2511,9 +2521,13 @@ fn structural_refusal_cause(
 
     let mut causes = Vec::new();
     if cap_rise >= fee_rise {
-        // NOTE the asymmetry with condition (ii) below, which IS a proof: if the fixed intercept
-        // alone exceeds the cap base then `fee(a) - cap(a) > 0` at every amount, with no sampling
-        // involved. Condition (i) is weaker and its wording now says so.
+        // NEITHER condition is a proof, and an earlier revision of this comment claimed condition
+        // (ii) was one — "with no sampling involved". That was wrong on its own terms: (ii)'s
+        // intercept is EXTRAPOLATED from these very two samples (see the `intercept` line below),
+        // so it inherits exactly the same non-monotonicity caveat. The affine argument it rests on
+        // — intercept over base and `s_f >= s_c` imply `fee(a) - cap(a) > 0` everywhere — holds
+        // for an affine fee, and this fee is explicitly not affine. Both messages now disclose
+        // that; only the STRENGTH of the evidence differs, not its kind.
         //
         // TWO SAMPLES CANNOT PROVE THIS, and the wording no longer pretends otherwise. The fee
         // curve is explicitly non-monotone — per-note mint fees DROP at note-selection
@@ -2536,8 +2550,11 @@ fn structural_refusal_cause(
     if fee_rise >= cap_rise && intercept > i128::from(cap.base_msat.0) && low.1 > cap.at(low.0) {
         causes.push(format!(
             "the fixed component alone — both gateways' bases plus the fixed federation and \
-             per-note mint fees, ~{intercept} msat — exceeds the cap base {} msat, so no amount \
-             can fit at any size",
+             per-note mint fees, ~{intercept} msat — exceeds the cap base {} msat, and the fee \
+             rises at least as fast as the cap, so the gap only widens with size; raise \
+             evac_fee_base_msat. NOTE this intercept is EXTRAPOLATED from the same two samples \
+             on a fee curve that is NOT monotone — evidence, not proof, since a per-note fee drop \
+             at an unprobed boundary can still let an intermediate amount serve",
             cap.base_msat.0
         ));
     }
@@ -5323,6 +5340,17 @@ mod tests {
         assert!(
             !reason.contains("cap's trend"),
             "condition (i) cannot fire here: {reason}"
+        );
+        // ...which makes this an assertion about condition (ii) SPECIFICALLY. Its intercept is
+        // measured from two samples on a curve this module itself calls non-monotone, so the
+        // message must disclose that rather than assert a global bound. ADR-0029:137 reserves the
+        // stronger claim for an analytically proven structural refusal; probe exhaustion alone
+        // "stays `Retryable` and must not mark the route unavailable" — which the caller honors by
+        // returning `Retryable`, and which the operator-facing text must not contradict.
+        assert!(
+            reason.contains("evidence, not proof"),
+            "the two-point intercept must not be reported as a proof that nothing can ever \
+             fit: {reason}"
         );
     }
 
