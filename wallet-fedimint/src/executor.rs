@@ -2448,9 +2448,14 @@ where
     // distinct text is what makes each test a pin on its own branch rather than on the function's
     // general mood.
     let Some(hint) = search.largest_affordable_hint else {
+        // NOT "no amount was ever observed affordable" — that is false. Pass 1 CLEARS the hint
+        // when its fresh re-quote at the same amount is no longer affordable, so an earlier probe
+        // may well have been affordable and then moved above budget. Saying otherwise sends an
+        // operator looking for a balance that was never the problem.
         return Ok(
-            "no amount was ever observed affordable during the search (the source may have \
-                   funds in flight; a later tick can succeed)"
+            "no affordable amount survived to the end of the search (one may have been \
+             affordable earlier and then re-quoted above budget; the source may also have funds \
+             in flight, and a later tick can succeed)"
                 .to_string(),
         );
     };
@@ -2498,10 +2503,21 @@ where
         ));
     }
     let floor = Msat(MINIMUM_INCOMING_CONTRACT_MSAT);
-    let CandidateQuote::Priced(floor_cost) = quote(floor).await? else {
+    let floor_quote = quote(floor).await?;
+    let CandidateQuote::Priced(floor_cost) = floor_quote else {
+        // NOT "the cap refused every probed amount": this quote was never compared with the cap at
+        // all, so claiming a cap refusal asserts something unmeasured. Report what was observed —
+        // the low point cannot be priced, so there is no second point to measure a trend from.
+        let gap = match floor_quote {
+            CandidateQuote::Unquotable {
+                source_shortfall: Some(shortfall),
+            } => format!(", short by {shortfall} msat"),
+            _ => String::new(),
+        };
         return Ok(format!(
-            "the cap refused every probed amount up to the largest affordable {} msat",
-            hint.0
+            "{} msat is affordable and over the cap, but the {} msat protocol minimum does not \
+             price at all{gap}, so there is no second point to measure a trend from",
+            hint.0, floor.0
         ));
     };
     // The slope needs two CURRENTLY affordable points, so an unfundable floor withholds it. What
@@ -2526,8 +2542,8 @@ where
     // Both sample points are DELIVERED nets, not asks. The cap is `base + bps*D/10_000`, so its
     // slope is exactly `bps/10_000` in D — and only in D. Sampling the asks and calling the rise
     // `bps * span` overstates the cap's trend by `bps * Δδ` (δ = ask − delivered), which can flip
-    // condition (i) and assert a PERMANENT structural cause — "raise evac_fee_base_msat" — for an
-    // incidental miss. That is the re-derivation this needed, not a substitution of one number.
+    // condition (i) and assert a structural cause for an incidental miss. That is the
+    // re-derivation this needed, not a substitution of one number.
     match structural_refusal_cause(
         cap,
         (floor_cost.delivered_net(), floor_cost.total_fee()),
@@ -2536,15 +2552,20 @@ where
         Some(cause) => Ok(format!(
             "structural refusal (measured, not proven) — {cause} (largest affordable ask {} msat \
              delivers {} msat and quotes {} msat of fees against a {} msat cap, both points \
-             re-quoted at diagnosis time)",
+             re-quoted at diagnosis time). NOTE raising evac_fee_base_msat or evac_fee_bps will \
+             NOT release THIS evacuation: it carries the cap parameters `decide()` admitted it \
+             with, and a policy change only affects evacuations decided afterwards. While this \
+             one keeps retrying there is currently no supported way to replace it",
             hint.0,
             high_cost.delivered_net().0,
             high_cost.total_fee().0,
             cap.at(high_cost.delivered_net()).0
         )),
         None => Ok(format!(
-            "the cap refused every probed amount up to the largest affordable {} msat, without a \
-             structural cause — the refusal may clear on a later quote",
+            "the cap refused every probed amount up to the largest affordable {} msat, and the \
+             two points measured show no trend indicating a structural cause — which is not the \
+             same as there being none, on a fee curve this is not monotone; the refusal may clear \
+             on a later quote",
             hint.0
         )),
     }
@@ -2624,10 +2645,10 @@ fn structural_refusal_cause(
         // a complete boundary proof or a global bound is what would license the stronger claim,
         // and neither is computed here.
         causes.push(
-            "the cap's trend across the two amounts probed rises no faster than the fee's, so \
-             nothing SMALLER is likely to fit either; raise evac_fee_base_msat or evac_fee_bps. \
-             NOTE this is a two-point measurement on a fee curve that is NOT monotone — evidence, \
-             not proof, since an unprobed amount between them may still serve"
+            "the FEE rises no faster than the CAP across the two amounts probed, so nothing \
+             SMALLER is likely to fit either. NOTE this is a two-point measurement on a fee curve \
+             that is NOT monotone — evidence, not proof, since an unprobed amount between them \
+             may still serve"
                 .to_string(),
         );
     }
@@ -2638,8 +2659,7 @@ fn structural_refusal_cause(
             "the fixed component alone — both gateways' bases plus the fixed federation and \
              per-note mint fees, ~{intercept} msat — exceeds the cap base {} msat, and the fee \
              rises at least as fast as the cap, so ON THE SAMPLED LINE the gap only widens with \
-             size; raise \
-             evac_fee_base_msat. NOTE this intercept is EXTRAPOLATED from the same two samples \
+             size. NOTE this intercept is EXTRAPOLATED from the same two samples \
              on a fee curve that is NOT monotone — evidence, not proof, since a per-note fee drop \
              at an unprobed boundary can still let an intermediate amount serve",
             cap.base_msat.0
@@ -4831,6 +4851,135 @@ mod tests {
         );
     }
 
+    /// GUARD 0 — nothing affordable survived the search.
+    ///
+    /// The message must NOT say no amount was ever observed affordable: pass 1 CLEARS the hint
+    /// when its fresh re-quote at the same amount is unaffordable, so an earlier probe may have
+    /// been affordable and then moved above budget. The old wording sent an operator after a
+    /// balance that was never the problem.
+    #[tokio::test]
+    async fn no_surviving_affordable_amount_does_not_claim_none_was_ever_seen() {
+        use std::cell::Cell;
+        let calls = Cell::new(0_u32);
+        // Call 0 at the ask: affordable (debit 450_000) but over cap, so the hint is recorded and
+        // `pass1 == desired`. Call 1+: the same amount is no longer fundable (debit 601_000), so
+        // pass 1's assignment CLEARS the hint and the diagnostic runs with none.
+        let quote = move |net: Msat| {
+            let n = calls.get();
+            calls.set(n + 1);
+            let (receive_quote, send_quote) = if n == 0 {
+                (Msat(125_000), Msat(125_000))
+            } else {
+                (Msat(1_000), Msat(400_000))
+            };
+            std::future::ready(Ok(CandidateQuote::Priced(FreshMoveCost {
+                invoice_amount: Msat(net.0 + receive_quote.0),
+                receive_quote,
+                send_quote,
+            })))
+        };
+        let reason = size_evacuation(Msat(200_000), Msat(500_000), PILOT_CAP, quote)
+            .await
+            .expect("no fault");
+        let reason = reason.expect_refused();
+        assert_recommends_no_fee_change(reason);
+        assert!(
+            reason.contains("no affordable amount survived"),
+            "expected the survival wording: {reason}"
+        );
+        assert!(
+            !reason.contains("was ever observed affordable"),
+            "one WAS observed affordable and then re-quoted above budget; claiming otherwise \
+             misdirects the operator: {reason}"
+        );
+    }
+
+    /// GUARD 5 — the FLOOR no longer prices.
+    ///
+    /// The old message said "the cap refused every probed amount", but this quote was never
+    /// compared with the cap at all, so that asserted something unmeasured. It must report the
+    /// measured fact and carry the mint's shortfall.
+    #[tokio::test]
+    async fn an_unpriceable_floor_does_not_claim_the_cap_refused_it() {
+        use std::cell::Cell;
+        let desired_hits = Cell::new(0_u32);
+        let quote = move |net: Msat| {
+            if net.0 != 200_000 {
+                // The floor cannot be priced at all.
+                return std::future::ready(Ok(CandidateQuote::Unquotable {
+                    source_shortfall: Some(7_777),
+                }));
+            }
+            let n = desired_hits.get();
+            desired_hits.set(n + 1);
+            std::future::ready(Ok(match n {
+                // Affordable and over cap, so the hint is set and pass 1 hands off to the
+                // diagnostic; the third answer keeps the high point affordable and over cap so
+                // the floor is the only thing left to check.
+                1 => CandidateQuote::Unquotable {
+                    source_shortfall: Some(101_000),
+                },
+                _ => CandidateQuote::Priced(FreshMoveCost {
+                    invoice_amount: Msat(325_000),
+                    receive_quote: Msat(125_000),
+                    send_quote: Msat(125_000),
+                }),
+            }))
+        };
+        let reason = size_evacuation(Msat(200_000), Msat(500_000), PILOT_CAP, quote)
+            .await
+            .expect("no fault");
+        let reason = reason.expect_refused();
+        assert_recommends_no_fee_change(reason);
+        assert!(
+            reason.contains("does not price at all"),
+            "expected the measured fact about the floor: {reason}"
+        );
+        assert!(
+            reason.contains("short by 7777 msat"),
+            "the mint measured the floor's gap; it must reach the operator: {reason}"
+        );
+        assert!(
+            !reason.contains("cap refused every probed amount"),
+            "the floor was never compared with the cap, so no cap refusal may be claimed of \
+             it: {reason}"
+        );
+    }
+
+    /// A structural refusal must NOT promise that raising a fee knob releases THIS evacuation.
+    ///
+    /// It cannot. The pending `Action` carries the `(base, bps)` pair `decide()` admitted it with
+    /// and the executor recomputes from those, so a policy change only reaches evacuations decided
+    /// afterwards. Meanwhile the refusal stays `Retryable`, nothing terminalizes it, and watch
+    /// skips ticks while retryable work remains — so the intent retries the old cap indefinitely
+    /// and no fresh decision is ever taken. An operator following the old advice would believe
+    /// they had released stranded funds.
+    ///
+    /// Owner for the missing mechanism: `br-n8o` (no operator action releases a structural
+    /// refusal) and `br-p93` (one retryable intent suppresses ticks for every federation).
+    #[tokio::test]
+    async fn a_structural_refusal_says_a_policy_change_will_not_release_this_evacuation() {
+        let route = TestRoute::new(gw(49_000, 2_500), gw(99_000, 2_500));
+        let cap = EvacFeeCap {
+            base_msat: Msat(100_000),
+            bps: 0,
+        };
+        let reason = route.size(Msat(75_000_000), Msat(75_000_000), cap).await;
+        let reason = reason.expect_refused();
+        assert!(
+            reason.contains("structural refusal"),
+            "fixture must reach the structural diagnostic: {reason}"
+        );
+        assert!(
+            reason.contains("will NOT release THIS evacuation"),
+            "the recommendation must not promise an action that cannot work: {reason}"
+        );
+        assert!(
+            reason.contains("no supported way to replace it"),
+            "and must say plainly that no replacement path exists yet: {reason}"
+        );
+    }
+
     /// PASS 2: its final re-quote must be revalidated too.
     ///
     /// Reaching pass 2 at all requires pass 1 to FAIL THE CAP at the largest affordable amount —
@@ -5561,7 +5710,7 @@ mod tests {
         // With a ZERO cap rate the cap-trend condition CANNOT fire, which is exactly why the
         // intercept condition has to exist.
         assert!(
-            !reason.contains("cap's trend"),
+            !reason.contains("the FEE rises no faster than the CAP"),
             "condition (i) cannot fire here: {reason}"
         );
         // ...which makes this an assertion about condition (ii) SPECIFICALLY. Its intercept is
@@ -5656,8 +5805,10 @@ mod tests {
                     "a refusal here must carry the diagnostic: {reason}"
                 );
                 assert!(
-                    reason.contains("cap's trend"),
-                    "and must name the cap trend: {reason}"
+                    reason.contains("the FEE rises no faster than the CAP"),
+                    "and must name the measured trend, in the direction the condition actually \
+                     tests — `cap_rise >= fee_rise` means the CAP rises at least as fast, which \
+                     is what makes 'nothing smaller helps' follow: {reason}"
                 );
             }
         }
