@@ -9,7 +9,7 @@ br-ucq, br-pfc, br-4yz), NOT br-2aa, NOT br-s0e, NOT the production canary.
 **Branch:** `feat/br-evac-cap-enforce-vn6`
 **Pending:** —
 **Gate:** `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
-· last green at `b18496c` (fmt 0, clippy 0, **777 passed / 0 failed**, EXIT=0)
+· last green at `0547cc9` (fmt 0, clippy 0, **779 passed / 0 failed**, EXIT=0)
 · live devimint gate re-run at the SAME commit: EXIT=0
 
 Supersedes the stranded-move drive, which was stopped for a retrospective and whose scope
