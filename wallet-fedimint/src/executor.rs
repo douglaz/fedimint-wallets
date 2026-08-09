@@ -4353,7 +4353,7 @@ mod tests {
         // driven quote stream. An earlier version of this test "covered" viability by asserting
         // `500_000 > 449_918` on its own literals, which called no production code and stayed
         // green against the ask-based version. That is the exact vacuity this suite exists to
-        // refuse, so it is deleted rather than left reading as coverage. `br-4yz`'s harness is
+        // refuse, so it is deleted rather than left reading as coverage. `br-evac-cap-driven-basis-v07` owns that fixture;
         // where the driven fixture belongs.
     }
 
