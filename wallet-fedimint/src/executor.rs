@@ -2223,6 +2223,17 @@ where
     let CandidateQuote::Priced(pass1_cost) = quote(Msat(pass1)).await? else {
         // A deterministic quote stream cannot un-price an amount it just priced; a
         // non-deterministic one simply gets no sizing this pass and retries.
+        //
+        // CLEAR THE SAMPLE ON THE WAY OUT, for the same reason the assignment below exists: an
+        // amount that will not price at all is fresh NEGATIVE evidence about that amount, and it
+        // supersedes the fast path's earlier sample at :2195 exactly as an unaffordable re-quote
+        // does. This is the MORE likely of the two paths in production, not the exotic one — the
+        // send-side dry-run reports a source that cannot fund the candidate as `Unquotable`
+        // (:968), not as a priced cost over `spendable`, so "the balance moved under us" arrives
+        // here rather than at the assignment. Returning without clearing would let
+        // `no_fitting_amount_reason` measure a cap trend against a cost nothing can currently
+        // quote, and recommend raising a money knob for a transient movement.
+        search.largest_affordable = None;
         return Ok(search);
     };
     // `largest_affordable` is ASSIGNED from this fresh re-quote — set when it is affordable and
@@ -4510,6 +4521,73 @@ mod tests {
             "the fast path's sample is superseded by the fresh re-quote at the SAME amount, which \
              the source cannot fund — leaving it would let the refusal diagnostics measure a cap \
              trend on a cost that no longer holds"
+        );
+    }
+
+    /// The SIBLING arm of the same property: a re-quote that does not price at all also clears.
+    ///
+    /// This is the path that actually carries the case in production. When the source cannot fund
+    /// a candidate, the send-side dry-run fails with the mint's `InsufficientBalanceError` and the
+    /// quote is reported `Unquotable` (executor.rs, `insufficient_balance_shortfall`) — NOT as a
+    /// `Priced` cost whose `source_debit` exceeds `spendable`. So "the balance moved under us"
+    /// reaches the `Unquotable` early return, which used to `return` before the clearing
+    /// assignment, and the stale fast-path sample survived into `no_fitting_amount_reason`.
+    ///
+    /// Fixing only the `Priced` arm therefore fixed the narrower half of the defect and left the
+    /// likelier half standing, which is why this pair exists rather than one test.
+    ///
+    /// RED-FIRST against the unconditional early return: `left: Some((200000, 450000))`.
+    #[tokio::test]
+    async fn a_stale_affordable_sample_is_cleared_by_an_unquotable_requote() {
+        use std::cell::Cell;
+        let spendable = Msat(500_000);
+        let desired = Msat(200_000);
+        let calls = Cell::new(0_u32);
+        let quote = |net: Msat| {
+            let n = calls.get();
+            calls.set(n + 1);
+            async move {
+                // Call 0 — the fast path: AFFORDABLE (debit 450_000) but over cap.at(200_000) =
+                // 206_000, so it records `largest_affordable` and falls through with
+                // `top_affordable` true, making `pass1 == desired` and call 1 the re-quote.
+                if n == 0 {
+                    let (receive_quote, send_quote) = (Msat(125_000), Msat(125_000));
+                    return Ok(CandidateQuote::Priced(FreshMoveCost {
+                        invoice_amount: Msat(net.0 + receive_quote.0),
+                        receive_quote,
+                        send_quote,
+                    }));
+                }
+                // Call 1 — the re-quote at that SAME amount no longer prices: the mint measured
+                // the source 101_000 msat short of the probed outgoing contract.
+                Ok(CandidateQuote::Unquotable {
+                    source_shortfall: Some(101_000),
+                })
+            }
+        };
+
+        let search = search_evacuation_net(
+            desired,
+            spendable,
+            PILOT_CAP,
+            oscillation_bound(spendable),
+            quote,
+        )
+        .await
+        .expect("no fault");
+
+        assert_eq!(
+            search
+                .largest_affordable
+                .map(|(n, c)| (n.0, c.source_debit().0)),
+            None,
+            "an amount that will not price at all is fresh negative evidence about that amount, \
+             and supersedes the fast path's sample exactly as an unaffordable re-quote does — \
+             this is the arm insufficient balance actually takes in production"
+        );
+        assert_eq!(
+            search.sized, None,
+            "nothing sized: the re-quote was unquotable"
         );
     }
 
