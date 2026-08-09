@@ -4434,11 +4434,16 @@ mod tests {
         // And prove the seam was actually REACHED: the final re-quote is a SECOND sighting of the
         // amount pass 1 settled on. Without this the two assertions above are satisfied by a
         // search that never got there.
+        // Prove the seam was REACHED, by the amount pass 1 actually settles on — not by "some
+        // amount somewhere was quoted twice", which is satisfied incidentally: the fast path and
+        // the bisection both probe 450_000, so that weaker form passes whether or not the final
+        // re-quote ever runs. 449_999 is what the bisection returns here, and its SECOND sighting
+        // is the re-quote at the admission this test is named for.
         let sightings = seen.borrow();
         assert!(
-            sightings.values().any(|&n| n >= 2),
-            "no amount was quoted twice — pass 1's final re-quote never happened, so this test \
-             asserts nothing about the admission it is named for: {sightings:?}"
+            sightings.get(&449_999).copied().unwrap_or(0) >= 2,
+            "449_999 was not re-quoted, so pass 1's admission was never reached and the \
+             assertions above prove nothing about it: {sightings:?}"
         );
     }
 
@@ -4500,10 +4505,12 @@ mod tests {
             None,
             "pass 2's final re-quote is unaffordable, so nothing may be sized on it"
         );
+        // Same, for the amount pass 2 settles on. The weaker "any amount twice" form is
+        // satisfied by the pass-1 probes that precede this and proves nothing here.
         let sightings = seen.borrow();
         assert!(
-            sightings.values().any(|&n| n >= 2),
-            "no amount was quoted twice — pass 2's final re-quote never happened: {sightings:?}"
+            sightings.get(&339_997).copied().unwrap_or(0) >= 2,
+            "339_997 was not re-quoted, so pass 2's admission was never reached: {sightings:?}"
         );
     }
 
