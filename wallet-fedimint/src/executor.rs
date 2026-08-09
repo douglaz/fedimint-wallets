@@ -2134,10 +2134,20 @@ enum EvacuationSizing {
 struct EvacuationSearch {
     /// The largest probed net that fits BOTH affordability and the cap, with its quoted cost.
     sized: Option<(Msat, FreshMoveCost)>,
-    /// The largest probed net the SOURCE can afford, cap ignored — pass 1's own result. The
-    /// structural-refusal diagnostic needs it: its first condition is about the cap failing AT
-    /// the largest affordable amount.
-    largest_affordable: Option<(Msat, FreshMoveCost)>,
+    /// The largest probed net the SOURCE could afford, cap ignored — pass 1's own result. A HINT
+    /// ONLY: which amount the refusal diagnostic should re-quote as its high point.
+    ///
+    /// It deliberately carries NO cost. An earlier revision cached the `FreshMoveCost` here and
+    /// three separate review rounds found three different ways for that cost to go stale before
+    /// the diagnostic read it — a conditional write, an early return that skipped the write, and
+    /// pass 2 re-probing this very amount without refreshing it. Each was fixed at its own site,
+    /// and the fourth site would have been found the same way, because the defect was never any
+    /// one write: `structural_refusal_cause` measured a fee-vs-cap SLOPE between a floor quoted at
+    /// diagnosis time and a high point quoted during the search. A slope across two epochs is not
+    /// a trend, and a perfectly maintained cache is still the wrong epoch. So the cost is gone and
+    /// the diagnostic quotes BOTH points back to back; a stale AMOUNT is then harmless by
+    /// construction, because the re-quote either confirms it or degrades to the transient message.
+    largest_affordable_hint: Option<Msat>,
 }
 
 /// TWO PASSES, because a single bisection on the combined predicate is not sufficient (§2c(a)).
@@ -2180,7 +2190,7 @@ where
     let floor = MINIMUM_INCOMING_CONTRACT_MSAT;
     let mut search = EvacuationSearch {
         sized: None,
-        largest_affordable: None,
+        largest_affordable_hint: None,
     };
     // FAST PATH: the full ask, which is what an evacuation wants whenever the source can fund it.
     // It runs BEFORE the floor check on purpose. `floor` bounds the BISECTION RANGE, not
@@ -2192,7 +2202,7 @@ where
     let top_affordable = top.affordability(spendable).fits;
     if let CandidateQuote::Priced(cost) = top {
         if top_affordable {
-            search.largest_affordable = Some((desired, cost));
+            search.largest_affordable_hint = Some(desired);
             if fits_cap(cost, cap) {
                 search.sized = Some((desired, cost));
                 return Ok(search);
@@ -2222,34 +2232,21 @@ where
     };
     let CandidateQuote::Priced(pass1_cost) = quote(Msat(pass1)).await? else {
         // A deterministic quote stream cannot un-price an amount it just priced; a
-        // non-deterministic one simply gets no sizing this pass and retries.
-        //
-        // CLEAR THE SAMPLE ON THE WAY OUT, for the same reason the assignment below exists: an
-        // amount that will not price at all is fresh NEGATIVE evidence about that amount, and it
-        // supersedes the fast path's earlier sample at :2195 exactly as an unaffordable re-quote
-        // does. This is the MORE likely of the two paths in production, not the exotic one — the
-        // send-side dry-run reports a source that cannot fund the candidate as `Unquotable`
-        // (:968), not as a priced cost over `spendable`, so "the balance moved under us" arrives
-        // here rather than at the assignment. Returning without clearing would let
-        // `no_fitting_amount_reason` measure a cap trend against a cost nothing can currently
-        // quote, and recommend raising a money knob for a transient movement.
-        search.largest_affordable = None;
+        // non-deterministic one simply gets no sizing this pass and retries. The hint may now name
+        // an amount that will not price — which is harmless, and deliberately not special-cased
+        // here: the diagnostic re-quotes it and degrades to its transient message. An earlier
+        // revision cleared a cached COST on this path because leaving it let a stale cost reach
+        // the trend measurement; with no cost cached there is nothing to go stale.
         return Ok(search);
     };
-    // `largest_affordable` is ASSIGNED from this fresh re-quote — set when it is affordable and
-    // CLEARED when it is not. Recording conditionally is not enough: when the fast path was
-    // affordable-but-over-cap it already stored a sample at this same amount (:2195), and a
-    // conditional write would leave that stale sample standing while the fresh quote at the same
-    // amount says the source can no longer fund it. `no_fitting_amount_reason` then measures a
-    // cap trend on a superseded cost and can tell an operator to raise a money knob for what is
-    // really a transient price or balance movement. The freshest evidence about an amount wins,
-    // including when it is negative.
-    //
-    // When `pass1` came from the bisection instead, nothing was recorded at :2195 (that write is
-    // gated on `top_affordable`), so clearing is a no-op and the assignment is still correct.
+    // ASSIGN the hint from this fresh re-quote — set when affordable, cleared when not. With only
+    // an amount stored this is no longer load-bearing for correctness (the diagnostic re-quotes
+    // whatever it names), but it still points at the better amount, and pass 2 below can move the
+    // truth again without touching it. That last part is exactly why no write site here can be
+    // trusted to keep a COST honest, and why none is asked to.
     let pass1_verdict = combined_verdict(CandidateQuote::Priced(pass1_cost), cap, spendable);
-    search.largest_affordable =
-        (pass1_cost.source_debit() <= spendable).then_some((Msat(pass1), pass1_cost));
+    search.largest_affordable_hint =
+        (pass1_cost.source_debit() <= spendable).then_some(Msat(pass1));
     // BOTH constraints on the fresh quote, through the one predicate — not the cap alone. This
     // re-quote is not the one the bisection accepted, and the hole is live precisely when it
     // moved: in the `top_affordable` branch the fast path's quote already failed the cap, so
@@ -2402,17 +2399,37 @@ where
     let search = search_evacuation_net(desired, spendable, cap, oscillation, &mut quote).await?;
     let Some(sized) = search.sized else {
         return Ok(EvacuationSizing::Refused(
-            no_fitting_amount_reason(cap, &search, &mut quote).await?,
+            no_fitting_amount_reason(cap, spendable, &search, &mut quote).await?,
         ));
     };
     evacuation_viability(sized, spendable, cap, oscillation, &mut quote).await
 }
 
-/// Why the search found nothing, and — when the measured slopes prove it — that the refusal is
-/// STRUCTURAL rather than incidental. A silent indefinite retry is the failure this whole change
-/// exists to kill; a refusal an operator can act on is not.
+/// Why the search found nothing, and — when two freshly quoted points give EVIDENCE for it — that
+/// the refusal looks structural rather than incidental. A silent indefinite retry is the failure
+/// this whole change exists to kill; a refusal an operator can act on is not.
+///
+/// BOTH sample points are quoted HERE, back to back, and that is the point of this function's
+/// shape. The trend it measures drives a recommendation to raise `evac_fee_base_msat` or
+/// `evac_fee_bps` — real money knobs — so it must not be computed from a cost cached earlier in
+/// the search: the execution path already refuses to act on anything but a fresh quote (the pass-1
+/// re-quote and the pass-2 revalidation exist because another intent can move the source's note
+/// inventory mid-search), and it would be incoherent to hold the operator-facing diagnosis to a
+/// WEAKER freshness standard than the money path holds itself to.
+///
+/// This is one diagnosis EPOCH, not an atomic snapshot: the two quotes are separate dry-runs and
+/// inventory can still move between them. That is the same freshness class the pass-2 revalidation
+/// already accepts as sufficient, and it is the best available — which is exactly why the emitted
+/// text says "evidence, not proof" rather than claiming a global bound.
+///
+/// Re-quoting can SUPPRESS a true structural warning for one tick, when the condition is real but
+/// the quote dips at diagnosis time. That is the correct direction to fail: the refusal stays
+/// `Retryable`, so a persistent condition reproduces on the next tick, whereas the cached-cost
+/// version could emit a FALSE recommendation to move a money knob — a delayed true positive beats
+/// a false one that drives operator action.
 async fn no_fitting_amount_reason<F, Fut>(
     cap: EvacFeeCap,
+    spendable: Msat,
     search: &EvacuationSearch,
     mut quote: F,
 ) -> Result<String, ExecError>
@@ -2420,24 +2437,52 @@ where
     F: FnMut(Msat) -> Fut,
     Fut: std::future::Future<Output = Result<CandidateQuote, ExecError>>,
 {
-    let Some((affordable_net, affordable_cost)) = search.largest_affordable else {
-        return Ok(
-            // NOT "no probed amount was affordable" — an earlier probe may well have been, and
-            // then the final re-quote moved above budget, which is exactly the case that leaves
-            // no affordable sample recorded. Saying otherwise sends an operator looking for a
-            // balance problem when the balance was fine and the price moved.
-            "no affordable sample remained at the end of the search (the source may have funds \
-             in flight, or a quote moved mid-search; a later tick can succeed)"
-                .to_string(),
-        );
+    // The transient explanation, used by every path below that cannot establish a CURRENT trend.
+    // NOT "no probed amount was affordable" — an earlier probe may well have been, and then a
+    // re-quote moved above budget. Saying otherwise sends an operator looking for a balance
+    // problem when the balance was fine and the price moved.
+    let transient = "no affordable sample held up at the end of the search (the source may have \
+                     funds in flight, or a quote moved mid-search; a later tick can succeed)"
+        .to_string();
+    let Some(hint) = search.largest_affordable_hint else {
+        return Ok(transient);
     };
     let floor = Msat(MINIMUM_INCOMING_CONTRACT_MSAT);
     let CandidateQuote::Priced(floor_cost) = quote(floor).await? else {
         return Ok(format!(
             "the cap refused every probed amount up to the largest affordable {} msat",
-            affordable_net.0
+            hint.0
         ));
     };
+    // A source that cannot fund even the protocol minimum has a BALANCE problem, and the trend
+    // below would answer it with "raise evac_fee_base_msat" — precisely the wrong lever. Both
+    // sample points must be currently affordable before any fee-knob recommendation is made.
+    if floor_cost.source_debit() > spendable {
+        return Ok(format!(
+            "the source cannot currently fund even the {} msat protocol minimum ({} msat needed \
+             against {} msat spendable) — a balance condition, not a fee-cap one, so no fee-knob \
+             change is recommended",
+            floor.0,
+            floor_cost.source_debit().0,
+            spendable.0
+        ));
+    }
+    // The high point, quoted NOW rather than read from the search. Anything other than a currently
+    // priced, currently affordable, still-over-cap quote means the search's refusal no longer
+    // describes the present, and no trend may be reported off it.
+    let CandidateQuote::Priced(high_cost) = quote(hint).await? else {
+        return Ok(transient);
+    };
+    if high_cost.source_debit() > spendable {
+        return Ok(transient);
+    }
+    // The high point now FITS the cap: the refusal itself has gone stale, and a later tick will
+    // simply succeed. Report that, and do NOT try to salvage a sizing from it — this function
+    // returns a diagnostic string, and sizing from the refusal path would be new money handling
+    // in the one place built on the assumption that nothing is being committed.
+    if fits_cap(high_cost, cap) {
+        return Ok(transient);
+    }
     // Both sample points are DELIVERED nets, not asks. The cap is `base + bps*D/10_000`, so its
     // slope is exactly `bps/10_000` in D — and only in D. Sampling the asks and calling the rise
     // `bps * span` overstates the cap's trend by `bps * Δδ` (δ = ask − delivered), which can flip
@@ -2446,20 +2491,21 @@ where
     match structural_refusal_cause(
         cap,
         (floor_cost.delivered_net(), floor_cost.total_fee()),
-        (affordable_cost.delivered_net(), affordable_cost.total_fee()),
+        (high_cost.delivered_net(), high_cost.total_fee()),
     ) {
         Some(cause) => Ok(format!(
-            "structural refusal — {cause} (largest affordable ask {} msat delivers {} msat and \
-             quotes {} msat of fees against a {} msat cap)",
-            affordable_net.0,
-            affordable_cost.delivered_net().0,
-            affordable_cost.total_fee().0,
-            cap.at(affordable_cost.delivered_net()).0
+            "structural refusal (measured, not proven) — {cause} (largest affordable ask {} msat \
+             delivers {} msat and quotes {} msat of fees against a {} msat cap, both points \
+             re-quoted at diagnosis time)",
+            hint.0,
+            high_cost.delivered_net().0,
+            high_cost.total_fee().0,
+            cap.at(high_cost.delivered_net()).0
         )),
         None => Ok(format!(
             "the cap refused every probed amount up to the largest affordable {} msat, without a \
              structural cause — the refusal may clear on a later quote",
-            affordable_net.0
+            hint.0
         )),
     }
 }
@@ -2551,7 +2597,8 @@ fn structural_refusal_cause(
         causes.push(format!(
             "the fixed component alone — both gateways' bases plus the fixed federation and \
              per-note mint fees, ~{intercept} msat — exceeds the cap base {} msat, and the fee \
-             rises at least as fast as the cap, so the gap only widens with size; raise \
+             rises at least as fast as the cap, so ON THE SAMPLED LINE the gap only widens with \
+             size; raise \
              evac_fee_base_msat. NOTE this intercept is EXTRAPOLATED from the same two samples \
              on a fee curve that is NOT monotone — evidence, not proof, since a per-note fee drop \
              at an unprobed boundary can still let an intermediate amount serve",
@@ -4458,11 +4505,9 @@ mod tests {
             "the moved re-quote is unaffordable, so nothing may be sized on it"
         );
         assert_eq!(
-            search
-                .largest_affordable
-                .map(|(n, c)| (n.0, c.source_debit().0)),
+            search.largest_affordable_hint.map(|n| n.0),
             None,
-            "and the unaffordable sample must not be recorded for the diagnostics either"
+            "and the unaffordable re-quote must clear the hint for the diagnostics too"
         );
         // And prove the seam was actually REACHED: the final re-quote is a SECOND sighting of the
         // amount pass 1 settled on. Without this the two assertions above are satisfied by a
@@ -4531,80 +4576,146 @@ mod tests {
         .expect("no fault");
 
         assert_eq!(
-            search
-                .largest_affordable
-                .map(|(n, c)| (n.0, c.source_debit().0)),
+            search.largest_affordable_hint.map(|n| n.0),
             None,
-            "the fast path's sample is superseded by the fresh re-quote at the SAME amount, which \
-             the source cannot fund — leaving it would let the refusal diagnostics measure a cap \
-             trend on a cost that no longer holds"
+            "the fast path's hint is superseded by the fresh re-quote at the SAME amount, which \
+             the source cannot fund — pointing the diagnostic at an amount already known \
+             unfundable wastes its high-point quote on a foregone answer"
         );
     }
 
-    /// The SIBLING arm of the same property: a re-quote that does not price at all also clears.
+    /// A STALE HINT MUST NEVER PRODUCE A FEE-KNOB RECOMMENDATION — the property that replaced
+    /// three separate "the cached sample is cleared at site X" tests.
     ///
-    /// This is the path that actually carries the case in production. When the source cannot fund
-    /// a candidate, the send-side dry-run fails with the mint's `InsufficientBalanceError` and the
-    /// quote is reported `Unquotable` (executor.rs, `insufficient_balance_shortfall`) — NOT as a
-    /// `Priced` cost whose `source_debit` exceeds `spendable`. So "the balance moved under us"
-    /// reaches the `Unquotable` early return, which used to `return` before the clearing
-    /// assignment, and the stale fast-path sample survived into `no_fitting_amount_reason`.
+    /// `largest_affordable_hint` carries no cost, so there is no longer any internal field whose
+    /// staleness a test could assert on. What matters is observable: when the amount the hint
+    /// names no longer holds up at diagnosis time, the emitted reason must be the transient one
+    /// and must NOT recommend moving `evac_fee_base_msat` / `evac_fee_bps`.
     ///
-    /// Fixing only the `Priced` arm therefore fixed the narrower half of the defect and left the
-    /// likelier half standing, which is why this pair exists rather than one test.
+    /// All three fixtures below share one shape, so each isolates exactly one guard:
+    ///   * call 0 at `desired` — the fast path: affordable (debit 450_000 <= 500_000) but over
+    ///     `cap.at(200_000) == 206_000` (fee 250_000). Records the hint, `top_affordable` true.
+    ///   * call 1 at `desired` — pass 1's re-quote comes back `Unquotable`, so the search RETURNS
+    ///     EARLY with `sized: None` and the hint still naming 200_000. Pass 2 never runs, which is
+    ///     what makes call 2 at `desired` unambiguously the diagnostic's high-point re-quote.
+    ///   * every other amount (including the 5_000 floor) — affordable and over cap, so the floor
+    ///     guard passes and nothing else can be sized.
     ///
-    /// RED-FIRST against the unconditional early return: `left: Some((200000, 450000))`.
-    #[tokio::test]
-    async fn a_stale_affordable_sample_is_cleared_by_an_unquotable_requote() {
+    /// Only call 2's answer differs between the three tests.
+    fn hint_fixture(
+        at_diagnosis: CandidateQuote,
+    ) -> impl Fn(Msat) -> std::future::Ready<Result<CandidateQuote, ExecError>> {
         use std::cell::Cell;
-        let spendable = Msat(500_000);
-        let desired = Msat(200_000);
-        let calls = Cell::new(0_u32);
-        let quote = |net: Msat| {
-            let n = calls.get();
-            calls.set(n + 1);
-            async move {
-                // Call 0 — the fast path: AFFORDABLE (debit 450_000) but over cap.at(200_000) =
-                // 206_000, so it records `largest_affordable` and falls through with
-                // `top_affordable` true, making `pass1 == desired` and call 1 the re-quote.
-                if n == 0 {
-                    let (receive_quote, send_quote) = (Msat(125_000), Msat(125_000));
-                    return Ok(CandidateQuote::Priced(FreshMoveCost {
-                        invoice_amount: Msat(net.0 + receive_quote.0),
-                        receive_quote,
-                        send_quote,
-                    }));
-                }
-                // Call 1 — the re-quote at that SAME amount no longer prices: the mint measured
-                // the source 101_000 msat short of the probed outgoing contract.
-                Ok(CandidateQuote::Unquotable {
-                    source_shortfall: Some(101_000),
+        let desired_hits = Cell::new(0_u32);
+        move |net: Msat| {
+            let priced = |receive_quote: Msat, send_quote: Msat| {
+                CandidateQuote::Priced(FreshMoveCost {
+                    invoice_amount: Msat(net.0 + receive_quote.0),
+                    receive_quote,
+                    send_quote,
                 })
+            };
+            if net.0 != 200_000 {
+                // Affordable (debit <= 256_000) and over cap at every probed amount: fee 251_000
+                // against `cap.at(5_000) == 200_150`.
+                return std::future::ready(Ok(priced(Msat(1_000), Msat(250_000))));
             }
-        };
+            let n = desired_hits.get();
+            desired_hits.set(n + 1);
+            std::future::ready(Ok(match n {
+                0 => priced(Msat(125_000), Msat(125_000)),
+                1 => CandidateQuote::Unquotable {
+                    source_shortfall: Some(101_000),
+                },
+                _ => at_diagnosis,
+            }))
+        }
+    }
 
-        let search = search_evacuation_net(
-            desired,
-            spendable,
+    /// GUARD 1 — the high re-quote does not price at all.
+    #[tokio::test]
+    async fn a_hint_that_will_not_requote_yields_the_transient_reason() {
+        let reason = size_evacuation(
+            Msat(200_000),
+            Msat(500_000),
             PILOT_CAP,
-            oscillation_bound(spendable),
-            quote,
+            hint_fixture(CandidateQuote::Unquotable {
+                source_shortfall: Some(101_000),
+            }),
         )
         .await
         .expect("no fault");
-
-        assert_eq!(
-            search
-                .largest_affordable
-                .map(|(n, c)| (n.0, c.source_debit().0)),
-            None,
-            "an amount that will not price at all is fresh negative evidence about that amount, \
-             and supersedes the fast path's sample exactly as an unaffordable re-quote does — \
-             this is the arm insufficient balance actually takes in production"
+        let reason = reason.expect_refused();
+        assert!(
+            !reason.contains("structural refusal"),
+            "an amount that will not price cannot support a fee-knob recommendation: {reason}"
         );
-        assert_eq!(
-            search.sized, None,
-            "nothing sized: the re-quote was unquotable"
+        assert!(
+            reason.contains("no affordable sample held up"),
+            "it must say the sample did not hold up, so an operator looks at the quote and not \
+             at the fee knobs: {reason}"
+        );
+    }
+
+    /// GUARD 2 — the high re-quote prices but the source can no longer fund it. This is INSTANCE 3
+    /// of the old staleness class (pass 2 re-probing `pass1` and moving the truth under a cached
+    /// cost), now unreachable as a defect because the cost is re-quoted rather than remembered.
+    #[tokio::test]
+    async fn a_hint_the_source_can_no_longer_fund_yields_the_transient_reason() {
+        let reason = size_evacuation(
+            Msat(200_000),
+            Msat(500_000),
+            PILOT_CAP,
+            // debit 201_000 + 400_000 = 601_000 > 500_000 spendable.
+            hint_fixture(CandidateQuote::Priced(FreshMoveCost {
+                invoice_amount: Msat(201_000),
+                receive_quote: Msat(1_000),
+                send_quote: Msat(400_000),
+            })),
+        )
+        .await
+        .expect("no fault");
+        let reason = reason.expect_refused();
+        assert!(
+            !reason.contains("structural refusal"),
+            "a cost the source cannot fund is not evidence about the FEE CAP, and recommending a \
+             cap change for it sends the operator after the wrong lever: {reason}"
+        );
+        assert!(
+            reason.contains("no affordable sample held up"),
+            "expected the transient reason: {reason}"
+        );
+    }
+
+    /// GUARD 3 — the high re-quote now FITS the cap, so the refusal itself has gone stale.
+    ///
+    /// Note what this test also forbids: `no_fitting_amount_reason` must not try to salvage a
+    /// sizing from this. It returns a diagnostic string, and sizing from the refusal path would
+    /// put money handling in the one function written on the assumption nothing is committed.
+    #[tokio::test]
+    async fn a_hint_that_now_fits_the_cap_yields_the_transient_reason() {
+        let reason = size_evacuation(
+            Msat(200_000),
+            Msat(500_000),
+            PILOT_CAP,
+            // fee 2_000 against cap.at(200_000) == 206_000, debit 202_000 <= 500_000.
+            hint_fixture(CandidateQuote::Priced(FreshMoveCost {
+                invoice_amount: Msat(201_000),
+                receive_quote: Msat(1_000),
+                send_quote: Msat(1_000),
+            })),
+        )
+        .await
+        .expect("no fault");
+        let reason = reason.expect_refused();
+        assert!(
+            !reason.contains("structural refusal"),
+            "the quote eased and this amount now fits — reporting a structural cause here would \
+             recommend raising a cap that is no longer binding: {reason}"
+        );
+        assert!(
+            reason.contains("no affordable sample held up"),
+            "expected the transient reason: {reason}"
         );
     }
 
@@ -5351,6 +5462,14 @@ mod tests {
             reason.contains("evidence, not proof"),
             "the two-point intercept must not be reported as a proof that nothing can ever \
              fit: {reason}"
+        );
+        // REJECT the old global-proof phrasing rather than merely requiring a caveat somewhere in
+        // the string: an appended disclaimer can coexist with an unqualified claim, and then the
+        // assertion above passes while the operator still reads "the gap only widens with size"
+        // as a fact about every amount. The qualifier has to be ON the widening claim.
+        assert!(
+            reason.contains("ON THE SAMPLED LINE the gap only widens"),
+            "the widening claim itself must be scoped to the fitted line: {reason}"
         );
     }
 
