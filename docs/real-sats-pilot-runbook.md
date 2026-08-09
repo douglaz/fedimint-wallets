@@ -77,14 +77,21 @@ pilot, 75k sats per fed is what makes the enforced caps imply a ~150k sat total:
 #   lower per-fed cap BEFORE joining, or the ceiling silently moves.
 # 50k sats float in the spending fed
 # 20k sats in standby
-# 50 sats absolute cap: evacuations + manual --fee-cap default
+# 50 sats absolute cap: the manual --fee-cap default and the probe leg cap. It does NOT
+#   bound evacuations — see the evac pair below.
 # 3% proportional cap on funding moves (top-up/standby)
+# 200 sats + 3% evacuation cap, computed from the net the DESTINATION IS CREDITED. These are
+#   the evacuation knobs; --max-fee is not. Raising them affects evacuations decided
+#   AFTERWARDS — a pending one carries the pair it was admitted with, so this is not a lever
+#   for releasing an evacuation that is already retrying.
 wallet-cli policy set \
   --per-fed-cap 75000000 \
   --spending-target 50000000 \
   --standby-target 20000000 \
   --max-fee 50000 \
-  --max-fee-bps-of-move 300
+  --max-fee-bps-of-move 300 \
+  --evac-fee-base-msat 200000 \
+  --evac-fee-bps 300
 wallet-cli policy get              # verify what is actually stored
 ```
 

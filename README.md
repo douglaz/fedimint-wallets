@@ -18,13 +18,16 @@ live and devimint-validated:
 - **Phase 2 sense + decide: complete.** Real federation probing feeds scoring,
   snapshot building, allocation decisions, and executor application through
   `wallet-cli tick` / `wallet-cli status`.
-- **Phase 3.A evacuation: built, not yet executable at real fee shapes.**
+- **Phase 3.A evacuation: executable at real fee shapes.**
   Shutdown/degradation signals can trigger an LN-only evacuation from a dying
   federation into an eligible healthy federation, and that path is devimint-validated.
-  It is *not* production-ready: the evacuation still carries the flat absolute
-  `--max-fee` cap, which at real gateway prices can be far below the cost of draining a
-  full balance in one move, so a real evacuation can chunk-drain or stall. The fix is a
-  base + proportional cap (ADR-0029) and is the next money-path change.
+  The evacuation is bounded by a BASE + PROPORTIONAL cap (ADR-0029) —
+  `--evac-fee-base-msat` + `--evac-fee-bps`, default 200 sats + 3% — computed from the net
+  the destination is actually credited, not the flat absolute `--max-fee`, which at real
+  gateway prices could fall below the cost of draining a full balance and stall the drain.
+  One limit to know before an incident: those knobs bound evacuations DECIDED AFTERWARDS. A
+  pending evacuation carries the pair it was admitted with, so raising them does not release
+  one already retrying.
 - **Phase 4 hardening + ledger: complete.** Review P1s are closed, per-federation
   caps are enforced, terminal stranded moves are explicit, and the append-only
   operation ledger is exposed through `wallet-cli history` / `wallet-cli show`.
@@ -100,12 +103,15 @@ field-by-field with `wallet-cli policy set` and printed by `wallet-cli policy ge
 balance knobs are `--per-fed-cap`, `--spending-target`, and `--standby-target` (all msat);
 the two fee caps are deliberately different shapes:
 
-- `--max-fee` - ABSOLUTE fee cap in msat (a flat ceiling, not scaled by the amount). Of the
-  Allocator's own moves it bounds only evacuations, where the amount is whatever remnant a
-  dying federation still holds and a proportional cap could compute below the gateway's base
-  fee and refuse the drain. It is
-  also the default `--fee-cap` for the manual `pay`/`move`/`receive`/`direct-inflow`
+- `--max-fee` - ABSOLUTE fee cap in msat (a flat ceiling, not scaled by the amount). It bounds
+  NO move the Allocator emits: funding moves use `--max-fee-bps-of-move` and evacuations use the
+  `--evac-fee-*` pair below. **In an evacuation incident this is not the knob to turn.** It is
+  still the default `--fee-cap` for the manual `pay`/`move`/`receive`/`direct-inflow`
   commands, so setting it very low refuses those too.
+- `--evac-fee-base-msat` + `--evac-fee-bps` - the EVACUATION cap, `base + floor(delivered *
+  bps / 10_000)`, default 200 sats + 3% (300 bps). It is computed from the net the destination
+  is actually CREDITED, not the amount asked for. Raising these affects evacuations decided
+  afterwards; a pending one keeps the pair it was admitted with.
 - `--max-fee-bps-of-move` - PROPORTIONAL fee cap for funding moves (top-up and standby), in
   basis points of the amount moved, `1`-`10000`; default `300` (3%). Funding sizing reserves
   it from the source, so `amount + amount * bps / 10000` always fits the source budget and a
