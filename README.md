@@ -109,9 +109,12 @@ the two fee caps are deliberately different shapes:
   still the default `--fee-cap` for the manual `pay`/`move`/`receive`/`direct-inflow`
   commands, so setting it very low refuses those too.
 - `--evac-fee-base-msat` + `--evac-fee-bps` - the EVACUATION cap, `base + floor(delivered *
-  bps / 10_000)`, default 200 sats + 3% (300 bps). It is computed from the net the destination
-  is actually CREDITED, not the amount asked for. Raising these affects evacuations decided
-  afterwards; a pending one keeps the pair it was admitted with.
+  bps / 10_000)`, default 200 sats + 3%. The base is msat; the second flag is BASIS POINTS,
+  `0`-`10000` — `300` is 3%, not 300 msat, and entering a bps value as msat silently widens the
+  cap by orders of magnitude. Zero bps is accepted and means a base-only cap, valid only
+  alongside a non-zero base. It is computed from the net the destination is actually CREDITED,
+  not the amount asked for. Raising these affects evacuations decided afterwards; a pending one
+  keeps the pair it was admitted with.
 - `--max-fee-bps-of-move` - PROPORTIONAL fee cap for funding moves (top-up and standby), in
   basis points of the amount moved, `1`-`10000`; default `300` (3%). Funding sizing reserves
   it from the source, so `amount + amount * bps / 10000` always fits the source budget and a

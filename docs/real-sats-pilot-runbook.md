@@ -98,8 +98,17 @@ wallet-cli policy get              # verify what is actually stored
 Keep `auto_join` off (the default) for the pilot: automatic federation discovery would raise
 the permitted total without an operator deciding to.
 
-(Values are msat, except `--max-fee-bps-of-move`, which is basis points, 1-10000. Raise
-them only after a clean first week.)
+(Values are msat, except the TWO basis-point flags — read this before tuning either, because a
+bps value entered as if it were msat silently widens the cap by orders of magnitude: `500` means
+5%, not 500 msat.
+
+  * `--max-fee-bps-of-move` — basis points of the amount moved, range **1-10000**. Zero is
+    rejected.
+  * `--evac-fee-bps` — basis points of the net DELIVERED to the destination, not of the amount
+    asked for, range **0-10000**. Zero IS accepted, and means a base-only evacuation cap; it is
+    only valid alongside a non-zero `--evac-fee-base-msat`.
+
+`--evac-fee-base-msat` is msat, like the rest. Raise any of them only after a clean first week.)
 
 ## Daily — the one-minute glance
 
