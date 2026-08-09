@@ -563,21 +563,25 @@ fn a_saturating_evacuation_cap_cannot_overflow_the_reservation() {
     snapshot.evac_fee_base_msat = Msat(u64::MAX);
     snapshot.evac_fee_bps = 10_000;
 
-    // The call itself is the assertion: reaching a decision at all means the reservation
-    // arithmetic did not overflow. `decide` runs `push_and_reserve` for every emitted action.
+    // Reaching a decision at all means the reservation arithmetic did not overflow; `decide`
+    // runs `push_and_reserve` for every emitted action.
     let decisions = decide(&snapshot, occ(1));
 
-    // And whatever it decided, the evacuation's cap saturated rather than wrapping to something
-    // small — a wrapped cap is the dangerous direction, because it would look affordable.
-    for d in &decisions {
-        if let Action::Evacuate { fee_cap, .. } = &d.action {
-            assert_eq!(
-                *fee_cap,
-                Msat(u64::MAX),
-                "a u64::MAX base must saturate the cap, never wrap it small"
-            );
-        }
-    }
+    // REQUIRE the evacuation, so fixture drift cannot make this test silently vacuous: a loop
+    // that finds no `Evacuate` would pass while proving nothing about the reservation path.
+    let evac_cap = decisions
+        .iter()
+        .find_map(|d| match &d.action {
+            Action::Evacuate { fee_cap, .. } => Some(*fee_cap),
+            _ => None,
+        })
+        .expect("the dying fed must still emit an Evacuate — without one this pins nothing");
+    assert_eq!(
+        evac_cap,
+        Msat(u64::MAX),
+        "a u64::MAX base must saturate the cap, never wrap it small — a wrapped cap is the \
+         dangerous direction, because it would look affordable"
+    );
 }
 
 #[test]

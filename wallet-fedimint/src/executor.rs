@@ -2225,7 +2225,15 @@ where
         // non-deterministic one simply gets no sizing this pass and retries.
         return Ok(search);
     };
-    search.largest_affordable = Some((Msat(pass1), pass1_cost));
+    // `largest_affordable` is recorded ONLY if this fresh re-quote is still affordable. Its
+    // contract says it names the largest AFFORDABLE amount, and the refusal diagnostics read it
+    // as one — storing an unaffordable sample here would let the structural cause be measured
+    // against a cost the source could never have funded, and told to an operator as a reason to
+    // raise a money knob.
+    let pass1_verdict = combined_verdict(CandidateQuote::Priced(pass1_cost), cap, spendable);
+    if pass1_cost.source_debit() <= spendable {
+        search.largest_affordable = Some((Msat(pass1), pass1_cost));
+    }
     // BOTH constraints on the fresh quote, through the one predicate — not the cap alone. This
     // re-quote is not the one the bisection accepted, and the hole is live precisely when it
     // moved: in the `top_affordable` branch the fast path's quote already failed the cap, so
@@ -2234,7 +2242,7 @@ where
     // cap-only check can size an amount the source cannot fund, mint, commit the receive, and
     // strand it when `Pay` cannot pay. Round 6 guarded this seam at pass 2 and left pass 1; the
     // shared predicate is what stops there being a third.
-    if combined_verdict(CandidateQuote::Priced(pass1_cost), cap, spendable).fits {
+    if pass1_verdict.fits {
         search.sized = Some((Msat(pass1), pass1_cost));
         return Ok(search);
     }
@@ -4345,50 +4353,51 @@ mod tests {
         // where the driven fixture belongs.
     }
 
-    /// A re-quote that moves between the bisection and the admission must NOT be admitted on the
-    /// cap alone. Pins BOTH passes, because both re-quote and both admit.
+    /// PASS 1: the final re-quote must be revalidated, not admitted on the cap alone.
     ///
-    /// `search_evacuation_net` takes `FnMut`, so a call-counting closure can make the same amount
-    /// price differently on a later call — which is exactly what a concurrent intent changing the
-    /// source's note inventory does. `Priced` does not imply affordable: `source_debit` carries
-    /// the send tx fee on top of what the mint dry-run funded, so a quote can stay `Priced` while
-    /// becoming unfundable.
+    /// The seam is only reachable when the BISECTION picks `pass1 != desired`. With
+    /// `top_affordable` true, `pass1 == desired`, and one net cannot be both
+    /// affordable-and-over-cap (the fast path's condition, `cap(N) < S-N`) and
+    /// cap-fitting-and-unaffordable (the re-quote's, `S-N < fee <= cap(N)`) — those are direct
+    /// contradictions. So the fast path here is UNAFFORDABLE, which sends the search into pass 1's
+    /// bisection.
     ///
-    /// RED-FIRST against the pre-fix code: pass 1 admitted on `fits_cap` alone, so it sized an
-    /// amount the source could not fund — which mints, COMMITS the receive, and then cannot pay.
-    /// Round 6 guarded pass 2 after a reviewer named pass 2; pass 1 had the identical seam and
-    /// did not, which is why both now go through `combined_verdict`.
+    /// Prices move the way they actually move: the FIRST quote of an amount is what the bisection
+    /// saw, and a LATER quote of the SAME amount is the moved one — which is exactly the
+    /// "the re-quote is not the one the bisection accepted" hazard the guard exists for.
     #[tokio::test]
-    async fn a_requote_that_becomes_unaffordable_is_not_admitted_by_either_pass() {
-        use std::cell::Cell;
+    async fn pass_one_revalidates_its_final_requote() {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
         let spendable = Msat(500_000);
-        let desired = Msat(200_000);
-        let calls = Cell::new(0_u32);
-        // CALL 0 — the fast path. AFFORDABLE (debit 450_000 <= 500_000) but over the cap
-        // (250_000 of fees against cap.at(200_000) = 206_000), so the search does NOT return
-        // here; `top_affordable` is true, which makes pass 1's answer `desired` itself and sends
-        // it straight to the re-quote below.
-        //
-        // CALL 1+ — the re-quote at that same amount, moved as a concurrent intent would move it:
-        // the fee is now tiny (2_000, comfortably under the cap) but the invoice ballooned, so
-        // `source_debit` is 601_000 and the source can no longer fund it. Cap-fitting and
-        // unaffordable at once, which is the state `Priced` does not rule out.
-        let quote = |_net: Msat| {
-            let n = calls.get();
-            calls.set(n + 1);
+        let desired = Msat(450_000);
+        let seen: RefCell<HashMap<u64, u32>> = RefCell::new(HashMap::new());
+        let quote = |net: Msat| {
+            let nth = {
+                let mut m = seen.borrow_mut();
+                let c = m.entry(net.0).or_insert(0);
+                *c += 1;
+                *c
+            };
             async move {
-                Ok(CandidateQuote::Priced(if n == 0 {
-                    FreshMoveCost {
-                        invoice_amount: Msat(325_000),
-                        receive_quote: Msat(125_000),
-                        send_quote: Msat(125_000),
-                    }
+                // First sighting: cheap, affordable, cap-fitting — what the bisection accepts.
+                // Later sighting of the SAME amount: the price moved. Still under the cap
+                // (fee 150_000 <= cap.at(450_000) = 213_500) but the source can no longer fund
+                // it (debit 450_000 + 150_000 = 600_000 > 500_000).
+                let (receive_quote, send_quote) = if net.0 == 450_000 && nth == 1 {
+                    // The FAST PATH's quote: unaffordable, so the search does not return there
+                    // and `top_affordable` is false — which is what sends it into pass 1's
+                    // bisection and makes `pass1 != desired`, the only shape this seam has.
+                    (Msat(1_000), Msat(400_000))
+                } else if nth == 1 {
+                    (Msat(1_000), Msat(1_000))
                 } else {
-                    FreshMoveCost {
-                        invoice_amount: Msat(600_000),
-                        receive_quote: Msat(1_000),
-                        send_quote: Msat(1_000),
-                    }
+                    (Msat(1_000), Msat(149_000))
+                };
+                Ok(CandidateQuote::Priced(FreshMoveCost {
+                    invoice_amount: Msat(net.0 + receive_quote.0),
+                    receive_quote,
+                    send_quote,
                 }))
             }
         };
@@ -4406,8 +4415,78 @@ mod tests {
         if let Some((net, cost)) = search.sized {
             assert!(
                 cost.source_debit().0 <= spendable.0,
-                "sized {net:?} on a quote debiting {} against {} spendable — admitted on the cap \
-                 alone, which mints and COMMITS a receive the source cannot then pay for",
+                "sized {net:?} on a re-quote debiting {} against {} spendable — admitted on the \
+                 cap alone, which mints and COMMITS a receive that Pay cannot fund",
+                cost.source_debit().0,
+                spendable.0
+            );
+        }
+        if let Some((_, cost)) = search.largest_affordable {
+            assert!(
+                cost.source_debit().0 <= spendable.0,
+                "largest_affordable holds an UNAFFORDABLE sample debiting {} — the refusal \
+                 diagnostics read it as affordable",
+                cost.source_debit().0
+            );
+        }
+    }
+
+    /// PASS 2: its final re-quote must be revalidated too.
+    ///
+    /// Reaching pass 2 at all requires pass 1 to FAIL THE CAP at the largest affordable amount —
+    /// otherwise pass 1 admits and returns. So everything above 100_000 is priced over the cap,
+    /// and the affordable, cap-fitting amounts live in the bottom window pass 2 searches. The
+    /// moved re-quote is again a LATER quote of the same amount: what the bisection accepted is
+    /// not what the admission sees.
+    #[tokio::test]
+    async fn pass_two_revalidates_its_final_requote() {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        let spendable = Msat(500_000);
+        let desired = Msat(400_000);
+        let seen: RefCell<HashMap<u64, u32>> = RefCell::new(HashMap::new());
+        let quote = |net: Msat| {
+            let nth = {
+                let mut m = seen.borrow_mut();
+                let c = m.entry(net.0).or_insert(0);
+                *c += 1;
+                *c
+            };
+            async move {
+                // Above 340_000 every sighting is dear, so the fast path is unaffordable and
+                // pass 1's bisection settles just under that. A FIRST sighting anywhere below is
+                // cheap — what both bisections accept. A LATER sighting is the moved price, and
+                // it is dear enough to be BOTH over the cap and unfundable, which is what makes
+                // pass 1 fail the cap (so the search reaches pass 2) and what pass 2's final
+                // re-quote must then reject.
+                let (receive_quote, send_quote) = if net.0 > 340_000 || nth > 1 {
+                    (Msat(1_000), Msat(260_000))
+                } else {
+                    (Msat(1_000), Msat(1_000))
+                };
+                Ok(CandidateQuote::Priced(FreshMoveCost {
+                    invoice_amount: Msat(net.0 + receive_quote.0),
+                    receive_quote,
+                    send_quote,
+                }))
+            }
+        };
+
+        let search = search_evacuation_net(
+            desired,
+            spendable,
+            PILOT_CAP,
+            oscillation_bound(spendable),
+            quote,
+        )
+        .await
+        .expect("no fault");
+
+        if let Some((net, cost)) = search.sized {
+            assert!(
+                cost.source_debit().0 <= spendable.0,
+                "pass 2 sized {net:?} on a re-quote debiting {} against {} spendable — admitted \
+                 without revalidating what the bisection had accepted",
                 cost.source_debit().0,
                 spendable.0
             );
