@@ -52,8 +52,10 @@ pub struct Policy {
     /// decoding this numeric field as zero.
     #[serde(default = "default_evac_fee_base_msat")]
     pub evac_fee_base_msat: Msat,
-    /// PROPORTIONAL component of the evacuation fee cap, in basis points of the amount evacuated
-    /// (0..=10000).
+    /// PROPORTIONAL component of the evacuation fee cap, in basis points of the net DELIVERED to
+    /// the destination — `invoice - receive_quote`, not the amount requested, which is larger
+    /// whenever the gross-up settles a hair under (CONTEXT.md, "Delivered net"). Applied with
+    /// integer FLOOR division, so `cap = base + floor(delivered * bps / 10_000)`. (0..=10000).
     #[serde(default = "default_evac_fee_bps")]
     pub evac_fee_bps: u16,
     pub spending_fed: Option<FederationId>,
@@ -179,7 +181,7 @@ impl Policy {
             return Err(PolicyValidationError::MaxFeeBpsExceedsCeiling);
         }
         if self.evac_fee_bps > 10_000 {
-            // Over 100% of the amount evacuated: nonsensical, same reasoning as the sibling knob.
+            // Over 100% of the net delivered: nonsensical, same reasoning as the sibling knob.
             return Err(PolicyValidationError::EvacFeeBpsExceedsCeiling);
         }
         // `evac_fee_bps == 0` is deliberately accepted, unlike `max_fee_bps_of_move`: a base-only
@@ -267,7 +269,7 @@ impl fmt::Display for PolicyValidationError {
             ),
             Self::EvacFeeBpsExceedsCeiling => write!(
                 formatter,
-                "{}: must not exceed 10000 (100% of the amount evacuated)",
+                "{}: must not exceed 10000 (100% of the net delivered)",
                 self.offending_field()
             ),
             Self::ZeroEvacFeeCap => write!(

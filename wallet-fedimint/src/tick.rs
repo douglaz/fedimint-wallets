@@ -52,7 +52,7 @@ const DEFAULT_MAX_FEE_BPS_OF_MOVE: u16 = 300;
 
 /// Default evacuation fee-cap base: 200 sats (200_000 msat).
 const DEFAULT_EVAC_FEE_BASE: Msat = Msat(200_000);
-/// Default evacuation fee-cap proportional part: 300 bps (3%) of the amount evacuated.
+/// Default evacuation fee-cap proportional part: 300 bps (3%) of the net DELIVERED.
 const DEFAULT_EVAC_FEE_BPS: u16 = 300;
 
 /// The standing instruction for one orchestrator tick (ADR-0014). Sensible v1 defaults
