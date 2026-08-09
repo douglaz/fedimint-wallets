@@ -348,18 +348,19 @@ struct PolicySetFlags {
     spending_target: Option<u64>,
     #[arg(long)]
     standby_target: Option<u64>,
-    /// Absolute evacuation and manual-operation fee cap, in millisatoshis.
+    /// Absolute fee cap for the MANUAL money verbs and the probe leg, in millisatoshis.
+    /// It does NOT bound evacuation — use --evac-fee-base-msat / --evac-fee-bps for that.
     #[arg(long)]
     max_fee: Option<u64>,
     /// Proportional funding-move fee cap, basis points (1-10000).
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..=10_000))]
     max_fee_bps_of_move: Option<u16>,
-    /// Base of the evacuation fee cap, msat. NOT YET ENFORCED — --max-fee still bounds
-    /// evacuation. Zero is allowed only alongside a non-zero --evac-fee-bps.
+    /// Base of the evacuation fee cap, msat. ENFORCED: with --evac-fee-bps this is the cap an
+    /// evacuation is held to. Zero is allowed only alongside a non-zero --evac-fee-bps.
     #[arg(long)]
     evac_fee_base_msat: Option<u64>,
-    /// Proportional part of the evacuation fee cap, bps (0-10000). NOT YET ENFORCED —
-    /// --max-fee still bounds evacuation. Zero is allowed: a base-only cap.
+    /// Proportional part of the evacuation fee cap, bps (0-10000) of the net DELIVERED to the
+    /// destination — not of the amount asked for. ENFORCED. Zero is allowed: a base-only cap.
     #[arg(long, value_parser = clap::value_parser!(u16).range(0..=10_000))]
     evac_fee_bps: Option<u16>,
     #[arg(long)]
@@ -455,18 +456,19 @@ struct PolicyFlags {
     /// Target warm-standby balance, in millisatoshis (fund below it).
     #[arg(long)]
     standby_target: Option<u64>,
-    /// Absolute evacuation fee cap, in millisatoshis.
+    /// Absolute fee cap for the MANUAL money verbs and the probe leg, in millisatoshis.
+    /// It does NOT bound evacuation — use --evac-fee-base-msat / --evac-fee-bps for that.
     #[arg(long)]
     max_fee: Option<u64>,
     /// Proportional funding-move fee cap, in basis points of the amount moved (1-10000).
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..=10_000))]
     max_fee_bps_of_move: Option<u16>,
-    /// Base of the evacuation fee cap, msat. NOT YET ENFORCED — --max-fee still bounds
-    /// evacuation.
+    /// Base of the evacuation fee cap, msat. ENFORCED: with --evac-fee-bps this is the cap an
+    /// evacuation is held to.
     #[arg(long)]
     evac_fee_base_msat: Option<u64>,
-    /// Proportional part of the evacuation fee cap, bps (0-10000). NOT YET ENFORCED —
-    /// --max-fee still bounds evacuation. Zero is allowed: a base-only cap.
+    /// Proportional part of the evacuation fee cap, bps (0-10000) of the net DELIVERED to the
+    /// destination — not of the amount asked for. ENFORCED. Zero is allowed: a base-only cap.
     #[arg(long, value_parser = clap::value_parser!(u16).range(0..=10_000))]
     evac_fee_bps: Option<u16>,
     /// Pin the spending federation (hex id). Default: auto-designate the best-ranked eligible fed.

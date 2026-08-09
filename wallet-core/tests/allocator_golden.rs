@@ -546,6 +546,40 @@ fn evacuation_cap_is_floor_of_base_plus_proportional() {
     assert_eq!(EvacFeeCap { base_msat: Msat(u64::MAX), bps: 10_000 }.at(Msat(u64::MAX)), Msat(u64::MAX));
 }
 
+/// A saturating cap must not overflow the RESERVATION arithmetic downstream of it.
+///
+/// `EvacFeeCap::at` saturates by design (asserted directly above) and `Policy::validate` puts no
+/// ceiling on `evac_fee_base_msat`, so a policy that validates can hand `push_and_reserve` a
+/// `fee_cap` of `u64::MAX`. It reserved `amount + fee_cap` with plain `+`: a panic in debug, and
+/// in release a WRAP to a tiny reservation, which under-reserves and lets the same balance be
+/// committed twice.
+///
+/// RED-FIRST: against the `+` version this test PANICS in debug with
+/// "attempt to add with overflow" inside `push_and_reserve`.
+#[test]
+fn a_saturating_evacuation_cap_cannot_overflow_the_reservation() {
+    // A dying fed with a real balance, and a cap base large enough that `at()` saturates.
+    let mut snapshot = snap!([fed!(1, 100_000, true, true, true), fed!(2, 30_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 100_000, 0, 40_003);
+    snapshot.evac_fee_base_msat = Msat(u64::MAX);
+    snapshot.evac_fee_bps = 10_000;
+
+    // The call itself is the assertion: reaching a decision at all means the reservation
+    // arithmetic did not overflow. `decide` runs `push_and_reserve` for every emitted action.
+    let decisions = decide(&snapshot, occ(1));
+
+    // And whatever it decided, the evacuation's cap saturated rather than wrapping to something
+    // small — a wrapped cap is the dangerous direction, because it would look affordable.
+    for d in &decisions {
+        if let Action::Evacuate { fee_cap, .. } = &d.action {
+            assert_eq!(
+                *fee_cap,
+                Msat(u64::MAX),
+                "a u64::MAX base must saturate the cap, never wrap it small"
+            );
+        }
+    }
+}
+
 #[test]
 fn move_cap_stays_purely_proportional() {
     // `Move` is deliberately NOT on the evacuation shape: no base term, so its cap is unchanged

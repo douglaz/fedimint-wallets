@@ -1432,16 +1432,36 @@ impl FedimintExecutor {
                     let cap_rule = evacuation_cap_rule(plan.fee_cap_components, rec.fee_cap);
                     // Cap-check the receive side alone (spec §6/§7): for a `DirectInflow` this is
                     // the whole check; for a `Move` the send leg is re-checked at `Pay`. Over cap →
-                    // persist the quote first (so the refusal is in history), then refuse terminally.
+                    // persist the quote first, so the refusal is in history either way.
+                    //
+                    // The DISPOSITION splits by shape, and only for an evacuation. Nothing has
+                    // committed here — `mc.receive` is still below — so a fee that drifted up
+                    // between sizing and this re-quote is a transient fact about one quote, not a
+                    // property of the move. Terminalizing it strands a dying federation's balance
+                    // until a fresh occurrence is emitted, when re-running `size_fresh_evacuation`
+                    // would simply re-size against the new prices. That is the same reasoning the
+                    // viability gate directly below already applies; having the two disagree was
+                    // the file contradicting itself. For a `Move`/`DirectInflow` the ask is the
+                    // user's own and `Permanent` remains right: there is no dying federation to
+                    // drain and no reason to keep retrying a request that no longer prices.
                     if !fee::total_within_cap(
                         grossed.receive_quote,
                         Msat(0),
                         cap_rule.at(requote_delivered),
                     ) {
                         self.journal.put_move(&rec).await?;
-                        return Err(ExecError::Permanent(
-                            "fee over cap (receive side exceeds fee_cap)".into(),
-                        ));
+                        let over_cap = format!(
+                            "fee over cap (receive side {} msat exceeds the {} msat cap at the \
+                             {} msat this would deliver)",
+                            grossed.receive_quote.0,
+                            cap_rule.at(requote_delivered).0,
+                            requote_delivered.0
+                        );
+                        return Err(if is_evacuate {
+                            ExecError::Retryable(over_cap)
+                        } else {
+                            ExecError::Permanent(over_cap)
+                        });
                     }
                     // VIABILITY, checked here and not only at Pay. The Pay step terminalizes
                     // `Permanent` when the receive fee exceeds what the move delivers, and by then
@@ -2206,7 +2226,15 @@ where
         return Ok(search);
     };
     search.largest_affordable = Some((Msat(pass1), pass1_cost));
-    if fits_cap(pass1_cost, cap) {
+    // BOTH constraints on the fresh quote, through the one predicate — not the cap alone. This
+    // re-quote is not the one the bisection accepted, and the hole is live precisely when it
+    // moved: in the `top_affordable` branch the fast path's quote already failed the cap, so
+    // reaching here REQUIRES the price to have changed. `Priced` does not imply affordable —
+    // `source_debit` carries the send tx fee on top of what the mint dry-run funded — so a
+    // cap-only check can size an amount the source cannot fund, mint, commit the receive, and
+    // strand it when `Pay` cannot pay. Round 6 guarded this seam at pass 2 and left pass 1; the
+    // shared predicate is what stops there being a third.
+    if combined_verdict(CandidateQuote::Priced(pass1_cost), cap, spendable).fits {
         search.sized = Some((Msat(pass1), pass1_cost));
         return Ok(search);
     }
@@ -2225,8 +2253,9 @@ where
         // re-quote can stay `Priced` while carrying a larger mint fee. Trusting the verdict here
         // would let an over-cap evacuation reach invoice creation and be refused only at Pay —
         // after the receive committed. Same seam, one function further along.
-        if let CandidateQuote::Priced(cost) = quote(Msat(pass2)).await? {
-            if fits_cap(cost, cap) && cost.source_debit() <= spendable {
+        let requote = quote(Msat(pass2)).await?;
+        if let CandidateQuote::Priced(cost) = requote {
+            if combined_verdict(requote, cap, spendable).fits {
                 search.sized = Some((Msat(pass2), cost));
             }
         }
@@ -2454,9 +2483,23 @@ fn structural_refusal_cause(
 
     let mut causes = Vec::new();
     if cap_rise >= fee_rise {
+        // NOTE the asymmetry with condition (ii) below, which IS a proof: if the fixed intercept
+        // alone exceeds the cap base then `fee(a) - cap(a) > 0` at every amount, with no sampling
+        // involved. Condition (i) is weaker and its wording now says so.
+        //
+        // TWO SAMPLES CANNOT PROVE THIS, and the wording no longer pretends otherwise. The fee
+        // curve is explicitly non-monotone — per-note mint fees DROP at note-selection
+        // boundaries, which is the whole reason the bounded probe exists — so both endpoints can
+        // miss the cap while an unprobed middle window fits. ADR-0029 is explicit that probe
+        // exhaustion alone stays inconclusive and must not mark the route unavailable. Reported
+        // as a measured trend the operator can act on, not as proof that no amount can ever fit;
+        // a complete boundary proof or a global bound is what would license the stronger claim,
+        // and neither is computed here.
         causes.push(
-            "the cap's trend excludes every smaller amount, so nothing below the largest \
-             affordable size can fit either; raise evac_fee_base_msat or evac_fee_bps"
+            "the cap's trend across the two amounts probed rises no faster than the fee's, so \
+             nothing SMALLER is likely to fit either; raise evac_fee_base_msat or evac_fee_bps. \
+             NOTE this is a two-point measurement on a fee curve that is NOT monotone — evidence, \
+             not proof, since an unprobed amount between them may still serve"
                 .to_string(),
         );
     }
@@ -4251,7 +4294,9 @@ mod tests {
     }
 
     /// `combined_verdict`'s cap gap reads the delivered net — pinned, because reverting it alone
-    /// leaves the rest of the suite green.
+    /// leaves the rest of the suite green. ONE site, not two: the viability half was deleted from
+    /// this test when it turned out to assert only on its own literals, and the NOTE below says
+    /// what remains uncovered.
     ///
     /// The seam test above pins `fits_cap`. That is one of five call sites this design pass
     /// converted, and the commit's own strongest evidence — that changing the basis moved no
@@ -4298,6 +4343,75 @@ mod tests {
         // green against the ask-based version. That is the exact vacuity this suite exists to
         // refuse, so it is deleted rather than left reading as coverage. `br-4yz`'s harness is
         // where the driven fixture belongs.
+    }
+
+    /// A re-quote that moves between the bisection and the admission must NOT be admitted on the
+    /// cap alone. Pins BOTH passes, because both re-quote and both admit.
+    ///
+    /// `search_evacuation_net` takes `FnMut`, so a call-counting closure can make the same amount
+    /// price differently on a later call — which is exactly what a concurrent intent changing the
+    /// source's note inventory does. `Priced` does not imply affordable: `source_debit` carries
+    /// the send tx fee on top of what the mint dry-run funded, so a quote can stay `Priced` while
+    /// becoming unfundable.
+    ///
+    /// RED-FIRST against the pre-fix code: pass 1 admitted on `fits_cap` alone, so it sized an
+    /// amount the source could not fund — which mints, COMMITS the receive, and then cannot pay.
+    /// Round 6 guarded pass 2 after a reviewer named pass 2; pass 1 had the identical seam and
+    /// did not, which is why both now go through `combined_verdict`.
+    #[tokio::test]
+    async fn a_requote_that_becomes_unaffordable_is_not_admitted_by_either_pass() {
+        use std::cell::Cell;
+        let spendable = Msat(500_000);
+        let desired = Msat(200_000);
+        let calls = Cell::new(0_u32);
+        // CALL 0 — the fast path. AFFORDABLE (debit 450_000 <= 500_000) but over the cap
+        // (250_000 of fees against cap.at(200_000) = 206_000), so the search does NOT return
+        // here; `top_affordable` is true, which makes pass 1's answer `desired` itself and sends
+        // it straight to the re-quote below.
+        //
+        // CALL 1+ — the re-quote at that same amount, moved as a concurrent intent would move it:
+        // the fee is now tiny (2_000, comfortably under the cap) but the invoice ballooned, so
+        // `source_debit` is 601_000 and the source can no longer fund it. Cap-fitting and
+        // unaffordable at once, which is the state `Priced` does not rule out.
+        let quote = |_net: Msat| {
+            let n = calls.get();
+            calls.set(n + 1);
+            async move {
+                Ok(CandidateQuote::Priced(if n == 0 {
+                    FreshMoveCost {
+                        invoice_amount: Msat(325_000),
+                        receive_quote: Msat(125_000),
+                        send_quote: Msat(125_000),
+                    }
+                } else {
+                    FreshMoveCost {
+                        invoice_amount: Msat(600_000),
+                        receive_quote: Msat(1_000),
+                        send_quote: Msat(1_000),
+                    }
+                }))
+            }
+        };
+
+        let search = search_evacuation_net(
+            desired,
+            spendable,
+            PILOT_CAP,
+            oscillation_bound(spendable),
+            quote,
+        )
+        .await
+        .expect("no fault");
+
+        if let Some((net, cost)) = search.sized {
+            assert!(
+                cost.source_debit().0 <= spendable.0,
+                "sized {net:?} on a quote debiting {} against {} spendable — admitted on the cap \
+                 alone, which mints and COMMITS a receive the source cannot then pay for",
+                cost.source_debit().0,
+                spendable.0
+            );
+        }
     }
 
     /// The shipped evacuation cap: 200 sats + 3%.
