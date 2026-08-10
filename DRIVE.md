@@ -107,6 +107,44 @@ code check BEFORE it is written down.
 
 Gate after the fix: fmt 0, clippy 0, **792 passed / 0 failed**, EXIT=0.
 
+### HARDEN pass 2 — panel restored by SUBSTITUTION (codex + opus-5, not fable)
+
+Fable was replaced with `claude --model claude-opus-5` after four failures. Say that plainly: this
+is not the documented panel, and the substitute reads the repo the way fable was supposed to.
+
+**Codex: 1 × P2 — verified real, DECLINED for this bead, filed as `br-v8x`.** `mc.receive` commits
+a real receive op, then `verify_replayable_receive_contract` can return `Permanent` BEFORE
+`invoice`/`recv_op` are persisted, so the gate sees no committed leg and the terminal row freezes
+the planned pair. Not a regression — that row showed the planned pair before this bead too. The
+proposed fix moves the executor's persistence ordering, which this bead's scope guard forbids and
+which is load-bearing: `has_move_artifact` is what stops `size_fresh_evacuation` re-sizing, so
+recording a leg the code deliberately abandons would prevent a later occurrence re-pricing.
+
+**Opus: 2 × P3, both ACCEPTED and fixed.**
+
+1. The gate re-derived `has_move_artifact` inline instead of calling it — and a THIRD, narrower
+   variant of the same question exists at `move_protocol.rs:503` (no `invoice` disjunct). No live
+   defect: `invoice ⟹ recv_op` holds on both writers. But narrowing `has_move_artifact` later
+   would let sizing rewrite a pair the ledger had already stamped, with no test failing. Now
+   `pub(crate)` and CALLED, with both sites documenting why they must not drift, and why
+   `move_protocol`'s variant asks a different question.
+2. The draft test pinned the harmless write. It drove `Pending → Pending` — a same-status rewrite,
+   the one case where the stamp costs nothing — while both the doc comment and the ADR justify the
+   gate by the TERMINAL case. It would also have passed if no write happened at all. Rewritten to
+   drive `Failed`, with an explicit status assertion so "the row is unchanged" cannot be vacuous.
+   Re-reddened in its new shape against an always-true gate.
+
+Opus also verified independently, and I am recording these as CHECKED rather than assumed: no row
+is made worse (a terminal row cannot be re-stamped — `advance` returns `None`); the reverse
+mismatch the ADR warns about is unreachable; every consumer of both fields is a formatter, with
+Pay-step enforcement, probe cost and reservations all reading `MoveRecord` and never the ledger.
+
+*Not verified by the panel.* Opus did not run the gate; the 792/0 figure is mine.
+
+**The cross-cutting tell fired.** Two consecutive rounds found different sites deciding ONE
+concept — *when is a move committed*. Response was to stop expanding: round 2 produced a bead and
+a shared predicate, not a wider diff.
+
 ## Done — 2/3
 **`br-evac-cap-enforce-vn6`** — the money change. Merged as `e9cc97d` (PR #31).
 

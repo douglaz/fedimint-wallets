@@ -811,10 +811,16 @@ async fn a_reconstructed_evacuation_row_reports_the_committed_cap_and_amount() {
 /// itself from one. `size_fresh_evacuation` re-sizes the draft from the intent on every
 /// pre-receive pass, and the pre-mint cap re-check persists it and then returns `Retryable`
 /// (`executor.rs`) — so a row stamped from it would report an amount and a cap that NO operation
-/// ever ran under. Terminal rows are immutable, so a permanent failure at that point would freeze
-/// that never-executed pair for good. The planned pair stands until a leg actually commits.
+/// ever ran under.
+///
+/// This drives the TERMINAL transition on purpose. A `Failed` write is where the harm is
+/// permanent — terminal rows are immutable, so a pair stamped here can never be corrected — and
+/// it is reachable over a persisted draft: `clamp_desired_to_cap_room` returns `Permanent` for an
+/// evacuation into a destination already at its cap, on a tick after an earlier tick persisted a
+/// sized draft. A same-status `Pending` rewrite would exercise the one case where the stamp costs
+/// nothing and would also pass if no write happened at all.
 #[tokio::test]
-async fn a_draft_move_row_with_no_committed_leg_leaves_the_planned_pair_standing() {
+async fn a_draft_move_row_does_not_freeze_its_pair_onto_the_terminal_row() {
     let j = mem_ledger();
     let k = "evac:0102:2";
     let intent = evacuation_intent(k, IntentStatus::Pending);
@@ -830,21 +836,26 @@ async fn a_draft_move_row_with_no_committed_leg_leaves_the_planned_pair_standing
     mv.phase = MovePhase::Created;
     j.put_move(&mv).await.expect("put_move");
 
-    // The retryable refusal puts the intent back to Pending, which rewrites the ledger row.
-    j.set_status(&intent.idempotency_key, IntentStatus::Pending, None)
-        .await
-        .expect("set_status");
+    j.set_status(
+        &intent.idempotency_key,
+        IntentStatus::Failed,
+        Some("destination is already at its cap"),
+    )
+    .await
+    .expect("set_status");
 
     let rec = op_of(&j, &intent.idempotency_key).await;
+    // The write really happened — otherwise "the row is unchanged" would be vacuously true.
+    assert_eq!(rec.status, OperationStatus::Failed, "the row is terminal");
     assert_eq!(
         rec.fees.fee_cap,
         Some(EVAC_CAP.at(EVAC_PLANNED)),
-        "a draft with no committed leg must not restate the row's cap"
+        "a draft with no committed leg must not freeze its cap onto the terminal row"
     );
     match rec.kind {
         OperationKind::Move { amount, .. } => assert_eq!(
             amount, EVAC_PLANNED,
-            "a draft with no committed leg must not restate the row's amount"
+            "a draft with no committed leg must not freeze its amount onto the terminal row"
         ),
         other => panic!("kind changed: {other:?}"),
     }

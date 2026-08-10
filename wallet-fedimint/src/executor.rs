@@ -3011,7 +3011,19 @@ fn gateway_from_cache_or_recovered(
     None
 }
 
-fn has_move_artifact(rec: &MoveRecord) -> bool {
+/// Whether any leg of this move has COMMITTED — the line between a re-sizable draft and a record
+/// that describes something that actually happened.
+///
+/// `pub(crate)` because the ledger gates on it too (`journal::refresh_from_move`), and the two
+/// must not drift: this predicate is what stops [`Executor::size_fresh_evacuation`] re-writing
+/// `amount`/`fee_cap`, so it is exactly the moment the pair stops being provisional. Narrowing it
+/// here without the ledger following would let sizing rewrite a pair the ledger has already
+/// stamped. One definition, two callers — do not re-derive it inline.
+///
+/// NOT the same question `assemble_move_record`'s cap fallback asks (`move_protocol.rs`), which
+/// deliberately omits `invoice`: it is choosing whether a CACHED cap may stand in for a committed
+/// one, not whether the move happened.
+pub(crate) fn has_move_artifact(rec: &MoveRecord) -> bool {
     rec.invoice.is_some() || rec.recv_op.is_some() || rec.send_op.is_some()
 }
 
