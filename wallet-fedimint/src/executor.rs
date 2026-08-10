@@ -3015,7 +3015,7 @@ fn gateway_from_cache_or_recovered(
 /// that describes something that actually happened.
 ///
 /// `pub(crate)` because the ledger gates on it too (`journal::refresh_from_move`), and the two
-/// must not drift: this predicate is what stops [`Executor::size_fresh_evacuation`] re-writing
+/// must not drift: this predicate is what stops [`FedimintExecutor::size_fresh_evacuation`] re-writing
 /// `amount`/`fee_cap`, so it is exactly the moment the pair stops being provisional. Narrowing it
 /// here without the ledger following would let sizing rewrite a pair the ledger has already
 /// stamped. One definition, two callers — do not re-derive it inline.

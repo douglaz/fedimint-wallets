@@ -2994,7 +2994,8 @@ fn fresh_intent_record(
 /// amount derives a different number — which is why they are written as one pair here, exactly
 /// as `apply_evacuation_sizing` writes them onto the [`MoveRecord`] this reads (ADR-0029).
 ///
-/// The pair is stamped ONLY once a leg has COMMITTED, which is what [`has_move_artifact`] tests.
+/// The pair is stamped ONLY once a leg has COMMITTED, which is what
+/// [`crate::executor::has_move_artifact`] tests.
 /// Before that the move row holds a pre-operation DRAFT: `size_fresh_evacuation` re-sizes it from
 /// the intent on every pre-receive pass, and the pre-mint cap re-check persists it and then
 /// returns `Retryable` — so a row stamped from a draft would report an amount and a cap that no
