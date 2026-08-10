@@ -2981,15 +2981,25 @@ fn fresh_intent_record(
     }
 }
 
-/// Copy the `0x02` move row's op-ids, gateway, and quoted fees onto an intent-backed ledger
-/// row (§9.2). `Move`'s two op-ids come from here (not the single-op `RawOpUpdate`); a `None`
-/// on the move row never clobbers a value already on the ledger row.
+/// Copy the `0x02` move row's op-ids, gateway, quoted fees, executed amount and enforced fee
+/// cap onto an intent-backed ledger row (§9.2). `Move`'s two op-ids come from here (not the
+/// single-op `RawOpUpdate`); a `None` on the move row never clobbers a value already on the
+/// ledger row.
+///
+/// The amount and the cap are stamped TOGETHER, and only on the two move-shaped kinds. The row
+/// is seeded from the PLANNED action (`kind_from_action`, `fresh_intent_record`), so for an
+/// evacuation the sizing search clamped, both seeded values describe a move that never
+/// happened. Refreshing just one is worse than refreshing neither: `amount = planned,
+/// fee_cap = enforced` is internally false — an auditor recomputing the cap from the displayed
+/// amount derives a different number — which is why they are written as one pair here, exactly
+/// as `apply_evacuation_sizing` writes them onto the [`MoveRecord`] this reads (ADR-0029).
 fn refresh_from_move(rec: &mut OperationRecord, mv: &MoveRecord) {
     match &mut rec.kind {
         OperationKind::Move {
             send_op,
             recv_op,
             gateway,
+            amount,
             ..
         } => {
             if mv.send_op.is_some() {
@@ -2999,14 +3009,21 @@ fn refresh_from_move(rec: &mut OperationRecord, mv: &MoveRecord) {
                 *recv_op = mv.recv_op;
             }
             *gateway = Some(mv.gateway.clone());
+            *amount = mv.amount;
+            rec.fees.fee_cap = Some(mv.fee_cap);
         }
         OperationKind::DirectInflow {
-            recv_op, gateway, ..
+            recv_op,
+            gateway,
+            amount,
+            ..
         } => {
             if mv.recv_op.is_some() {
                 *recv_op = mv.recv_op;
             }
             *gateway = Some(mv.gateway.clone());
+            *amount = mv.amount;
+            rec.fees.fee_cap = Some(mv.fee_cap);
         }
         _ => {}
     }

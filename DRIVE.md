@@ -9,8 +9,8 @@ br-ucq, br-pfc, br-4yz), NOT br-2aa, NOT br-s0e, NOT the production canary.
 **Branch:** `feat/br-evac-cap-ledger-x9k`
 **Pending:** —
 **Gate:** `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
-· workspace gate green on `main` at `e9cc97d` — 2/3's squash-merge — fmt 0, clippy 0,
-  **789 passed / 0 failed**, EXIT=0
+· workspace gate green on this branch's implementation tree — fmt 0, clippy 0,
+  **791 passed / 0 failed**, EXIT=0 (789 on `main` at `e9cc97d`, plus 3/3's two)
 · live devimint evacuation gate green nine consecutive times across 2/3's branch, last at its
   final pre-merge tree. Those branch SHAs are NOT reachable from `main`: PR #31 was squash-merged,
   so `e9cc97d` is the only hash a future reader can resolve. Do not cite the branch hashes.
@@ -37,6 +37,32 @@ TWO of its three documentation criteria are ALREADY MET — the bot review on PR
 into 2/3, which is where it belonged, since the runbook was wrong the moment enforcement landed.
 Verify before redoing: the runbook's `policy set` sample carries the evac knobs and says `--max-fee`
 does not bound an evacuation, and README describes both caps' shapes, units and ranges.
+**Re-verified on this branch** (`README.md:106-123`, `docs/real-sats-pilot-runbook.md:84-111`) —
+not redone.
+
+**Implemented, gate green, awaiting review.** `refresh_from_move` now stamps the executed amount
+and the enforced cap together, on the two move-shaped kinds only.
+
+*Evidence.* Red-first, per property, per path:
+· the CAP assertion went red against the unfixed code in BOTH tests — `Some(Msat(2450000))` where
+  `Some(Msat(230000))` was enforced, the bead's own numbers.
+· the AMOUNT assertion was SHADOWED by that failure, so it proves nothing from that run. It was
+  reddened separately, by removing only the amount stamp: `Msat(75000000)` vs `Msat(1000000)`, in
+  both the clamp path and the reconstruction path. The file was then restored and verified
+  byte-identical to a pre-mutation copy before the green re-run.
+
+*Not run, and not claimed.* No live devimint gate on this branch. The change is read/report only —
+it alters what a ledger row DISPLAYS, not what any money path decides — so the money behaviour a
+live run would exercise is 2/3's, already gated nine times there. Say so rather than implying this
+branch inherited that evidence.
+
+*Not proven.* That `wallet-cli history` renders the refreshed pair end-to-end: the tests assert on
+the `OperationRecord`, one layer below the CLI's formatting.
+
+*Deliberate.* BUILD ran as a direct implementation rather than through rb-lite — one function,
+~15 production lines, seams already located. The panel arrives in HARDEN, where the money-adjacent
+rule wants it. BUILD's exit gate is still met on its own terms: the real gate at a real exit code,
+and every load-bearing behaviour inverted with its pinning assertion observed to fail.
 
 ## Done — 2/3
 **`br-evac-cap-enforce-vn6`** — the money change. Merged as `e9cc97d` (PR #31).

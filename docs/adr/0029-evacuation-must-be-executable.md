@@ -154,6 +154,12 @@ specified a four-case pin-precedence table for evacuation — that table is dele
 
 ## Why
 
+> Line references in this section cite the tree at `ed0d679`, where this ADR was recorded — the
+> code the diagnosis is ABOUT. Enforcement landed later (`e9cc97d`) and moved several of them.
+> They are deliberately NOT renumbered: today's `size_fresh_evacuation` no longer searches against
+> a constant `fee_cap`, so a citation pointing at today's lines would attribute the diagnosed
+> defect to the code that fixed it.
+
 **The absolute cap cannot fund a real evacuation, and it fails in TWO different ways depending on
 the gateway's fee shape.** Neither is what an earlier draft of this ADR claimed; both were
 established by reading the code rather than reasoning from the parameter.
@@ -239,6 +245,13 @@ not rest on something a user can click past.
 
 ## Consequences
 
+- **The ledger reports the pair that EXECUTED, not the pair that was planned.** Because the cap
+  is recomputed at the net the evacuation sized down to, a row still showing the planned amount
+  and the planned cap describes a move that never happened — and a fee audit against
+  `wallet-cli history` would validate fees the enforced cap refused. The two are therefore
+  refreshed together onto the ledger row from the `MoveRecord` that holds them, never one alone:
+  `amount = planned, fee_cap = enforced` is internally false, since recomputing the cap from the
+  displayed amount yields a different number.
 - **`Evacuate` and `Move` no longer share a fee-cap shape.** A reader comparing them will find
   `Move` proportional-only and `Evacuate` base + proportional; that asymmetry is deliberate and
   exists because only one of them must succeed.

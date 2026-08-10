@@ -12,13 +12,14 @@ use fedimint_core::db::mem_impl::MemDatabase;
 use fedimint_core::db::{IDatabaseTransactionOpsCore, IRawDatabaseExt};
 use std::collections::BTreeMap;
 use wallet_core::{
-    Action, Actor, AllocatorDecision, DiscoverySource, ExecError, FederationId, FeeBreakdown,
-    IdempotencyKey, Intent, IntentStatus, Journal, Msat, Occurrence, OperationKind,
+    Action, Actor, AllocatorDecision, DiscoverySource, EvacFeeCap, ExecError, FederationId,
+    FeeBreakdown, IdempotencyKey, Intent, IntentStatus, Journal, Msat, Occurrence, OperationKind,
     OperationRecord, OperationStatus, RawOpUpdate, ReasonCode, RefusalDiagnostics, SourceStatus,
 };
 use wallet_fedimint::{
-    FederationInfo, FedimintJournal, GatewayUrl, Invoice, LedgerRepairOracle, MovePhase,
-    MoveRecord, OperationId, OperationRef, RawOpObservation, RawOperationRole, RawTerminal,
+    assemble_move_record, FederationInfo, FedimintJournal, GatewayUrl, Invoice, LedgerRepairOracle,
+    Leg, MoveParams, MovePhase, MoveRecord, OpArtifact, OperationId, OperationRef,
+    RawOpObservation, RawOperationRole, RawTerminal,
 };
 
 const BASE: u64 = 1_700_000_000_000; // a base ms timestamp (divisible by 1000: joins the sec/ms math)
@@ -118,6 +119,53 @@ fn move_record_for(k: &str) -> MoveRecord {
         preimage: None,
         receive_fee_quoted: Some(Msat(150)),
         send_fee_quoted: Some(Msat(250)),
+    }
+}
+
+/// The pilot's evacuation cap rule (`200_000 msat + 300 bps`) and a planned ask far above what
+/// the tests then execute — so the cap at the plan and the cap at the executed net differ.
+const EVAC_CAP: EvacFeeCap = EvacFeeCap {
+    base_msat: Msat(200_000),
+    bps: 300,
+};
+const EVAC_PLANNED: Msat = Msat(75_000_000);
+
+fn evacuation_intent(k: &str, status: IntentStatus) -> Intent {
+    Intent {
+        idempotency_key: key(k),
+        attempt: 0,
+        action: Action::Evacuate {
+            from: fed(1),
+            to: fed(2),
+            amount: EVAC_PLANNED,
+            fee_cap: EVAC_CAP.at(EVAC_PLANNED),
+            gateway: None,
+            fee_cap_components: Some(EVAC_CAP),
+        },
+        max_fee: Some(EVAC_CAP.at(EVAC_PLANNED)),
+        status,
+        reason: ReasonCode::ShutdownNotice,
+        actor: Actor::Agent {
+            occurrence: Occurrence(1),
+        },
+        created_at_ms: BASE,
+        operation_id: None,
+        invoice: None,
+    }
+}
+
+/// The params reassembly starts from: the PLANNED pair, exactly as the durable intent holds it.
+fn evacuation_params(k: &str) -> MoveParams {
+    MoveParams {
+        key: key(k),
+        operation_key: key(k),
+        from: Some(fed(1)),
+        to: fed(2),
+        amount: EVAC_PLANNED,
+        fee_cap: EVAC_CAP.at(EVAC_PLANNED),
+        fee_cap_components: Some(EVAC_CAP),
+        gateway: GatewayUrl("https://gw.example".to_string()),
+        send_required: true,
     }
 }
 
@@ -652,6 +700,109 @@ async fn ledger_refreshes_fees_and_op_ids_from_the_move_row_on_non_terminal_writ
             assert_eq!(recv_op, Some(op(7)));
             assert_eq!(gateway, Some(GatewayUrl("https://gw.example".to_string())));
         }
+        other => panic!("kind changed: {other:?}"),
+    }
+}
+
+/// ADR-0029 LEDGER AGREEMENT — an evacuation the sizing search clamped must leave the ledger
+/// row reporting the pair it EXECUTED: the net it moved, and the cap recomputed at that net.
+///
+/// Both or neither. A row reading `amount = planned, fee_cap = enforced` is internally FALSE —
+/// an auditor recomputing the cap from the displayed amount derives a different number — so
+/// refreshing one alone makes the row worse than leaving both planned.
+#[tokio::test]
+async fn a_clamped_evacuation_row_reports_the_cap_and_the_amount_it_executed() {
+    let j = mem_ledger();
+    let k = "evac:0102:0";
+    let intent = evacuation_intent(k, IntentStatus::Pending);
+    j.upsert(&intent).await.expect("upsert");
+
+    // What sizing did: clamp the net to what the dying source can fund, then recompute the cap
+    // AT that net — `apply_evacuation_sizing`'s two writes, which always move together.
+    let executed = Msat(1_000_000);
+    let enforced = EVAC_CAP.at(executed);
+    assert_ne!(
+        enforced,
+        EVAC_CAP.at(EVAC_PLANNED),
+        "planned and enforced caps must differ, or neither assertion below distinguishes them"
+    );
+    let mut mv = move_record_for(k);
+    mv.amount = executed;
+    mv.fee_cap = enforced;
+    j.put_move(&mv).await.expect("put_move");
+
+    j.set_status(&intent.idempotency_key, IntentStatus::Awaiting, None)
+        .await
+        .expect("set_status");
+
+    let rec = op_of(&j, &intent.idempotency_key).await;
+    assert_eq!(
+        rec.fees.fee_cap,
+        Some(enforced),
+        "the row must report the cap the move was authorised under, not the planned {:?}",
+        intent.max_fee
+    );
+    match rec.kind {
+        OperationKind::Move { amount, .. } => assert_eq!(
+            amount, executed,
+            "the row must report the net that moved, not the planned ask"
+        ),
+        other => panic!("kind changed: {other:?}"),
+    }
+}
+
+/// The same agreement after CACHE-LOSS RECONSTRUCTION. With the journal's cached move row gone,
+/// `assemble_move_record` recovers the executed pair from the committed op metadata while its
+/// params still carry the PLANNED pair — so this is the path where a ledger row that reads its
+/// amount from the intent, and its cap from nowhere, disagrees with the move it describes.
+#[tokio::test]
+async fn a_reconstructed_evacuation_row_reports_the_committed_cap_and_amount() {
+    let j = mem_ledger();
+    let k = "evac:0102:1";
+    let intent = evacuation_intent(k, IntentStatus::Pending);
+    j.upsert(&intent).await.expect("upsert");
+
+    let executed = Msat(1_000_000);
+    let enforced = EVAC_CAP.at(executed);
+    // The receive leg committed at the sized-down net. The cache is GONE (`None`), so reassembly
+    // has only this artifact and the intent's planned params to work from.
+    let mv = assemble_move_record(
+        evacuation_params(k),
+        &[OpArtifact {
+            move_id: key(k),
+            leg: Leg::Receive,
+            op_id: op(7),
+            amount: executed,
+            fee_cap: Some(enforced),
+            invoice: Some(Invoice("lnbc1".to_string())),
+        }],
+        None,
+    );
+    assert_eq!(
+        mv.amount, executed,
+        "reassembly must recover the executed net"
+    );
+    assert_eq!(
+        mv.fee_cap, enforced,
+        "reassembly must recover the enforced cap"
+    );
+    j.put_move(&mv).await.expect("put_move");
+
+    j.set_status(&intent.idempotency_key, IntentStatus::Awaiting, None)
+        .await
+        .expect("set_status");
+
+    let rec = op_of(&j, &intent.idempotency_key).await;
+    assert_eq!(
+        rec.fees.fee_cap,
+        Some(enforced),
+        "a reconstructed row must report the recovered cap, not the intent's planned one"
+    );
+    match rec.kind {
+        OperationKind::Move { amount, .. } => assert_eq!(
+            amount, executed,
+            "a reconstructed row must report the recovered net, not the intent's planned ask"
+        ),
         other => panic!("kind changed: {other:?}"),
     }
 }
