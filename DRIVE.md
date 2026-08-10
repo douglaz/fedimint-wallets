@@ -29,7 +29,13 @@ excluded these beads.
 ## Now
 **3/3 `br-evac-cap-ledger-x9k`** — the ledger must report the cap it ENFORCED and the amount it
 EXECUTED, not the pair it planned. After a clamp the row keeps the planned figures for life, so a
-post-incident audit against `wallet-cli history` validates fees the enforced cap would have refused.
+post-incident fee audit clears fees the enforced cap would have refused.
+
+The bead — and 2/3's ADR text — name `wallet-cli history` as that audit surface. **Checked: wrong
+command.** `history_tsv` (`wallet-cli/src/main.rs:2921`) emits amount, receive_fee and
+send_fee_quoted and has NO cap column; `print_show_record` (`:2953-2954`) prints `amount_msat` and
+`fee_cap_msat` adjacent. `show` is where the false pair is visible and where the fix pays off. The
+motivation is unchanged — the durable row was wrong either way — but the ADR now names `show`.
 Seam: `refresh_from_move` (`wallet-fedimint/src/journal.rs`) copies op-ids, gateway and quoted fees
 but neither `fee_cap` nor the amount; `MoveRecord` already carries both.
 
@@ -63,6 +69,43 @@ the `OperationRecord`, one layer below the CLI's formatting.
 ~15 production lines, seams already located. The panel arrives in HARDEN, where the money-adjacent
 rule wants it. BUILD's exit gate is still met on its own terms: the real gate at a real exit code,
 and every load-bearing behaviour inverted with its pinning assertion observed to fail.
+
+### HARDEN pass 1 — **DEGRADED** (codex only)
+
+**Fable never ran.** It sat at 0.0% CPU for 11h30m having written zero bytes, then was killed by
+exact PID (exit 144). Fourth failure of this reviewer on this thread. A one-reviewer pass is one
+opinion, so this pass cannot report `CLEAN` — only `CLEAN_DEGRADED` — and pass 2 must restore the
+panel or say plainly that it could not.
+
+**Codex: 2 × P2, both verified against the code, both ACCEPTED.**
+
+1. *The stamp fired on drafts, not just executed moves.* `executor.rs:1462`/`:1489` persist a
+   SIZED BUT UNMINTED `MoveRecord` and then return `Retryable`, before `mc.receive` commits
+   anything. The intent returns to Pending, the row is rewritten, and the unconditional stamp
+   wrote that draft pair onto it — permanently, since terminal rows are immutable. Reproduced
+   red before fixing (`Some(Msat(230000))` on a row where nothing executed). Both stamps are now
+   gated on committed-leg evidence (`invoice`/`recv_op`/`send_op`), which is strictly more
+   conservative and costs the audit case nothing: fees only exist once a leg commits. Third test
+   added, red-first. Tests 1 and 2 still pass ungated-by-accident — their move rows carry
+   committed legs — and the draft test failing without the gate is also the vacuity check that
+   `committed` actually discriminates.
+
+   This is the planning-vs-executed conflation of 2/3 arriving through a different door. Worth
+   naming: the concept was already known to be the dangerous one on this thread.
+
+2. *The audit surface needs `--standalone`.* Correcting `history` → `show` was still wrong.
+   `wallet-cli --standalone show` prints the pair; client-mode `show` renders `OperationView`
+   (`wallet-api/src/lib.rs`), which has **no `fee_cap` field at all**. So the row is now right and
+   an operator on a normal deployment still cannot see it. NOT fixed here — the wire view never
+   carried the cap, so this is a pre-existing gap this work exposed. ADR qualified; filed as
+   **`br-w6p`** (P2).
+
+**Three prose claims about operator surfaces have now failed verification on this thread**, two of
+them in text written this session. The tell is asserting an audit path from the bead's framing
+instead of reading the formatter. Treat "names a CLI command, a knob, or a view" as requiring a
+code check BEFORE it is written down.
+
+Gate after the fix: fmt 0, clippy 0, **792 passed / 0 failed**, EXIT=0.
 
 ## Done — 2/3
 **`br-evac-cap-enforce-vn6`** — the money change. Merged as `e9cc97d` (PR #31).

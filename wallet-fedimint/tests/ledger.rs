@@ -807,6 +807,49 @@ async fn a_reconstructed_evacuation_row_reports_the_committed_cap_and_amount() {
     }
 }
 
+/// A move row with NO committed leg is a pre-operation DRAFT, and the ledger must not restate
+/// itself from one. `size_fresh_evacuation` re-sizes the draft from the intent on every
+/// pre-receive pass, and the pre-mint cap re-check persists it and then returns `Retryable`
+/// (`executor.rs`) — so a row stamped from it would report an amount and a cap that NO operation
+/// ever ran under. Terminal rows are immutable, so a permanent failure at that point would freeze
+/// that never-executed pair for good. The planned pair stands until a leg actually commits.
+#[tokio::test]
+async fn a_draft_move_row_with_no_committed_leg_leaves_the_planned_pair_standing() {
+    let j = mem_ledger();
+    let k = "evac:0102:2";
+    let intent = evacuation_intent(k, IntentStatus::Pending);
+    j.upsert(&intent).await.expect("upsert");
+
+    // Sized, persisted, and then refused BEFORE minting: no invoice, no op ids on either leg.
+    let mut mv = move_record_for(k);
+    mv.amount = Msat(1_000_000);
+    mv.fee_cap = EVAC_CAP.at(Msat(1_000_000));
+    mv.invoice = None;
+    mv.recv_op = None;
+    mv.send_op = None;
+    mv.phase = MovePhase::Created;
+    j.put_move(&mv).await.expect("put_move");
+
+    // The retryable refusal puts the intent back to Pending, which rewrites the ledger row.
+    j.set_status(&intent.idempotency_key, IntentStatus::Pending, None)
+        .await
+        .expect("set_status");
+
+    let rec = op_of(&j, &intent.idempotency_key).await;
+    assert_eq!(
+        rec.fees.fee_cap,
+        Some(EVAC_CAP.at(EVAC_PLANNED)),
+        "a draft with no committed leg must not restate the row's cap"
+    );
+    match rec.kind {
+        OperationKind::Move { amount, .. } => assert_eq!(
+            amount, EVAC_PLANNED,
+            "a draft with no committed leg must not restate the row's amount"
+        ),
+        other => panic!("kind changed: {other:?}"),
+    }
+}
+
 // --- §9.3 scans: resolve by key AND seq; poison tolerance ---
 
 #[tokio::test]

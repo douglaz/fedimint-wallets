@@ -2993,7 +2993,16 @@ fn fresh_intent_record(
 /// fee_cap = enforced` is internally false — an auditor recomputing the cap from the displayed
 /// amount derives a different number — which is why they are written as one pair here, exactly
 /// as `apply_evacuation_sizing` writes them onto the [`MoveRecord`] this reads (ADR-0029).
+///
+/// The pair is stamped ONLY once a leg has COMMITTED. Before that the move row holds a
+/// pre-operation DRAFT: `size_fresh_evacuation` re-sizes it from the intent on every pre-receive
+/// pass, and the pre-mint cap re-check persists it and then returns `Retryable` — so a row
+/// stamped from a draft would report an amount and a cap that no operation ever ran under, and a
+/// permanent failure there would freeze that pair onto an immutable terminal row. The op-ids,
+/// gateway and quoted fees below are NOT gated: each is already `None` until it is real, and a
+/// gateway is chosen pre-mint and is informative on a row that never got further.
 fn refresh_from_move(rec: &mut OperationRecord, mv: &MoveRecord) {
+    let committed = mv.invoice.is_some() || mv.recv_op.is_some() || mv.send_op.is_some();
     match &mut rec.kind {
         OperationKind::Move {
             send_op,
@@ -3009,8 +3018,10 @@ fn refresh_from_move(rec: &mut OperationRecord, mv: &MoveRecord) {
                 *recv_op = mv.recv_op;
             }
             *gateway = Some(mv.gateway.clone());
-            *amount = mv.amount;
-            rec.fees.fee_cap = Some(mv.fee_cap);
+            if committed {
+                *amount = mv.amount;
+                rec.fees.fee_cap = Some(mv.fee_cap);
+            }
         }
         OperationKind::DirectInflow {
             recv_op,
@@ -3022,8 +3033,10 @@ fn refresh_from_move(rec: &mut OperationRecord, mv: &MoveRecord) {
                 *recv_op = mv.recv_op;
             }
             *gateway = Some(mv.gateway.clone());
-            *amount = mv.amount;
-            rec.fees.fee_cap = Some(mv.fee_cap);
+            if committed {
+                *amount = mv.amount;
+                rec.fees.fee_cap = Some(mv.fee_cap);
+            }
         }
         _ => {}
     }

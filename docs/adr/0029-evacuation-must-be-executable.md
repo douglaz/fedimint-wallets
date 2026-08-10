@@ -247,11 +247,20 @@ not rest on something a user can click past.
 
 - **The ledger reports the pair that EXECUTED, not the pair that was planned.** Because the cap
   is recomputed at the net the evacuation sized down to, a row still showing the planned amount
-  and the planned cap describes a move that never happened — and a fee audit against
-  `wallet-cli history` would validate fees the enforced cap refused. The two are therefore
-  refreshed together onto the ledger row from the `MoveRecord` that holds them, never one alone:
-  `amount = planned, fee_cap = enforced` is internally false, since recomputing the cap from the
-  displayed amount yields a different number.
+  and the planned cap describes a move that never happened, and a post-incident fee audit would
+  clear fees the enforced cap refused. The two are therefore refreshed together onto the ledger
+  row from the `MoveRecord` that holds them, never one alone: `amount = planned,
+  fee_cap = enforced` is internally false, since recomputing the cap from the displayed amount
+  yields a different number. They are refreshed only ONCE A LEG HAS COMMITTED — before that the
+  move row is a re-sized draft, and a pre-mint refusal would otherwise freeze a never-executed
+  pair onto an immutable terminal row.
+- **Reading the enforced cap back needs `--standalone`, today.** `wallet-cli --standalone show`
+  prints `amount_msat` and `fee_cap_msat` adjacent (`print_show_record`), and its `--json` emits
+  the whole `OperationRecord`. Neither daemon-backed view carries the cap: `history` has no cap
+  column, and client-mode `show` renders `OperationView` (`wallet-api/src/lib.rs`), which has
+  `amount`, `receive_fee` and `send_fee_quoted` and no `fee_cap` field at all. So the row is now
+  correct, but on a normal deployment an operator cannot yet see it — a gap this ADR's
+  implementation exposes rather than creates, tracked separately.
 - **`Evacuate` and `Move` no longer share a fee-cap shape.** A reader comparing them will find
   `Move` proportional-only and `Evacuate` base + proportional; that asymmetry is deliberate and
   exists because only one of them must succeed.
