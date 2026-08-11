@@ -11,9 +11,10 @@ br-ucq, br-pfc, br-4yz), NOT br-2aa, NOT br-s0e, NOT the production canary.
 · 3/3 merged as `50e25e9` (PR #32). Workspace gate green on its final pre-merge tree —
   fmt 0, clippy 0, **792 passed / 0 failed**, EXIT=0 — and `nix build` green on `main` at
   `50e25e9` after the merge.
-· **The repository now has CI** (`.github/workflows/ci.yml`, separate PR): fmt + clippy +
-  test in the devshell, and `nix build` of `walletd`, `wallet-cli` and the deployment image.
-  Every gate before that one was local-only.
+· **CI is PENDING, not present.** This repo has no `.github/workflows/` in this tree; every
+  gate cited above ran locally. A workflow adding fmt + clippy + test in the devshell, plus
+  `nix build` of `walletd`, `wallet-cli` and the deployment image, is open in its own PR and
+  NOT merged. Do not read the gates above as CI-enforced until it lands.
 · live devimint evacuation gate green nine consecutive times across 2/3's branch, last at its
   final pre-merge tree. Those branch SHAs are NOT reachable from `main`: PR #31 was squash-merged,
   so `e9cc97d` is the only hash a future reader can resolve. Do not cite the branch hashes.
@@ -59,8 +60,8 @@ does not bound an evacuation, and README describes both caps' shapes, units and 
 **Re-verified on this branch** (`README.md:106-123`, `docs/real-sats-pilot-runbook.md:84-111`) —
 not redone.
 
-**Implemented, gate green, awaiting review.** `refresh_from_move` now stamps the executed amount
-and the enforced cap together, on the two move-shaped kinds only.
+**Merged.** `refresh_from_move` stamps the executed amount and the enforced cap together, on
+the two move-shaped kinds only, and only once a leg has committed.
 
 *Evidence.* Red-first, per property, per path:
 · the CAP assertion went red against the unfixed code in BOTH tests — `Some(Msat(2450000))` where
@@ -234,9 +235,11 @@ establish is recorded below.
   settled amount", not "the guard broke".
 
 ## Next
-`br-evac-cap-ledger-x9k` (3/3) — the ledger reporting the enforced cap and executed
-amount, plus runbook and README. Then `br-y2j` closes, which unblocks
-`br-recanary-y2j-ujs`.
+Nothing in this drive's scope — it is empty and `br-y2j` is closed.
+
+`br-recanary-y2j-ujs` (the production re-canary, real sats) became READY when `br-y2j` closed.
+It is the operator's decision, not this drive's next step. The deferred beads listed at the top
+are backlog, each with its own acceptance criteria; none is a continuation of this drive.
 
 ## Open questions for the human
 - none. `br-devimint-runbook-mint-na3` is a filed defect, not an open gate: the runbook's
