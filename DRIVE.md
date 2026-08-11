@@ -5,15 +5,15 @@
 `br-evac-cap-ledger-x9k` (3/3). NOT the wallet-web epic (br-nfz, br-5om, br-t8f,
 br-ucq, br-pfc, br-4yz), NOT br-2aa, NOT br-s0e, NOT the production canary.
 
-**Phase:** HARDEN · **Bead:** `br-evac-cap-enforce-vn6` ·
-**Branch:** `feat/br-evac-cap-enforce-vn6`
+**Phase:** BUILD · **Bead:** `br-evac-cap-ledger-x9k` (3/3) ·
+**Branch:** `feat/br-evac-cap-ledger-x9k`
 **Pending:** —
 **Gate:** `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
-· workspace gate green at `1da1981` (fmt 0, clippy 0, **789 passed / 0 failed**, EXIT=0)
-· live devimint evacuation gate green at `0cb6b2e`, EXIT=0 — a DIFFERENT commit, and the two
-  hashes are written out because they diverge. `1da1981` adds no logic: the "probed" qualification
-  on five diagnostic strings, this file, and a bead description. The live gate has run green at
-  seven commits on this branch, and NONE of them exercised the refusal diagnostics (see NOT proven).
+· workspace gate green on this branch's final tree — fmt 0, clippy 0,
+  **792 passed / 0 failed**, EXIT=0 (789 on `main` at `e9cc97d`, plus 3/3's three)
+· live devimint evacuation gate green nine consecutive times across 2/3's branch, last at its
+  final pre-merge tree. Those branch SHAs are NOT reachable from `main`: PR #31 was squash-merged,
+  so `e9cc97d` is the only hash a future reader can resolve. Do not cite the branch hashes.
 
 Supersedes the stranded-move drive, which was stopped for a retrospective and whose scope
 excluded these beads.
@@ -27,7 +27,127 @@ excluded these beads.
   panel, 742 tests, CodeRabbit no actionable comments.
 
 ## Now
-**2/3 `br-evac-cap-enforce-vn6`** — the money change. PR #31.
+**3/3 `br-evac-cap-ledger-x9k`** — the ledger must report the cap it ENFORCED and the amount it
+EXECUTED, not the pair it planned. After a clamp the row keeps the planned figures for life, so a
+post-incident fee audit clears fees the enforced cap would have refused.
+
+The bead — and 2/3's ADR text — name `wallet-cli history` as that audit surface. **Checked: wrong
+command.** `history_tsv` (`wallet-cli/src/main.rs:2921`) emits amount, receive_fee and
+send_fee_quoted and has NO cap column; `print_show_record` (`:2953-2954`) prints `amount_msat` and
+`fee_cap_msat` adjacent. `show` is where the false pair is visible and where the fix pays off. The
+motivation is unchanged — the durable row was wrong either way — but the ADR now names `show`.
+Seam: `refresh_from_move` (`wallet-fedimint/src/journal.rs`) copies op-ids, gateway and quoted fees
+but neither `fee_cap` nor the amount; `MoveRecord` already carries both.
+
+TWO of its three documentation criteria are ALREADY MET — the bot review on PR #31 pulled that work
+into 2/3, which is where it belonged, since the runbook was wrong the moment enforcement landed.
+Verify before redoing: the runbook's `policy set` sample carries the evac knobs and says `--max-fee`
+does not bound an evacuation, and README describes both caps' shapes, units and ranges.
+**Re-verified on this branch** (`README.md:106-123`, `docs/real-sats-pilot-runbook.md:84-111`) —
+not redone.
+
+**Implemented, gate green, awaiting review.** `refresh_from_move` now stamps the executed amount
+and the enforced cap together, on the two move-shaped kinds only.
+
+*Evidence.* Red-first, per property, per path:
+· the CAP assertion went red against the unfixed code in BOTH tests — `Some(Msat(2450000))` where
+  `Some(Msat(230000))` was enforced, the bead's own numbers.
+· the AMOUNT assertion was SHADOWED by that failure, so it proves nothing from that run. It was
+  reddened separately, by removing only the amount stamp: `Msat(75000000)` vs `Msat(1000000)`, in
+  both the clamp path and the reconstruction path. The file was then restored and verified
+  byte-identical to a pre-mutation copy before the green re-run.
+
+*Not run, and not claimed.* No live devimint gate on this branch. The change is read/report only —
+it alters what a ledger row DISPLAYS, not what any money path decides — so the money behaviour a
+live run would exercise is 2/3's, already gated nine times there. Say so rather than implying this
+branch inherited that evidence.
+
+*Not proven.* That `wallet-cli history` renders the refreshed pair end-to-end: the tests assert on
+the `OperationRecord`, one layer below the CLI's formatting.
+
+*Deliberate.* BUILD ran as a direct implementation rather than through rb-lite — one function,
+~15 production lines, seams already located. The panel arrives in HARDEN, where the money-adjacent
+rule wants it. BUILD's exit gate is still met on its own terms: the real gate at a real exit code,
+and every load-bearing behaviour inverted with its pinning assertion observed to fail.
+
+### HARDEN pass 1 — **DEGRADED** (one reviewer)
+
+**The repo-aware reviewer never ran.** It sat at 0.0% CPU for 11h30m having written zero bytes,
+then was killed by exact PID (exit 144). Fourth failure of that reviewer on this thread. A one-reviewer pass is one
+opinion, so this pass cannot report `CLEAN` — only `CLEAN_DEGRADED` — and pass 2 must restore the
+panel or say plainly that it could not.
+
+**Diff-scoped reviewer: 2 × P2, both verified against the code, both ACCEPTED.**
+
+1. *The stamp fired on drafts, not just executed moves.* `executor.rs:1462`/`:1489` persist a
+   SIZED BUT UNMINTED `MoveRecord` and then return `Retryable`, before `mc.receive` commits
+   anything. The intent returns to Pending, the row is rewritten, and the unconditional stamp
+   wrote that draft pair onto it — permanently, since terminal rows are immutable. Reproduced
+   red before fixing (`Some(Msat(230000))` on a row where nothing executed). Both stamps are now
+   gated on committed-leg evidence (`invoice`/`recv_op`/`send_op`), which is strictly more
+   conservative and costs the audit case nothing: fees only exist once a leg commits. Third test
+   added, red-first. Tests 1 and 2 still pass ungated-by-accident — their move rows carry
+   committed legs — and the draft test failing without the gate is also the vacuity check that
+   `committed` actually discriminates.
+
+   This is the planning-vs-executed conflation of 2/3 arriving through a different door. Worth
+   naming: the concept was already known to be the dangerous one on this thread.
+
+2. *The audit surface needs `--standalone`.* Correcting `history` → `show` was still wrong.
+   `wallet-cli --standalone show` prints the pair; client-mode `show` renders `OperationView`
+   (`wallet-api/src/lib.rs`), which has **no `fee_cap` field at all**. So the row is now right and
+   an operator on a normal deployment still cannot see it. NOT fixed here — the wire view never
+   carried the cap, so this is a pre-existing gap this work exposed. ADR qualified; filed as
+   **`br-w6p`** (P2).
+
+**Three prose claims about operator surfaces have now failed verification on this thread**, two of
+them in text written this session. The tell is asserting an audit path from the bead's framing
+instead of reading the formatter. Treat "names a CLI command, a knob, or a view" as requiring a
+code check BEFORE it is written down.
+
+Gate after the fix: fmt 0, clippy 0, **792 passed / 0 failed**, EXIT=0.
+
+### HARDEN pass 2 — panel restored by SUBSTITUTION
+
+The repo-aware reviewer was replaced with a different model after four failures. Say that plainly:
+this is not the documented panel, and the substitute reads the repo the way the original was
+supposed to.
+
+**Diff-scoped reviewer: 1 × P2 — verified real, DECLINED for this bead, filed as `br-v8x`.** `mc.receive` commits
+a real receive op, then `verify_replayable_receive_contract` can return `Permanent` BEFORE
+`invoice`/`recv_op` are persisted, so the gate sees no committed leg and the terminal row freezes
+the planned pair. Not a regression — that row showed the planned pair before this bead too. The
+proposed fix moves the executor's persistence ordering, which this bead's scope guard forbids and
+which is load-bearing: `has_move_artifact` is what stops `size_fresh_evacuation` re-sizing, so
+recording a leg the code deliberately abandons would prevent a later occurrence re-pricing.
+
+**Repo-aware reviewer: 2 × P3, both ACCEPTED and fixed.**
+
+1. The gate re-derived `has_move_artifact` inline instead of calling it — and a THIRD, narrower
+   variant of the same question exists at `move_protocol.rs:503` (no `invoice` disjunct). No live
+   defect: `invoice ⟹ recv_op` holds on both writers. But narrowing `has_move_artifact` later
+   would let sizing rewrite a pair the ledger had already stamped, with no test failing. Now
+   `pub(crate)` and CALLED, with both sites documenting why they must not drift, and why
+   `move_protocol`'s variant asks a different question.
+2. The draft test pinned the harmless write. It drove `Pending → Pending` — a same-status rewrite,
+   the one case where the stamp costs nothing — while both the doc comment and the ADR justify the
+   gate by the TERMINAL case. It would also have passed if no write happened at all. Rewritten to
+   drive `Failed`, with an explicit status assertion so "the row is unchanged" cannot be vacuous.
+   Re-reddened in its new shape against an always-true gate.
+
+That reviewer also verified independently, and these are recorded as CHECKED rather than assumed: no row
+is made worse (a terminal row cannot be re-stamped — `advance` returns `None`); the reverse
+mismatch the ADR warns about is unreachable; every consumer of both fields is a formatter, with
+Pay-step enforcement, probe cost and reservations all reading `MoveRecord` and never the ledger.
+
+*Not verified by the panel.* No reviewer ran the gate; the 792/0 figure is the driver's own.
+
+**The cross-cutting tell fired.** Two consecutive rounds found different sites deciding ONE
+concept — *when is a move committed*. Response was to stop expanding: round 2 produced a bead and
+a shared predicate, not a wider diff.
+
+## Done — 2/3
+**`br-evac-cap-enforce-vn6`** — the money change. Merged as `e9cc97d` (PR #31).
 
 **The shape, since per-round detail lives on the bead.** Rounds 2–4 each found a different
 consumer of ONE undefined concept — *which net does the cap bind to* — and round 2's fix caused
@@ -53,7 +173,7 @@ it: the execution path already refuses to act on anything but a fresh quote, so 
 operator-facing diagnosis to a WEAKER freshness standard than the money path holds itself to was
 the actual defect.
 
-**PANEL HEALTH — the last four rounds were codex-only.** The Claude Fable reviewer produced its
+**PANEL HEALTH — the last four rounds used one reviewer.** The repo-aware reviewer produced its
 last verdict at `7167ed8`; three attempts since then failed without reviewing (twice wedged with no
 output for 20–50 minutes, once `error_during_execution` after two turns), including one with a
 deliberately shortened prompt, so it is not prompt size. Those rounds are DEGRADED: one reviewer is
