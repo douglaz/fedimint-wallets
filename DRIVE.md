@@ -9,8 +9,8 @@ br-ucq, br-pfc, br-4yz), NOT br-2aa, NOT br-s0e, NOT the production canary.
 **Branch:** `feat/br-evac-cap-ledger-x9k`
 **Pending:** —
 **Gate:** `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
-· workspace gate green on this branch's implementation tree — fmt 0, clippy 0,
-  **791 passed / 0 failed**, EXIT=0 (789 on `main` at `e9cc97d`, plus 3/3's two)
+· workspace gate green on this branch's final tree — fmt 0, clippy 0,
+  **792 passed / 0 failed**, EXIT=0 (789 on `main` at `e9cc97d`, plus 3/3's three)
 · live devimint evacuation gate green nine consecutive times across 2/3's branch, last at its
   final pre-merge tree. Those branch SHAs are NOT reachable from `main`: PR #31 was squash-merged,
   so `e9cc97d` is the only hash a future reader can resolve. Do not cite the branch hashes.
