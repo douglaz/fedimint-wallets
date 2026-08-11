@@ -58,10 +58,22 @@ jobs:
 
       # Caches the cargo registry and target/ keyed on Cargo.lock, so the expensive first
       # build of the fedimint/RocksDB tree is paid only on a cache miss.
+      #
+      # `cmd-format` matters: the action shells out to `cargo metadata` to compute its key,
+      # and by default that runs the RUNNER's cargo, outside the devshell and without
+      # `--locked` — a different toolchain that may rewrite Cargo.lock before the locked
+      # steps below ever run, which would make their `--locked` vacuous.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: ". -> target"
           cache-on-failure: true
+          cmd-format: nix develop . --no-update-lock-file --command {0}
+
+      # Belt to that brace: assert the lock is byte-identical to the committed one before any
+      # gate runs. If the cache step (or anything else) rewrote it, the checks below would
+      # certify a dependency graph that is not the reviewed one.
+      - name: Cargo.lock is unchanged
+        run: git diff --exit-code -- Cargo.lock
 
       - name: fmt
         run: nix develop . --no-update-lock-file --command cargo fmt --check
@@ -119,6 +131,16 @@ jobs:
         run: |
           nix build .#walletd    -o result-walletd    --no-update-lock-file --print-build-logs
           nix build .#wallet-cli -o result-wallet-cli --no-update-lock-file --print-build-logs
+
+      # The OCI image is the artifact that actually runs in the cluster, and its derivation
+      # can break on its own — contents, entrypoint, env, dockerTools config — while both
+      # binaries still build. Without this the gate can approve a revision whose DEPLOYABLE
+      # artifact does not exist. Cheap, since it layers the closure already built above.
+      - name: build the deployment image
+        run: nix build .#walletd-image -o result-image-ci --no-update-lock-file --print-build-logs
+
+      - name: the image archive is non-empty
+        run: test -s result-image-ci
 
       # A build that produces an unrunnable binary is not a passing build. `--version` is
       # NOT accepted by either of these (clap rejects it); `--help` exits 0 and is the
