@@ -70,12 +70,17 @@ jobs:
       - name: test
         run: nix develop . --command cargo test --workspace --locked
 
-  # Proves the SHIPPED artifact builds, which the devshell gate above does not: `nix build`
+  # Proves the SHIPPED artifacts build, which the devshell gate above does not: `nix build`
   # goes through the flakebox derivation rather than the dev profile, so it can fail while
   # `cargo build` succeeds. Separate job so it runs in parallel with the gate and gives an
   # independent signal.
+  #
+  # BOTH packages, not just the default. `flake.nix` exposes `walletd` and `wallet-cli` as
+  # separate `buildPackageGroup` derivations, and ADR-0023 makes the CLI a first-class shipped
+  # frontend rather than a test harness — so a break confined to its derivation (its package
+  # group, its `mainProgram`) must not pass green just because the daemon still builds.
   nix-build:
-    name: nix build (walletd)
+    name: nix build (walletd + wallet-cli)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -94,14 +99,21 @@ jobs:
             experimental-features = nix-command flakes
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
 
-      - name: build the default package
-        run: nix build .# --print-build-logs
+      # Explicit `-o` links, because a bare `nix build` writes `./result` and the second
+      # invocation would replace the first's symlink before it could be smoked. Both names
+      # are already gitignored alongside `result`.
+      - name: build the shipped packages
+        run: |
+          nix build .#walletd    -o result-walletd    --print-build-logs
+          nix build .#wallet-cli -o result-wallet-cli --print-build-logs
 
       # A build that produces an unrunnable binary is not a passing build. `--version` is
-      # NOT accepted by this daemon (clap rejects it); `--help` exits 0 and is the cheapest
-      # thing that proves the binary links and starts.
-      - name: smoke the built binary
-        run: ./result/bin/walletd --help > /dev/null
+      # NOT accepted by either of these (clap rejects it); `--help` exits 0 and is the
+      # cheapest thing that proves the binary links and starts.
+      - name: smoke the built binaries
+        run: |
+          ./result-walletd/bin/walletd --help > /dev/null
+          ./result-wallet-cli/bin/wallet-cli --help > /dev/null
 
 # NOT gated here, deliberately:
 #

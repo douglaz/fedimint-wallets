@@ -26,7 +26,9 @@
 /target-pinbump
 target-musl/
 result
-result-image
+# Any named `nix build -o` link, e.g. result-image, and the per-package links CI builds
+# (result-walletd, result-wallet-cli) which anyone reproducing that job locally also gets.
+result-*
 
 # bv (beads viewer) local config and caches
 .bv/
