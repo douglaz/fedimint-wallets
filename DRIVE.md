@@ -42,10 +42,13 @@ excluded these beads.
 
 ## Done — 3/3
 **3/3 `br-evac-cap-ledger-x9k`** — merged as `50e25e9` (PR #32). The ledger now reports the cap
-it ENFORCED and the amount it EXECUTED, not the pair it planned. After a clamp the row keeps the planned figures for life, so a
-post-incident fee audit clears fees the enforced cap would have refused.
+it ENFORCED and the amount it EXECUTED, not the pair it planned.
 
-The bead — and 2/3's ADR text — name `wallet-cli history` as that audit surface. **Checked: wrong
+*The defect it fixed, in the past tense so nobody reads it as current:* a clamped row USED TO keep
+the planned figures for life, so a post-incident fee audit WOULD HAVE cleared fees the enforced cap
+had refused. That is no longer true of any row written after `50e25e9`.
+
+The bead — and 2/3's ADR text — NAMED `wallet-cli history` as that audit surface. **Checked: wrong
 command.** `history_tsv` (`wallet-cli/src/main.rs:2921`) emits amount, receive_fee and
 send_fee_quoted and has NO cap column; `print_show_record` (`:2953-2954`) prints `amount_msat` and
 `fee_cap_msat` adjacent. `show` is where the false pair is visible and where the fix pays off. The
