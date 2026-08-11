@@ -5,15 +5,28 @@
 `br-evac-cap-ledger-x9k` (3/3). NOT the wallet-web epic (br-nfz, br-5om, br-t8f,
 br-ucq, br-pfc, br-4yz), NOT br-2aa, NOT br-s0e, NOT the production canary.
 
-**Phase:** BUILD · **Bead:** `br-evac-cap-ledger-x9k` (3/3) ·
-**Branch:** `feat/br-evac-cap-ledger-x9k`
-**Pending:** —
+**Phase:** DONE — the scope above is empty. `br-y2j` and all three children are closed.
+**Branch:** — · **Pending:** this closure PR
 **Gate:** `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
-· workspace gate green on this branch's final tree — fmt 0, clippy 0,
-  **792 passed / 0 failed**, EXIT=0 (789 on `main` at `e9cc97d`, plus 3/3's three)
+· 3/3 merged as `50e25e9` (PR #32). Workspace gate green on its final pre-merge tree —
+  fmt 0, clippy 0, **792 passed / 0 failed**, EXIT=0 — and `nix build` green on `main` at
+  `50e25e9` after the merge.
+· **The repository now has CI** (`.github/workflows/ci.yml`, separate PR): fmt + clippy +
+  test in the devshell, and `nix build` of `walletd`, `wallet-cli` and the deployment image.
+  Every gate before that one was local-only.
 · live devimint evacuation gate green nine consecutive times across 2/3's branch, last at its
   final pre-merge tree. Those branch SHAs are NOT reachable from `main`: PR #31 was squash-merged,
   so `e9cc97d` is the only hash a future reader can resolve. Do not cite the branch hashes.
+
+**What is NOT closed by this, and must not be inferred from it.** `br-recanary-y2j-ujs` is now
+READY — the production re-canary against real sats. It is deliberately outside this drive's scope
+and is the operator's call, not a step to be taken because the beads went green.
+
+Beads carrying what was found and deliberately deferred:
+`br-w6p` (the enforced cap is invisible from a live daemon — only `--standalone show` prints it),
+`br-v8x` (a receive refused AFTER committing freezes the planned pair on a terminal row),
+`br-h34` (nine tracked docs name assistant tooling, against the workspace convention),
+plus the pre-existing `br-evac-cap-driven-basis-v07`, `br-cqv`, `br-u4i`, `br-vvo`, `br-7xc`.
 
 Supersedes the stranded-move drive, which was stopped for a retrospective and whose scope
 excluded these beads.
@@ -26,9 +39,9 @@ excluded these beads.
   enforcement — merged PR #30 (`7d5e69f`). rb-lite clean in 3 rounds, full 3-reviewer
   panel, 742 tests, CodeRabbit no actionable comments.
 
-## Now
-**3/3 `br-evac-cap-ledger-x9k`** — the ledger must report the cap it ENFORCED and the amount it
-EXECUTED, not the pair it planned. After a clamp the row keeps the planned figures for life, so a
+## Done — 3/3
+**3/3 `br-evac-cap-ledger-x9k`** — merged as `50e25e9` (PR #32). The ledger now reports the cap
+it ENFORCED and the amount it EXECUTED, not the pair it planned. After a clamp the row keeps the planned figures for life, so a
 post-incident fee audit clears fees the enforced cap would have refused.
 
 The bead — and 2/3's ADR text — name `wallet-cli history` as that audit surface. **Checked: wrong
