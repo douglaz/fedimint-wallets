@@ -10,6 +10,15 @@ on:
 permissions:
   contents: read
 
+# Every third-party action below is pinned to a full commit SHA, with the tag it corresponded
+# to in a trailing comment. Tags are mutable — a compromised or retargeted tag would run
+# arbitrary code in a job that has checked out this repo — and this is a wallet. The trailing
+# comments are for humans; only the SHA is authoritative, so re-resolve it when bumping.
+#
+# The pins are the versions this workflow was actually verified against. Newer majors exist
+# (checkout v7, install-nix-action v31.11, rust-cache v2.9) — bumping them is a separate change
+# that should be proven by a green run, not folded in here.
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -25,7 +34,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       # The fedimint SDK tree and RocksDB are large, and target/ grows past what a stock
       # runner has free. Reclaim before building rather than failing halfway through.
@@ -39,7 +50,7 @@ jobs:
       # pinned rev, and unauthenticated runners hit the API rate limit intermittently, which
       # presents as a mysterious flake-input failure rather than a rate-limit message.
       - name: install nix
-        uses: cachix/install-nix-action@v31
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -47,13 +58,13 @@ jobs:
 
       # Caches the cargo registry and target/ keyed on Cargo.lock, so the expensive first
       # build of the fedimint/RocksDB tree is paid only on a cache miss.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: ". -> target"
           cache-on-failure: true
 
       - name: fmt
-        run: nix develop . --command cargo fmt --check
+        run: nix develop . --no-update-lock-file --command cargo fmt --check
 
       # `-D warnings` is deliberate: a warning that only prints is a warning nobody reads,
       # and this tree is clean under it. If a rustc/clippy bump lands a new lint and floods
@@ -62,13 +73,13 @@ jobs:
       # `--locked` fails if the build would need to change Cargo.lock, so a dependency
       # cannot drift silently in CI.
       - name: clippy
-        run: nix develop . --command cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: nix develop . --no-update-lock-file --command cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # No `-- -D warnings` here: after `--`, cargo test forwards arguments to the test
       # BINARY, not to rustc, and libtest rejects it. Lint coverage of test code comes from
       # `--all-targets` on the clippy step above.
       - name: test
-        run: nix develop . --command cargo test --workspace --locked
+        run: nix develop . --no-update-lock-file --command cargo test --workspace --locked
 
   # Proves the SHIPPED artifacts build, which the devshell gate above does not: `nix build`
   # goes through the flakebox derivation rather than the dev profile, so it can fail while
@@ -84,7 +95,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: free disk space
         run: |
@@ -93,7 +106,7 @@ jobs:
           df -h / | tail -1
 
       - name: install nix
-        uses: cachix/install-nix-action@v31
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -104,8 +117,8 @@ jobs:
       # are already gitignored alongside `result`.
       - name: build the shipped packages
         run: |
-          nix build .#walletd    -o result-walletd    --print-build-logs
-          nix build .#wallet-cli -o result-wallet-cli --print-build-logs
+          nix build .#walletd    -o result-walletd    --no-update-lock-file --print-build-logs
+          nix build .#wallet-cli -o result-wallet-cli --no-update-lock-file --print-build-logs
 
       # A build that produces an unrunnable binary is not a passing build. `--version` is
       # NOT accepted by either of these (clap rejects it); `--help` exits 0 and is the
