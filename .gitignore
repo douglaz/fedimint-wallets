@@ -11,7 +11,11 @@
 
 # Rust build output
 /target
-# nix-env build output (CARGO_TARGET_DIR under `nix develop`)
+# Opt-in target dir for the live devimint smokes: their documented invocation passes
+# CARGO_BUILD_TARGET_DIR=<repo>/target-nix explicitly, and the scripts look for
+# target-nix/{debug,release}/wallet-cli. `nix develop` does NOT set CARGO_TARGET_DIR — a
+# plain cargo build in the devshell writes to /target above. The earlier wording here said
+# otherwise and led a reviewer to conclude CI was caching the wrong directory.
 /target-nix
 # review/build output
 /target-review
