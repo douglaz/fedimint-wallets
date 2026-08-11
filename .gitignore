@@ -29,10 +29,13 @@
 # untouched while a soak/smoke runs from them)
 /target-pinbump
 target-musl/
-result
+# Anchored: a slash-less pattern matches at EVERY level, so a future `docs/result-analysis.md`
+# or `wallet-core/result-types/` would be silently invisible to `git status`. These are the
+# root-level `nix build` output links only.
+/result
 # Any named `nix build -o` link, e.g. result-image, and the per-package links CI builds
 # (result-walletd, result-wallet-cli) which anyone reproducing that job locally also gets.
-result-*
+/result-*
 
 # bv (beads viewer) local config and caches
 .bv/
