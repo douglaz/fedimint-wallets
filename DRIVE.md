@@ -21,9 +21,27 @@ br-ucq, br-pfc, br-4yz), NOT br-2aa, NOT br-s0e, NOT the production canary.
 
 **What is NOT closed by this, and must not be inferred from it.** `br-recanary-y2j-ujs` is now
 READY — the production re-canary against real sats. It is deliberately outside this drive's scope
-and is the operator's call, not a step to be taken because the beads went green.
+and is the operator's call, not a step to be taken because the beads went green. Read the two open
+P1s below BEFORE treating `ready` as a recommendation: `br` reports readiness from the dependency
+graph, which knows nothing about them.
 
-Beads carrying what was found and deliberately deferred:
+**TWO OPEN P1s ON THIS PATH, and they qualify the closure above.** The scope is empty because
+its beads closed; that is not the same as the evacuation path being free of known serious
+defects, and an operator weighing the re-canary needs both of these in front of them:
+
+- **`br-n8o` — a structural refusal cannot be released by any operator action.** The refusal is
+  decided against the `(base, bps)` the intent was ADMITTED with, so raising the policy knobs
+  reaches only evacuations decided afterwards. The existing intent retries forever on the old
+  parameters, and funds stay on the shutting-down federation.
+- **`br-p93` — one retryable intent suppresses ticks for every federation.** A single pending
+  retryable intent makes `reconcile` report `retryable > 0`, which skips the tick GLOBALLY, so
+  every other federation stops receiving allocator decisions too.
+
+Together they are the failure this drive's own work can still produce: an evacuation that refuses
+structurally, cannot be un-stuck by changing policy, and quietly stops the wallet deciding
+anything anywhere. Neither was in scope here; both were filed during 2/3 and remain open.
+
+Also deferred, lower severity:
 `br-w6p` (the enforced cap is invisible from a live daemon — only `--standalone show` prints it),
 `br-v8x` (a receive refused AFTER committing freezes the planned pair on a terminal row),
 `br-h34` (nine tracked docs name assistant tooling, against the workspace convention),
@@ -46,7 +64,13 @@ it ENFORCED and the amount it EXECUTED, not the pair it planned.
 
 *The defect it fixed, in the past tense so nobody reads it as current:* a clamped row USED TO keep
 the planned figures for life, so a post-incident fee audit WOULD HAVE cleared fees the enforced cap
-had refused. That is no longer true of any row written after `50e25e9`.
+had refused.
+
+That is fixed **for rows carrying committed-leg evidence**, which is the deliberate boundary — see
+the draft-row gate below. It is NOT a universal claim about rows written after `50e25e9`: the
+`br-v8x` path (a receive that COMMITS and is then refused by the §15.7 contract check before
+`invoice`/`recv_op` are persisted) still terminalizes holding the PLANNED pair. An auditor must
+not read every post-`50e25e9` row's pair as enforced.
 
 The bead — and 2/3's ADR text — NAMED `wallet-cli history` as that audit surface. **Checked: wrong
 command.** `history_tsv` (`wallet-cli/src/main.rs:2921`) emits amount, receive_fee and
