@@ -5,15 +5,48 @@
 `br-evac-cap-ledger-x9k` (3/3). NOT the wallet-web epic (br-nfz, br-5om, br-t8f,
 br-ucq, br-pfc, br-4yz), NOT br-2aa, NOT br-s0e, NOT the production canary.
 
-**Phase:** BUILD · **Bead:** `br-evac-cap-ledger-x9k` (3/3) ·
-**Branch:** `feat/br-evac-cap-ledger-x9k`
-**Pending:** —
+**Phase:** DONE — the scope above is empty. `br-y2j` and all three children are closed.
+**Branch:** — · **Pending:** —
 **Gate:** `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
-· workspace gate green on this branch's final tree — fmt 0, clippy 0,
-  **792 passed / 0 failed**, EXIT=0 (789 on `main` at `e9cc97d`, plus 3/3's three)
+· 3/3 merged as `50e25e9` (PR #32). Workspace gate green on its final pre-merge tree —
+  fmt 0, clippy 0, **792 passed / 0 failed**, EXIT=0 — and `nix build` green on `main` at
+  `50e25e9` after the merge.
+· **CI now exists** — `.github/workflows/ci.yml`, merged as `8e0791e` (PR #33): fmt + clippy +
+  test in the devshell, and `nix build` of `walletd`, `wallet-cli` and the deployment image,
+  on every push to `main` and every PR. Note the ordering, because it bounds what CI attests
+  to: every gate cited ABOVE ran locally, on trees that predate the workflow. `50e25e9` was
+  never CI-verified; nothing after `8e0791e` has that excuse.
 · live devimint evacuation gate green nine consecutive times across 2/3's branch, last at its
   final pre-merge tree. Those branch SHAs are NOT reachable from `main`: PR #31 was squash-merged,
   so `e9cc97d` is the only hash a future reader can resolve. Do not cite the branch hashes.
+
+**What is NOT closed by this, and must not be inferred from it.** `br-recanary-y2j-ujs` is now
+READY — the production re-canary against real sats. It is deliberately outside this drive's scope
+and is the operator's call, not a step to be taken because the beads went green. Read the two open
+P1s below BEFORE treating `ready` as a recommendation: `br` reports readiness from the dependency
+graph, which knows nothing about them.
+
+**TWO OPEN P1s ON THIS PATH, and they qualify the closure above.** The scope is empty because
+its beads closed; that is not the same as the evacuation path being free of known serious
+defects, and an operator weighing the re-canary needs both of these in front of them:
+
+- **`br-n8o` — a structural refusal cannot be released by any operator action.** The refusal is
+  decided against the `(base, bps)` the intent was ADMITTED with, so raising the policy knobs
+  reaches only evacuations decided afterwards. The existing intent retries forever on the old
+  parameters, and funds stay on the shutting-down federation.
+- **`br-p93` — one retryable intent suppresses ticks for every federation.** A single pending
+  retryable intent makes `reconcile` report `retryable > 0`, which skips the tick GLOBALLY, so
+  every other federation stops receiving allocator decisions too.
+
+Together they are the failure this drive's own work can still produce: an evacuation that refuses
+structurally, cannot be un-stuck by changing policy, and quietly stops the wallet deciding
+anything anywhere. Neither was in scope here; both were filed during 2/3 and remain open.
+
+Also deferred, lower severity:
+`br-w6p` (the enforced cap is invisible from a live daemon — only `--standalone show` prints it),
+`br-v8x` (a receive refused AFTER committing freezes the planned pair on a terminal row),
+`br-h34` (nine tracked docs name assistant tooling, against the workspace convention),
+plus the pre-existing `br-evac-cap-driven-basis-v07`, `br-cqv`, `br-u4i`, `br-vvo`, `br-7xc`.
 
 Supersedes the stranded-move drive, which was stopped for a retrospective and whose scope
 excluded these beads.
@@ -26,12 +59,21 @@ excluded these beads.
   enforcement — merged PR #30 (`7d5e69f`). rb-lite clean in 3 rounds, full 3-reviewer
   panel, 742 tests, CodeRabbit no actionable comments.
 
-## Now
-**3/3 `br-evac-cap-ledger-x9k`** — the ledger must report the cap it ENFORCED and the amount it
-EXECUTED, not the pair it planned. After a clamp the row keeps the planned figures for life, so a
-post-incident fee audit clears fees the enforced cap would have refused.
+## Done — 3/3
+**3/3 `br-evac-cap-ledger-x9k`** — merged as `50e25e9` (PR #32). The ledger now reports the cap
+it ENFORCED and the amount it EXECUTED, not the pair it planned.
 
-The bead — and 2/3's ADR text — name `wallet-cli history` as that audit surface. **Checked: wrong
+*The defect it fixed, in the past tense so nobody reads it as current:* a clamped row USED TO keep
+the planned figures for life, so a post-incident fee audit WOULD HAVE cleared fees the enforced cap
+had refused.
+
+That is fixed **for rows carrying committed-leg evidence**, which is the deliberate boundary — see
+the draft-row gate below. It is NOT a universal claim about rows written after `50e25e9`: the
+`br-v8x` path (a receive that COMMITS and is then refused by the §15.7 contract check before
+`invoice`/`recv_op` are persisted) still terminalizes holding the PLANNED pair. An auditor must
+not read every post-`50e25e9` row's pair as enforced.
+
+The bead — and 2/3's ADR text — NAMED `wallet-cli history` as that audit surface. **Checked: wrong
 command.** `history_tsv` (`wallet-cli/src/main.rs:2921`) emits amount, receive_fee and
 send_fee_quoted and has NO cap column; `print_show_record` (`:2953-2954`) prints `amount_msat` and
 `fee_cap_msat` adjacent. `show` is where the false pair is visible and where the fix pays off. The
@@ -46,8 +88,8 @@ does not bound an evacuation, and README describes both caps' shapes, units and 
 **Re-verified on this branch** (`README.md:106-123`, `docs/real-sats-pilot-runbook.md:84-111`) —
 not redone.
 
-**Implemented, gate green, awaiting review.** `refresh_from_move` now stamps the executed amount
-and the enforced cap together, on the two move-shaped kinds only.
+**Merged.** `refresh_from_move` stamps the executed amount and the enforced cap together, on
+the two move-shaped kinds only, and only once a leg has committed.
 
 *Evidence.* Red-first, per property, per path:
 · the CAP assertion went red against the unfixed code in BOTH tests — `Some(Msat(2450000))` where
@@ -221,9 +263,11 @@ establish is recorded below.
   settled amount", not "the guard broke".
 
 ## Next
-`br-evac-cap-ledger-x9k` (3/3) — the ledger reporting the enforced cap and executed
-amount, plus runbook and README. Then `br-y2j` closes, which unblocks
-`br-recanary-y2j-ujs`.
+Nothing in this drive's scope — it is empty and `br-y2j` is closed.
+
+`br-recanary-y2j-ujs` (the production re-canary, real sats) became READY when `br-y2j` closed.
+It is the operator's decision, not this drive's next step. The deferred beads listed at the top
+are backlog, each with its own acceptance criteria; none is a continuation of this drive.
 
 ## Open questions for the human
 - none. `br-devimint-runbook-mint-na3` is a filed defect, not an open gate: the runbook's
