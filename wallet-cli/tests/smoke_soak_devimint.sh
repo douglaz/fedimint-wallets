@@ -16,18 +16,75 @@
 # failure is COUNTED and the loop continues (a 24h run must not die at hour 3 on one blip;
 # the count fails the run at the end). A dead walletd fails fast.
 #
-# Run (two-fed harness):
-#   cd ~/p/fedimint
-#   nix develop -c bash -c '
+# Run (two-fed harness; first follow docs/devimint-runbook.md §1's exact-pin patch/release
+# build, which exports FEDIMINT_WORKTREE):
+#   set -euo pipefail
+#   : "${WALLETS_REPO:?run runbook §1 first}"
+#   declare -F refuse_cargo_config_for_dir >/dev/null || { echo "missing refuse_cargo_config_for_dir; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }
+#   declare -F refuse_ambient_rust_build_overrides >/dev/null || { echo "missing refuse_ambient_rust_build_overrides; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }
+#   declare -F run_exact_nix_develop >/dev/null || { echo "missing run_exact_nix_develop; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }
+#   declare -F run_exact_cargo >/dev/null || { echo "missing run_exact_cargo; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }
+#   declare -F reset_exact_target_dir >/dev/null || { echo "missing reset_exact_target_dir; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }
+#   cd "$WALLETS_REPO"
+#   refuse_cargo_config_for_dir "$WALLETS_REPO"
+#   refuse_ambient_rust_build_overrides
+#   [[ ! -e .shrc.local && ! -L .shrc.local ]] || { echo "refusing wallets .shrc.local as a reproducibility precaution" >&2; exit 1; }
+#   reset_exact_target_dir "$WALLETS_REPO/target-nix"
+#   run_exact_cargo \
+#     build --release --locked --target-dir "$WALLETS_REPO/target-nix" \
+#       -p wallet-daemon -p wallet-cli
+#   # Run §2 through its "OUTER PREFLIGHT COMPLETE" marker immediately first.
+#   declare -F verify_exact_two_fed_launch_state >/dev/null || { echo "missing verify_exact_two_fed_launch_state; replay docs/devimint-runbook.md §1 and §2 through OUTER PREFLIGHT COMPLETE in this same shell" >&2; exit 1; }
+#   verify_exact_two_fed_launch_state
+#   cd "$FEDIMINT_WORKTREE"
+#   run_exact_nix_develop -c bash -c '
 #     set -euo pipefail
+#     export CARGO_PROFILE=release
 #     source scripts/_common.sh
 #     add_target_dir_to_path
+#     for variable in $(compgen -v FM_ || true); do
+#       unset "$variable"
+#     done
+#     for variable in $(compgen -v WALLET_CLI_ || true) $(compgen -v WALLETD_ || true); do
+#       unset "$variable"
+#     done
+#     export WALLET_CLI_BIN="$WALLETS_REPO/target-nix/release/wallet-cli"
+#     export WALLETD_BIN="$WALLETS_REPO/target-nix/release/walletd"
+#     export FM_DISCOVER_API_VERSION_TIMEOUT=10
+#     PINNED_FEDIMINT_BIN_DIR="$FEDIMINT_WORKTREE/target-nix/release"
+#     export FM_FEDIMINTD_BASE_EXECUTABLE="$PINNED_FEDIMINT_BIN_DIR/fedimintd"
+#     export FM_FEDIMINT_CLI_BASE_EXECUTABLE="$PINNED_FEDIMINT_BIN_DIR/fedimint-cli"
+#     export FM_GATEWAYD_BASE_EXECUTABLE="$PINNED_FEDIMINT_BIN_DIR/gatewayd"
+#     export FM_GATEWAY_CLI_BASE_EXECUTABLE="$PINNED_FEDIMINT_BIN_DIR/gateway-cli"
+#     export FM_RECURRINGD_BASE_EXECUTABLE="$PINNED_FEDIMINT_BIN_DIR/fedimint-recurringd"
+#     DEVIMINT_BIN="$PINNED_FEDIMINT_BIN_DIR/devimint"
+#     launch_binaries=(
+#       "$WALLET_CLI_BIN"
+#       "$FM_FEDIMINTD_BASE_EXECUTABLE"
+#       "$FM_FEDIMINT_CLI_BASE_EXECUTABLE"
+#       "$FM_GATEWAYD_BASE_EXECUTABLE"
+#       "$FM_GATEWAY_CLI_BASE_EXECUTABLE"
+#       "$FM_RECURRINGD_BASE_EXECUTABLE"
+#       "$DEVIMINT_BIN"
+#     )
+#     if [[ -n "${WALLETD_BIN:-}" ]]; then
+#       launch_binaries+=("$WALLETD_BIN")
+#     fi
+#     for binary in "${launch_binaries[@]}"; do
+#       if [[ "$binary" != /* || ! -f "$binary" || ! -x "$binary" ]]; then
+#         echo "refusing launch binary that is not an absolute regular executable: $binary" >&2
+#         exit 1
+#       fi
+#     done
 #     export FM_DEVIMINT_STATIC_DATA_DIR="$PWD/devimint/share"
+#     export FM_ENABLE_MODULE_LNV1=1
+#     export FM_ENABLE_MODULE_MINT=1
+#     export FM_ENABLE_MODULE_WALLET=1
 #     export FM_ENABLE_MODULE_LNV2=1
 #     export FM_NUM_FEDS=2
 #     export SOAK_HOURS=24
-#     /home/master/p/fedimint/target-nix/release/devimint --link-test-dir ./test-dir dev-fed \
-#       --exec bash /home/master/p/fedimint-wallets/wallet-cli/tests/smoke_soak_devimint.sh
+#     "$DEVIMINT_BIN" --link-test-dir "$FEDIMINT_WORKTREE/target-nix/devimint" --num-feds 2 dev-fed \
+#       --exec bash "$WALLETS_REPO/wallet-cli/tests/smoke_soak_devimint.sh"
 #   '
 set -euo pipefail
 
@@ -41,7 +98,20 @@ SOAK_OP_PERIOD_SECS="${SOAK_OP_PERIOD_SECS:-300}"
 WALLET_CLI="${WALLET_CLI_BIN:-/home/master/p/fedimint-wallets/target-nix/release/wallet-cli}"
 WALLETD="${WALLETD_BIN:-/home/master/p/fedimint-wallets/target-nix/release/walletd}"
 for f in "$WALLET_CLI" "$WALLETD"; do
-  [[ -x "$f" ]] || { echo "FAIL: missing binary $f" >&2; exit 1; }
+  if [[ ! -x "$f" ]]; then
+    echo "FAIL: missing binary $f" >&2
+    echo 'Follow docs/devimint-runbook.md §1 to export FEDIMINT_WORKTREE, then build:' >&2
+    echo '  cd "$WALLETS_REPO"' >&2
+    echo '  refuse_cargo_config_for_dir "$WALLETS_REPO"' >&2
+    echo '  refuse_ambient_rust_build_overrides' >&2
+    echo '  [[ ! -e .shrc.local && ! -L .shrc.local ]] || { echo "refusing wallets .shrc.local as a reproducibility precaution" >&2; exit 1; }' >&2
+    echo '  declare -F run_exact_nix_develop >/dev/null || { echo "missing run_exact_nix_develop; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }' >&2
+    echo '  declare -F run_exact_cargo >/dev/null || { echo "missing run_exact_cargo; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }' >&2
+    echo '  declare -F reset_exact_target_dir >/dev/null || { echo "missing reset_exact_target_dir; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }' >&2
+    echo '  reset_exact_target_dir "$WALLETS_REPO/target-nix"' >&2
+    echo '  run_exact_cargo build --release --locked --target-dir "$WALLETS_REPO/target-nix" -p wallet-daemon -p wallet-cli' >&2
+    exit 1
+  fi
 done
 for c in fedimint-cli jq curl; do
   command -v "$c" >/dev/null || { echo "FAIL: $c not on PATH" >&2; exit 1; }

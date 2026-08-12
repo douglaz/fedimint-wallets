@@ -35,27 +35,76 @@
 # script IS that validation once B is provided.
 # ────────────────────────────────────────────────────────────────────────────────────────────
 #
-#   # 1. Build wallet-cli (from this repo):
-#   cd ~/p/fedimint-wallets
-#   nix develop /home/master/p/fedimint -c cargo build -p wallet-cli
+#   # 1. Follow docs/devimint-runbook.md §1's exact-pin two-fed patch/release build. It exports
+#   #    FEDIMINT_WORKTREE; do not substitute an arbitrary fedimint checkout.
+#   # 2. Build wallet-cli (from this repo):
+#   set -euo pipefail
+#   : "${WALLETS_REPO:?run runbook §1 first}"
+#   declare -F refuse_cargo_config_for_dir >/dev/null || { echo "missing refuse_cargo_config_for_dir; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }
+#   declare -F refuse_ambient_rust_build_overrides >/dev/null || { echo "missing refuse_ambient_rust_build_overrides; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }
+#   declare -F run_exact_nix_develop >/dev/null || { echo "missing run_exact_nix_develop; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }
+#   declare -F run_exact_cargo >/dev/null || { echo "missing run_exact_cargo; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }
+#   declare -F reset_exact_target_dir >/dev/null || { echo "missing reset_exact_target_dir; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }
+#   cd "$WALLETS_REPO"
+#   refuse_cargo_config_for_dir "$WALLETS_REPO"
+#   refuse_ambient_rust_build_overrides
+#   [[ ! -e .shrc.local && ! -L .shrc.local ]] || { echo "refusing wallets .shrc.local as a reproducibility precaution" >&2; exit 1; }
+#   reset_exact_target_dir "$WALLETS_REPO/target-nix"
+#   run_exact_cargo build --locked --target-dir "$WALLETS_REPO/target-nix" -p wallet-cli
 #
-#   # 2. Build fedimint/devimint once (from ~/p/fedimint), per docs/devimint-runbook.md §1:
-#   cd ~/p/fedimint
-#   nix develop -c cargo build --workspace --bins
-#
-#   # 3. Bring up dev-fed (fed A) + your second federation (fed B) sharing the LDK gateway, then
+#   # 3. Bring up dev-fed (fed A) + your second federation (fed B) from the exact-pinned release
+#   #    binary, then
 #   #    run this inside the exec with FED_B_INVITE set to fed B's invite:
-#   nix develop -c bash -c '
+#   #    Run §2 through its "OUTER PREFLIGHT COMPLETE" marker immediately first.
+#   declare -F verify_exact_two_fed_launch_state >/dev/null || { echo "missing verify_exact_two_fed_launch_state; replay docs/devimint-runbook.md §1 and §2 through OUTER PREFLIGHT COMPLETE in this same shell" >&2; exit 1; }
+#   verify_exact_two_fed_launch_state
+#   cd "$FEDIMINT_WORKTREE"
+#   run_exact_nix_develop -c bash -c '
 #     set -euo pipefail
+#     export CARGO_PROFILE=release
 #     source scripts/_common.sh
 #     add_target_dir_to_path
+#     for variable in $(compgen -v FM_ || true); do
+#       unset "$variable"
+#     done
+#     for variable in $(compgen -v WALLET_CLI_ || true) $(compgen -v WALLETD_ || true); do
+#       unset "$variable"
+#     done
+#     export WALLET_CLI_BIN="$WALLETS_REPO/target-nix/debug/wallet-cli"
+#     export FM_DISCOVER_API_VERSION_TIMEOUT=10
+#     PINNED_FEDIMINT_BIN_DIR="$FEDIMINT_WORKTREE/target-nix/release"
+#     export FM_FEDIMINTD_BASE_EXECUTABLE="$PINNED_FEDIMINT_BIN_DIR/fedimintd"
+#     export FM_FEDIMINT_CLI_BASE_EXECUTABLE="$PINNED_FEDIMINT_BIN_DIR/fedimint-cli"
+#     export FM_GATEWAYD_BASE_EXECUTABLE="$PINNED_FEDIMINT_BIN_DIR/gatewayd"
+#     export FM_GATEWAY_CLI_BASE_EXECUTABLE="$PINNED_FEDIMINT_BIN_DIR/gateway-cli"
+#     export FM_RECURRINGD_BASE_EXECUTABLE="$PINNED_FEDIMINT_BIN_DIR/fedimint-recurringd"
+#     DEVIMINT_BIN="$PINNED_FEDIMINT_BIN_DIR/devimint"
+#     launch_binaries=(
+#       "$WALLET_CLI_BIN"
+#       "$FM_FEDIMINTD_BASE_EXECUTABLE"
+#       "$FM_FEDIMINT_CLI_BASE_EXECUTABLE"
+#       "$FM_GATEWAYD_BASE_EXECUTABLE"
+#       "$FM_GATEWAY_CLI_BASE_EXECUTABLE"
+#       "$FM_RECURRINGD_BASE_EXECUTABLE"
+#       "$DEVIMINT_BIN"
+#     )
+#     for binary in "${launch_binaries[@]}"; do
+#       if [[ "$binary" != /* || ! -f "$binary" || ! -x "$binary" ]]; then
+#         echo "refusing launch binary that is not an absolute regular executable: $binary" >&2
+#         exit 1
+#       fi
+#     done
 #     export FM_DEVIMINT_STATIC_DATA_DIR="$PWD/devimint/share"
 #     export RUST_LOG=warn
+#     export FM_ENABLE_MODULE_LNV1=1
+#     export FM_ENABLE_MODULE_MINT=1           # wallet-cli primary module: mint v1
+#     export FM_ENABLE_MODULE_WALLET=1         # wallet module required by dev-fed
 #     export FM_ENABLE_MODULE_LNV2=1           # ensure lnv2 + the LDK gateway are up
-#     export FED_B_INVITE="fed1...."           # <-- fed B (see the TWO FEDERATIONS note above)
-#     devimint --link-test-dir "${CARGO_BUILD_TARGET_DIR:-target}/devimint" \
+#     export FM_NUM_FEDS=2
+#     # The patched harness exports FED_B_INVITE inside --exec.
+#     "$DEVIMINT_BIN" --link-test-dir "$FEDIMINT_WORKTREE/target-nix/devimint" \
 #       --num-feds 2 dev-fed \
-#       --exec bash /home/master/p/fedimint-wallets/wallet-cli/tests/smoke_move_devimint.sh
+#       --exec bash "$WALLETS_REPO/wallet-cli/tests/smoke_move_devimint.sh"
 #   '
 #
 # Inside `dev-fed --exec` devimint sets FM_INVITE_CODE (fed A/fed-0's invite) and FM_PORT_GW_LDK
@@ -92,7 +141,16 @@ fi
 WALLET_CLI="${WALLET_CLI_BIN:-/home/master/p/fedimint-wallets/target-nix/debug/wallet-cli}"
 if [[ ! -x "$WALLET_CLI" ]]; then
   echo "FAIL: wallet-cli binary not found/executable at $WALLET_CLI" >&2
-  echo "Build it first: nix develop /home/master/p/fedimint -c cargo build -p wallet-cli" >&2
+  echo 'Follow docs/devimint-runbook.md §1 to export FEDIMINT_WORKTREE, then build:' >&2
+  echo '  cd "$WALLETS_REPO"' >&2
+  echo '  refuse_cargo_config_for_dir "$WALLETS_REPO"' >&2
+  echo '  refuse_ambient_rust_build_overrides' >&2
+  echo '  [[ ! -e .shrc.local && ! -L .shrc.local ]] || { echo "refusing wallets .shrc.local as a reproducibility precaution" >&2; exit 1; }' >&2
+  echo '  declare -F run_exact_nix_develop >/dev/null || { echo "missing run_exact_nix_develop; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }' >&2
+  echo '  declare -F run_exact_cargo >/dev/null || { echo "missing run_exact_cargo; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }' >&2
+  echo '  declare -F reset_exact_target_dir >/dev/null || { echo "missing reset_exact_target_dir; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }' >&2
+  echo '  reset_exact_target_dir "$WALLETS_REPO/target-nix"' >&2
+  echo '  run_exact_cargo build --locked --target-dir "$WALLETS_REPO/target-nix" -p wallet-cli' >&2
   exit 1
 fi
 command -v fedimint-cli >/dev/null || { echo "FAIL: fedimint-cli not on PATH (run inside dev-fed --exec)" >&2; exit 1; }

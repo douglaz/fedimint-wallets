@@ -8,7 +8,7 @@ license = "AGPL-3.0-or-later"
 # in-process `WalletService` (wallet-fedimint) with a local, bearer-authed axum HTTP surface.
 # axum lives ONLY here; wallet-fedimint stays HTTP-free (crate-boundary discipline).
 # NOTE: needs the nix build env for fedimint's native deps, same as wallet-fedimint —
-# build/test with: nix develop /home/master/p/fedimint -c cargo <cmd>
+# use the target-pinned commands under README.md "Local development".
 [[bin]]
 name = "walletd"
 path = "src/main.rs"

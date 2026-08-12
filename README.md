@@ -136,13 +136,27 @@ The workspace is pinned to `douglaz/fedimint` at commit
 `72b1e5beadc5a31a33ebc751764cb2f840a63b5e` (branch `wallet-pin/iroh-recovery-tpe8838`:
 the iroh long-poll transport, a recovery-complete-or-fail cherry-pick, and the #8838
 single-share TPE fix — see `wallet-fedimint/Cargo.toml`). The Fedimint native
-dependencies are expected from the sibling Fedimint checkout's Nix environment:
+dependencies come from this repository's own Nix devshell. Run these commands
+from the repository root:
 
 ```bash
-nix develop /home/master/p/fedimint -c cargo build --workspace
-nix develop /home/master/p/fedimint -c cargo test --workspace
-nix develop /home/master/p/fedimint -c cargo clippy --workspace -- -D warnings
+env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR nix develop -c \
+  cargo build --locked --target-dir "$PWD/target-nix" --workspace
+env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR nix develop -c \
+  cargo test --locked --target-dir "$PWD/target-nix" --workspace
+env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR nix develop -c \
+  cargo clippy --locked --target-dir "$PWD/target-nix" --workspace --all-targets -- -D warnings
+# The 24-hour soak defaults to release wallet binaries:
+env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR nix develop -c \
+  cargo build --release --locked --target-dir "$PWD/target-nix" -p wallet-daemon -p wallet-cli
 ```
+
+These are ordinary local-development commands, not certifying live-validation recipes:
+they clear both Cargo target-directory environment variables before entering the devshell,
+then use an explicit target flag. The exact live runbook and copied smoke headers use a
+fixed Nix child-environment allowlist, rebuild `target-nix` clean before each wallet build,
+and use a fresh temporary Cargo source home for every certifying Cargo invocation. This prevents
+reuse of binaries from an ambiently overridden build or mutable Cargo Git source checkouts.
 
 Live money-path validation uses devimint and the smoke scripts under
 [wallet-cli/tests/](./wallet-cli/tests/). Start with

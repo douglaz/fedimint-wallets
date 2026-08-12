@@ -119,6 +119,7 @@
             pkgs.cmake
             pkgs.rust-bindgen
             pkgs.jq
+            pkgs.python3
           ];
         };
       }

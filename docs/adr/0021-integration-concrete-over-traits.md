@@ -36,7 +36,8 @@ executor core) is built **concrete-first**, not as a hexagonal port-and-adapter 
 - ADR-0006 reframe: V1's active set is ~2 federations (spending + warm standby);
   `MultiClient` manages that small set + ephemeral probe-joins, not an N-client registry.
   "Many federations" is the discovery/probe universe only.
-- The devimint harness (TODOS T4) is the Phase 1 deliverable, not later overhead: "until
+- The devimint harness (the former TODO T4; see `docs/devimint-runbook.md`) is the
+  Phase 1 deliverable, not later overhead: "until
   `apply()` provably moves ecash through devimint and survives replay, the rest of the
   architecture is decorative."
 - Build method note: Phase 1 is real-SDK + devimint work, not a pure-function golden-test
