@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: nothing here writes to the repo. Declared explicitly so the workflow does
+# not silently gain write scope if the repository default changes.
+permissions:
+  contents: read
+
+# Every third-party action below is pinned to a full commit SHA, with the tag it corresponded
+# to in a trailing comment. Tags are mutable — a compromised or retargeted tag would run
+# arbitrary code in a job that has checked out this repo — and this is a wallet. The trailing
+# comments are for humans; only the SHA is authoritative, so re-resolve it when bumping.
+#
+# The pins are the versions this workflow was actually verified against. Newer majors exist
+# (checkout v7, install-nix-action v31.11, rust-cache v2.9) — bumping them is a separate change
+# that should be proven by a green run, not folded in here.
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # THE GATE. These three steps are the same checks AGENTS.md documents as the local gate:
+  #   nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'
+  # Split into separate steps here so a failure names which check failed rather than one
+  # opaque red step; keep them in sync with AGENTS.md, since a CI gate that is weaker than
+  # the documented local one teaches people to trust the wrong signal.
+  gate:
+    name: fmt + clippy + test (nix devshell)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # The fedimint SDK tree and RocksDB are large, and target/ grows past what a stock
+      # runner has free. Reclaim before building rather than failing halfway through.
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h / | tail -1
+
+      # `access-tokens` is not optional here: this flake fetches flakebox from GitHub at a
+      # pinned rev, and unauthenticated runners hit the API rate limit intermittently, which
+      # presents as a mysterious flake-input failure rather than a rate-limit message.
+      - name: install nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      # Caches the cargo registry and target/ keyed on Cargo.lock, so the expensive first
+      # build of the fedimint/RocksDB tree is paid only on a cache miss.
+      #
+      # `cmd-format` matters: the action shells out to `cargo metadata` to compute its key,
+      # and by default that runs the RUNNER's cargo, outside the devshell and without
+      # `--locked` — a different toolchain that may rewrite Cargo.lock before the locked
+      # steps below ever run, which would make their `--locked` vacuous.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
+          cmd-format: nix develop . --no-update-lock-file --command {0}
+
+      # Belt to that brace: assert the lock is byte-identical to the committed one before any
+      # gate runs. If the cache step (or anything else) rewrote it, the checks below would
+      # certify a dependency graph that is not the reviewed one.
+      - name: Cargo.lock is unchanged
+        run: git diff --exit-code -- Cargo.lock
+
+      - name: fmt
+        run: nix develop . --no-update-lock-file --command cargo fmt --check
+
+      # `-D warnings` is deliberate: a warning that only prints is a warning nobody reads,
+      # and this tree is clean under it. If a rustc/clippy bump lands a new lint and floods
+      # CI, fix it or #[allow] it with a reason — do not drop the flag.
+      #
+      # `--locked` fails if the build would need to change Cargo.lock, so a dependency
+      # cannot drift silently in CI.
+      - name: clippy
+        run: nix develop . --no-update-lock-file --command cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # No `-- -D warnings` here: after `--`, cargo test forwards arguments to the test
+      # BINARY, not to rustc, and libtest rejects it. Lint coverage of test code comes from
+      # `--all-targets` on the clippy step above.
+      - name: test
+        run: nix develop . --no-update-lock-file --command cargo test --workspace --locked
+
+  # Proves the SHIPPED artifacts build, which the devshell gate above does not: `nix build`
+  # goes through the flakebox derivation rather than the dev profile, so it can fail while
+  # `cargo build` succeeds. Separate job so it runs in parallel with the gate and gives an
+  # independent signal.
+  #
+  # BOTH packages, not just the default. `flake.nix` exposes `walletd` and `wallet-cli` as
+  # separate `buildPackageGroup` derivations, and ADR-0023 makes the CLI a first-class shipped
+  # frontend rather than a test harness — so a break confined to its derivation (its package
+  # group, its `mainProgram`) must not pass green just because the daemon still builds.
+  nix-build:
+    name: nix build (walletd + wallet-cli)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h / | tail -1
+
+      - name: install nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      # Explicit `-o` links, because a bare `nix build` writes `./result` and the second
+      # invocation would replace the first's symlink before it could be smoked. Both names
+      # are already gitignored alongside `result`.
+      - name: build the shipped packages
+        run: |
+          nix build .#walletd    -o result-walletd    --no-update-lock-file --print-build-logs
+          nix build .#wallet-cli -o result-wallet-cli --no-update-lock-file --print-build-logs
+
+      # The OCI image is the artifact that actually runs in the cluster, and its derivation
+      # can break on its own — contents, entrypoint, env, dockerTools config — while both
+      # binaries still build. Without this the gate can approve a revision whose DEPLOYABLE
+      # artifact does not exist. Cheap, since it layers the closure already built above.
+      - name: build the deployment image
+        run: nix build .#walletd-image -o result-image-ci --no-update-lock-file --print-build-logs
+
+      - name: the image archive is non-empty
+        run: test -s result-image-ci
+
+      # A build that produces an unrunnable binary is not a passing build. `--version` is
+      # NOT accepted by either of these (clap rejects it); `--help` exits 0 and is the
+      # cheapest thing that proves the binary links and starts.
+      - name: smoke the built binaries
+        run: |
+          ./result-walletd/bin/walletd --help > /dev/null
+          ./result-wallet-cli/bin/wallet-cli --help > /dev/null
+
+# NOT gated here, deliberately:
+#
+# The live devimint evacuation gate (wallet-cli/tests/smoke_evacuate_devimint.sh) needs a
+# devimint built from a pinned fedimint worktree with a local patch applied, and drives real
+# federations. It is not reproducible from a clean runner, so it stays a local gate that
+# money-adjacent changes run by hand — see AGENTS.md. Adding a green CI job that silently
+# skips it would be worse than not having one.

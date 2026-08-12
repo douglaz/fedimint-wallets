@@ -11,7 +11,11 @@
 
 # Rust build output
 /target
-# nix-env build output (CARGO_TARGET_DIR under `nix develop`)
+# Opt-in target dir for the live devimint smokes: their documented invocation passes
+# CARGO_BUILD_TARGET_DIR=<repo>/target-nix explicitly, and the scripts look for
+# target-nix/{debug,release}/wallet-cli. `nix develop` does NOT set CARGO_TARGET_DIR — a
+# plain cargo build in the devshell writes to /target above. The earlier wording here said
+# otherwise and led a reviewer to conclude CI was caching the wrong directory.
 /target-nix
 # review/build output
 /target-review
@@ -25,8 +29,13 @@
 # untouched while a soak/smoke runs from them)
 /target-pinbump
 target-musl/
-result
-result-image
+# Anchored: a slash-less pattern matches at EVERY level, so a future `docs/result-analysis.md`
+# or `wallet-core/result-types/` would be silently invisible to `git status`. These are the
+# root-level `nix build` output links only.
+/result
+# Any named `nix build -o` link, e.g. result-image, and the per-package links CI builds
+# (result-walletd, result-wallet-cli) which anyone reproducing that job locally also gets.
+/result-*
 
 # bv (beads viewer) local config and caches
 .bv/
