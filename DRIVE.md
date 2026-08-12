@@ -6,15 +6,16 @@
 br-ucq, br-pfc, br-4yz), NOT br-2aa, NOT br-s0e, NOT the production canary.
 
 **Phase:** DONE — the scope above is empty. `br-y2j` and all three children are closed.
-**Branch:** — · **Pending:** this closure PR
+**Branch:** — · **Pending:** —
 **Gate:** `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
 · 3/3 merged as `50e25e9` (PR #32). Workspace gate green on its final pre-merge tree —
   fmt 0, clippy 0, **792 passed / 0 failed**, EXIT=0 — and `nix build` green on `main` at
   `50e25e9` after the merge.
-· **CI is PENDING, not present.** This repo has no `.github/workflows/` in this tree; every
-  gate cited above ran locally. A workflow adding fmt + clippy + test in the devshell, plus
-  `nix build` of `walletd`, `wallet-cli` and the deployment image, is open in its own PR and
-  NOT merged. Do not read the gates above as CI-enforced until it lands.
+· **CI now exists** — `.github/workflows/ci.yml`, merged as `8e0791e` (PR #33): fmt + clippy +
+  test in the devshell, and `nix build` of `walletd`, `wallet-cli` and the deployment image,
+  on every push to `main` and every PR. Note the ordering, because it bounds what CI attests
+  to: every gate cited ABOVE ran locally, on trees that predate the workflow. `50e25e9` was
+  never CI-verified; nothing after `8e0791e` has that excuse.
 · live devimint evacuation gate green nine consecutive times across 2/3's branch, last at its
   final pre-merge tree. Those branch SHAs are NOT reachable from `main`: PR #31 was squash-merged,
   so `e9cc97d` is the only hash a future reader can resolve. Do not cite the branch hashes.
