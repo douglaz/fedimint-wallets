@@ -8,7 +8,7 @@ license = "AGPL-3.0-or-later"
 # all logic lives in wallet-fedimint/wallet-core; this crate only parses arguments, drives
 # the engine, and formats output.
 # NOTE: needs the nix build env for fedimint's native deps, same as wallet-fedimint —
-# build/test with: nix develop /home/master/p/fedimint -c cargo <cmd>
+# use the target-pinned commands under README.md "Local development".
 [dependencies]
 wallet-core = { path = "../wallet-core" }
 wallet-api = { path = "../wallet-api" }

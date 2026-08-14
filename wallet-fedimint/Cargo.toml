@@ -5,14 +5,11 @@ edition = "2021"
 license = "AGPL-3.0-or-later"
 
 # Phase 1: the pure `move_protocol` (step 1) plus the fedimint SDK integration
-# (steps 2-4). The fedimint dependency is pinned to douglaz/fedimint (the project
-# owner's fork) at the 0.12-alpha commit we built + validated against live
-# (PR fedimint/fedimint#8774, branch docs/custodial-receive-spec). Pinned to the
-# live branch HEAD; the earlier ade83765 pin was orphaned by a docs-only rebase
-# (the 1-commit delta touched only docs/specs/*.md — SDK code is identical, so no
-# re-validation). Revisit this pin before any production ship.
+# (steps 2-4). The dependency remains pinned to the owner's douglaz/fedimint fork;
+# the authoritative current branch, revision, and carried fixes are documented
+# immediately above the dependency list below. Revisit that pin before production.
 # NOTE: from here the crate needs the nix build env for fedimint's native deps —
-# build/test with: nix develop /home/master/p/fedimint -c cargo <cmd>
+# use the target-pinned commands under README.md "Local development".
 [dependencies]
 wallet-core = { path = "../wallet-core" }
 wallet-api = { path = "../wallet-api" }

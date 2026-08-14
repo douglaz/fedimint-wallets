@@ -11,17 +11,37 @@
 #
 # NOT part of the rb-lite gate (needs a LIVE two-fed devimint; run by hand). Same harness
 # as smoke_history/smoke_evacuate: docs/devimint-two-fed-harness.patch supplies
-# $FED_B_INVITE and connects/pegs the shared LDK gateway. REBUILD wallet-cli into this
-# repo's target-nix BEFORE running (the fedimint devshell redirects cargo's target dir —
-# docs/devimint-runbook.md):
-#   CARGO_BUILD_TARGET_DIR=/home/master/p/fedimint-wallets/target-nix \
-#     nix develop /home/master/p/fedimint -c cargo build -p wallet-cli
+# $FED_B_INVITE and connects/pegs the shared LDK gateway. Follow docs/devimint-runbook.md §1
+# to export FEDIMINT_WORKTREE, then REBUILD wallet-cli into this repo's target-nix BEFORE running:
+#   set -euo pipefail
+#   : "${WALLETS_REPO:?run runbook §1 first}"
+#   declare -F refuse_cargo_config_for_dir >/dev/null || { echo "missing refuse_cargo_config_for_dir; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }
+#   declare -F refuse_ambient_rust_build_overrides >/dev/null || { echo "missing refuse_ambient_rust_build_overrides; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }
+#   declare -F run_exact_nix_develop >/dev/null || { echo "missing run_exact_nix_develop; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }
+#   declare -F run_exact_cargo >/dev/null || { echo "missing run_exact_cargo; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }
+#   declare -F reset_exact_target_dir >/dev/null || { echo "missing reset_exact_target_dir; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }
+#   cd "$WALLETS_REPO"
+#   refuse_cargo_config_for_dir "$WALLETS_REPO"
+#   refuse_ambient_rust_build_overrides
+#   [[ ! -e .shrc.local && ! -L .shrc.local ]] || { echo "refusing wallets .shrc.local as a reproducibility precaution" >&2; exit 1; }
+#   reset_exact_target_dir "$WALLETS_REPO/target-nix"
+#   run_exact_cargo \
+#     build --locked --target-dir "$WALLETS_REPO/target-nix" -p wallet-cli
 set -euo pipefail
 
 WALLET_CLI="${WALLET_CLI_BIN:-/home/master/p/fedimint-wallets/target-nix/debug/wallet-cli}"
 if [[ ! -x "$WALLET_CLI" ]]; then
   echo "FAIL: wallet-cli binary not found at $WALLET_CLI — build it first:" >&2
-  echo "  CARGO_BUILD_TARGET_DIR=/home/master/p/fedimint-wallets/target-nix nix develop /home/master/p/fedimint -c cargo build -p wallet-cli" >&2
+  echo 'Follow docs/devimint-runbook.md §1 to export FEDIMINT_WORKTREE, then build:' >&2
+  echo '  cd "$WALLETS_REPO"' >&2
+  echo '  refuse_cargo_config_for_dir "$WALLETS_REPO"' >&2
+  echo '  refuse_ambient_rust_build_overrides' >&2
+  echo '  [[ ! -e .shrc.local && ! -L .shrc.local ]] || { echo "refusing wallets .shrc.local as a reproducibility precaution" >&2; exit 1; }' >&2
+  echo '  declare -F run_exact_nix_develop >/dev/null || { echo "missing run_exact_nix_develop; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }' >&2
+  echo '  declare -F run_exact_cargo >/dev/null || { echo "missing run_exact_cargo; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }' >&2
+  echo '  declare -F reset_exact_target_dir >/dev/null || { echo "missing reset_exact_target_dir; replay docs/devimint-runbook.md §1 in this same shell" >&2; exit 1; }' >&2
+  echo '  reset_exact_target_dir "$WALLETS_REPO/target-nix"' >&2
+  echo '  run_exact_cargo build --locked --target-dir "$WALLETS_REPO/target-nix" -p wallet-cli' >&2
   exit 1
 fi
 

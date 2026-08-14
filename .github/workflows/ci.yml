@@ -152,8 +152,8 @@ jobs:
 
 # NOT gated here, deliberately:
 #
-# The live devimint evacuation gate (wallet-cli/tests/smoke_evacuate_devimint.sh) needs a
-# devimint built from a pinned fedimint worktree with a local patch applied, and drives real
-# federations. It is not reproducible from a clean runner, so it stays a local gate that
-# money-adjacent changes run by hand — see AGENTS.md. Adding a green CI job that silently
+# The live devimint evacuation gate (wallet-cli/tests/smoke_evacuate_devimint.sh) drives real
+# federations. The tracked runbook reproducibly creates the exact pinned fedimint worktree and
+# applies the tracked patch, but this remains a manual local gate because starting live
+# federations is too expensive and long for routine CI. Adding a green CI job that silently
 # skips it would be worse than not having one.

@@ -58,8 +58,9 @@ Two rules, drawn along a line the code did not previously have:
      `list-feds`, `policy`, `health`, `candidates`, `approve`, `recover`. The flag is global, so a
      helper script that appends it to every invocation must not break on these; there is nothing
      for it to mean and nothing it can mislead about. `smoke_money` depends on exactly this: its
-     helper passes `--gateway` to `join` and `balance` (`smoke_money_devimint.sh:74`, `:77`,
-     `:85`), which is why it is one of the two untouched smokes.
+     helper passes `--gateway` to `join` and `balance` (the `wcli`, `join_fed`, and
+     `balance_msat_for_fed` helpers in `smoke_money_devimint.sh`), which is why it is one of the
+     two untouched smokes.
 
 The asymmetry is the decision: the CLI has a flag the daemon config does not. That is intentional
 and is the thing a future reader will otherwise assume was an oversight.
@@ -143,8 +144,8 @@ miss:
     with `await-move`, so a `Join`-only implementation would refuse the pending recovery. This mirrors
     the Ignored bucket at the verb level and it is load-bearing: `smoke_money`'s `join_fed`
     helper runs `await-move <join-key>` through a `--gateway` helper
-    (`wallet-cli/tests/smoke_money_devimint.sh:74`, `:77-79`), so refusing here breaks one of the
-    two smokes this ADR promises stay untouched.
+    (the `wcli` and `join_fed` helpers in `wallet-cli/tests/smoke_money_devimint.sh`), so
+    refusing here breaks one of the two smokes this ADR promises stay untouched.
   - Any AUTOMATED reason code (`ActiveProbe`, allocator- or scheduler-stamped) → REFUSED, loudly.
 Refusal is reserved for automated provenance. Do not refuse merely because an intent is not a
 money action.

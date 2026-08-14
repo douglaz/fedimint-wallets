@@ -36,8 +36,8 @@ corrected here.
 
 ## Consequences
 
-- These corrections land in Phase 1b (model-from-reality), after the 1a spike. Tracked as
-  TODOS T12-T16.
+- These corrections land in Phase 1b (model-from-reality), after the 1a spike. They were
+  formerly tracked as TODOs T12-T16; the live backlog is now in `br`.
 - Key management shapes storage from day one: sketch seed/Keystore/Block Store/recovery
   (incl. recovery of PENDING operations, not just ecash — ADR-0003/0011) before client DBs.
 - Honesty: after ADR-0006, v1 holds ~2 active federations; "allocates across many
