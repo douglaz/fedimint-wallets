@@ -1,6 +1,7 @@
 //! Registered driver wrapper and actor-routed journal adapter.
 
 use super::*;
+use crate::runtime::AwaitFailure;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::future::Future;
@@ -183,6 +184,7 @@ pub(super) fn spawn_registered<F>(
 struct ActorJournal {
     durable: Arc<FedimintJournal>,
     client: WalletClient,
+    attempt: u32,
 }
 
 #[async_trait]
@@ -191,7 +193,10 @@ impl Journal for ActorJournal {
         self.client
             .journal_transition(
                 intent.idempotency_key.clone(),
-                JournalTransition::Upsert(Box::new(intent.clone())),
+                JournalTransition::Upsert {
+                    expected_attempt: self.attempt,
+                    intent: Box::new(intent.clone()),
+                },
             )
             .await
             .map(|_| ())
@@ -205,6 +210,7 @@ impl Journal for ActorJournal {
     async fn set_status(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         status: IntentStatus,
         error: Option<&str>,
     ) -> Result<(), ExecError> {
@@ -212,6 +218,7 @@ impl Journal for ActorJournal {
             .journal_transition(
                 key.clone(),
                 JournalTransition::SetStatus {
+                    expected_attempt,
                     status,
                     error: error.map(str::to_owned),
                 },
@@ -224,6 +231,7 @@ impl Journal for ActorJournal {
     async fn set_status_if(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         expected: IntentStatus,
         new: IntentStatus,
     ) -> Result<bool, ExecError> {
@@ -231,7 +239,11 @@ impl Journal for ActorJournal {
             .client
             .journal_transition(
                 key.clone(),
-                JournalTransition::CompareAndSet { expected, new },
+                JournalTransition::CompareAndSet {
+                    expected_attempt,
+                    expected,
+                    new,
+                },
             )
             .await
             .map_err(service_exec_error)?
@@ -266,25 +278,6 @@ impl Journal for ActorJournal {
         self.durable.move_record(key).await
     }
 
-    async fn set_operation_artifact(
-        &self,
-        key: &IdempotencyKey,
-        operation_id: OperationId,
-        invoice: Option<&Invoice>,
-    ) -> Result<(), ExecError> {
-        self.client
-            .journal_transition(
-                key.clone(),
-                JournalTransition::OperationArtifact {
-                    operation_id,
-                    invoice: invoice.cloned(),
-                },
-            )
-            .await
-            .map(|_| ())
-            .map_err(service_exec_error)
-    }
-
     fn store_id(&self) -> usize {
         self.durable.store_id()
     }
@@ -313,6 +306,7 @@ pub(super) fn spawn_intent(
         let actor_journal = ActorJournal {
             durable: journal,
             client,
+            attempt: intent.attempt,
         };
         let mut summary = ExecutionSummary::default();
         let drive = wallet_core::drive_intent_step(
@@ -338,7 +332,11 @@ pub(super) fn spawn_intent(
         let _ = transition_client
             .journal_transition(
                 finished_key,
-                JournalTransition::DriverFinished { generation },
+                JournalTransition::DriverFinished {
+                    generation,
+                    expected_attempt: intent.attempt,
+                    retry_awaiter: false,
+                },
             )
             .await;
     };
@@ -366,9 +364,65 @@ pub(super) fn spawn_awaiter(
     let task_key = key.clone();
     let future = async move {
         if let Some(runtime) = runtime {
-            let _ = runtime.service_await_intent(&intent).await;
+            let retry_awaiter = match runtime.service_await_intent(&intent, &client).await {
+                Ok(()) => false,
+                Err(AwaitFailure::Retryable(error)) => {
+                    tracing::warn!(
+                        key = %intent.idempotency_key.0,
+                        attempt = intent.attempt,
+                        %error,
+                        "service awaiter ended before terminalizing its intent; retrying after backoff"
+                    );
+                    // Keep retry pacing out of the serial actor. Aborting this task during
+                    // shutdown cancels the sleep, so shutdown can never manufacture a successor.
+                    runtime.service_awaiter_retry_delay().await;
+                    true
+                }
+                Err(AwaitFailure::Permanent(error)) => {
+                    tracing::warn!(
+                        key = %intent.idempotency_key.0,
+                        attempt = intent.attempt,
+                        %error,
+                        "service awaiter found a permanent failure; terminalizing the durable attempt"
+                    );
+                    // This must go through the actor: it applies the expected-attempt fence,
+                    // invalidates balance facts, wakes waiters, and cannot regress a newer or
+                    // already-terminal intent. Only a failed actor transition retains ownership
+                    // for retry; a stale successful no-op has no Awaiting attempt to orphan.
+                    match client
+                        .journal_transition(
+                            task_key.clone(),
+                            JournalTransition::SetStatus {
+                                expected_attempt: intent.attempt,
+                                status: IntentStatus::Failed,
+                                error: Some(format!("service awaiter permanent failure: {error}")),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(_) => false,
+                        Err(transition_error) => {
+                            tracing::warn!(
+                                key = %intent.idempotency_key.0,
+                                attempt = intent.attempt,
+                                ?transition_error,
+                                "service awaiter could not terminalize permanent failure; retrying ownership"
+                            );
+                            runtime.service_awaiter_retry_delay().await;
+                            true
+                        }
+                    }
+                }
+            };
             let _ = client
-                .journal_transition(task_key, JournalTransition::DriverFinished { generation })
+                .journal_transition(
+                    task_key,
+                    JournalTransition::DriverFinished {
+                        generation,
+                        expected_attempt: intent.attempt,
+                        retry_awaiter,
+                    },
+                )
                 .await;
         } else {
             std::future::pending::<()>().await;
@@ -405,19 +459,26 @@ pub(super) fn spawn_probe(
                 .service_active_probe(
                     candidate,
                     source,
+                    decision.session.nonce.clone(),
                     &policy,
                     actor,
                     per_fed_cap,
                     client.clone(),
                 )
                 .await;
-            let _ = client
-                .journal_transition(refresh_key, JournalTransition::Refresh)
-                .await;
+            if !refresh_probe_budget_until_success(&client, refresh_key).await {
+                return;
+            }
             let _ = client
                 .journal_transition(
                     finished_key,
-                    JournalTransition::DriverFinished { generation },
+                    JournalTransition::DriverFinished {
+                        generation,
+                        // Probe keys are not retryable raw intents; zero is a harmless
+                        // process-bookkeeping stamp retained for the common transition shape.
+                        expected_attempt: 0,
+                        retry_awaiter: false,
+                    },
                 )
                 .await;
         } else {
@@ -431,4 +492,35 @@ pub(super) fn spawn_probe(
         DriverKind::Probe { candidate },
         future,
     );
+}
+
+/// Refresh the actor's in-memory probe budget only after the probe outcome has
+/// reached the durable ledger.  This intentionally sleeps in the driver, never on
+/// the serial actor, and retains the sole probe owner until the active reservation
+/// is replaced by its terminal row (or the service stops).
+pub(super) async fn refresh_probe_budget_until_success(
+    client: &WalletClient,
+    key: IdempotencyKey,
+) -> bool {
+    let mut backoff = std::time::Duration::from_millis(25);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+    loop {
+        match client
+            .journal_transition(key.clone(), JournalTransition::Refresh)
+            .await
+        {
+            Ok(_) => return true,
+            Err(ServiceError::ActorStopped | ServiceError::ShuttingDown) => return false,
+            Err(error) => {
+                tracing::warn!(
+                    key = %key.0,
+                    ?error,
+                    ?backoff,
+                    "probe budget refresh failed; retrying before releasing ownership"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
+            }
+        }
+    }
 }

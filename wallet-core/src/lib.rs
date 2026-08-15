@@ -3,6 +3,7 @@
 //! `Journal`). No fedimint, no network, no db.
 
 pub mod allocator;
+pub mod conflict;
 pub mod discovery;
 pub mod executor;
 pub mod ledger;
@@ -11,7 +12,8 @@ pub mod scorer;
 pub mod types;
 pub mod watch;
 
-pub use allocator::{decide, max_fundable, move_fee_cap};
+pub use allocator::{decide, decide_with_blockers, funding_shortfall, max_fundable, move_fee_cap};
+pub use conflict::{AllocatorGoal, GoalBlockers};
 pub use discovery::{
     auto_join_budget, BudgetVerdict, DiscoveryPolicy, DiscoverySource, SourceStatus,
     STRUCTURAL_RECHECK_BACKOFF_MS,

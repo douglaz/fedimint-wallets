@@ -109,9 +109,10 @@ for f in "$WALLET_CLI" "$WALLETD"; do
   fi
 done
 [[ -f "$DOUBLE_PY" ]] || { echo "FAIL: missing $DOUBLE_PY" >&2; exit 1; }
-for c in fedimint-cli jq curl python3; do
+for c in fedimint-cli jq python3; do
   command -v "$c" >/dev/null || { echo "FAIL: $c not on PATH" >&2; exit 1; }
 done
+command -v curl >/dev/null || { echo "FAIL: lock-pinned curl not on PATH (use run_exact_nix_develop)" >&2; exit 1; }
 
 GW_REAL="http://127.0.0.1:${FM_PORT_GW_LDK}/"
 PORT=19737           # walletd, off the default

@@ -10,6 +10,7 @@
 
 use crate::journal::{CandidateRecord, CandidateState, StructuralOutcome};
 use crate::multi_client::{bridge_federation_id, JoinOutcome};
+use crate::service::WalletClient;
 use async_trait::async_trait;
 use fedimint_core::invite_code::InviteCode;
 use fedimint_core::runtime;
@@ -146,13 +147,16 @@ pub(crate) trait DiscoveryBackend {
         now_ms: u64,
         probe_policy: &ProbePolicy,
     ) -> anyhow::Result<AutoJoinCounts>;
-    async fn join_as_agent(
+    /// Service discovery supplies this authority only for auto-join's final membership
+    /// publication. Standalone discovery passes `None`.
+    async fn join_as_agent_with_membership_lease(
         &self,
         id: FederationId,
         invite: InviteCode,
         occurrence: Occurrence,
         now_ms: u64,
         join_timeout: Duration,
+        membership_client: Option<&WalletClient>,
     ) -> AutoJoinAttempt;
     async fn record_discover(
         &self,
@@ -334,6 +338,34 @@ pub(crate) async fn run_discover_pass_bounded_with_rotation_and_probe_policy(
     policy: &DiscoveryPolicy,
     probe_policy: &ProbePolicy,
     backend: &impl DiscoveryBackend,
+    now_ms: u64,
+    nonce: &str,
+    watch_policy: &WatchPolicy,
+    resume: DiscoverPassResume<'_>,
+) -> anyhow::Result<BoundedDiscoverReport> {
+    run_discover_pass_bounded_with_rotation_and_probe_policy_with_membership_lease(
+        sources,
+        policy,
+        probe_policy,
+        backend,
+        None,
+        now_ms,
+        nonce,
+        watch_policy,
+        resume,
+    )
+    .await
+}
+
+/// As [`run_discover_pass_bounded_with_rotation_and_probe_policy`], but passes service
+/// membership authority through to auto-join's final registry/client publication only.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_discover_pass_bounded_with_rotation_and_probe_policy_with_membership_lease(
+    sources: &[Box<dyn CandidateSource>],
+    policy: &DiscoveryPolicy,
+    probe_policy: &ProbePolicy,
+    backend: &impl DiscoveryBackend,
+    membership_client: Option<&WalletClient>,
     now_ms: u64,
     nonce: &str,
     watch_policy: &WatchPolicy,
@@ -528,6 +560,7 @@ pub(crate) async fn run_discover_pass_bounded_with_rotation_and_probe_policy(
                 policy,
                 probe_policy,
                 backend,
+                membership_client,
                 &scorer_policy,
                 &joined,
                 &floored_this_pass,
@@ -963,6 +996,7 @@ async fn run_auto_join(
     policy: &DiscoveryPolicy,
     probe_policy: &ProbePolicy,
     backend: &impl DiscoveryBackend,
+    membership_client: Option<&WalletClient>,
     scorer_policy: &ScorerPolicy,
     joined: &BTreeSet<FederationId>,
     floored_this_pass: &BTreeSet<FederationId>,
@@ -1091,7 +1125,16 @@ async fn run_auto_join(
             attempted_ids.insert(candidate.id);
         }
 
-        match join_as_agent_with_timeout(backend, &candidate, occurrence, now_ms, timing).await {
+        match join_as_agent_with_timeout(
+            backend,
+            &candidate,
+            occurrence,
+            now_ms,
+            timing,
+            membership_client,
+        )
+        .await
+        {
             AutoJoinAttempt::Joined(outcome) => {
                 if outcome.newly_joined {
                     candidate.state = CandidateState::AutoJoined;
@@ -1138,17 +1181,19 @@ async fn join_as_agent_with_timeout(
     occurrence: Occurrence,
     now_ms: u64,
     timing: DiscoverTiming,
+    membership_client: Option<&WalletClient>,
 ) -> AutoJoinAttempt {
     let Some(join_timeout) = timing.remaining_budget() else {
         return AutoJoinAttempt::DeadlineElapsed;
     };
     backend
-        .join_as_agent(
+        .join_as_agent_with_membership_lease(
             candidate.id,
             candidate.invite.clone(),
             occurrence,
             now_ms,
             join_timeout,
+            membership_client,
         )
         .await
 }
@@ -1440,12 +1485,20 @@ fn parse_federation_id(hex: &str) -> anyhow::Result<FederationId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::FedimintJournal;
+    use crate::multi_client::MultiClient;
+    use crate::runtime::Runtime;
+    use crate::service::WalletService;
+    use fedimint_bip39::Mnemonic;
+    use fedimint_core::db::mem_impl::MemDatabase;
+    use fedimint_core::db::IRawDatabaseExt as _;
     use fedimint_core::util::SafeUrl;
     use fedimint_core::PeerId;
     use std::collections::BTreeMap;
     use std::str::FromStr;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use wallet_api::Policy;
     use wallet_core::{Module, WatchPolicy};
 
     fn test_invite() -> InviteCode {
@@ -1579,6 +1632,7 @@ mod tests {
         agent_created: Mutex<BTreeSet<FederationId>>,
         joins: Mutex<Vec<FederationId>>,
         join_occurrences: Mutex<Vec<(FederationId, Occurrence)>>,
+        membership_authority: Mutex<Vec<bool>>,
         discover_keys: Mutex<Vec<IdempotencyKey>>,
         discover_rows: Mutex<Vec<DiscoverSourceReport>>,
         auto_rows: Mutex<Vec<AutoJoinReport>>,
@@ -1724,19 +1778,24 @@ mod tests {
             Ok(*self.counts.lock().expect("counts lock"))
         }
 
-        async fn join_as_agent(
+        async fn join_as_agent_with_membership_lease(
             &self,
             id: FederationId,
             _invite: InviteCode,
             occurrence: Occurrence,
             _now_ms: u64,
             join_timeout: Duration,
+            membership_client: Option<&WalletClient>,
         ) -> AutoJoinAttempt {
             self.joins.lock().expect("joins lock").push(id);
             self.join_occurrences
                 .lock()
                 .expect("join occurrences lock")
                 .push((id, occurrence));
+            self.membership_authority
+                .lock()
+                .expect("membership-authority lock")
+                .push(membership_client.is_some());
             let reply = self
                 .join_replies
                 .lock()
@@ -2453,6 +2512,86 @@ mod tests {
                 .as_slice(),
             [(id, occurrence)]
         );
+        assert_eq!(
+            backend
+                .membership_authority
+                .lock()
+                .expect("membership-authority lock")
+                .as_slice(),
+            [false],
+            "the standalone discovery entry point must not manufacture service membership authority"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn service_discovery_threads_membership_authority_to_auto_join() -> anyhow::Result<()> {
+        let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
+        let mnemonic = Mnemonic::from_entropy(&[0x48; 16]).expect("valid test mnemonic");
+        let multi_client = Arc::new(MultiClient::new(db, journal_db.clone(), mnemonic).await);
+        let journal = Arc::new(FedimintJournal::new(journal_db));
+        let runtime = Runtime::new(multi_client, journal.clone(), None, None, None);
+        let service = WalletService::start_detached(
+            journal,
+            Arc::new(runtime.service_executor(None)),
+            Policy::default(),
+        )
+        .await
+        .expect("start actor-only service");
+        let client = service.client();
+
+        let backend = FakeBackend::default();
+        let id = fed(0x48);
+        let invite = invite_for(id, "service-autojoin-authority");
+        backend.put_existing(candidate(
+            id,
+            invite.clone(),
+            CandidateState::Discovered,
+            10_000,
+        ));
+        backend.with_preview(
+            &invite,
+            PreviewReply::Ok(PreviewedCandidate {
+                id,
+                facts: good_facts(id),
+            }),
+        );
+        let policy = DiscoveryPolicy {
+            auto_join: true,
+            ..DiscoveryPolicy::default()
+        };
+        let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+
+        let outcome =
+            run_discover_pass_bounded_with_rotation_and_probe_policy_with_membership_lease(
+                &sources,
+                &policy,
+                &ProbePolicy::default(),
+                &backend,
+                Some(&client),
+                20_000,
+                "0000000000000048",
+                &WatchPolicy::default(),
+                DiscoverPassResume {
+                    cursor: None,
+                    rotation: &[],
+                    occurrence: Occurrence(48),
+                },
+            )
+            .await?;
+
+        assert_eq!(outcome.report.auto_join.joined, 1);
+        assert_eq!(
+            backend
+                .membership_authority
+                .lock()
+                .expect("membership-authority lock")
+                .as_slice(),
+            [true],
+            "the service discovery path must carry actor membership authority to the join backend"
+        );
+        service.shutdown().await.expect("shutdown");
         Ok(())
     }
 

@@ -76,9 +76,9 @@ pub use runtime::{
     WatchProbeOutcome, WatchProbeReport, WatchReconcileOutcome, WatchTickOutcome,
 };
 pub use service::{
-    AwaitOutcome, Command, DecidedOp, JournalTransition, OpRequest, ProbeCandidate, ProbeDecision,
-    ReconcileReport as ServiceReconcileReport, ServiceError, Snapshot, SnapshotScope,
-    TransitionResult, WalletClient, WalletService,
+    repair_ledger_with_actor, AwaitOutcome, DecidedOp, OpRequest,
+    ReconcileReport as ServiceReconcileReport, ServiceError, Snapshot, SnapshotScope, WalletClient,
+    WalletService,
 };
 pub use tick::{build_snapshot, ScoredFed, StatusReport, TickPolicy, TickReport};
 pub use types::{GatewayUrl, Invoice, OperationId, Preimage};

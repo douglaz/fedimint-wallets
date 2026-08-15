@@ -21,8 +21,9 @@
 use crate::probe::{assemble_facts, assemble_status, ProbeResult};
 use std::collections::{BTreeMap, BTreeSet};
 use wallet_core::{
-    score, Action, ActiveProbeVerdict, AllocatorDecision, AllocatorSnapshot, ExecutionSummary,
-    FederationId, FederationStatus, FederationVerdict, Msat, Occurrence, ScorerPolicy,
+    score, Action, ActiveProbeVerdict, AllocatorDecision, AllocatorGoal, AllocatorSnapshot,
+    ExecutionSummary, FederationId, FederationStatus, FederationVerdict, Msat, Occurrence,
+    ReasonCode, ScorerPolicy,
 };
 
 // ---- v1 default standing instruction (documented) --------------------------------
@@ -98,6 +99,12 @@ pub struct TickPolicy {
     /// a 7d ttl); an operator may loosen the window (they own the risk tradeoff), which is also
     /// how a live gate demonstrates the probe-pass -> fund path without a 24h wait.
     pub probe_gate_policy: wallet_core::ProbePolicy,
+    /// The logical allocator goals durable work already owns (br-p93), projected by the daemon's
+    /// preceding reconcile or by the standalone Runtime's own durable scan. Per-CYCLE state like
+    /// `occurrence`/`now`, not an operator knob: `Policy` cannot set it and `Default` is EMPTY for
+    /// callers that do not plan allocator work. Carrying it here keeps route pricing and planning
+    /// on one value; each apply/commit seam re-scans to close a planning race.
+    pub blocked: wallet_core::GoalBlockers,
 }
 
 impl Default for TickPolicy {
@@ -115,6 +122,7 @@ impl Default for TickPolicy {
             standby_fed: None,
             now: 0,
             probe_gate_policy: wallet_core::ProbePolicy::default(),
+            blocked: wallet_core::GoalBlockers::default(),
         }
     }
 }
@@ -334,17 +342,26 @@ pub fn unfundable_pinned_feds(
 /// - a pin PRESENT but not fundable after snapshot assembly, such as an AutoJoined candidate
 ///   without a `Passed` active probe ([`unfundable_pinned_feds`]);
 /// - a pin PRESENT but unusable for lnv2 moves this tick — no lnv2 module, dead quorum, or no
-///   usable gateway route ([`unusable_pinned_feds`]) — UNLESS it already drives an executable
-///   `Move` in `decisions`, in which case its rebalance is genuinely running (see below).
+///   usable gateway route ([`unusable_pinned_feds`]) — subject to the voucher rules below.
 ///
-/// The `decisions` refinement fixes a source-only pin's false bail: a rebalance `A -> B` routes
+/// Admitted work fixes a source-only pin's false bail: a rebalance `A -> B` routes
 /// through the DESTINATION's gateway (spec §7's shared-gateway internal swap — the executor even
 /// proves that gateway serves the source before minting), so a pinned SOURCE `A` needs only live
-/// quorum and `B`'s gateway to serve it, NOT its own registered gateway. The runtime's `plan_tick`
-/// already validated that exact end-to-end route before emitting the `Move`, so a pinned fed
-/// appearing as the `from`/`to` of a surviving `Move` is provably usable this tick even when its
-/// own `probed_ok` proxy (which reads only its first registered gateway) is false. Only a pin whose
-/// rebalance did NOT survive as an executable `Move` is failed on the coarser raw probe gate.
+/// quorum and `B`'s gateway to serve it, NOT its own registered gateway. A surviving admitted
+/// `Move` or `Evacuate` names the current round's exact route endpoints; the planner concretely
+/// preflights it when the round has route-I/O budget, and the executor revalidates before sending
+/// either way. Thus either endpoint is stronger evidence than the coarse per-fed `probed_ok`
+/// proxy: that proxy checks the explicitly supplied gateway when present, or otherwise scans the
+/// federation's registered gateways for one that validates, while the admitted endpoint identifies
+/// the shared route this decision will use. Only a pin whose rebalance did NOT survive as admitted
+/// executable work is failed on the coarser raw probe gate.
+///
+/// `admitted` contains work which conflict projection allowed and which may execute; `suppressed`
+/// contains work withheld before any concrete preflight. Suppressed work never vouches for an
+/// endpoint merely by appearing in a decision list. A suppressed executable can vouch only for its
+/// SOURCE, and only when the conflicting durable holder has the same associated source. Advisory
+/// recurrences are similarly source-and-goal-associated. This avoids a policy rotation turning an
+/// old `A -> B` holder into a voucher for fresh funding into unusable `A`.
 ///
 /// PURE, total over the inputs. [`Runtime::tick`](crate::runtime::Runtime::tick) turns any problem
 /// into a hard non-zero bail — a money op must never report a pinned rebalance it could not run as
@@ -355,7 +372,9 @@ pub fn pinned_input_problems(
     policy: &TickPolicy,
     snapshot: &AllocatorSnapshot,
     probes: &[(FederationId, ProbeResult)],
-    decisions: &[AllocatorDecision],
+    admitted: &[AllocatorDecision],
+    suppressed: &[AllocatorDecision],
+    blockers: &wallet_core::GoalBlockers,
 ) -> Vec<String> {
     let mut problems = Vec::new();
     let missing = missing_pinned_feds(policy, snapshot);
@@ -384,14 +403,20 @@ pub fn pinned_input_problems(
             hexes(&unfundable)
         ));
     }
-    // A pin that already drives an executable `Move` this tick is usable by construction — its
-    // full route was validated before the move was emitted — so drop it from the raw probe-gate
-    // failures. Otherwise a source-only pin (which routes through the destination's gateway)
-    // falsely fails the tick on its own missing registered gateway.
+    // Missing and active-probe/fundability pins stay loud above.  The evidence order is deliberately
+    // narrow: an admitted endpoint wins; then an exact suppressed source/holder pair wins; only then
+    // does a current funding receive-gate refusal dominate advisory recurrence evidence.  A suppressed
+    // executable candidate is still current source evidence for its exact durable holder, whereas a
+    // zero advisory was neither preflighted nor executable and must never hide a fresh `NotProbed`.
     let unusable: Vec<FederationId> = unusable_pinned_feds(policy, probes)
         .into_iter()
         .filter(|id| !unfundable.contains(id))
-        .filter(|id| !fed_in_executable_move(*id, decisions))
+        .filter(|id| {
+            !fed_in_executable_move(*id, admitted)
+                && !suppressed_source_vouches(*id, suppressed, blockers)
+                && (has_funding_receive_gate_refusal(*id, admitted)
+                    || !advisory_recurrence_vouches(*id, admitted, suppressed, blockers))
+        })
         .collect();
     if !unusable.is_empty() {
         problems.push(format!(
@@ -405,10 +430,11 @@ pub fn pinned_input_problems(
     problems
 }
 
-/// Whether `id` is the source or destination of an executable `Move` OR `Evacuate` in
-/// `decisions` — a rebalance leg that will actually reach `apply` (advisory `RefuseInflow`/`Cap`
-/// never do). A pinned fed in such a move had its end-to-end route validated by the runtime, so it
-/// is not failed on the coarser per-fed probe gate.
+/// Whether `id` is the source or destination of an admitted executable `Move` OR `Evacuate` — a
+/// rebalance leg allowed by conflict projection which can reach `apply` (advisory
+/// `RefuseInflow`/`Cap` never does). Planning preflights it when route-I/O budget is available and
+/// the executor revalidates before sending, so it is stronger evidence than the coarse per-fed
+/// probe gate.
 ///
 /// `Evacuate` counts as of Phase 3.A (it is no longer withheld by [`decisions_to_apply`]). The
 /// evacuating SOURCE is unhealthy/shutting-down BY DEFINITION — that is exactly why it is being
@@ -423,6 +449,69 @@ fn fed_in_executable_move(id: FederationId, decisions: &[AllocatorDecision]) -> 
             Action::Move { from, to, .. } | Action::Evacuate { from, to, .. }
                 if *from == id || *to == id
         )
+    })
+}
+
+/// A funding destination's current receive-gate refusal. `receive_blocker` currently reports
+/// `NotProbed`; the arithmetic marker keeps an unrelated advisory with the same reason from
+/// becoming a pin gate.
+fn has_funding_receive_gate_refusal(id: FederationId, decisions: &[AllocatorDecision]) -> bool {
+    decisions.iter().any(|decision| {
+        matches!(
+            &decision.action,
+            Action::RefuseInflow { fed, reason: ReasonCode::NotProbed, diagnostics }
+                if *fed == id && diagnostics.want.is_some() && diagnostics.max_fee_bps.is_some()
+        )
+    })
+}
+
+/// Suppressed work was not preflighted. It can therefore vouch only for its source, and only if
+/// the exact conflicting holder retains that same source association.
+fn suppressed_source_vouches(
+    id: FederationId,
+    suppressed: &[AllocatorDecision],
+    blockers: &wallet_core::GoalBlockers,
+) -> bool {
+    suppressed.iter().any(|decision| {
+        let source = match &decision.action {
+            Action::Move { from, .. } | Action::Evacuate { from, .. } => *from,
+            _ => return false,
+        };
+        source == id
+            && blockers.has_blocking_holder_from(
+                decision,
+                wallet_core::Actor::Agent {
+                    occurrence: decision.occurrence,
+                },
+                source,
+            )
+    })
+}
+
+/// A zero/advisory recurrence has no route preflight. It is only evidence of a held goal when both
+/// the current recurrence and its durable holder name the same source.
+fn advisory_recurrence_vouches(
+    id: FederationId,
+    admitted: &[AllocatorDecision],
+    suppressed: &[AllocatorDecision],
+    blockers: &wallet_core::GoalBlockers,
+) -> bool {
+    admitted.iter().chain(suppressed).any(|decision| {
+        let Action::RefuseInflow {
+            fed,
+            reason,
+            diagnostics,
+        } = &decision.action
+        else {
+            return false;
+        };
+        if matches!(reason, ReasonCode::ShutdownNotice | ReasonCode::Unhealthy) {
+            *fed == id && blockers.holds_goal_from(AllocatorGoal::Evacuate(*fed), *fed)
+        } else {
+            diagnostics.source.is_some_and(|source| {
+                source == id && blockers.holds_goal_from(AllocatorGoal::FundInto(*fed), source)
+            })
+        }
     })
 }
 
@@ -492,10 +581,57 @@ pub struct StatusReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wallet_core::{decide, ReasonCode};
+    use wallet_core::{decide, Actor, GoalBlockers, IdempotencyKey, ReasonCode};
 
     fn fed_id(byte: u8) -> FederationId {
         FederationId([byte; 32])
+    }
+
+    fn held_funding_blockers(from: FederationId, to: FederationId) -> GoalBlockers {
+        let decision = AllocatorDecision {
+            action: Action::Move {
+                from,
+                to,
+                amount: Msat(1),
+                fee_cap: Msat(0),
+                gateway: None,
+            },
+            reason: ReasonCode::StandbyBelowTarget,
+            occurrence: Occurrence(1),
+            idempotency_key: IdempotencyKey("held-pin-boundary".to_owned()),
+        };
+        let mut blockers = GoalBlockers::default();
+        blockers.hold_decision(
+            &decision,
+            Actor::Agent {
+                occurrence: Occurrence(1),
+            },
+        );
+        blockers
+    }
+
+    fn held_evacuation_blockers(from: FederationId, to: FederationId) -> GoalBlockers {
+        let decision = AllocatorDecision {
+            action: Action::Evacuate {
+                from,
+                to,
+                amount: Msat(1),
+                fee_cap: Msat(0),
+                gateway: None,
+                fee_cap_components: None,
+            },
+            reason: ReasonCode::ShutdownNotice,
+            occurrence: Occurrence(1),
+            idempotency_key: IdempotencyKey("held-evacuation-pin-boundary".to_owned()),
+        };
+        let mut blockers = GoalBlockers::default();
+        blockers.hold_decision(
+            &decision,
+            Actor::Agent {
+                occurrence: Occurrence(1),
+            },
+        );
+        blockers
     }
 
     /// A healthy, scorer-eligible probe holding `spendable_msat` (4-guardian mainnet fed
@@ -750,13 +886,35 @@ mod tests {
                 .any(|d| matches!(&d.action, Action::Move { to, .. } if *to == fed_id(2))),
             "pinning must not bypass the probe gate: {gated_decisions:?}"
         );
-        let gated_problems = pinned_input_problems(&policy, &gated, &probes, &gated_decisions);
+        let gated_problems = pinned_input_problems(
+            &policy,
+            &gated,
+            &probes,
+            &gated_decisions,
+            &[],
+            &wallet_core::GoalBlockers::default(),
+        );
         assert!(
             gated_problems.iter().any(
                 |p| p.contains("failed the fundability gate")
                     && p.contains(&fed_id(2).to_hex())
             ),
             "a pinned AutoJoined fed blocked by the active-probe gate must fail loudly: {gated_problems:?}"
+        );
+        let held_gated_problems = pinned_input_problems(
+            &policy,
+            &gated,
+            &probes,
+            &gated_decisions,
+            &[],
+            &held_funding_blockers(fed_id(1), fed_id(2)),
+        );
+        assert!(
+            held_gated_problems.iter().any(
+                |p| p.contains("failed the fundability gate")
+                    && p.contains(&fed_id(2).to_hex())
+            ),
+            "a held rebalance must not relax the active-probe/fundability gate: {held_gated_problems:?}"
         );
 
         let spending_pin_policy = TickPolicy {
@@ -796,6 +954,8 @@ mod tests {
             &spending_pin,
             &probes,
             &spending_pin_decisions,
+            &[],
+            &wallet_core::GoalBlockers::default(),
         );
         assert!(
             spending_pin_problems.iter().any(
@@ -821,7 +981,15 @@ mod tests {
             "passed auto-joined standby can be funded: {passed_decisions:?}"
         );
         assert!(
-            pinned_input_problems(&policy, &passed, &probes, &passed_decisions).is_empty(),
+            pinned_input_problems(
+                &policy,
+                &passed,
+                &probes,
+                &passed_decisions,
+                &[],
+                &wallet_core::GoalBlockers::default(),
+            )
+            .is_empty(),
             "a passed AutoJoined pin should not fail the tick guard"
         );
     }
@@ -868,7 +1036,14 @@ mod tests {
         );
         assert!(fed_in_executable_move(fed_id(1), &decisions));
         // Despite driving that move, the fundability gate must still fail loudly.
-        let problems = pinned_input_problems(&policy, &snapshot, &probes, &decisions);
+        let problems = pinned_input_problems(
+            &policy,
+            &snapshot,
+            &probes,
+            &decisions,
+            &[],
+            &wallet_core::GoalBlockers::default(),
+        );
         assert!(
             problems
                 .iter()
@@ -1055,7 +1230,14 @@ mod tests {
         };
         let snapshot = build_snapshot(&probes, &policy, &ScorerPolicy::default());
         let decisions = decide(&snapshot, policy.occurrence);
-        let problems = pinned_input_problems(&policy, &snapshot, &probes, &decisions);
+        let problems = pinned_input_problems(
+            &policy,
+            &snapshot,
+            &probes,
+            &decisions,
+            &[],
+            &wallet_core::GoalBlockers::default(),
+        );
         assert_eq!(problems.len(), 2, "{problems:?}");
         assert!(
             problems
@@ -1068,6 +1250,20 @@ mod tests {
                 |p| p.contains("failed the lnv2/probe gate") && p.contains(&fed_id(1).to_hex())
             ),
             "{problems:?}"
+        );
+        let held_problems = pinned_input_problems(
+            &policy,
+            &snapshot,
+            &probes,
+            &decisions,
+            &[],
+            &held_funding_blockers(fed_id(1), fed_id(9)),
+        );
+        assert!(
+            held_problems
+                .iter()
+                .any(|p| p.contains("failed to probe") && p.contains(&fed_id(9).to_hex())),
+            "a held source association must not relax a missing pin: {held_problems:?}"
         );
 
         // A pinned STANDBY whose quorum is DEAD (fed 3) is now EVACUATED, not pre-failed. As of
@@ -1101,6 +1297,8 @@ mod tests {
                 &dead_quorum_snap,
                 &probes,
                 &dead_quorum_decisions,
+                &[],
+                &wallet_core::GoalBlockers::default(),
             )
             .is_empty(),
             "an evacuating pinned fed must not be pre-failed on its own probe gate"
@@ -1114,14 +1312,269 @@ mod tests {
         };
         let ok_snap = build_snapshot(&probes, &ok, &ScorerPolicy::default());
         let ok_decisions = decide(&ok_snap, ok.occurrence);
-        assert!(pinned_input_problems(&ok, &ok_snap, &probes, &ok_decisions).is_empty());
+        assert!(pinned_input_problems(
+            &ok,
+            &ok_snap,
+            &probes,
+            &ok_decisions,
+            &[],
+            &wallet_core::GoalBlockers::default(),
+        )
+        .is_empty());
 
         // Fully auto (no pins) never reports a problem, even with an unusable fed present:
         // auto-designation degrades safely by excluding it.
         let auto = TickPolicy::default();
         let auto_snap = build_snapshot(&probes, &auto, &ScorerPolicy::default());
         let auto_decisions = decide(&auto_snap, auto.occurrence);
-        assert!(pinned_input_problems(&auto, &auto_snap, &probes, &auto_decisions).is_empty());
+        assert!(pinned_input_problems(
+            &auto,
+            &auto_snap,
+            &probes,
+            &auto_decisions,
+            &[],
+            &wallet_core::GoalBlockers::default(),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_held_rebalance_without_a_current_same_source_recurrence_does_not_relax_the_raw_pin_gate() {
+        // A durable route is not an uncorrelated raw-pin voucher. A current recurrence must pair
+        // the same goal and source; otherwise an old route can hide a policy-rotated pin.
+        let mut no_gateway = healthy_probe(100_000);
+        no_gateway.gateway_available = false;
+
+        for (shape, blockers) in [
+            ("funding", held_funding_blockers(fed_id(1), fed_id(2))),
+            ("evacuation", held_evacuation_blockers(fed_id(1), fed_id(2))),
+        ] {
+            let destination_pinned = TickPolicy {
+                standby_fed: Some(fed_id(2)),
+                ..TickPolicy::default()
+            };
+            let destination_probes = vec![
+                (fed_id(1), healthy_probe(100_000)),
+                (fed_id(2), no_gateway.clone()),
+            ];
+            let destination_snapshot = build_snapshot(
+                &destination_probes,
+                &destination_pinned,
+                &ScorerPolicy::default(),
+            );
+            let destination_problems = pinned_input_problems(
+                &destination_pinned,
+                &destination_snapshot,
+                &destination_probes,
+                &[],
+                &[],
+                &blockers,
+            );
+            assert!(
+                destination_problems.iter().any(
+                    |problem| problem.contains("failed the lnv2/probe gate")
+                        && problem.contains(&fed_id(2).to_hex())
+                ),
+                "a held {shape} destination must not relax a stale raw pin: {destination_problems:?}"
+            );
+
+            let source_pinned = TickPolicy {
+                spending_fed: Some(fed_id(1)),
+                ..TickPolicy::default()
+            };
+            let source_probes = vec![
+                (fed_id(1), no_gateway.clone()),
+                (fed_id(2), healthy_probe(100_000)),
+            ];
+            let source_snapshot =
+                build_snapshot(&source_probes, &source_pinned, &ScorerPolicy::default());
+            assert!(
+                !pinned_input_problems(
+                    &source_pinned,
+                    &source_snapshot,
+                    &source_probes,
+                    &[],
+                    &[],
+                    &blockers,
+                )
+                .is_empty(),
+                "a held {shape} source alone must not relax a raw pin"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_pin_vouchers_are_associated_and_an_admitted_endpoint_wins() {
+        let mut unavailable_a = healthy_probe(100_000);
+        unavailable_a.gateway_available = false;
+        let probes = vec![
+            (fed_id(1), unavailable_a),
+            (fed_id(2), healthy_probe(100_000)),
+            (fed_id(3), healthy_probe(100_000)),
+        ];
+        let policy = TickPolicy {
+            spending_fed: Some(fed_id(1)),
+            ..TickPolicy::default()
+        };
+        let snapshot = build_snapshot(&probes, &policy, &ScorerPolicy::default());
+        assert!(unusable_pinned_feds(&policy, &probes).contains(&fed_id(1)));
+
+        let funding_advisory = AllocatorDecision {
+            action: Action::RefuseInflow {
+                fed: fed_id(2),
+                reason: ReasonCode::SpendingBelowTarget,
+                diagnostics: wallet_core::RefusalDiagnostics {
+                    source: Some(fed_id(1)),
+                    ..Default::default()
+                },
+            },
+            reason: ReasonCode::SpendingBelowTarget,
+            occurrence: Occurrence(2),
+            idempotency_key: IdempotencyKey("refuse:funding-advisory".to_owned()),
+        };
+        let held_a_to_b = held_funding_blockers(fed_id(1), fed_id(2));
+        assert!(
+            pinned_input_problems(
+                &policy,
+                &snapshot,
+                &probes,
+                std::slice::from_ref(&funding_advisory),
+                &[],
+                &held_a_to_b,
+            )
+            .is_empty(),
+            "a held funding advisory vouches only for its paired source"
+        );
+        let held_c_to_b = held_funding_blockers(fed_id(3), fed_id(2));
+        assert!(
+            !pinned_input_problems(
+                &policy,
+                &snapshot,
+                &probes,
+                &[funding_advisory],
+                &[],
+                &held_c_to_b,
+            )
+            .is_empty(),
+            "a same-goal holder with a different source must not form a cross-product voucher"
+        );
+
+        let evacuation_advisory = AllocatorDecision {
+            action: Action::RefuseInflow {
+                fed: fed_id(1),
+                reason: ReasonCode::ShutdownNotice,
+                diagnostics: Default::default(),
+            },
+            reason: ReasonCode::ShutdownNotice,
+            occurrence: Occurrence(2),
+            idempotency_key: IdempotencyKey("refuse:empty-evacuation".to_owned()),
+        };
+        assert!(
+            pinned_input_problems(
+                &policy,
+                &snapshot,
+                &probes,
+                &[evacuation_advisory],
+                &[],
+                &held_evacuation_blockers(fed_id(1), fed_id(2)),
+            )
+            .is_empty(),
+            "a held empty evacuation advisory vouches for its own source"
+        );
+
+        let suppressed_a_to_b = AllocatorDecision {
+            action: Action::Move {
+                from: fed_id(1),
+                to: fed_id(2),
+                amount: Msat(1),
+                fee_cap: Msat(0),
+                gateway: None,
+            },
+            reason: ReasonCode::StandbyBelowTarget,
+            occurrence: Occurrence(2),
+            idempotency_key: IdempotencyKey("move:suppressed-a-b".to_owned()),
+        };
+        assert!(
+            pinned_input_problems(
+                &policy,
+                &snapshot,
+                &probes,
+                &[],
+                std::slice::from_ref(&suppressed_a_to_b),
+                &held_a_to_b,
+            )
+            .is_empty(),
+            "a suppressed recurrence vouches only when its blocking holder has the same source"
+        );
+        let suppressed_a_to_b_with_resourced_holder = AllocatorDecision {
+            action: Action::Move {
+                from: fed_id(1),
+                to: fed_id(2),
+                amount: Msat(1),
+                fee_cap: Msat(0),
+                gateway: None,
+            },
+            reason: ReasonCode::StandbyBelowTarget,
+            occurrence: Occurrence(2),
+            idempotency_key: IdempotencyKey("move:resourced-a-b".to_owned()),
+        };
+        assert!(
+            !pinned_input_problems(
+                &policy,
+                &snapshot,
+                &probes,
+                &[],
+                &[suppressed_a_to_b_with_resourced_holder],
+                &held_c_to_b,
+            )
+            .is_empty(),
+            "a re-sourced holder must not relax a suppressed candidate's source"
+        );
+
+        let receive_gate = AllocatorDecision {
+            // The old policy's held A -> B funding goal does not vouch for this rotated policy's
+            // fresh attempt to fund unusable A: its current receive gate must stay loud.
+            action: Action::RefuseInflow {
+                fed: fed_id(1),
+                reason: ReasonCode::NotProbed,
+                diagnostics: wallet_core::RefusalDiagnostics {
+                    want: Some(Msat(1)),
+                    max_fee_bps: Some(100),
+                    ..Default::default()
+                },
+            },
+            reason: ReasonCode::NotProbed,
+            occurrence: Occurrence(2),
+            idempotency_key: IdempotencyKey("refuse:not-probed-a".to_owned()),
+        };
+        assert!(has_funding_receive_gate_refusal(
+            fed_id(1),
+            std::slice::from_ref(&receive_gate)
+        ));
+        assert!(
+            pinned_input_problems(
+                &policy,
+                &snapshot,
+                &probes,
+                std::slice::from_ref(&receive_gate),
+                std::slice::from_ref(&suppressed_a_to_b),
+                &held_a_to_b,
+            )
+            .is_empty(),
+            "the exact current suppressed source voucher outranks a simultaneous receive refusal"
+        );
+        assert!(
+            pinned_input_problems(
+                &policy,
+                &snapshot,
+                &probes,
+                &[suppressed_a_to_b, receive_gate],
+                &[],
+                &held_a_to_b,
+            )
+            .is_empty(),
+            "a current admitted endpoint must beat the concurrent coarse receive-gate refusal"
+        );
     }
 
     #[test]
@@ -1159,7 +1612,15 @@ mod tests {
         assert_eq!(unusable_pinned_feds(&policy, &probes), vec![fed_id(1)]);
         // ...but because A drives an executable Move this tick, the tick does NOT fail on it.
         assert!(
-            pinned_input_problems(&policy, &snapshot, &probes, &decisions).is_empty(),
+            pinned_input_problems(
+                &policy,
+                &snapshot,
+                &probes,
+                &decisions,
+                &[],
+                &wallet_core::GoalBlockers::default(),
+            )
+            .is_empty(),
             "a source-only pin whose rebalance is actually running must not fail the tick"
         );
     }

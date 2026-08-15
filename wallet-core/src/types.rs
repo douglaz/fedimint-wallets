@@ -342,7 +342,8 @@ pub struct RefusalDiagnostics {
     /// The federation that would have SOURCED the move, when there was a usable one. Names the
     /// fed the source-side figures (`available`, `source_spendable`) describe.
     pub source: Option<FederationId>,
-    /// The shortfall the decision was trying to fill (`target − spendable`), when it had one.
+    /// The target shortfall after wallet-delivered target credit and same-round credit, when it
+    /// had one. External inbound still reserves hard cap room but cannot reduce this shortfall.
     /// `None` for an evacuation, which drains its source rather than filling a target.
     pub want: Option<Msat>,
     /// The largest amount fundable from the source: since br-ljj.2, the exact integer maximum
@@ -370,8 +371,16 @@ pub struct RefusalDiagnostics {
     pub max_fee_bps: Option<u16>,
     /// The destination's remaining per-fed cap room, once it had been computed.
     pub cap_room: Option<Msat>,
-    /// The move amount the allocator settled on before refusing the remainder.
+    /// The amount emitted with this refusal: the allocator-selected amount, or `Some(Msat(0))`
+    /// when a nonzero candidate was conflict-suppressed before it could be emitted. `None` means
+    /// no amount was determined. Read [`Self::conflict_suppressed`] to distinguish that suppressed
+    /// zero from a genuine zero-sized result.
     pub amount: Option<Msat>,
+    /// Whether a nonzero allocator candidate was withheld because durable work already owns its
+    /// logical goal. Observational only: no holder identity is exposed. Legacy rows lack this key
+    /// and decode as `false`.
+    #[serde(default)]
+    pub conflict_suppressed: bool,
     /// The protocol move floor (`min_move`) in effect, below which a move is dust.
     pub min_move: Option<Msat>,
 }
@@ -392,6 +401,7 @@ impl RefusalDiagnostics {
             max_fee_bps,
             cap_room,
             amount,
+            conflict_suppressed,
             min_move,
         } = self;
         source.is_some()
@@ -402,6 +412,7 @@ impl RefusalDiagnostics {
             || max_fee_bps.is_some()
             || cap_room.is_some()
             || amount.is_some()
+            || *conflict_suppressed
             || min_move.is_some()
     }
 }
@@ -536,8 +547,9 @@ pub enum MovePhase {
     Stranded,
 }
 
-/// Durable derived artifacts for a move-shaped intent. Network code owns the writes; core
-/// consumes only the phase and sizing fields when projecting reservations.
+/// Durable derived artifacts for a move-shaped intent. Core's strict user projection ignores this
+/// cache; its serialized allocator projection validates the identity/direction/bounds before using
+/// the phase and sizing fields.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MoveRecord {
     pub key: IdempotencyKey,
@@ -566,7 +578,15 @@ pub struct MoveRecord {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Reservations {
     pub per_fed_outbound: std::collections::BTreeMap<FederationId, Msat>,
+    /// All pending inbound value, including external `Receive` and `DirectInflow` promises.
+    /// This is used only for hard-cap accounting: an external payer can still consume
+    /// destination cap room.
     pub per_fed_inbound: std::collections::BTreeMap<FederationId, Msat>,
+    /// Pending inbound value that this wallet has committed to deliver with a `Move` or
+    /// `Evacuate`. Unlike [`Self::per_fed_inbound`], external `Receive` and `DirectInflow`
+    /// promises do not count here: they cannot reduce an allocator target shortfall before
+    /// their payer settles.
+    pub per_fed_target_credit: std::collections::BTreeMap<FederationId, Msat>,
 }
 
 impl Reservations {
@@ -576,5 +596,13 @@ impl Reservations {
 
     pub fn inbound(&self, fed: FederationId) -> Msat {
         self.per_fed_inbound.get(&fed).copied().unwrap_or(Msat(0))
+    }
+
+    /// Inbound value that is safe to credit against an allocator spending or standby target.
+    pub fn target_credit(&self, fed: FederationId) -> Msat {
+        self.per_fed_target_credit
+            .get(&fed)
+            .copied()
+            .unwrap_or(Msat(0))
     }
 }

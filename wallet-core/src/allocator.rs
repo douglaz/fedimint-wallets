@@ -1,3 +1,5 @@
+use crate::conflict::GoalBlockers;
+use crate::ledger::Actor;
 use crate::types::*;
 use std::collections::BTreeMap;
 
@@ -8,8 +10,28 @@ use std::collections::BTreeMap;
 /// `occurrence` (T10) is the caller's current allocation epoch; it is stamped into
 /// every decision's key so a legitimately recurring decision (after a prior one
 /// settled `Done`) produces a fresh key instead of being permanently skipped.
+///
+/// **This entry point suppresses NOTHING.** It decides against an empty conflict projection, so a
+/// goal a durable intent already owns comes back out under this occurrence's fresh key — the same
+/// money moved twice. Every production path calls [`decide_with_blockers`] with the goals its
+/// reconcile projected; `decide` remains for callers that have nothing in flight by construction,
+/// which today means the pure decision-logic tests.
 pub fn decide(snapshot: &AllocatorSnapshot, occurrence: Occurrence) -> Vec<AllocatorDecision> {
+    decide_with_blockers(snapshot, occurrence, &GoalBlockers::default()).0
+}
+
+/// Decide while withholding logical allocator goals that durable work already owns.
+///
+/// The second vector contains the withheld decisions for diagnostics. Filtering happens before
+/// [`push_and_reserve`], so suppressed work cannot consume the intra-tick capacity needed by an
+/// independent evacuation or funding move.
+pub fn decide_with_blockers(
+    snapshot: &AllocatorSnapshot,
+    occurrence: Occurrence,
+    blocked: &GoalBlockers,
+) -> (Vec<AllocatorDecision>, Vec<AllocatorDecision>) {
     let mut decisions = Vec::new();
+    let mut suppressed = Vec::new();
 
     // Per-tick reservation (§4.2): every decision in this pass is computed against ONE
     // immutable snapshot, so without bookkeeping two evacuations into the same
@@ -27,7 +49,28 @@ pub fn decide(snapshot: &AllocatorSnapshot, occurrence: Occurrence) -> Vec<Alloc
         if let Some(reason) = evacuation_reason(fed) {
             let decision =
                 evacuate_decision(fed, reason, snapshot, occurrence, &credited, &debited);
-            push_and_reserve(&mut decisions, decision, &mut credited, &mut debited);
+            let suppression_refusal =
+                evacuation_suppression_refusal(&decision, snapshot, &credited, &debited);
+            if matches!(
+                push_if_eligible_and_reserve(
+                    &mut decisions,
+                    &mut suppressed,
+                    decision,
+                    blocked,
+                    occurrence,
+                    &mut credited,
+                    &mut debited,
+                ),
+                Admission::ConflictSuppressed
+            ) {
+                // A withheld evacuation reserves nothing and is not executable, but it must leave
+                // the same durable audit fact as a withheld funding candidate.  This is built from
+                // the pre-admission snapshot, before a suppressed decision could change either
+                // reservation map.
+                if let Some(refusal) = suppression_refusal {
+                    push_decision(&mut decisions, refusal);
+                }
+            }
         }
         // ADR-0018: a federation already over the per-fed cap (e.g. from an inbound
         // payment, not from our funding) is a cap violation the executor must reduce.
@@ -49,10 +92,13 @@ pub fn decide(snapshot: &AllocatorSnapshot, occurrence: Occurrence) -> Vec<Alloc
     }
 
     if let Some(spending) = snapshot.spending_fed.and_then(|id| find(snapshot, id)) {
-        if evacuation_reason(spending).is_none()
-            && spending.balance.spendable < snapshot.target_spending_balance
-        {
-            let want = snapshot.target_spending_balance.0 - spending.balance.spendable.0;
+        let want = funding_shortfall(
+            snapshot.target_spending_balance,
+            spending.balance.spendable,
+            snapshot.reservations.target_credit(spending.id),
+            reserved(&credited, spending.id),
+        );
+        if evacuation_reason(spending).is_none() && want > 0 {
             let source = usable_source(snapshot.standby_fed.and_then(|id| find(snapshot, id)));
             // TopUp availability: the source budget is its spendable minus prior outbound and
             // same-tick debits; the move's own PROPORTIONAL fee cap is then reserved inside
@@ -76,19 +122,24 @@ pub fn decide(snapshot: &AllocatorSnapshot, occurrence: Occurrence) -> Vec<Alloc
                 want,
                 FundKind::TopUp,
                 occurrence,
+                blocked,
                 &mut credited,
                 &mut debited,
                 &mut decisions,
+                &mut suppressed,
             );
         }
     }
 
     if let Some(standby) = snapshot.standby_fed.and_then(|id| find(snapshot, id)) {
-        if evacuation_reason(standby).is_none()
-            && standby.balance.spendable < snapshot.standby_target
-        {
+        let want = funding_shortfall(
+            snapshot.standby_target,
+            standby.balance.spendable,
+            snapshot.reservations.target_credit(standby.id),
+            reserved(&credited, standby.id),
+        );
+        if evacuation_reason(standby).is_none() && want > 0 {
             let spending = snapshot.spending_fed.and_then(|id| find(snapshot, id));
-            let want = snapshot.standby_target.0 - standby.balance.spendable.0;
             let source = usable_source(spending);
             // The surplus floor STAYS — the spending fed is never drained below its
             // configured target to fund the standby — and, like TopUp, the move's own
@@ -111,14 +162,16 @@ pub fn decide(snapshot: &AllocatorSnapshot, occurrence: Occurrence) -> Vec<Alloc
                 want,
                 FundKind::Standby,
                 occurrence,
+                blocked,
                 &mut credited,
                 &mut debited,
                 &mut decisions,
+                &mut suppressed,
             );
         }
     }
 
-    decisions
+    (decisions, suppressed)
 }
 
 /// Pending reserved amount for `fed` in a per-tick `credited`/`debited` map (`0` when
@@ -157,6 +210,25 @@ pub fn move_fee_cap(amount: Msat, bps: u16) -> Msat {
     Msat((amount.0 as u128 * bps as u128 / 10_000) as u64)
 }
 
+/// The remaining funding needed to reach `target` after all value that is already
+/// wallet-delivered inbound is credited. `target_credit` is the durable snapshot
+/// projection of pending `Move`/`Evacuate` deliveries; `same_round_credited` is
+/// wallet-delivered work admitted earlier in this allocator pass. Keeping this arithmetic in
+/// one helper prevents planning, route pricing, and commit-time validation from treating an
+/// unpaid external receive as target value.
+pub fn funding_shortfall(
+    target: Msat,
+    spendable: Msat,
+    target_credit: Msat,
+    same_round_credited: u64,
+) -> u64 {
+    target
+        .0
+        .saturating_sub(spendable.0)
+        .saturating_sub(target_credit.0)
+        .saturating_sub(same_round_credited)
+}
+
 #[derive(Clone, Copy)]
 enum FundKind {
     TopUp,
@@ -181,9 +253,11 @@ fn fund_into(
     want: u64,
     kind: FundKind,
     occurrence: Occurrence,
+    blocked: &GoalBlockers,
     credited: &mut BTreeMap<FederationId, u64>,
     debited: &mut BTreeMap<FederationId, u64>,
     out: &mut Vec<AllocatorDecision>,
+    suppressed: &mut Vec<AllocatorDecision>,
 ) {
     // Source-side figures, shared by every refusal this function can emit. `source`-derived
     // fields are `None` exactly when there is no usable source. `max_fee` is NOT among them:
@@ -209,6 +283,7 @@ fn fund_into(
             max_fee_bps: Some(snapshot.max_fee_bps_of_move),
             cap_room: None,
             amount: None,
+            conflict_suppressed: false,
             min_move: Some(snapshot.min_move),
         };
         push_decision(
@@ -273,26 +348,42 @@ fn fund_into(
     } else {
         amount
     };
-    if let Some(src) = source.filter(|_| amount > 0) {
-        push_and_reserve(
-            out,
-            move_decision(
-                kind,
-                src.id,
-                dest.id,
-                Msat(amount),
-                snapshot,
-                occurrence,
-                route.and_then(|route| route.resolved_gateway.clone()),
-            ),
-            credited,
-            debited,
+    let suppression_candidate = if let Some(src) = source.filter(|_| amount > 0) {
+        let candidate = move_decision(
+            kind,
+            src.id,
+            dest.id,
+            Msat(amount),
+            snapshot,
+            occurrence,
+            route.and_then(|route| route.resolved_gateway.clone()),
         );
-    }
-    // Both refusals below share the full arithmetic: `amount` (the emitted move, possibly 0)
-    // was clamped by `want` / `cap_room` / `available`, then suppressed when it did not clear the
-    // finite route floor. A reader recovers both stages from these figures alone. `available` is
-    // `None` iff there was no source.
+        if matches!(
+            push_if_eligible_and_reserve(
+                out,
+                suppressed,
+                candidate.clone(),
+                blocked,
+                occurrence,
+                credited,
+                debited,
+            ),
+            Admission::ConflictSuppressed
+        ) {
+            Some(candidate)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let conflict_suppressed = suppression_candidate.is_some();
+    let emitted_amount = if conflict_suppressed { 0 } else { amount };
+    // Both refusals below share the full arithmetic. `amount` was clamped by `want` / `cap_room` /
+    // `available`, then zeroed when it did not clear the finite route floor. `emitted_amount` also
+    // accounts for conflict suppression: a nonzero move parked in `suppressed` was NOT emitted in
+    // this pass, so its co-produced durable refusal reports 0 plus `conflict_suppressed = true`
+    // rather than claim that money moved. `available` is `None` iff there was no source.
     let diagnostics = RefusalDiagnostics {
         source: source_id,
         want: Some(Msat(want)),
@@ -307,7 +398,8 @@ fn fund_into(
         // both had their `available` sized by this bps.
         max_fee_bps: Some(snapshot.max_fee_bps_of_move),
         cap_room: Some(Msat(cap_room)),
-        amount: Some(Msat(amount)),
+        amount: Some(Msat(emitted_amount)),
+        conflict_suppressed,
         // This public diagnostic retains its established meaning: the protocol minimum. A
         // route-economics deferral is deliberately silent; an indefinitely uneconomic route is
         // explained by its specific reason below.
@@ -322,12 +414,19 @@ fn fund_into(
         if want > cap_room {
             push_decision(
                 out,
-                refuse_decision(dest.id, ReasonCode::OverCap, occurrence, diagnostics),
+                suppression_refusal_or_ordinary(
+                    suppression_candidate.as_ref(),
+                    dest.id,
+                    ReasonCode::OverCap,
+                    occurrence,
+                    diagnostics,
+                ),
             );
         }
         push_decision(
             out,
-            refuse_decision(
+            suppression_refusal_or_ordinary(
+                suppression_candidate.as_ref(),
                 dest.id,
                 ReasonCode::UneconomicRoute,
                 occurrence,
@@ -339,15 +438,60 @@ fn fund_into(
     if want > cap_room {
         push_decision(
             out,
-            refuse_decision(dest.id, ReasonCode::OverCap, occurrence, diagnostics),
+            suppression_refusal_or_ordinary(
+                suppression_candidate.as_ref(),
+                dest.id,
+                ReasonCode::OverCap,
+                occurrence,
+                diagnostics,
+            ),
         );
     }
-    if amount < want.min(cap_room) {
+    if conflict_suppressed || amount < want.min(cap_room) {
         push_decision(
             out,
-            refuse_decision(dest.id, kind.reason(), occurrence, diagnostics),
+            suppression_refusal_or_ordinary(
+                suppression_candidate.as_ref(),
+                dest.id,
+                kind.reason(),
+                occurrence,
+                diagnostics,
+            ),
         );
     }
+}
+
+/// Suppress a conflicting money decision before it can affect the allocator's local reservation
+/// maps. The actor is always the allocator agent here; user and probe operations do not enter
+/// `decide` and therefore cannot be suppressed by this seam.
+#[allow(clippy::too_many_arguments)]
+fn push_if_eligible_and_reserve(
+    out: &mut Vec<AllocatorDecision>,
+    suppressed: &mut Vec<AllocatorDecision>,
+    decision: AllocatorDecision,
+    blocked: &GoalBlockers,
+    occurrence: Occurrence,
+    credited: &mut BTreeMap<FederationId, u64>,
+    debited: &mut BTreeMap<FederationId, u64>,
+) -> Admission {
+    if blocked.blocks_decision(&decision, Actor::Agent { occurrence }) {
+        push_decision(suppressed, decision);
+        Admission::ConflictSuppressed
+    } else if push_and_reserve(out, decision, credited, debited) {
+        Admission::Admitted
+    } else {
+        Admission::Duplicate
+    }
+}
+
+/// The only outcomes of allocator admission. In particular, a duplicate idempotency key is not a
+/// conflict suppression: callers which persist the latter as an operator diagnostic must not
+/// derive it from a lossy boolean.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    Admitted,
+    ConflictSuppressed,
+    Duplicate,
 }
 
 /// Push a decision if its idempotency key is not already present; returns whether it was
@@ -395,7 +539,7 @@ fn push_and_reserve(
     decision: AllocatorDecision,
     credited: &mut BTreeMap<FederationId, u64>,
     debited: &mut BTreeMap<FederationId, u64>,
-) {
+) -> bool {
     let reservation = match &decision.action {
         Action::Move {
             from,
@@ -413,7 +557,8 @@ fn push_and_reserve(
         } => Some((*from, *to, amount.0, fee_cap.0)),
         _ => None,
     };
-    if push_decision(out, decision) {
+    let pushed = push_decision(out, decision);
+    if pushed {
         if let Some((from, to, amount, fee_cap)) = reservation {
             // SATURATING, not `+`. `EvacFeeCap::at` saturates by design and `Policy::validate`
             // puts no ceiling on `evac_fee_base_msat`, so a large-but-valid base yields a
@@ -428,6 +573,7 @@ fn push_and_reserve(
             *debited_from = debited_from.saturating_add(amount.saturating_add(fee_cap));
         }
     }
+    pushed
 }
 
 fn find(snapshot: &AllocatorSnapshot, id: FederationId) -> Option<&FederationStatus> {
@@ -542,6 +688,17 @@ fn idem_refuse(fed: FederationId, reason: ReasonCode, occurrence: Occurrence) ->
     ))
 }
 
+/// The advisory refusal for a withheld executable candidate must never share the ordinary
+/// `(reason, fed, occurrence)` refusal key. A retry may already have persisted that ordinary row;
+/// instead, name the exact candidate whose conflict made this zero-amount refusal necessary.
+fn idem_conflict_suppressed(candidate: &IdempotencyKey, reason: ReasonCode) -> IdempotencyKey {
+    IdempotencyKey(format!(
+        "conflict-suppressed:{}:{}",
+        candidate.0,
+        reason_tag(reason)
+    ))
+}
+
 fn reason_tag(reason: ReasonCode) -> &'static str {
     match reason {
         ReasonCode::SpendingBelowTarget => "spending_below_target",
@@ -619,6 +776,7 @@ fn evacuate_decision(
                     max_fee_bps: None,
                     cap_room: Some(Msat(cap_room)),
                     amount: Some(amount),
+                    conflict_suppressed: false,
                     min_move: None,
                 };
                 return refuse_decision(from.id, reason, occurrence, diagnostics);
@@ -660,6 +818,74 @@ fn evacuate_decision(
         // advisory refusal with no shortfall arithmetic to record.
         None => refuse_decision(from.id, reason, occurrence, RefusalDiagnostics::default()),
     }
+}
+
+/// The durable advisory twin of a nonzero evacuation withheld by conflict projection.  An
+/// evacuation drains `from`, so its source-side availability is deliberately calculated without
+/// either funding fee knob: execution sizes its own evacuation fee at perform time.
+fn evacuation_suppression_refusal(
+    decision: &AllocatorDecision,
+    snapshot: &AllocatorSnapshot,
+    credited: &BTreeMap<FederationId, u64>,
+    debited: &BTreeMap<FederationId, u64>,
+) -> Option<AllocatorDecision> {
+    let Action::Evacuate {
+        from, to, amount, ..
+    } = &decision.action
+    else {
+        return None;
+    };
+    if amount.0 == 0 {
+        return None;
+    }
+    let from = *from;
+    let to = *to;
+    let from_status = find(snapshot, from)?;
+    let to_status = find(snapshot, to)?;
+    let available = from_status
+        .balance
+        .spendable
+        .0
+        .saturating_sub(snapshot.reservations.outbound(from).0)
+        .saturating_sub(reserved(debited, from));
+    let diagnostics = RefusalDiagnostics {
+        source: Some(from),
+        want: None,
+        available: Some(Msat(available)),
+        source_spendable: Some(from_status.balance.spendable),
+        // `max_fee` and `max_fee_bps` are funding knobs.  Evacuations use their own
+        // base-plus-bps cap at perform time and do not pre-reserve it.
+        max_fee: None,
+        max_fee_bps: None,
+        cap_room: Some(Msat(cap_room_with(snapshot, to_status, credited))),
+        amount: Some(Msat(0)),
+        conflict_suppressed: true,
+        min_move: None,
+    };
+    Some(suppression_refusal_or_ordinary(
+        Some(decision),
+        from,
+        decision.reason,
+        decision.occurrence,
+        diagnostics,
+    ))
+}
+
+/// Produce an ordinary refusal unless this is the audit twin of a nonzero executable candidate
+/// withheld by conflict projection. The latter is keyed by that candidate, rather than the generic
+/// refusal key, so an ordinary refusal from an earlier retry cannot hide it.
+fn suppression_refusal_or_ordinary(
+    candidate: Option<&AllocatorDecision>,
+    fed: FederationId,
+    reason: ReasonCode,
+    occurrence: Occurrence,
+    diagnostics: RefusalDiagnostics,
+) -> AllocatorDecision {
+    let mut refusal = refuse_decision(fed, reason, occurrence, diagnostics);
+    if let Some(candidate) = candidate {
+        refusal.idempotency_key = idem_conflict_suppressed(&candidate.idempotency_key, reason);
+    }
+    refusal
 }
 
 fn refuse_decision(
@@ -708,5 +934,63 @@ fn move_decision(
         reason: kind.reason(),
         occurrence,
         idempotency_key: idem_move(from, to, occurrence),
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    const A: FederationId = FederationId([0xAA; 32]);
+    const B: FederationId = FederationId([0xBB; 32]);
+
+    fn funding(key: &str, from: FederationId) -> AllocatorDecision {
+        AllocatorDecision {
+            action: Action::Move {
+                from,
+                to: B,
+                amount: Msat(1),
+                fee_cap: Msat(0),
+                gateway: None,
+            },
+            reason: ReasonCode::StandbyBelowTarget,
+            occurrence: Occurrence(1),
+            idempotency_key: IdempotencyKey(key.to_owned()),
+        }
+    }
+
+    #[test]
+    fn admission_distinguishes_duplicate_keys_from_conflict_suppression() {
+        let candidate = funding("move:candidate", A);
+        let mut out = vec![candidate.clone()];
+        let duplicate = push_if_eligible_and_reserve(
+            &mut out,
+            &mut vec![],
+            candidate.clone(),
+            &GoalBlockers::default(),
+            Occurrence(1),
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+        );
+        assert_eq!(duplicate, Admission::Duplicate);
+
+        let held = funding("move:held", A);
+        let mut blockers = GoalBlockers::default();
+        blockers.hold_decision(
+            &held,
+            Actor::Agent {
+                occurrence: Occurrence(1),
+            },
+        );
+        let conflict = push_if_eligible_and_reserve(
+            &mut vec![],
+            &mut vec![],
+            candidate,
+            &blockers,
+            Occurrence(1),
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+        );
+        assert_eq!(conflict, Admission::ConflictSuppressed);
     }
 }

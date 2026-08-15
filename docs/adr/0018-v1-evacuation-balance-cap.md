@@ -25,7 +25,8 @@ gateway-independent escape) is pulled into EARLY v2.
   intended behaviour, not a violation; refusal is for amounts that cannot be reduced. Where the
   wallet does not control the inflow there is nothing to refuse: warn, and let evacuation handle
   it. That principle classifies every verb without an enumeration to keep in sync.
-  This SUPERSEDES the `--allow-over-cap` contract in `docs/phase4-implementation-spec.md:760-779`,
+  This SUPERSEDES the `--allow-over-cap` contract in
+  [`docs/phase4-implementation-spec.md` §15.2](../phase4-implementation-spec.md),
   which still disables `hard_cap` and tests that the over-cap operation SUCCEEDS. That escape
   hatch is incompatible with this resolution: whoever implements the refusal must retire it and
   its test rather than leave two live contracts. NO OPEN BEAD OWNS THIS YET: `--allow-over-cap`

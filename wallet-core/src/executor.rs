@@ -1,7 +1,7 @@
 use crate::ledger::Actor;
 use crate::types::{
-    Action, AllocatorDecision, FederationId, IdempotencyKey, MovePhase, MoveRecord, Msat,
-    OperationId, ReasonCode, Reservations,
+    Action, AllocatorDecision, FederationId, IdempotencyKey, MoveRecord, Msat, OperationId,
+    ReasonCode, Reservations,
 };
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,6 +16,24 @@ pub enum IntentStatus {
     /// subscription (§9.5); `reconcile` does NOT re-drive it through `perform`.
     Awaiting,
     Failed,
+}
+
+/// Whether a lifecycle write may move an intent within its current attempt.
+///
+/// A terminal attempt is immutable: only the durable journal's explicit
+/// `retry_failed_intent` operation may create a new pending attempt after a
+/// failure.  Keeping this pure and in wallet-core makes actor-routed and
+/// direct durable writes obey the same fence.
+pub fn intent_status_transition_allowed(current: IntentStatus, next: IntentStatus) -> bool {
+    use IntentStatus::{Awaiting, Done, Executing, Failed, Pending};
+    matches!(
+        (current, next),
+        (Pending, Pending | Executing | Awaiting | Done | Failed)
+            | (Executing, Pending | Executing | Awaiting | Done | Failed)
+            | (Awaiting, Awaiting | Done | Failed)
+            | (Done, Done)
+            | (Failed, Failed)
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -80,10 +98,33 @@ impl Intent {
     }
 }
 
-/// Project the journal-visible work that live balances have not absorbed yet.
-pub fn project_reservations(
+/// Project the strict reservation view used for fresh user admission.
+///
+/// This deliberately ignores derived move phases. A nonterminal intent therefore holds its
+/// complete action reservation until its terminal intent transition. Allocator planning has a
+/// separate, artifact-aware projection ([`project_allocator_reservations`]); callers must not use
+/// that weaker view for ordinary user admission.
+pub fn project_reservations(intents: &[Intent]) -> Reservations {
+    let mut out = Reservations::default();
+    for intent in intents {
+        if matches!(intent.status, IntentStatus::Done | IntentStatus::Failed) {
+            continue;
+        }
+        project_strict_intent(&mut out, intent);
+    }
+    out
+}
+
+/// Project reservations for a serialized allocator/tick decision.
+///
+/// Unlike [`project_reservations`], this view may resize from an artifact-fixed amount and omits a
+/// side only when the phase proves it absorbed or no longer outstanding. It is safe only when every
+/// reservation-releasing writer is serialized with the allocator's balance-facts authority (or
+/// while a standalone runtime owns the database exclusively). Missing or malformed derived records
+/// always fall back to the strict action reservation.
+pub fn project_allocator_reservations(
     intents: &[Intent],
-    records: impl Fn(&IdempotencyKey) -> Option<MoveRecord>,
+    records: &BTreeMap<IdempotencyKey, MoveRecord>,
 ) -> Reservations {
     let mut out = Reservations::default();
     for intent in intents {
@@ -91,88 +132,220 @@ pub fn project_reservations(
             continue;
         }
 
-        let add_outbound = |out: &mut Reservations, fed, amount: Msat| {
-            let slot = out.per_fed_outbound.entry(fed).or_insert(Msat(0));
-            slot.0 = slot.0.saturating_add(amount.0);
-        };
-        let add_inbound = |out: &mut Reservations, fed, amount: Msat| {
-            let slot = out.per_fed_inbound.entry(fed).or_insert(Msat(0));
-            slot.0 = slot.0.saturating_add(amount.0);
-        };
-
         match &intent.action {
-            Action::Move {
-                from,
-                to,
-                amount,
-                fee_cap,
-                ..
-            }
-            | Action::Evacuate {
-                from,
-                to,
-                amount,
-                fee_cap,
-                ..
-            } => {
-                let record = records(&intent.idempotency_key);
-                let reservation_amount = record.as_ref().map_or(*amount, |record| record.amount);
-                let phase = record.map(|record| record.phase);
-                match phase {
-                    Some(
-                        MovePhase::Settled
-                        | MovePhase::Refunded
-                        | MovePhase::Failed
-                        | MovePhase::Stranded,
-                    ) => {}
-                    Some(MovePhase::Sending) => add_inbound(&mut out, *to, reservation_amount),
-                    None | Some(MovePhase::Created | MovePhase::Invoiced) => {
-                        if matches!(&intent.action, Action::Move { .. }) {
-                            add_outbound(
-                                &mut out,
-                                *from,
-                                Msat(reservation_amount.0.saturating_add(fee_cap.0)),
-                            );
-                        }
-                        add_inbound(&mut out, *to, reservation_amount);
+            Action::Move { from, to, .. } | Action::Evacuate { from, to, .. } => {
+                let Some(record) = records
+                    .get(&intent.idempotency_key)
+                    .filter(|record| allocator_record_is_trusted(intent, record))
+                else {
+                    project_strict_intent(&mut out, intent);
+                    continue;
+                };
+                match record.phase {
+                    crate::types::MovePhase::Created => project_strict_intent(&mut out, intent),
+                    crate::types::MovePhase::Invoiced => {
+                        add_outbound(
+                            &mut out,
+                            *from,
+                            Msat(record.amount.0.saturating_add(record.fee_cap.0)),
+                        );
+                        add_inbound(&mut out, *to, record.amount);
+                        add_target_credit(&mut out, *to, record.amount);
                     }
+                    crate::types::MovePhase::Sending => {
+                        add_inbound(&mut out, *to, record.amount);
+                        add_target_credit(&mut out, *to, record.amount);
+                    }
+                    crate::types::MovePhase::Settled
+                    | crate::types::MovePhase::Refunded
+                    | crate::types::MovePhase::Failed
+                    | crate::types::MovePhase::Stranded => {}
                 }
             }
-            Action::DirectInflow { to, amount, .. } => {
-                let record = records(&intent.idempotency_key);
-                let terminal_record = record.as_ref().is_some_and(|record| {
-                    matches!(
-                        record.phase,
-                        MovePhase::Settled
-                            | MovePhase::Refunded
-                            | MovePhase::Failed
-                            | MovePhase::Stranded
-                    )
-                });
-                if !terminal_record {
-                    add_inbound(
-                        &mut out,
-                        *to,
-                        record.as_ref().map_or(*amount, |record| record.amount),
-                    );
+            Action::DirectInflow { to, .. } => {
+                let Some(record) = records
+                    .get(&intent.idempotency_key)
+                    .filter(|record| allocator_record_is_trusted(intent, record))
+                else {
+                    project_strict_intent(&mut out, intent);
+                    continue;
+                };
+                match record.phase {
+                    crate::types::MovePhase::Created | crate::types::MovePhase::Sending => {
+                        project_strict_intent(&mut out, intent);
+                    }
+                    crate::types::MovePhase::Invoiced => {
+                        add_inbound(&mut out, *to, record.amount);
+                    }
+                    crate::types::MovePhase::Settled
+                    | crate::types::MovePhase::Refunded
+                    | crate::types::MovePhase::Failed
+                    | crate::types::MovePhase::Stranded => {}
                 }
             }
-            Action::Pay {
-                from,
-                amount,
-                fee_cap,
-                ..
-            } if intent.operation_id.is_none() => {
-                add_outbound(&mut out, *from, Msat(amount.0.saturating_add(fee_cap.0)))
-            }
-            Action::Receive { to, amount, .. } => add_inbound(&mut out, *to, *amount),
+            Action::Pay { .. } if intent.operation_id.is_some() => {}
             Action::Pay { .. }
+            | Action::Receive { .. }
             | Action::Join { .. }
             | Action::Recover { .. }
-            | Action::RefuseInflow { .. } => {}
+            | Action::RefuseInflow { .. } => project_strict_intent(&mut out, intent),
         }
     }
     out
+}
+
+/// Whether a derived record is coherent enough to weaken an Intent's strict reservation.
+///
+/// Identity/direction/sizing checks prevent a foreign or semantically different cache row from
+/// being trusted.
+/// Phase-required operation artifacts prevent a contradictory `Sending` row from releasing the
+/// source even though replay would still execute `Pay`.
+pub fn allocator_record_is_trusted(intent: &Intent, record: &MoveRecord) -> bool {
+    let structural = match &intent.action {
+        Action::Move {
+            from,
+            to,
+            amount,
+            fee_cap,
+            ..
+        } => {
+            record.from == Some(*from)
+                && record.to == *to
+                && record.send_required
+                && record.amount == *amount
+                && record.fee_cap == *fee_cap
+        }
+        Action::Evacuate {
+            from,
+            to,
+            amount,
+            fee_cap,
+            fee_cap_components,
+            ..
+        } => {
+            record.from == Some(*from)
+                && record.to == *to
+                && record.send_required
+                && record.amount.0 > 0
+                && record.amount <= *amount
+                && match fee_cap_components {
+                    Some(components) => {
+                        record.fee_cap == components.at(record.amount) && record.fee_cap <= *fee_cap
+                    }
+                    // Rows written before component caps were introduced retain their absolute cap.
+                    None => record.fee_cap == *fee_cap,
+                }
+        }
+        Action::DirectInflow {
+            to,
+            amount,
+            fee_cap,
+        } => {
+            record.from.is_none()
+                && record.to == *to
+                && !record.send_required
+                && record.amount == *amount
+                && record.fee_cap == *fee_cap
+        }
+        Action::Pay { .. }
+        | Action::Receive { .. }
+        | Action::Join { .. }
+        | Action::Recover { .. }
+        | Action::RefuseInflow { .. } => false,
+    };
+    if record.key != intent.idempotency_key || !structural {
+        return false;
+    }
+
+    if matches!(intent.action, Action::DirectInflow { .. }) {
+        // A receive-only inflow never has sender-side state. Reject those artifacts before the
+        // phase check so a corrupt row cannot look like a valid Created/Invoiced/terminal receive.
+        if record.send_op.is_some() || record.preimage.is_some() || record.send_fee_quoted.is_some()
+        {
+            return false;
+        }
+        // A direct inflow never pays, refunds, or strands a sender-side operation. These phases
+        // would otherwise look terminal enough to release its inbound reservation.
+        if matches!(
+            record.phase,
+            crate::types::MovePhase::Sending
+                | crate::types::MovePhase::Refunded
+                | crate::types::MovePhase::Stranded
+        ) {
+            return false;
+        }
+    }
+
+    let receive_artifact = record.invoice.is_some() && record.recv_op.is_some();
+    match record.phase {
+        crate::types::MovePhase::Created => true,
+        crate::types::MovePhase::Invoiced => receive_artifact,
+        crate::types::MovePhase::Sending => {
+            record.send_required && receive_artifact && record.send_op.is_some()
+        }
+        crate::types::MovePhase::Settled | crate::types::MovePhase::Stranded => {
+            receive_artifact
+                && (!record.send_required
+                    || (record.send_op.is_some() && record.preimage.is_some()))
+        }
+        crate::types::MovePhase::Refunded | crate::types::MovePhase::Failed => {
+            receive_artifact
+                && (!record.send_required
+                    || (record.send_op.is_some() && record.preimage.is_none()))
+        }
+    }
+}
+
+fn project_strict_intent(out: &mut Reservations, intent: &Intent) {
+    project_strict_action(out, &intent.action);
+}
+
+fn project_strict_action(out: &mut Reservations, action: &Action) {
+    match action {
+        Action::Move {
+            from,
+            to,
+            amount,
+            fee_cap,
+            ..
+        }
+        | Action::Evacuate {
+            from,
+            to,
+            amount,
+            fee_cap,
+            ..
+        } => {
+            add_outbound(out, *from, Msat(amount.0.saturating_add(fee_cap.0)));
+            add_inbound(out, *to, *amount);
+            add_target_credit(out, *to, *amount);
+        }
+        Action::DirectInflow { to, amount, .. } | Action::Receive { to, amount, .. } => {
+            add_inbound(out, *to, *amount);
+        }
+        Action::Pay {
+            from,
+            amount,
+            fee_cap,
+            ..
+        } => add_outbound(out, *from, Msat(amount.0.saturating_add(fee_cap.0))),
+        Action::Join { .. } | Action::Recover { .. } | Action::RefuseInflow { .. } => {}
+    }
+}
+
+fn add_outbound(out: &mut Reservations, fed: FederationId, amount: Msat) {
+    let slot = out.per_fed_outbound.entry(fed).or_insert(Msat(0));
+    slot.0 = slot.0.saturating_add(amount.0);
+}
+
+fn add_inbound(out: &mut Reservations, fed: FederationId, amount: Msat) {
+    let slot = out.per_fed_inbound.entry(fed).or_insert(Msat(0));
+    slot.0 = slot.0.saturating_add(amount.0);
+}
+
+fn add_target_credit(out: &mut Reservations, fed: FederationId, amount: Msat) {
+    let slot = out.per_fed_target_credit.entry(fed).or_insert(Msat(0));
+    slot.0 = slot.0.saturating_add(amount.0);
 }
 
 /// Outcome counts from [`apply`]/[`reconcile`]. An `Awaiting` outcome counts as
@@ -242,6 +415,7 @@ pub trait Journal: Send + Sync {
     async fn set_status(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         status: IntentStatus,
         error: Option<&str>,
     ) -> Result<(), ExecError>;
@@ -254,6 +428,7 @@ pub trait Journal: Send + Sync {
     async fn set_status_if(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         expected: IntentStatus,
         new: IntentStatus,
     ) -> Result<bool, ExecError>;
@@ -264,27 +439,20 @@ pub trait Journal: Send + Sync {
     async fn awaiting(&self) -> Result<Vec<Intent>, ExecError> {
         Ok(Vec::new())
     }
-    /// The complete journal view used for decide-time reservation projection. Durable
-    /// implementations may make this stricter than their operational reconcile/resume scans:
-    /// admitting money work from a partial view must fail closed.
+    /// The complete intent population used by both reservation projections. Strict admission
+    /// consumes it directly; serialized allocator callers additionally validate derived records.
+    /// Durable implementations may make this stricter than their operational reconcile/resume
+    /// scans: admitting money work from a partial view must fail closed.
     async fn reservation_intents(&self) -> Result<Vec<Intent>, ExecError> {
         let mut intents = self.pending().await?;
         intents.extend(self.awaiting().await?);
         Ok(intents)
     }
     async fn failed(&self) -> Vec<Intent>;
-    /// Read the derived move phase used by reservation projection.
+    /// Read the derived move phase used for resume/diagnostics and the serialized allocator view.
+    /// Strict user admission deliberately ignores this derived record.
     async fn move_record(&self, _key: &IdempotencyKey) -> Result<Option<MoveRecord>, ExecError> {
         Ok(None)
-    }
-    /// Atomically persist a raw operation's network artifact on its intent.
-    async fn set_operation_artifact(
-        &self,
-        _key: &IdempotencyKey,
-        _operation_id: OperationId,
-        _invoice: Option<&crate::Invoice>,
-    ) -> Result<(), ExecError> {
-        Err(ExecError::Unsupported)
     }
     /// A stable identity for this journal's underlying durable store — used ONLY to scope
     /// `drive`'s process-local in-flight-performs guard (a belt-and-suspenders duplicate-perform
@@ -369,10 +537,22 @@ impl MemJournal {
 #[async_trait]
 impl Journal for MemJournal {
     async fn upsert(&self, intent: &Intent) -> Result<(), ExecError> {
-        self.intents
-            .lock()
-            .expect("journal mutex poisoned")
-            .insert(intent.idempotency_key.clone(), intent.clone());
+        let mut intents = self.intents.lock().expect("journal mutex poisoned");
+        if let Some(existing) = intents.get(&intent.idempotency_key) {
+            if existing.attempt != intent.attempt {
+                return Err(ExecError::Permanent(format!(
+                    "journal: stale attempt {} for current attempt {}",
+                    intent.attempt, existing.attempt
+                )));
+            }
+            if !intent_status_transition_allowed(existing.status, intent.status) {
+                return Err(ExecError::Permanent(format!(
+                    "journal: invalid status transition {:?} -> {:?}",
+                    existing.status, intent.status
+                )));
+            }
+        }
+        intents.insert(intent.idempotency_key.clone(), intent.clone());
         Ok(())
     }
 
@@ -388,28 +568,46 @@ impl Journal for MemJournal {
     async fn set_status(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         status: IntentStatus,
         // The failure diagnostic is durable-ledger material (§9); the in-memory test journal
         // has no ledger, so it accepts and ignores it.
         _error: Option<&str>,
     ) -> Result<(), ExecError> {
-        self.intents
-            .lock()
-            .expect("journal mutex poisoned")
+        let mut intents = self.intents.lock().expect("journal mutex poisoned");
+        let intent = intents
             .get_mut(key)
-            .map(|intent| intent.status = status)
-            .ok_or_else(|| ExecError::Permanent("journal: intent not found".into()))
+            .ok_or_else(|| ExecError::Permanent("journal: intent not found".into()))?;
+        if intent.attempt != expected_attempt {
+            return Err(ExecError::Permanent(format!(
+                "journal: stale attempt {expected_attempt} for current attempt {}",
+                intent.attempt
+            )));
+        }
+        if !intent_status_transition_allowed(intent.status, status) {
+            return Err(ExecError::Permanent(format!(
+                "journal: invalid status transition {:?} -> {:?}",
+                intent.status, status
+            )));
+        }
+        intent.status = status;
+        Ok(())
     }
 
     async fn set_status_if(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         expected: IntentStatus,
         new: IntentStatus,
     ) -> Result<bool, ExecError> {
         let mut intents = self.intents.lock().expect("journal mutex poisoned");
         match intents.get_mut(key) {
-            Some(intent) if intent.status == expected => {
+            Some(intent)
+                if intent.attempt == expected_attempt
+                    && intent.status == expected
+                    && intent_status_transition_allowed(intent.status, new) =>
+            {
                 intent.status = new;
                 Ok(true)
             }
@@ -429,23 +627,6 @@ impl Journal for MemJournal {
 
     async fn failed(&self) -> Vec<Intent> {
         self.with_status(|status| status == IntentStatus::Failed)
-    }
-
-    async fn set_operation_artifact(
-        &self,
-        key: &IdempotencyKey,
-        operation_id: OperationId,
-        invoice: Option<&crate::Invoice>,
-    ) -> Result<(), ExecError> {
-        let mut intents = self.intents.lock().expect("journal mutex poisoned");
-        let intent = intents
-            .get_mut(key)
-            .ok_or_else(|| ExecError::Permanent("journal: intent not found".into()))?;
-        intent.operation_id = Some(operation_id);
-        if let Some(invoice) = invoice {
-            intent.invoice = Some(invoice.clone());
-        }
-        Ok(())
     }
 }
 
@@ -607,6 +788,81 @@ pub async fn apply_with_admission<J: Journal, E: Executor>(
     summary
 }
 
+/// Apply a serialized allocator batch against an artifact-aware starting reservation view.
+///
+/// This is the standalone/exclusive counterpart of the service actor's tokenized `CommitTick`
+/// path. Newly durable decisions are folded back in strictly before the next decision, so the
+/// caller's one balance sample cannot be reused to over-admit siblings in the same batch.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_with_allocator_admission<J: Journal, E: Executor>(
+    journal: &J,
+    executor: &E,
+    decisions: &[AllocatorDecision],
+    actor: Actor,
+    now_ms: u64,
+    balances: Option<&BTreeMap<FederationId, Msat>>,
+    per_fed_cap: Option<Msat>,
+    mut reservations: Reservations,
+) -> ExecutionSummary {
+    let mut summary = ExecutionSummary::default();
+    let mut seen = BTreeSet::new();
+
+    for decision in decisions {
+        if !decision.action.is_executable() {
+            summary.skipped += 1;
+            continue;
+        }
+        if !seen.insert(decision.idempotency_key.clone()) {
+            summary.skipped += 1;
+            continue;
+        }
+        let existed = match journal.get(&decision.idempotency_key).await {
+            Ok(existing) => existing.is_some(),
+            Err(_) => {
+                summary.failed += 1;
+                continue;
+            }
+        };
+        match decide_and_journal_with_allocator_reservations(
+            journal,
+            decision,
+            actor,
+            now_ms,
+            balances,
+            per_fed_cap,
+            &reservations,
+        )
+        .await
+        {
+            Ok(DecideAndJournal::TerminalFailed) => {
+                summary.skipped += 1;
+                summary.terminal_failed_skipped += 1;
+            }
+            Ok(DecideAndJournal::Skip) => summary.skipped += 1,
+            Ok(DecideAndJournal::Drive(intent)) => {
+                if !existed {
+                    project_strict_intent(&mut reservations, &intent);
+                }
+                drive_to_terminal(journal, executor, &intent, &mut summary).await;
+            }
+            Err(_) => {
+                // `upsert` can durably commit before returning an error.  This caller supplied
+                // the allocator snapshot instead of re-scanning it for every decision, so an
+                // absent key at the pre-call read must remain reserved for later siblings even
+                // when that ambiguous write prevents us from receiving the exact Intent back.
+                // Folding the requested action is deliberately conservative: a false-positive
+                // reservation fails the batch closed, whereas omitting a committed write can
+                // over-admit the next decision.
+                if !existed {
+                    project_strict_action(&mut reservations, &decision.action);
+                }
+                summary.failed += 1;
+            }
+        }
+    }
+    summary
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum DecideAndJournal {
     Drive(Box<Intent>),
@@ -623,6 +879,58 @@ pub async fn decide_and_journal<J: Journal>(
     now_ms: u64,
     balances: Option<&BTreeMap<FederationId, Msat>>,
     per_fed_cap: Option<Msat>,
+) -> Result<DecideAndJournal, ExecError> {
+    decide_and_journal_inner(
+        journal,
+        decision,
+        actor,
+        now_ms,
+        balances,
+        per_fed_cap,
+        None,
+    )
+    .await
+}
+
+/// Serialized allocator-only admission using a caller-projected durable reservation snapshot.
+///
+/// The caller must either hold exclusive database ownership or serialize every artifact/phase
+/// writer with the balance sample which authorized this decision. Fresh user admission must use
+/// [`decide_and_journal`], whose strict projection cannot be overridden.
+pub async fn decide_and_journal_with_allocator_reservations<J: Journal>(
+    journal: &J,
+    decision: &AllocatorDecision,
+    actor: Actor,
+    now_ms: u64,
+    balances: Option<&BTreeMap<FederationId, Msat>>,
+    per_fed_cap: Option<Msat>,
+    reservations: &Reservations,
+) -> Result<DecideAndJournal, ExecError> {
+    if crate::conflict::AllocatorGoal::of_decision(decision, actor).is_none() {
+        return Err(ExecError::Permanent(
+            "allocator reservation override requires an Agent allocator goal".to_owned(),
+        ));
+    }
+    decide_and_journal_inner(
+        journal,
+        decision,
+        actor,
+        now_ms,
+        balances,
+        per_fed_cap,
+        Some(reservations),
+    )
+    .await
+}
+
+async fn decide_and_journal_inner<J: Journal>(
+    journal: &J,
+    decision: &AllocatorDecision,
+    actor: Actor,
+    now_ms: u64,
+    balances: Option<&BTreeMap<FederationId, Msat>>,
+    per_fed_cap: Option<Msat>,
+    allocator_reservations: Option<&Reservations>,
 ) -> Result<DecideAndJournal, ExecError> {
     // Advisory actions (`RefuseInflow`) are policy signals, not work: never journal an
     // Intent for them. `apply` filters them before calling; this hard error makes the
@@ -673,15 +981,16 @@ pub async fn decide_and_journal<J: Journal>(
         }
         None => {
             let intent = Intent::from_decision(decision, actor, now_ms);
-            let in_flight = journal.reservation_intents().await?;
-            let mut records = BTreeMap::new();
-            for pending in &in_flight {
-                if let Some(record) = journal.move_record(&pending.idempotency_key).await? {
-                    records.insert(pending.idempotency_key.clone(), record);
+            let strict_reservations;
+            let reservations = match allocator_reservations {
+                Some(reservations) => reservations,
+                None => {
+                    let in_flight = journal.reservation_intents().await?;
+                    strict_reservations = project_reservations(&in_flight);
+                    &strict_reservations
                 }
-            }
-            let reservations = project_reservations(&in_flight, |key| records.get(key).cloned());
-            admit_intent(&intent, balances, per_fed_cap, &reservations)?;
+            };
+            admit_intent(&intent, balances, per_fed_cap, reservations)?;
             journal.upsert(&intent).await?;
             Ok(DecideAndJournal::Drive(Box::new(intent)))
         }
@@ -878,6 +1187,7 @@ pub async fn drive_intent_step<J: Journal, E: Executor + ?Sized>(
         match journal
             .set_status_if(
                 &intent.idempotency_key,
+                intent.attempt,
                 IntentStatus::Pending,
                 IntentStatus::Executing,
             )
@@ -902,7 +1212,13 @@ pub async fn drive_intent_step<J: Journal, E: Executor + ?Sized>(
     };
 
     let executing = match journal.get(&intent.idempotency_key).await {
-        Ok(Some(intent)) if intent.status == IntentStatus::Executing => intent,
+        Ok(Some(current))
+            if current.status == IntentStatus::Executing
+                && current.idempotency_key == intent.idempotency_key
+                && current.attempt == intent.attempt =>
+        {
+            current
+        }
         Ok(_) => {
             // This can be a stale `Executing` snapshot from a concurrent scan after the
             // winning driver has already written a terminal status.
@@ -924,7 +1240,7 @@ pub async fn drive_intent_step<J: Journal, E: Executor + ?Sized>(
                 }
             };
             if let Err(error) = journal
-                .set_status(&intent.idempotency_key, next, None)
+                .set_status(&executing.idempotency_key, executing.attempt, next, None)
                 .await
             {
                 summary.failed += 1;
@@ -942,7 +1258,12 @@ pub async fn drive_intent_step<J: Journal, E: Executor + ?Sized>(
             // Leave the intent Pending so the next reconcile retries it (NOT Failed). A
             // retry is not a terminal failure, so no ledger `error` string is threaded (§8.3).
             let reset = journal
-                .set_status(&intent.idempotency_key, IntentStatus::Pending, None)
+                .set_status(
+                    &executing.idempotency_key,
+                    executing.attempt,
+                    IntentStatus::Pending,
+                    None,
+                )
                 .await;
             // Retryable: count it in `failed` (unchanged gating) AND in the `retryable` subset
             // (§15.11), so a scheduler can tell a left-Pending retry from a terminal failure.
@@ -962,7 +1283,12 @@ pub async fn drive_intent_step<J: Journal, E: Executor + ?Sized>(
             // source for the row's error.
             summary.failed += 1;
             journal
-                .set_status(&intent.idempotency_key, IntentStatus::Failed, Some(&reason))
+                .set_status(
+                    &executing.idempotency_key,
+                    executing.attempt,
+                    IntentStatus::Failed,
+                    Some(&reason),
+                )
                 .await?;
             Err(ExecError::Permanent(reason))
         }
@@ -974,7 +1300,8 @@ pub async fn drive_intent_step<J: Journal, E: Executor + ?Sized>(
             summary.failed += 1;
             journal
                 .set_status(
-                    &intent.idempotency_key,
+                    &executing.idempotency_key,
+                    executing.attempt,
                     IntentStatus::Failed,
                     Some("executor does not support this action"),
                 )

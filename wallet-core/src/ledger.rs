@@ -137,8 +137,9 @@ pub enum OperationKind {
         fed: FederationId,
         /// The balance/threshold figures the refusal was decided from (§9.3), so the row is
         /// self-explanatory after a restart. Empty (`default`) for refusals with no
-        /// shortfall arithmetic — an over-cap fed, an evacuation with no destination, or a
-        /// commit-time tick-drop.
+        /// shortfall arithmetic — an over-cap fed, an evacuation with no destination, or an
+        /// ordinary commit-time tick drop. A conflict-suppressed commit-time tick drop instead
+        /// records its emitted zero plus the observational suppression discriminator.
         diagnostics: RefusalDiagnostics,
     },
     /// The active probe's UMBRELLA row (phase 5 §5.0.5), keyed `probe:<fed-hex>:<nonce>`:

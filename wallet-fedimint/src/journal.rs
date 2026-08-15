@@ -47,14 +47,18 @@ use fedimint_core::invite_code::InviteCode;
 use futures::StreamExt;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use wallet_api::Policy;
 use wallet_core::{
-    advance, kind_from_action, status_from_intent, Action, Actor, AllocatorDecision,
-    DiscoverySource, ExecError, FederationId, FeeBreakdown, GatewayUrl, IdempotencyKey, Intent,
-    IntentStatus, Journal, Msat, Occurrence, OperationId, OperationKind, OperationRecord,
-    OperationStatus, ProbeAttempt, ProbePolicy, RawOpUpdate, ReasonCode, RefusalDiagnostics,
-    WriteKind,
+    advance, intent_status_transition_allowed, kind_from_action, status_from_intent, Action, Actor,
+    AllocatorDecision, DiscoverySource, ExecError, FederationId, FeeBreakdown, GatewayUrl,
+    IdempotencyKey, Intent, IntentStatus, Journal, Msat, Occurrence, OperationId, OperationKind,
+    OperationRecord, OperationStatus, ProbeAttempt, ProbePolicy, RawOpUpdate, ReasonCode,
+    RefusalDiagnostics, WriteKind,
 };
 
 /// The app-state partition prefix (spec §4/§8). Clients live at `[0x01, ..]`, see
@@ -275,6 +279,65 @@ pub struct FedimintJournal {
     /// authority — the clock is display material plus the one repair dependency (§10.3), so it
     /// is injectable (production [`SystemTime::now`]; tests pin it via [`Self::with_clock`]).
     clock: fn() -> u64,
+    /// Unit-test seam for the post-driver-finish intent refresh.  It intentionally faults the
+    /// shared read helper so the actor recovery path is tested against the same `Journal::get`
+    /// failure it handles in production.
+    #[cfg(test)]
+    fail_intent_reads: Arc<AtomicUsize>,
+    /// Persistent, key-specific version of the post-driver-finish read fault.  The ownership
+    /// recovery regression uses this rather than a broad database failure so it can keep
+    /// producing the exact `DriverFinished` race while the durable scan itself remains healthy.
+    #[cfg(test)]
+    persistent_intent_read_faults: Arc<Mutex<BTreeSet<IdempotencyKey>>>,
+    #[cfg(test)]
+    fail_operation_reads: Arc<AtomicUsize>,
+    /// Inject an error after `set_status` has durably committed, exercising the actor's
+    /// scoped durability-ambiguity recovery.
+    #[cfg(test)]
+    fail_after_status_writes: Arc<AtomicUsize>,
+    /// Inject errors after the actor-routed artifact writers durably commit.
+    #[cfg(test)]
+    fail_after_artifact_writes: Arc<AtomicUsize>,
+    #[cfg(test)]
+    fail_after_move_writes: Arc<AtomicUsize>,
+    /// Inject an error after `upsert` has durably committed.  CommitTick uses this to prove it
+    /// treats a storage refusal as a potentially durable fresh admission.
+    #[cfg(test)]
+    fail_after_upserts: Arc<AtomicUsize>,
+    /// Test-only durable corruption seam: replace the just-committed intent row before returning
+    /// the configured post-upsert error.  This models a concurrent/corrupt row whose exact key is
+    /// readable but whose request identity is not the one the fresh caller attempted.
+    #[cfg(test)]
+    replace_after_upsert: Arc<Mutex<Option<Intent>>>,
+    /// One-shot targeted read fault which waits for a caller-selected number of successful
+    /// `Journal::get` calls.  This distinguishes CommitTick's pre-read from the core helper's
+    /// replay read without making every intent read fail.
+    #[cfg(test)]
+    fail_intent_read_after_successes: Arc<Mutex<Option<usize>>>,
+    #[cfg(test)]
+    pending_reads: Arc<AtomicUsize>,
+    /// A one-shot pause after a durable pending scan.  This lets the actor test queue a later
+    /// `DriverFinished` read fault between the scan and its generation acknowledgement.
+    #[cfg(test)]
+    pending_read_pause: Arc<Mutex<Option<Arc<PendingReadPause>>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct PendingReadPause {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl PendingReadPause {
+    pub(crate) async fn wait_until_started(&self) {
+        self.started.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_waiters();
+    }
 }
 
 impl FedimintJournal {
@@ -303,12 +366,230 @@ impl FedimintJournal {
             db: db.with_prefix(vec![APP_PREFIX]),
             store_id,
             clock,
+            #[cfg(test)]
+            fail_intent_reads: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            persistent_intent_read_faults: Arc::new(Mutex::new(BTreeSet::new())),
+            #[cfg(test)]
+            fail_operation_reads: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_after_status_writes: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_after_artifact_writes: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_after_move_writes: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_after_upserts: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            replace_after_upsert: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            fail_intent_read_after_successes: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            pending_reads: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            pending_read_pause: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_intent_reads_for_test(&self, count: usize) {
+        self.fail_intent_reads.store(count, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persistently_fail_intent_read_for_test(&self, key: IdempotencyKey) {
+        self.persistent_intent_read_faults
+            .lock()
+            .expect("persistent intent fault lock poisoned")
+            .insert(key);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_persistent_intent_read_fault_for_test(&self, key: &IdempotencyKey) {
+        self.persistent_intent_read_faults
+            .lock()
+            .expect("persistent intent fault lock poisoned")
+            .remove(key);
+    }
+
+    /// Test seam for callers which refresh an operation-ledger row after updating a
+    /// durable probe outcome.  Keep this separate from intent reads: probe umbrellas
+    /// are ledger-backed, not intent-backed.
+    #[cfg(test)]
+    pub(crate) fn fail_next_operation_reads_for_test(&self, count: usize) {
+        self.fail_operation_reads.store(count, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_after_next_status_write_for_test(&self) {
+        self.fail_after_status_writes.store(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_after_next_artifact_write_for_test(&self) {
+        self.fail_after_artifact_writes.store(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_after_next_move_write_for_test(&self) {
+        self.fail_after_move_writes.store(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_after_next_upsert_for_test(&self) {
+        self.fail_after_upserts.store(1, Ordering::SeqCst);
+    }
+
+    /// Replace the next successful `upsert`'s durable intent row before it reports its configured
+    /// post-commit fault.  The replacement must keep the key and indexed status stable so this
+    /// seam isolates identity ambiguity rather than testing index repair.
+    #[cfg(test)]
+    pub(crate) fn replace_after_next_upsert_for_test(&self, intent: Intent) {
+        *self
+            .replace_after_upsert
+            .lock()
+            .expect("post-upsert replacement lock poisoned") = Some(intent);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_one_intent_read_after_successes_for_test(&self, successes: usize) {
+        *self
+            .fail_intent_read_after_successes
+            .lock()
+            .expect("intent read fault lock poisoned") = Some(successes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_pending_reads_for_test(&self) {
+        self.pending_reads.store(0, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_reads_for_test(&self) -> usize {
+        self.pending_reads.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_pending_read_for_test(&self) -> Arc<PendingReadPause> {
+        let pause = Arc::new(PendingReadPause {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *self
+            .pending_read_pause
+            .lock()
+            .expect("pending read pause lock poisoned") = Some(Arc::clone(&pause));
+        pause
     }
 
     /// The ledger's wall-clock in unix millis (the injected [`Self::clock`]).
     fn now_ms(&self) -> u64 {
         (self.clock)()
+    }
+
+    /// CAS a raw Pay/Receive terminal status against the ledger row that repair actually
+    /// terminalized.  A retry replaces the public-key row with a higher attempt, and an
+    /// authoritative same-attempt artifact can supersede a soft repair, so both must benignly
+    /// lose rather than terminalize a reservation on stale evidence.
+    pub async fn set_raw_terminal_if_fenced(
+        &self,
+        key: &IdempotencyKey,
+        fence: &RawIntentTerminalFence,
+        status: IntentStatus,
+        _error: Option<&str>,
+    ) -> Result<bool, ExecError> {
+        // The fence names the completed ledger outcome, not merely any terminal ledger row.
+        // This public sink is also used by actor-routed repair, so never let a caller turn a
+        // successful ledger repair into a Failed intent (or vice versa).
+        let status_matches_ledger = matches!(
+            (fence.expected_ledger_status, status),
+            (OperationStatus::Succeeded, IntentStatus::Done)
+                | (OperationStatus::Failed, IntentStatus::Failed)
+        );
+        if !status_matches_ledger {
+            return Ok(false);
+        }
+        self.db
+            .autocommit(
+                |dbtx, _| {
+                    Box::pin(async move {
+                        let index_key = ledger_key_index(key);
+                        let Some(index) = dbtx.raw_get_bytes(&index_key).await.map_err(db_err)?
+                        else {
+                            return Ok(false);
+                        };
+                        if read_be64(&index) != Some(fence.expected_seq) {
+                            return Ok(false);
+                        }
+                        let row_key = ledger_row_key(fence.expected_seq);
+                        let Some(row_bytes) = dbtx.raw_get_bytes(&row_key).await.map_err(db_err)?
+                        else {
+                            return Ok(false);
+                        };
+                        let row: OperationRecord =
+                            decode_row_result("ledger row", &row_key, &row_bytes)?;
+                        let Some((fed, op_id, _)) = raw_row_parts(&row.kind) else {
+                            return Ok(false);
+                        };
+                        if row.correlation_key != *key
+                            || row.seq != fence.expected_seq
+                            || fed != fence.fed
+                            || op_id != fence.expected_op
+                            || raw_role(&row.kind) != Some(fence.role)
+                            || row.status != fence.expected_ledger_status
+                        {
+                            return Ok(false);
+                        }
+                        let ikey = intent_key(key);
+                        let Some(bytes) = dbtx.raw_get_bytes(&ikey).await.map_err(db_err)? else {
+                            return Ok(false);
+                        };
+                        let mut intent = decode_row_result::<Intent>("intent", &ikey, &bytes)?;
+                        if intent.attempt != fence.expected_attempt
+                            || !matches!(intent.action, Action::Pay { .. } | Action::Receive { .. })
+                            || intent_status_is_terminal(intent.status)
+                        {
+                            return Ok(false);
+                        }
+                        let intent_fed = match intent.action {
+                            Action::Pay { from, .. } => from,
+                            Action::Receive { to, .. } => to,
+                            _ => unreachable!("raw action check above admits only pay/receive"),
+                        };
+                        if intent_fed != fence.fed {
+                            return Ok(false);
+                        }
+                        // Repair's fenced ledger write is already durable.  Its recovered raw
+                        // operation identity must become part of this exact intent before the
+                        // terminal status releases it: a failed Pay with a committed operation
+                        // cannot be manually retried, because the SDK would only rediscover that
+                        // same operation.  Never overwrite a conflicting intent identity.
+                        match (intent.operation_id, fence.expected_op) {
+                            (Some(recorded), expected) if Some(recorded) != expected => {
+                                return Ok(false);
+                            }
+                            (None, Some(recovered)) => intent.operation_id = Some(recovered),
+                            _ => {}
+                        }
+                        let old_status = intent.status;
+                        intent.status = status;
+                        // Repair already made the fenced ledger terminal durable before it asks
+                        // this sink to release the reservation.  Do not re-run the ordinary
+                        // intent+ledger writer here: an uncertain hash-dedup repair must retain
+                        // both its `repaired` bit and its audit note until an authoritative
+                        // observation deliberately supersedes it.
+                        write_intent_and_pending_index(dbtx, &ikey, key, old_status, &intent)
+                            .await?;
+                        Ok(true)
+                    })
+                },
+                None,
+            )
+            .await
+            .map_err(|e| match e {
+                AutocommitError::CommitFailed { last_error, .. } => db_err(last_error),
+                AutocommitError::ClosureError { error, .. } => error,
+            })
     }
 
     /// Atomically begin a deliberate retry of a terminal-failed intent while preserving the
@@ -387,6 +668,41 @@ impl FedimintJournal {
 
     /// Load and decode the [`Intent`] stored under `key`, or `None` if absent.
     async fn read_intent(&self, key: &IdempotencyKey) -> Result<Option<Intent>, ExecError> {
+        #[cfg(test)]
+        {
+            let mut after_successes = self
+                .fail_intent_read_after_successes
+                .lock()
+                .expect("intent read fault lock poisoned");
+            if matches!(*after_successes, Some(0)) {
+                *after_successes = None;
+                return Err(ExecError::Retryable(format!(
+                    "journal: injected intent read failure for --key {}",
+                    key.0
+                )));
+            }
+            if let Some(remaining) = after_successes.as_mut() {
+                *remaining -= 1;
+            }
+        }
+        #[cfg(test)]
+        if self
+            .persistent_intent_read_faults
+            .lock()
+            .expect("persistent intent fault lock poisoned")
+            .contains(key)
+            || self
+                .fail_intent_reads
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            return Err(ExecError::Retryable(format!(
+                "injected intent refresh read failure for --key {}",
+                key.0
+            )));
+        }
         let raw_key = intent_key(key);
         let mut dbtx = self.db.begin_transaction_nc().await;
         let Some(bytes) = dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? else {
@@ -533,15 +849,70 @@ impl FedimintJournal {
         Ok(Some(decode_row_result("move record", &raw_key, &bytes)?))
     }
 
-    /// Upsert the derived [`MoveRecord`] cache for its key (spec §5; rebuilt from op-log).
+    /// Upsert a standalone derived [`MoveRecord`] cache. Intent-backed records must use
+    /// [`Self::put_move_if_attempt`], so a late writer cannot recreate an old attempt's cache
+    /// after a manual retry has reset it.
     pub async fn put_move(&self, rec: &MoveRecord) -> Result<(), ExecError> {
         let value = encode_row(rec)?;
         let mut dbtx = self.db.begin_transaction().await;
+        if dbtx
+            .raw_get_bytes(&intent_key(&rec.key))
+            .await
+            .map_err(db_err)?
+            .is_some()
+        {
+            return Err(ExecError::Permanent(
+                "journal: intent-backed MoveRecord requires put_move_if_attempt".to_owned(),
+            ));
+        }
         dbtx.raw_insert_bytes(&move_key(&rec.key), &value)
             .await
             .map_err(db_err)?;
         dbtx.commit_tx_result().await.map_err(db_err)?;
         Ok(())
+    }
+
+    /// Upsert an intent-backed derived [`MoveRecord`] only while `expected_attempt` still owns
+    /// `key`. A false result is a benign stale writer: callers must not recreate the cache that a
+    /// manual retry deliberately removed for a newer attempt.
+    pub async fn put_move_if_attempt(
+        &self,
+        key: &IdempotencyKey,
+        expected_attempt: u32,
+        rec: &MoveRecord,
+    ) -> Result<bool, ExecError> {
+        if rec.key != *key {
+            return Err(ExecError::Permanent(
+                "journal: MoveRecord key does not match attempt fence".to_owned(),
+            ));
+        }
+        let value = encode_row(rec)?;
+        let mut dbtx = self.db.begin_transaction().await;
+        let ikey = intent_key(key);
+        let Some(bytes) = dbtx.raw_get_bytes(&ikey).await.map_err(db_err)? else {
+            return Ok(false);
+        };
+        let intent: Intent = decode_row_result("intent", &ikey, &bytes)?;
+        if intent.idempotency_key != *key || intent.attempt != expected_attempt {
+            return Ok(false);
+        }
+        dbtx.raw_insert_bytes(&move_key(key), &value)
+            .await
+            .map_err(db_err)?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        #[cfg(test)]
+        if self
+            .fail_after_move_writes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(ExecError::Retryable(
+                "injected error after durable MoveRecord write".to_owned(),
+            ));
+        }
+        Ok(true)
     }
 
     /// Register (or update) a federation in the durable registry (spec §8/§9.1, ADR-0003).
@@ -572,7 +943,8 @@ impl FedimintJournal {
         info: &FederationInfo,
         invite: &InviteCode,
         key: &IdempotencyKey,
-    ) -> Result<(), ExecError> {
+        expected_attempt: u32,
+    ) -> Result<bool, ExecError> {
         let now_ms = self.now_ms();
         // Autocommit-retry (like `set_status_if`), NOT a bare `begin_transaction`/`commit_tx`: this
         // is the terminal commit of an hours-long module-recovery replay, so a write-conflict with a
@@ -603,11 +975,10 @@ impl FedimintJournal {
                                 "journal: recovery completion does not match its intent".to_owned(),
                             ));
                         }
-                        if intent.status != IntentStatus::Executing {
-                            return Err(ExecError::Permanent(format!(
-                                "journal: recovery completion requires Executing intent, found {:?}",
-                                intent.status
-                            )));
+                        if intent.attempt != expected_attempt
+                            || intent.status != IntentStatus::Executing
+                        {
+                            return Ok(false);
                         }
 
                         intent.status = IntentStatus::Done;
@@ -630,7 +1001,7 @@ impl FedimintJournal {
                             None,
                         )
                         .await?;
-                        Ok(())
+                        Ok(true)
                     })
                 },
                 None,
@@ -800,6 +1171,7 @@ impl FedimintJournal {
     ) -> Result<(), ExecError> {
         let now = self.now_ms();
         let mut dbtx = self.db.begin_transaction().await;
+        reject_legacy_intent_backed_raw_writer(&mut dbtx, key, "record_update").await?;
         ledger_upsert_in(&mut dbtx, key, |existing, _seq| {
             let existing = existing?;
             // A repaired terminal is defeasible. Never feed the same terminal status back into
@@ -847,6 +1219,7 @@ impl FedimintJournal {
         upd: Option<RawOpUpdate>,
     ) -> Result<(), ExecError> {
         let mut dbtx = self.db.begin_transaction().await;
+        reject_legacy_intent_backed_raw_writer(&mut dbtx, key, "record_terminal").await?;
         ledger_upsert_in(&mut dbtx, key, |existing, _seq| {
             let existing = existing?;
             advance(
@@ -863,23 +1236,176 @@ impl FedimintJournal {
         Ok(())
     }
 
-    /// Persist a terminal raw-op observation before the intent transition makes its ledger row
-    /// immutable. This reuses the same authoritative enrichment path as reconcile repair.
-    pub async fn record_raw_observation(
+    /// Persist a raw terminal observation only while `expected_attempt` still owns this public
+    /// key.  In particular, an SDK result from attempt N must not terminalize the ledger row that
+    /// a manual retry has replaced with attempt N+1.
+    pub async fn record_raw_observation_if_attempt(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         op: OperationId,
         observation: &RawOpObservation,
-    ) -> Result<(), ExecError> {
-        self.apply_observation(
-            key,
-            op,
-            observation,
-            self.now_ms(),
-            WriteKind::Authoritative,
-            None,
-        )
-        .await
+    ) -> Result<bool, ExecError> {
+        let update = RawOpUpdate {
+            op_id: Some(op),
+            gateway: observation.gateway.clone(),
+            invoice_amount: observation.invoice_amount,
+            payment_hash: observation.payment_hash,
+            fees: Some(observation.fees),
+            fees_definitive: observation.terminal.is_some(),
+        };
+        let (status, error) = match &observation.terminal {
+            Some(terminal) => (
+                if terminal.succeeded {
+                    OperationStatus::Succeeded
+                } else {
+                    OperationStatus::Failed
+                },
+                terminal.error.as_deref(),
+            ),
+            // This sink is deliberately usable for an in-flight prelookup too.  It preserves the
+            // same attempt fence even though the outcome is not terminal yet.
+            None => (OperationStatus::Awaiting, None),
+        };
+        let now = self.now_ms();
+        let ikey = intent_key(key);
+        let mut dbtx = self.db.begin_transaction().await;
+        let Some(bytes) = dbtx.raw_get_bytes(&ikey).await.map_err(db_err)? else {
+            return Ok(false);
+        };
+        let intent: Intent = decode_row_result("intent", &ikey, &bytes)?;
+        if intent.attempt != expected_attempt || intent_status_is_terminal(intent.status) {
+            return Ok(false);
+        }
+
+        let mut applied = false;
+        ledger_upsert_in(&mut dbtx, key, |existing, _seq| {
+            let existing = existing?;
+            let (fed, existing_op, _) = raw_row_parts(&existing.kind)?;
+            let intent_fed = match &intent.action {
+                Action::Pay { from, .. } => *from,
+                Action::Receive { to, .. } => *to,
+                _ => return None,
+            };
+            if fed != intent_fed || existing_op.is_some_and(|recorded| recorded != op) {
+                return None;
+            }
+            // A crash can leave the ledger's authoritative conclusion durable while the intent
+            // is still Executing/Pending.  Re-observing that exact operation/outcome is a
+            // successful no-op, so the core driver can make the remaining intent transition.
+            // A soft repair stays defeasible: authoritative evidence is still allowed to replace
+            // it (including its definitive settlement fields).
+            if existing.status.is_terminal() && !existing.repaired {
+                if existing.status == status && existing_op == Some(op) {
+                    applied = true;
+                }
+                return None;
+            }
+            let next = advance(
+                &existing,
+                status,
+                now,
+                Some(&update),
+                error,
+                WriteKind::Authoritative,
+            );
+            applied = next.is_some();
+            next
+        })
+        .await?;
+        if !applied {
+            return Ok(false);
+        }
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(true)
+    }
+
+    /// Atomically attach a raw SDK artifact to the attempt that created it.  The attempt and
+    /// non-terminal checks protect a retried public key; the operation-id check makes the artifact
+    /// monotonic rather than letting a late SDK response replace a durable identity.
+    pub async fn set_operation_artifact_if_attempt(
+        &self,
+        key: &IdempotencyKey,
+        expected_attempt: u32,
+        operation_id: OperationId,
+        invoice: Option<&wallet_core::Invoice>,
+    ) -> Result<bool, ExecError> {
+        let ikey = intent_key(key);
+        let now = self.now_ms();
+        let mut dbtx = self.db.begin_transaction().await;
+        let Some(bytes) = dbtx.raw_get_bytes(&ikey).await.map_err(db_err)? else {
+            return Ok(false);
+        };
+        let mut intent = decode_row_result::<Intent>("intent", &ikey, &bytes)?;
+        if intent.attempt != expected_attempt || intent_status_is_terminal(intent.status) {
+            return Ok(false);
+        }
+        if intent
+            .operation_id
+            .is_some_and(|recorded| recorded != operation_id)
+        {
+            return Ok(false);
+        }
+        // Normally both artifacts move together.  The sole exception is crash convergence: a
+        // current, exact terminal raw row already proves this operation concluded, so attach a
+        // missing matching artifact to the still-nonterminal intent without rewriting that
+        // immutable ledger conclusion.
+        let index_key = ledger_key_index(key);
+        let Some(index) = dbtx.raw_get_bytes(&index_key).await.map_err(db_err)? else {
+            return Ok(false);
+        };
+        let Some(seq) = read_be64(&index) else {
+            return Ok(false);
+        };
+        let row_key = ledger_row_key(seq);
+        let Some(row_bytes) = dbtx.raw_get_bytes(&row_key).await.map_err(db_err)? else {
+            return Ok(false);
+        };
+        let row: OperationRecord = decode_row_result("ledger row", &row_key, &row_bytes)?;
+        let Some((fed, recorded_op, _)) = raw_row_parts(&row.kind) else {
+            return Ok(false);
+        };
+        let intent_fed = match &intent.action {
+            Action::Pay { from, .. } => *from,
+            Action::Receive { to, .. } => *to,
+            _ => return Ok(false),
+        };
+        if row.correlation_key != *key
+            || row.seq != seq
+            || fed != intent_fed
+            || recorded_op.is_some_and(|recorded| recorded != operation_id)
+        {
+            return Ok(false);
+        }
+        let terminal_convergence = row.status.is_terminal();
+        if terminal_convergence && recorded_op != Some(operation_id) {
+            return Ok(false);
+        }
+
+        intent.operation_id = Some(operation_id);
+        if let Some(invoice) = invoice {
+            intent.invoice = Some(invoice.clone());
+        }
+        dbtx.raw_insert_bytes(&ikey, &encode_row(&intent)?)
+            .await
+            .map_err(db_err)?;
+        if !terminal_convergence {
+            write_intent_ledger_row(&mut dbtx, &intent, now, None).await?;
+        }
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        #[cfg(test)]
+        if self
+            .fail_after_artifact_writes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(ExecError::Retryable(
+                "injected error after durable operation artifact write".to_owned(),
+            ));
+        }
+        Ok(true)
     }
 
     /// Record whether a join created membership or merely reopened an existing federation.
@@ -888,112 +1414,366 @@ impl FedimintJournal {
     pub async fn record_join_outcome(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         newly_joined: bool,
-    ) -> Result<(), ExecError> {
-        self.record_terminal(
-            key,
-            OperationStatus::Succeeded,
-            self.now_ms(),
-            (!newly_joined).then_some(JOIN_NOOP_REOPEN_NOTE),
-            None,
-        )
-        .await
+    ) -> Result<bool, ExecError> {
+        let now = self.now_ms();
+        let mut dbtx = self.db.begin_transaction().await;
+        let ikey = intent_key(key);
+        let Some(bytes) = dbtx.raw_get_bytes(&ikey).await.map_err(db_err)? else {
+            return Ok(false);
+        };
+        let intent: Intent = decode_row_result("intent", &ikey, &bytes)?;
+        let Action::Join { federation, .. } = &intent.action else {
+            return Ok(false);
+        };
+        if intent.idempotency_key != *key
+            || intent.attempt != expected_attempt
+            || intent_status_is_terminal(intent.status)
+        {
+            return Ok(false);
+        }
+
+        let mut applied = false;
+        ledger_upsert_in(&mut dbtx, key, |existing, _seq| {
+            let existing = existing?;
+            if existing.correlation_key != *key
+                || !matches!(existing.kind, OperationKind::Join { fed } if fed == *federation)
+            {
+                return None;
+            }
+            // A crash after the authoritative ledger outcome committed but before core
+            // terminalized the intent may re-drive this same attempt. Its already-authoritative
+            // Succeeded row is idempotent. A repaired terminal, by contrast, is only a
+            // defeasible reconciliation conclusion and `advance` must receive this
+            // authoritative outcome to supersede it.
+            if existing.status == OperationStatus::Succeeded && !existing.repaired {
+                applied = true;
+                return None;
+            }
+            // Non-repaired terminals are immutable. A repaired Succeeded or Failed terminal gets
+            // the Authoritative `advance` below, which clears its repair marker and replaces any
+            // stale repair diagnostic with this actual join outcome.
+            if existing.status.is_terminal() && !existing.repaired {
+                return None;
+            }
+            let next = advance(
+                &existing,
+                OperationStatus::Succeeded,
+                now,
+                None,
+                (!newly_joined).then_some(JOIN_NOOP_REOPEN_NOTE),
+                WriteKind::Authoritative,
+            );
+            applied = next.is_some();
+            next
+        })
+        .await?;
+        if !applied {
+            return Ok(false);
+        }
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(true)
     }
 
-    /// Complete an externally-awaited raw pay/receive through the same durable journal used by
-    /// the issue driver. `Ok(notes)` preserves the CLI's best-effort audit diagnostics; an
-    /// intent status-write failure remains fatal so a caller cannot report completion while the
-    /// reservation stays live.
+    /// Observe and correlate an externally-awaited raw operation before entering the service
+    /// actor's terminal-mutation lease.  This is deliberately the only half that consults the
+    /// SDK/op-log; the returned preparation is later committed by
+    /// [`Self::finalize_raw_operation`] with database work only.
     #[allow(clippy::too_many_arguments)]
-    pub async fn finalize_raw_operation(
+    pub async fn prepare_raw_operation_terminal(
         &self,
         oracle: &dyn LedgerRepairOracle,
         fed: FederationId,
         op: OperationId,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         role: RawOperationRole,
-        status: OperationStatus,
-        error: Option<&str>,
-    ) -> Result<Vec<String>, ExecError> {
+    ) -> Result<PreparedRawOperationTerminal, ExecError> {
         let Some(row) = self.operation(&OperationRef::Key(key.clone())).await? else {
-            return Ok(vec![format!(
-                "no ledger row for --key {}; not recording",
-                key.0
-            )]);
+            return Ok(PreparedRawOperationTerminal {
+                notes: vec![format!("no ledger row for --key {}; not recording", key.0)],
+                expected_attempt,
+                update: None,
+                fence: None,
+                observed_status: None,
+            });
         };
+        let Some(fence) = self.capture_raw_repair_fence(&row, role).await? else {
+            return Ok(PreparedRawOperationTerminal {
+                notes: vec![format!(
+                    "--key {} changed before terminal preparation; not recording",
+                    key.0
+                )],
+                expected_attempt,
+                update: None,
+                fence: None,
+                observed_status: None,
+            });
+        };
+        if fence.expected_attempt != Some(expected_attempt) {
+            return Ok(PreparedRawOperationTerminal {
+                notes: vec![format!(
+                    "--key {} no longer belongs to awaiting attempt {expected_attempt}; \
+                     not recording",
+                    key.0
+                )],
+                expected_attempt,
+                update: None,
+                fence: None,
+                observed_status: None,
+            });
+        }
         let needs_correlation_proof = match raw_operation_row_matches(&row, role, fed, op) {
             Ok(needs_proof) => needs_proof,
             Err(reason) => {
-                return Ok(vec![format!(
-                    "--key {} does not match this operation ({reason}); not recording",
-                    key.0
-                )]);
+                return Ok(PreparedRawOperationTerminal {
+                    notes: vec![format!(
+                        "--key {} does not match this operation ({reason}); not recording",
+                        key.0
+                    )],
+                    expected_attempt,
+                    update: None,
+                    fence: None,
+                    observed_status: None,
+                });
             }
         };
         if needs_correlation_proof {
-            match oracle.find_op_by_correlation_key(fed, key).await {
+            match oracle
+                .find_op_by_correlation_key(fed, &fence.attempt_correlation_key)
+                .await
+            {
                 Ok(Some(found)) if found == op => {}
                 Ok(_) => {
-                    return Ok(vec![format!(
-                        "--key {} has no recorded op id and the op-log does not tie this \
-                         operation to it; not recording (reconcile repairs it)",
-                        key.0
-                    )]);
+                    return Ok(PreparedRawOperationTerminal {
+                        notes: vec![format!(
+                            "--key {} has no recorded op id and the op-log does not tie this \
+                              operation to it; not recording (reconcile repairs it)",
+                            key.0
+                        )],
+                        expected_attempt,
+                        update: None,
+                        fence: None,
+                        observed_status: None,
+                    });
                 }
                 Err(error) => {
-                    return Ok(vec![format!(
-                        "could not verify --key {} against the op-log: {error:?}; not recording",
-                        key.0
-                    )]);
+                    return Ok(PreparedRawOperationTerminal {
+                        notes: vec![format!(
+                            "could not verify --key {} against the op-log: {error:?}; not recording",
+                            key.0
+                        )],
+                        expected_attempt,
+                        update: None,
+                        fence: None,
+                        observed_status: None,
+                    });
                 }
             }
         }
 
-        let mut notes = Vec::new();
-        let update = match oracle.observe_op(fed, op).await {
-            Ok(observation) => RawOpUpdate {
-                op_id: Some(op),
-                gateway: observation.gateway,
-                invoice_amount: observation.invoice_amount,
-                payment_hash: observation.payment_hash,
-                fees: Some(observation.fees),
-                fees_definitive: observation.terminal.is_some(),
-            },
-            Err(observe_error) => {
-                notes.push(format!(
-                    "could not read settlement fees for {op:?}: {observe_error:?}"
-                ));
-                RawOpUpdate {
-                    op_id: Some(op),
-                    ..RawOpUpdate::default()
-                }
-            }
+        // An observation is the terminal outcome and its definitive settlement enrichment, not
+        // merely an optional fee quote.  If it cannot be read, leave both rows non-terminal and
+        // surface the failure so the awaiter/reconcile loop retries rather than terminalizing an
+        // unobserved operation.
+        let observation = oracle.observe_op(fed, op).await?;
+        let Some(terminal) = observation.terminal else {
+            return Err(ExecError::Retryable(format!(
+                "raw operation {:?} for --key {} is still in flight",
+                op.0, key.0
+            )));
         };
-        if let Err(record_error) = self
-            .record_terminal(key, status, self.now_ms(), error, Some(update))
-            .await
-        {
-            notes.push(format!(
-                "recording the terminal ledger row failed: {record_error:?}"
-            ));
-        }
+        let observed_status = if terminal.succeeded {
+            OperationStatus::Succeeded
+        } else {
+            OperationStatus::Failed
+        };
+        let update = RawOpUpdate {
+            op_id: Some(op),
+            gateway: observation.gateway,
+            invoice_amount: observation.invoice_amount,
+            payment_hash: observation.payment_hash,
+            fees: Some(observation.fees),
+            fees_definitive: true,
+        };
+        Ok(PreparedRawOperationTerminal {
+            notes: Vec::new(),
+            expected_attempt,
+            update: Some(update),
+            fence: Some(fence),
+            observed_status: Some(observed_status),
+        })
+    }
 
+    /// Commit a raw terminal observation prepared before the external terminal-mutation lease.
+    /// This performs only journal/intent database writes; in particular it never awaits SDK or
+    /// network I/O while the lease is live.
+    pub async fn finalize_raw_operation(
+        &self,
+        key: &IdempotencyKey,
+        status: OperationStatus,
+        error: Option<&str>,
+        prepared: PreparedRawOperationTerminal,
+    ) -> Result<Vec<String>, ExecError> {
+        let PreparedRawOperationTerminal {
+            notes,
+            expected_attempt,
+            update,
+            fence,
+            observed_status,
+        } = prepared;
+        let (Some(update), Some(fence), Some(observed_status)) = (update, fence, observed_status)
+        else {
+            return self
+                .raw_terminal_noop_is_stale(key, expected_attempt, notes, "preparation")
+                .await;
+        };
+        if status != observed_status {
+            return Err(ExecError::Permanent(format!(
+                "raw terminal status {:?} conflicts with observed {:?}",
+                status, observed_status
+            )));
+        }
+        // A prepared result is only valid for the exact ledger attempt and intent attempt read
+        // before the SDK observation.  This transaction intentionally performs no I/O other than
+        // DB work; a ledger failure aborts before the intent write, so callers cannot report a
+        // released reservation without a terminal audit row.
+        if self
+            .finalize_raw_terminal_if_fenced(key, status, error, &update, &fence)
+            .await?
+        {
+            return Ok(notes);
+        }
+        // A failed fence is only benign when another attempt won, the intent disappeared, or it
+        // is already terminal.  If this exact attempt still owns a non-terminal reservation, it
+        // needs another await/reconcile pass rather than silently losing its only subscription.
+        self.raw_terminal_noop_is_stale(key, expected_attempt, notes, "fence")
+            .await
+    }
+
+    /// A raw terminal finalizer may benignly lose a stale attempt, but it must never silently
+    /// abandon the same durable non-terminal reservation.  The explicit prepare attempt is the
+    /// correlation point even when preparation could not construct a ledger fence.
+    async fn raw_terminal_noop_is_stale(
+        &self,
+        key: &IdempotencyKey,
+        expected_attempt: u32,
+        notes: Vec<String>,
+        stage: &str,
+    ) -> Result<Vec<String>, ExecError> {
+        if self.get(key).await?.is_some_and(|intent| {
+            intent.attempt == expected_attempt && !intent_status_is_terminal(intent.status)
+        }) {
+            return Err(ExecError::Retryable(format!(
+                "raw terminal {stage} no-op left attempt {expected_attempt} for --key {} \
+                 non-terminal; retrying ownership",
+                key.0
+            )));
+        }
+        Ok(notes)
+    }
+
+    async fn finalize_raw_terminal_if_fenced(
+        &self,
+        key: &IdempotencyKey,
+        status: OperationStatus,
+        error: Option<&str>,
+        update: &RawOpUpdate,
+        fence: &RawRepairFence,
+    ) -> Result<bool, ExecError> {
+        let Some(expected_attempt) = fence.expected_attempt else {
+            return Ok(false);
+        };
         let intent_status = match status {
             OperationStatus::Succeeded => IntentStatus::Done,
             OperationStatus::Failed => IntentStatus::Failed,
-            OperationStatus::Started | OperationStatus::Awaiting => return Ok(notes),
+            OperationStatus::Started | OperationStatus::Awaiting => return Ok(false),
         };
-        if let Some(intent) = self.get(key).await? {
-            let role_matches = matches!(
-                (&intent.action, role),
-                (Action::Pay { .. }, RawOperationRole::Send)
-                    | (Action::Receive { .. }, RawOperationRole::Receive)
-            );
-            if role_matches {
-                self.set_status(key, intent_status, error).await?;
+        let now = self.now_ms();
+        let mut dbtx = self.db.begin_transaction().await;
+        let ikey = intent_key(key);
+        let Some(bytes) = dbtx.raw_get_bytes(&ikey).await.map_err(db_err)? else {
+            return Ok(false);
+        };
+        let mut intent: Intent = decode_row_result("intent", &ikey, &bytes)?;
+        let role_matches = matches!(
+            (&intent.action, fence.role),
+            (Action::Pay { .. }, RawOperationRole::Send)
+                | (Action::Receive { .. }, RawOperationRole::Receive)
+        );
+        if intent.attempt != expected_attempt
+            || !role_matches
+            || intent_status_is_terminal(intent.status)
+            || !intent_status_transition_allowed(intent.status, intent_status)
+        {
+            return Ok(false);
+        }
+        let action_fed = match &intent.action {
+            Action::Pay { from, .. } => *from,
+            Action::Receive { to, .. } => *to,
+            _ => unreachable!("role_matches admits only raw actions"),
+        };
+        if action_fed != fence.fed {
+            return Ok(false);
+        }
+        // The terminal observation is authoritative about the SDK operation that completed.
+        // Adopt it before changing intent status so a failed Pay cannot be manually retried into
+        // the same completed SDK operation.  A different durable operation belongs to another
+        // attempt and is a benign stale no-op.
+        if let Some(observed_op) = update.op_id {
+            match intent.operation_id {
+                Some(recorded) if recorded != observed_op => return Ok(false),
+                None => intent.operation_id = Some(observed_op),
+                _ => {}
             }
         }
-        Ok(notes)
+
+        let mut ledger_satisfied = false;
+        ledger_upsert_in(&mut dbtx, key, |existing, seq| {
+            let existing = existing?;
+            let (fed, op_id, _) = raw_row_parts(&existing.kind)?;
+            if existing.correlation_key != *key
+                || seq != fence.expected_seq
+                || fed != fence.fed
+                || raw_role(&existing.kind) != Some(fence.role)
+                || op_id != fence.expected_op
+            {
+                return None;
+            }
+            // A prior authoritative finalizer can commit the ledger half and crash before it
+            // releases this intent.  Its ordinary terminal row is exactly the terminal evidence
+            // this finalizer prepared, so preserve that immutable audit row and complete only the
+            // matching intent half in this same transaction.  A repaired terminal remains
+            // defeasible: `advance` below is the one authoritative replacement that clears its
+            // repaired bit and records this observation.
+            if existing.status == status && existing.status.is_terminal() && !existing.repaired {
+                ledger_satisfied = true;
+                return None;
+            }
+            if existing.status != fence.expected_ledger_status {
+                return None;
+            }
+            let next = advance(
+                &existing,
+                status,
+                now,
+                Some(update),
+                error,
+                WriteKind::Authoritative,
+            );
+            ledger_satisfied = next.is_some();
+            next
+        })
+        .await?;
+        if !ledger_satisfied {
+            return Ok(false);
+        }
+        let old_status = intent.status;
+        intent.status = intent_status;
+        write_intent_and_index(&mut dbtx, &ikey, key, old_status, &intent, now, error).await?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(true)
     }
 
     /// Open a `Tick` ledger row `Started` before the agent decides (§9.3). Idempotent per
@@ -1126,15 +1906,19 @@ impl FedimintJournal {
         occurrence: Occurrence,
         now_ms: u64,
         message: &str,
+        conflict_suppressed: bool,
     ) -> Result<(), ExecError> {
-        let fed = match decision.action {
-            Action::Move { to, .. } => to,
-            Action::Evacuate { from, .. } => from,
-            Action::DirectInflow { to, .. } | Action::Receive { to, .. } => to,
-            Action::Pay { from, .. } => from,
-            Action::RefuseInflow { fed, .. } => fed,
-            Action::Join { federation, .. } | Action::Recover { federation, .. } => federation,
+        let (fed, amount) = match &decision.action {
+            Action::Move { to, amount, .. } => (*to, Some(*amount)),
+            Action::Evacuate { from, amount, .. } => (*from, Some(*amount)),
+            Action::DirectInflow { to, .. } | Action::Receive { to, .. } => (*to, None),
+            Action::Pay { from, .. } => (*from, None),
+            Action::RefuseInflow { fed, .. } => (*fed, None),
+            Action::Join { federation, .. } | Action::Recover { federation, .. } => {
+                (*federation, None)
+            }
         };
+        let conflict_suppressed = conflict_suppressed && amount.is_some_and(|amount| amount.0 > 0);
         let key = IdempotencyKey(format!(
             "tick-drop:{}:{}",
             occurrence.0, decision.idempotency_key.0
@@ -1147,10 +1931,16 @@ impl FedimintJournal {
                 correlation_key: key.clone(),
                 // A commit-time admission drop of an EXECUTABLE decision — not an
                 // allocator refusal — so there is no shortfall arithmetic to carry; the
-                // `error` field below records why it was dropped.
+                // `error` field below records why it was dropped. A nonzero conflict suppression
+                // records its emitted zero and observational discriminator, so the row alone
+                // distinguishes it from a genuine zero-sized refusal.
                 kind: OperationKind::Refusal {
                     fed,
-                    diagnostics: RefusalDiagnostics::default(),
+                    diagnostics: RefusalDiagnostics {
+                        amount: conflict_suppressed.then_some(Msat(0)),
+                        conflict_suppressed,
+                        ..Default::default()
+                    },
                 },
                 actor: Actor::Agent { occurrence },
                 reason: decision.reason,
@@ -1328,6 +2118,18 @@ impl FedimintJournal {
         &self,
         sel: &OperationRef,
     ) -> Result<Option<OperationRecord>, ExecError> {
+        #[cfg(test)]
+        if self
+            .fail_operation_reads
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(ExecError::Retryable(
+                "injected operation refresh read failure".to_owned(),
+            ));
+        }
         let mut dbtx = self.db.begin_transaction_nc().await;
         let seq = match sel {
             OperationRef::Seq(seq) => *seq,
@@ -1878,6 +2680,18 @@ impl FedimintJournal {
         &self,
         oracle: &dyn LedgerRepairOracle,
     ) -> Result<RepairSummary, ExecError> {
+        let sink = DirectRawIntentTerminalSink { journal: self };
+        self.repair_ledger_with_terminal_sink(oracle, &sink).await
+    }
+
+    /// As [`Self::repair_ledger`], but delegates only raw Pay/Receive terminal
+    /// intent synchronization to `sink`.  The expensive ledger/op-log scan and
+    /// ledger-row repair remain direct and off-actor.
+    pub async fn repair_ledger_with_terminal_sink(
+        &self,
+        oracle: &dyn LedgerRepairOracle,
+        sink: &dyn RawIntentTerminalSink,
+    ) -> Result<RepairSummary, ExecError> {
         let now = self.now_ms();
         let rows = self.scan_ledger_rows().await?;
         let mut summary = RepairSummary::default();
@@ -1908,10 +2722,59 @@ impl FedimintJournal {
         // age gate instead of staying in-flight forever.
         for row in &rows {
             if row.status.is_terminal() {
+                // A prior pass may have committed the ledger terminal but lost its actor sink
+                // response.  Retry that intent synchronization only while this exact row remains
+                // the key's current attempt; an older terminal row must never poison N+1.
+                if classify_key(&row.correlation_key) == KeyClass::Raw {
+                    let Some(role) = raw_role(&row.kind) else {
+                        continue;
+                    };
+                    // This capture is the terminal-row retry's linearization point.  If a retry
+                    // has selected N+1, do not even ask the sink to touch its reservation.
+                    let Some(fence) = self.capture_raw_repair_fence(row, role).await? else {
+                        continue;
+                    };
+                    if raw_terminal_repair_must_not_sink_intent(row) {
+                        // `RAW_NEVER_REACHED` is the one deliberate no-evidence soft repair.
+                        // Its terminal ledger diagnosis remains defeasible until an authoritative
+                        // driver/artifact supersedes it; terminal-row retries must not turn that
+                        // deliberately live intent into a terminal reservation.
+                        continue;
+                    }
+                    let status = if row.status == OperationStatus::Succeeded {
+                        IntentStatus::Done
+                    } else {
+                        IntentStatus::Failed
+                    };
+                    let Some(terminal_fence) =
+                        fence.terminal_sink_fence(row.status, fence.expected_op)
+                    else {
+                        continue;
+                    };
+                    if let Err(error) = self
+                        .sync_raw_intent_terminal(
+                            &row.correlation_key,
+                            &terminal_fence,
+                            status,
+                            row.error.clone(),
+                            sink,
+                        )
+                        .await
+                    {
+                        // The terminal ledger row is already durable.  Keep the pass
+                        // successful so the next scan can retry this sink without hiding
+                        // the committed accounting advancement.
+                        tracing::warn!(
+                            key = %row.correlation_key.0,
+                            ?error,
+                            "journal: terminal raw intent synchronization failed; will retry"
+                        );
+                    }
+                }
                 continue;
             }
             match classify_key(&row.correlation_key) {
-                KeyClass::Raw => match self.repair_raw(row, oracle, now).await {
+                KeyClass::Raw => match self.repair_raw(row, oracle, now, sink).await {
                     Ok(repaired) => summary.repaired += repaired,
                     Err(e) => {
                         tracing::warn!(
@@ -1943,6 +2806,97 @@ impl FedimintJournal {
             }
         }
         Ok(summary)
+    }
+
+    /// Capture the attempt fence for a raw repair from one database snapshot.  The public
+    /// idempotency key deliberately does not identify a retry in the SDK: the attempt's
+    /// correlation key does.  Never read the intent after an op-log request, because a retry can
+    /// replace both the selected ledger row and the intent attempt in that gap.
+    async fn capture_raw_repair_fence(
+        &self,
+        scanned: &OperationRecord,
+        role: RawOperationRole,
+    ) -> Result<Option<RawRepairFence>, ExecError> {
+        let key = &scanned.correlation_key;
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        let Some(index) = dbtx
+            .raw_get_bytes(&ledger_key_index(key))
+            .await
+            .map_err(db_err)?
+        else {
+            return Ok(None);
+        };
+        if read_be64(&index) != Some(scanned.seq) {
+            return Ok(None);
+        }
+        let row_key = ledger_row_key(scanned.seq);
+        let Some(row_bytes) = dbtx.raw_get_bytes(&row_key).await.map_err(db_err)? else {
+            return Ok(None);
+        };
+        let current: OperationRecord = decode_row_result("ledger row", &row_key, &row_bytes)?;
+        let Some((scanned_fed, scanned_op, _)) = raw_row_parts(&scanned.kind) else {
+            return Ok(None);
+        };
+        let Some((fed, op_id, _)) = raw_row_parts(&current.kind) else {
+            return Ok(None);
+        };
+        // The index sequence alone is not sufficient: a concurrent writer may have enriched the
+        // row with a different raw operation while preserving its sequence.
+        if current.correlation_key != *key
+            || current.seq != scanned.seq
+            || current.status != scanned.status
+            || raw_role(&current.kind) != Some(role)
+            || fed != scanned_fed
+            || op_id != scanned_op
+        {
+            return Ok(None);
+        }
+
+        let intent = match dbtx.raw_get_bytes(&intent_key(key)).await.map_err(db_err)? {
+            Some(bytes) => Some(decode_row_result::<Intent>(
+                "intent",
+                &intent_key(key),
+                &bytes,
+            )?),
+            None => None,
+        };
+        let (expected_attempt, attempt_correlation_key, intent_nonterminal) = match intent {
+            Some(intent)
+                if matches!(
+                    (&intent.action, role),
+                    (Action::Pay { .. }, RawOperationRole::Send)
+                        | (Action::Receive { .. }, RawOperationRole::Receive)
+                ) =>
+            {
+                let action_fed = match &intent.action {
+                    Action::Pay { from, .. } => *from,
+                    Action::Receive { to, .. } => *to,
+                    _ => unreachable!("matches above admits only raw actions"),
+                };
+                if action_fed != fed {
+                    return Ok(None);
+                }
+                (
+                    Some(intent.attempt),
+                    intent.operation_correlation_key(),
+                    !intent_status_is_terminal(intent.status),
+                )
+            }
+            Some(_) => return Ok(None),
+            // Standalone raw ledger rows predate intent-backed rows and have no reservation to
+            // sink.  Keep their repair behavior, while intent-backed repair is always fenced.
+            None => (None, key.clone(), false),
+        };
+        Ok(Some(RawRepairFence {
+            expected_seq: scanned.seq,
+            expected_attempt,
+            attempt_correlation_key,
+            intent_nonterminal,
+            fed,
+            expected_op: op_id,
+            role,
+            expected_ledger_status: current.status,
+        }))
     }
 
     /// Arbitrate the `join:` attempts (`attempts`, oldest-first) for one `fed` against the
@@ -2042,8 +2996,15 @@ impl FedimintJournal {
         row: &OperationRecord,
         oracle: &dyn LedgerRepairOracle,
         now: u64,
+        sink: &dyn RawIntentTerminalSink,
     ) -> Result<usize, ExecError> {
         let Some((fed, op_id, payment_hash)) = raw_row_parts(&row.kind) else {
+            return Ok(0);
+        };
+        let Some(role) = raw_role(&row.kind) else {
+            return Ok(0);
+        };
+        let Some(fence) = self.capture_raw_repair_fence(row, role).await? else {
             return Ok(0);
         };
         let key = &row.correlation_key;
@@ -2069,59 +3030,111 @@ impl FedimintJournal {
                     } else {
                         (WriteKind::Authoritative, None)
                     };
-                    self.apply_observation(key, op, &obs, now, write, note)
-                        .await?;
-                    self.sync_raw_intent_from_observation(key, &obs).await?;
-                    return Ok(1);
+                    if self
+                        .apply_observation_if_current(&fence, key, op, &obs, now, write, note)
+                        .await?
+                    {
+                        if let Err(error) = self
+                            .sync_raw_intent_from_observation(key, &fence, op, &obs, sink)
+                            .await
+                        {
+                            tracing::warn!(key = %key.0, ?error, "journal: raw repair sink failed; will retry");
+                        }
+                        return Ok(1);
+                    }
+                    return Ok(0);
                 }
                 // Still in flight → leave Awaiting (truthful) for a later pass.
                 Ok(0)
             }
             None => {
                 // 1. The primary backfill: find the op by its `correlation_key` in `custom_meta`.
-                if let Some(op) = oracle.find_op_by_correlation_key(fed, key).await? {
+                if let Some(op) = oracle
+                    .find_op_by_correlation_key(fed, &fence.attempt_correlation_key)
+                    .await?
+                {
                     let obs = oracle.observe_op(fed, op).await?;
-                    self.apply_observation(key, op, &obs, now, WriteKind::Authoritative, None)
-                        .await?;
-                    self.sync_raw_intent_from_observation(key, &obs).await?;
-                    return Ok(1);
+                    if self
+                        .apply_observation_if_current(
+                            &fence,
+                            key,
+                            op,
+                            &obs,
+                            now,
+                            WriteKind::Authoritative,
+                            None,
+                        )
+                        .await?
+                    {
+                        if let Err(error) = self
+                            .sync_raw_intent_from_observation(key, &fence, op, &obs, sink)
+                            .await
+                        {
+                            tracing::warn!(key = %key.0, ?error, "journal: raw repair sink failed; will retry");
+                        }
+                        return Ok(1);
+                    }
+                    return Ok(0);
                 }
                 // 2. A deduped retry reuses the ORIGINAL op, so its key is in no op's meta; the
                 //    durably-written payment hash is the recovery link (pay rows only).
                 if let Some(hash) = payment_hash {
                     if let Some(op) = oracle.find_send_op_by_payment_hash(fed, hash).await? {
                         let obs = oracle.observe_op(fed, op).await?;
+                        // A hash may resolve an original SDK attempt, but it does not prove that a
+                        // later manual retry owns that operation while it is in flight or if it
+                        // failed. The current retry's correlation key (or an already-recorded
+                        // current op) remains authoritative; only a hash-only terminal success can
+                        // settle the paid invoice. Leave N+1 live rather than adopting/sinking N's
+                        // in-flight or failed operation.
+                        if fence.expected_attempt.is_some_and(|attempt| attempt > 0)
+                            && !matches!(obs.terminal.as_ref(), Some(terminal) if terminal.succeeded)
+                        {
+                            return Ok(0);
+                        }
                         // Attempt attribution is uncertain (deduped retry OR never-sent
                         // attempt), so this is a SOFT correlation with the ambiguity recorded.
-                        self.apply_observation(
-                            key,
-                            op,
-                            &obs,
-                            now,
-                            WriteKind::Repair,
-                            Some(HASH_DEDUP_NOTE),
-                        )
-                        .await?;
-                        self.sync_raw_intent_from_observation(key, &obs).await?;
-                        return Ok(1);
+                        if self
+                            .apply_observation_if_current(
+                                &fence,
+                                key,
+                                op,
+                                &obs,
+                                now,
+                                WriteKind::Repair,
+                                Some(HASH_DEDUP_NOTE),
+                            )
+                            .await?
+                        {
+                            if let Err(error) = self
+                                .sync_raw_intent_from_observation(key, &fence, op, &obs, sink)
+                                .await
+                            {
+                                tracing::warn!(key = %key.0, ?error, "journal: raw repair sink failed; will retry");
+                            }
+                            return Ok(1);
+                        }
+                        return Ok(0);
                     }
                 }
                 // 3. Nothing found: after 1h, a NEGATIVE inference — soft-`Failed` (truthful at
                 //    attempt granularity: a no-hash row was malformed or crashed pre-parse).
                 if now.saturating_sub(row.created_at_ms) >= REPAIR_AGE_MS {
-                    self.apply_repair(
-                        key,
-                        OperationStatus::Failed,
-                        now,
-                        None,
-                        Some(RAW_NEVER_REACHED.to_owned()),
-                        WriteKind::Repair,
-                    )
-                    .await?;
+                    let applied = self
+                        .apply_raw_repair_if_current(
+                            &fence,
+                            key,
+                            OperationStatus::Failed,
+                            now,
+                            None,
+                            Some(RAW_NEVER_REACHED.to_owned()),
+                            WriteKind::Repair,
+                        )
+                        .await?;
                     // Absence of evidence is deliberately SOFT. Keep the intent re-drivable:
                     // the next authoritative Pending→Executing claim will supersede this repaired
                     // ledger conclusion if a late operation appears or a retry reaches the SDK.
-                    return Ok(1);
+                    return Ok(usize::from(applied));
                 }
                 Ok(0)
             }
@@ -2131,19 +3144,32 @@ impl FedimintJournal {
     async fn sync_raw_intent_from_observation(
         &self,
         key: &IdempotencyKey,
+        fence: &RawRepairFence,
+        op: OperationId,
         observation: &RawOpObservation,
+        sink: &dyn RawIntentTerminalSink,
     ) -> Result<(), ExecError> {
         let Some(terminal) = &observation.terminal else {
             return Ok(());
         };
+        let status = if terminal.succeeded {
+            OperationStatus::Succeeded
+        } else {
+            OperationStatus::Failed
+        };
+        let Some(terminal_fence) = fence.terminal_sink_fence(status, Some(op)) else {
+            return Ok(());
+        };
         self.sync_raw_intent_terminal(
             key,
+            &terminal_fence,
             if terminal.succeeded {
                 IntentStatus::Done
             } else {
                 IntentStatus::Failed
             },
-            terminal.error.as_deref(),
+            terminal.error.clone(),
+            sink,
         )
         .await
     }
@@ -2151,40 +3177,39 @@ impl FedimintJournal {
     async fn sync_raw_intent_terminal(
         &self,
         key: &IdempotencyKey,
+        fence: &RawIntentTerminalFence,
         status: IntentStatus,
-        error: Option<&str>,
+        error: Option<String>,
+        sink: &dyn RawIntentTerminalSink,
     ) -> Result<(), ExecError> {
-        let Some(intent) = self.get(key).await? else {
-            return Ok(());
-        };
-        if matches!(intent.action, Action::Pay { .. } | Action::Receive { .. }) {
-            self.set_status(key, status, error).await?;
-        }
+        // The fence was captured in the same snapshot that proved this ledger row current.  The
+        // sink rechecks it atomically with the intent write, so neither a retry N+1 nor an
+        // authoritative same-sequence supersession can be terminalized by this old observation.
+        let _ = sink.set_raw_terminal(key, fence, status, error).await?;
         Ok(())
     }
 
-    /// Apply an op observation to a raw row: terminal → `Succeeded`/`Failed` carrying the
-    /// definitive settlement enrichment; in-flight → `Awaiting`. `note` records an uncertain
-    /// (hash-dedup) attribution; `write` decides whether the terminal is defeasible.
-    async fn apply_observation(
+    /// Apply a repair observation only if the correlation-key index still selects the exact row
+    /// scanned by this pass and that row still belongs to the observed operation.  A manual retry
+    /// moves the index to a new sequence; a delayed N observation then returns `false` without
+    /// touching N+1's ledger row or intent.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_observation_if_current(
         &self,
+        fence: &RawRepairFence,
         key: &IdempotencyKey,
         op: OperationId,
         obs: &RawOpObservation,
         now: u64,
         write: WriteKind,
         note: Option<&str>,
-    ) -> Result<(), ExecError> {
+    ) -> Result<bool, ExecError> {
         let upd = RawOpUpdate {
             op_id: Some(op),
             gateway: obs.gateway.clone(),
             invoice_amount: obs.invoice_amount,
             payment_hash: obs.payment_hash,
             fees: Some(obs.fees),
-            // A TERMINAL observation's fees are the §9.3 definitive settlement statement:
-            // they must replace any pre-call estimate (even with `None` — an unknown
-            // settlement fee must not be papered over by a stale estimate). An in-flight
-            // observation merges as usual.
             fees_definitive: obs.terminal.is_some(),
         };
         let (status, term_error) = match &obs.terminal {
@@ -2198,15 +3223,70 @@ impl FedimintJournal {
             ),
             None => (OperationStatus::Awaiting, None),
         };
-        self.apply_repair(
-            key,
-            status,
-            now,
-            Some(upd),
-            combine_note(note, term_error),
-            write,
-        )
-        .await
+        let error = combine_note(note, term_error);
+        let mut applied = false;
+        let mut dbtx = self.db.begin_transaction().await;
+        ledger_upsert_in(&mut dbtx, key, |existing, seq| {
+            let existing = existing?;
+            let (current_fed, current_op, _) = raw_row_parts(&existing.kind)?;
+            if seq != fence.expected_seq
+                || current_fed != fence.fed
+                || raw_role(&existing.kind) != Some(fence.role)
+                || current_op != fence.expected_op
+                || existing.status != fence.expected_ledger_status
+            {
+                return None;
+            }
+            let next = advance(&existing, status, now, Some(&upd), error.as_deref(), write);
+            applied = next.is_some();
+            next
+        })
+        .await?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(applied)
+    }
+
+    /// The negative (no-op-log-evidence) repair is just as stale-sensitive as a positive
+    /// observation.  It must not turn a retry's current row into Failed merely because an older
+    /// scan became old enough while the operator retried it.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_raw_repair_if_current(
+        &self,
+        fence: &RawRepairFence,
+        key: &IdempotencyKey,
+        status: OperationStatus,
+        now: u64,
+        upd: Option<RawOpUpdate>,
+        error: Option<String>,
+        write: WriteKind,
+    ) -> Result<bool, ExecError> {
+        let mut applied = false;
+        let mut dbtx = self.db.begin_transaction().await;
+        ledger_upsert_in(&mut dbtx, key, |existing, seq| {
+            let existing = existing?;
+            let (fed, op_id, _) = raw_row_parts(&existing.kind)?;
+            if seq != fence.expected_seq
+                || fed != fence.fed
+                || raw_role(&existing.kind) != Some(fence.role)
+                || op_id != fence.expected_op
+                || existing.status != fence.expected_ledger_status
+            {
+                return None;
+            }
+            let next = advance(
+                &existing,
+                status,
+                now,
+                upd.as_ref(),
+                error.as_deref(),
+                write,
+            );
+            applied = next.is_some();
+            next
+        })
+        .await?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(applied)
     }
 
     /// One repair write in its own dbtx: re-read the CURRENT row inside the dbtx and re-apply
@@ -2396,7 +3476,22 @@ const HASH_DEDUP_NOTE: &str = "correlated by payment hash to an existing payment
      attempt-level correlation uncertain (deduped retry or never-sent attempt); the matched \
      operation is authoritative";
 
+/// The only raw terminal repair that intentionally has no settlement evidence.  It remains a
+/// ledger-only, defeasible diagnosis: terminal-row sink retries must not convert its live intent
+/// into `Failed`.  Keep this exact marker guard narrow so witnessed soft repairs (for example
+/// hash-dedup attribution) still release the matching reservation through their fenced sink.
+fn raw_terminal_repair_must_not_sink_intent(row: &OperationRecord) -> bool {
+    row.status == OperationStatus::Failed
+        && row.repaired
+        && row.error.as_deref() == Some(RAW_NEVER_REACHED)
+}
+
+fn intent_status_is_terminal(status: IntentStatus) -> bool {
+    matches!(status, IntentStatus::Done | IntentStatus::Failed)
+}
+
 /// Which repair family a correlation key belongs to (§10.3), by its `<verb>:` prefix.
+#[derive(PartialEq, Eq)]
 enum KeyClass {
     Join,
     Tick,
@@ -2462,6 +3557,142 @@ pub enum RawOperationRole {
     Receive,
 }
 
+/// Correlation and op-log observation captured before the actor's raw-terminal lease.  Its
+/// fields stay private so callers cannot manufacture a terminal settlement without the journal's
+/// row/role checks.
+pub struct PreparedRawOperationTerminal {
+    notes: Vec<String>,
+    expected_attempt: u32,
+    update: Option<RawOpUpdate>,
+    fence: Option<RawRepairFence>,
+    observed_status: Option<OperationStatus>,
+}
+
+#[cfg(test)]
+impl PreparedRawOperationTerminal {
+    /// Test-only unfenced preparation for exercising a caller's finalizer/lease cleanup when its
+    /// in-memory SDK fixture cannot supply an op-log observation.
+    pub(crate) fn unfenced_for_test(expected_attempt: u32) -> Self {
+        Self {
+            notes: Vec::new(),
+            expected_attempt,
+            update: None,
+            fence: None,
+            observed_status: None,
+        }
+    }
+}
+
+/// The durable identity captured before raw repair/finalization leaves the database.  `None`
+/// attempt is retained solely for old standalone ledger rows, which have no intent reservation
+/// to synchronize.
+#[derive(Clone, Debug)]
+struct RawRepairFence {
+    expected_seq: u64,
+    expected_attempt: Option<u32>,
+    attempt_correlation_key: IdempotencyKey,
+    /// Captured with the ledger row and matching intent in one database snapshot.
+    /// Already-terminal intents need no actor sink retry.
+    intent_nonterminal: bool,
+    fed: FederationId,
+    expected_op: Option<OperationId>,
+    role: RawOperationRole,
+    expected_ledger_status: OperationStatus,
+}
+
+impl RawRepairFence {
+    /// Convert a repair scan fence into the sink's post-write fence.  The sink only accepts an
+    /// intent-backed row and only after the expected terminal ledger state has committed.
+    fn terminal_sink_fence(
+        &self,
+        expected_ledger_status: OperationStatus,
+        expected_op: Option<OperationId>,
+    ) -> Option<RawIntentTerminalFence> {
+        (self.intent_nonterminal && expected_ledger_status.is_terminal()).then_some(
+            RawIntentTerminalFence {
+                expected_seq: self.expected_seq,
+                expected_attempt: self.expected_attempt?,
+                fed: self.fed,
+                expected_op,
+                role: self.role,
+                expected_ledger_status,
+            },
+        )
+    }
+}
+
+/// Every fact a raw repair terminal sink must recheck in its one intent-only transaction.
+///
+/// It is public because [`RawIntentTerminalSink`] is an extension point.  Its fields stay private;
+/// callers that need to relay one through another component use [`Self::new`], while the database
+/// transaction remains the authority and rechecks every value before changing an intent.
+#[derive(Clone, Debug)]
+pub struct RawIntentTerminalFence {
+    expected_seq: u64,
+    expected_attempt: u32,
+    fed: FederationId,
+    expected_op: Option<OperationId>,
+    role: RawOperationRole,
+    expected_ledger_status: OperationStatus,
+}
+
+impl RawIntentTerminalFence {
+    /// Name the exact terminal ledger row that authorizes a raw intent terminal transition.
+    /// Construction grants no authority: [`FedimintJournal::set_raw_terminal_if_fenced`] verifies
+    /// every field atomically before it writes the intent or its pending index.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        expected_seq: u64,
+        expected_attempt: u32,
+        fed: FederationId,
+        expected_op: Option<OperationId>,
+        role: RawOperationRole,
+        expected_ledger_status: OperationStatus,
+    ) -> Self {
+        Self {
+            expected_seq,
+            expected_attempt,
+            fed,
+            expected_op,
+            role,
+            expected_ledger_status,
+        }
+    }
+}
+
+/// The sole repair write that changes a raw Pay/Receive intent's terminality.
+/// Service callers inject an actor-backed implementation so repair's op-log scan
+/// stays off actor while its reservation-releasing CAS remains serialized.
+#[async_trait]
+pub trait RawIntentTerminalSink: Send + Sync {
+    async fn set_raw_terminal(
+        &self,
+        key: &IdempotencyKey,
+        fence: &RawIntentTerminalFence,
+        status: IntentStatus,
+        error: Option<String>,
+    ) -> Result<bool, ExecError>;
+}
+
+struct DirectRawIntentTerminalSink<'a> {
+    journal: &'a FedimintJournal,
+}
+
+#[async_trait]
+impl RawIntentTerminalSink for DirectRawIntentTerminalSink<'_> {
+    async fn set_raw_terminal(
+        &self,
+        key: &IdempotencyKey,
+        fence: &RawIntentTerminalFence,
+        status: IntentStatus,
+        error: Option<String>,
+    ) -> Result<bool, ExecError> {
+        self.journal
+            .set_raw_terminal_if_fenced(key, fence, status, error.as_deref())
+            .await
+    }
+}
+
 /// Verify that an externally supplied raw operation handle belongs to a ledger row before an
 /// immutable terminal write. `Ok(true)` means the row has no op id and needs correlation proof.
 pub fn raw_operation_row_matches(
@@ -2484,6 +3715,14 @@ pub fn raw_operation_row_matches(
         }
         Some(_) => Ok(false),
         None => Ok(true),
+    }
+}
+
+fn raw_role(kind: &OperationKind) -> Option<RawOperationRole> {
+    match kind {
+        OperationKind::Pay { .. } => Some(RawOperationRole::Send),
+        OperationKind::Receive { .. } => Some(RawOperationRole::Receive),
+        _ => None,
     }
 }
 
@@ -2554,6 +3793,18 @@ impl Journal for FedimintJournal {
         // indexed under a status it no longer holds (upsert may overwrite an Intent's status).
         if let Some(old_bytes) = dbtx.raw_get_bytes(&ikey).await.map_err(db_err)? {
             let old = decode_row_result::<Intent>("intent", &ikey, &old_bytes)?;
+            if old.attempt != intent.attempt {
+                return Err(ExecError::Permanent(format!(
+                    "journal: stale attempt {} for current attempt {}",
+                    intent.attempt, old.attempt
+                )));
+            }
+            if !intent_status_transition_allowed(old.status, intent.status) {
+                return Err(ExecError::Permanent(format!(
+                    "journal: invalid status transition {:?} -> {:?}",
+                    old.status, intent.status
+                )));
+            }
             if old.status != intent.status && is_indexed(old.status) {
                 dbtx.raw_remove_entry(&pending_index_key(old.status, &intent.idempotency_key))
                     .await
@@ -2575,6 +3826,44 @@ impl Journal for FedimintJournal {
         // `MoveRecord.outcome` fallback still applies on a Failed status).
         write_intent_ledger_row(&mut dbtx, intent, self.now_ms(), None).await?;
         dbtx.commit_tx_result().await.map_err(db_err)?;
+        #[cfg(test)]
+        let replacement = {
+            self.replace_after_upsert
+                .lock()
+                .expect("post-upsert replacement lock poisoned")
+                .take()
+        };
+        #[cfg(test)]
+        if let Some(replacement) = replacement {
+            if replacement.idempotency_key != intent.idempotency_key
+                || replacement.status != intent.status
+            {
+                return Err(ExecError::Permanent(
+                    "journal: invalid post-upsert test replacement identity or status".to_owned(),
+                ));
+            }
+            // The normal write above already atomically established the row/index/ledger shape.
+            // This seam changes only the durable intent bytes under that same indexed key, precisely
+            // to present the actor with a readable mismatched row after a reported post-commit error.
+            let replacement_value = encode_row(&replacement)?;
+            let mut dbtx = self.db.begin_transaction().await;
+            dbtx.raw_insert_bytes(&ikey, &replacement_value)
+                .await
+                .map_err(db_err)?;
+            dbtx.commit_tx_result().await.map_err(db_err)?;
+        }
+        #[cfg(test)]
+        if self
+            .fail_after_upserts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(ExecError::Retryable(
+                "journal: injected error after durable intent upsert".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -2585,6 +3874,7 @@ impl Journal for FedimintJournal {
     async fn set_status(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         status: IntentStatus,
         // §8.3/§9.2: the terminal failure diagnostic. It becomes the ledger row's `error` on a
         // `Failed` transition (executor string first, `MoveRecord.outcome` as fallback).
@@ -2596,7 +3886,18 @@ impl Journal for FedimintJournal {
             return Err(ExecError::Permanent("journal: intent not found".into()));
         };
         let mut intent = decode_row_result::<Intent>("intent", &ikey, &bytes)?;
+        if intent.attempt != expected_attempt {
+            return Err(ExecError::Permanent(format!(
+                "journal: stale attempt {expected_attempt} for current attempt {}",
+                intent.attempt
+            )));
+        }
         let old_status = intent.status;
+        if !intent_status_transition_allowed(old_status, status) {
+            return Err(ExecError::Permanent(format!(
+                "journal: invalid status transition {old_status:?} -> {status:?}"
+            )));
+        }
         intent.status = status;
 
         write_intent_and_index(
@@ -2610,6 +3911,18 @@ impl Journal for FedimintJournal {
         )
         .await?;
         dbtx.commit_tx_result().await.map_err(db_err)?;
+        #[cfg(test)]
+        if self
+            .fail_after_status_writes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(ExecError::Retryable(
+                "injected error after durable intent status write".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -2622,6 +3935,7 @@ impl Journal for FedimintJournal {
     async fn set_status_if(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         expected: IntentStatus,
         new: IntentStatus,
     ) -> Result<bool, ExecError> {
@@ -2638,7 +3952,10 @@ impl Journal for FedimintJournal {
                             return Ok(false);
                         };
                         let mut intent = decode_row_result::<Intent>("intent", &ikey, &bytes)?;
-                        if intent.status != expected {
+                        if intent.attempt != expected_attempt
+                            || intent.status != expected
+                            || !intent_status_transition_allowed(intent.status, new)
+                        {
                             return Ok(false);
                         }
                         intent.status = new;
@@ -2658,8 +3975,25 @@ impl Journal for FedimintJournal {
     }
 
     async fn pending(&self) -> Result<Vec<Intent>, ExecError> {
-        self.intents_indexed_as(&[IntentStatus::Pending, IntentStatus::Executing], false)
-            .await
+        #[cfg(test)]
+        self.pending_reads.fetch_add(1, Ordering::SeqCst);
+        let pending = self
+            .intents_indexed_as(&[IntentStatus::Pending, IntentStatus::Executing], false)
+            .await;
+        #[cfg(test)]
+        {
+            let pause = {
+                self.pending_read_pause
+                    .lock()
+                    .expect("pending read pause lock poisoned")
+                    .take()
+            };
+            if let Some(pause) = pause {
+                pause.started.notify_waiters();
+                pause.release.notified().await;
+            }
+        }
+        pending
     }
 
     async fn awaiting(&self) -> Result<Vec<Intent>, ExecError> {
@@ -2690,30 +4024,6 @@ impl Journal for FedimintJournal {
 
     async fn move_record(&self, key: &IdempotencyKey) -> Result<Option<MoveRecord>, ExecError> {
         self.get_move(key).await
-    }
-
-    async fn set_operation_artifact(
-        &self,
-        key: &IdempotencyKey,
-        operation_id: OperationId,
-        invoice: Option<&wallet_core::Invoice>,
-    ) -> Result<(), ExecError> {
-        let ikey = intent_key(key);
-        let mut dbtx = self.db.begin_transaction().await;
-        let Some(bytes) = dbtx.raw_get_bytes(&ikey).await.map_err(db_err)? else {
-            return Err(ExecError::Permanent("journal: intent not found".into()));
-        };
-        let mut intent = decode_row_result::<Intent>("intent", &ikey, &bytes)?;
-        intent.operation_id = Some(operation_id);
-        if let Some(invoice) = invoice {
-            intent.invoice = Some(invoice.clone());
-        }
-        dbtx.raw_insert_bytes(&ikey, &encode_row(&intent)?)
-            .await
-            .map_err(db_err)?;
-        write_intent_ledger_row(&mut dbtx, &intent, self.now_ms(), None).await?;
-        dbtx.commit_tx_result().await.map_err(db_err)?;
-        Ok(())
     }
 
     fn store_id(&self) -> usize {
@@ -2777,6 +4087,33 @@ async fn write_recovered_user_ownership(
     Ok(())
 }
 
+/// Rewrite only the Intent row and move its `PendingIndexKey` entry from `old_status` to
+/// `new_intent.status`, in the caller's already-open `dbtx`.
+///
+/// This is intentionally separate from [`write_intent_and_index`]: raw-repair's terminal sink
+/// runs *after* its fenced ledger repair is durable and must not rewrite that ledger conclusion.
+async fn write_intent_and_pending_index(
+    dbtx: &mut impl IDatabaseTransactionOpsCore,
+    ikey: &[u8],
+    key: &IdempotencyKey,
+    old_status: IntentStatus,
+    new_intent: &Intent,
+) -> Result<(), ExecError> {
+    if old_status != new_intent.status && is_indexed(old_status) {
+        dbtx.raw_remove_entry(&pending_index_key(old_status, key))
+            .await
+            .map_err(db_err)?;
+    }
+    if is_indexed(new_intent.status) {
+        dbtx.raw_insert_bytes(&pending_index_key(new_intent.status, key), &[])
+            .await
+            .map_err(db_err)?;
+    }
+    let value = encode_row(new_intent)?;
+    dbtx.raw_insert_bytes(ikey, &value).await.map_err(db_err)?;
+    Ok(())
+}
+
 /// Rewrite the Intent row and move its `PendingIndexKey` entry from `old_status` to
 /// `new_intent.status`, in the caller's already-open `dbtx` — the one-dbtx atomicity contract
 /// (spec §8) shared by [`Journal::set_status`] and [`Journal::set_status_if`]. The ledger row
@@ -2791,18 +4128,7 @@ async fn write_intent_and_index(
     now_ms: u64,
     error: Option<&str>,
 ) -> Result<(), ExecError> {
-    if old_status != new_intent.status && is_indexed(old_status) {
-        dbtx.raw_remove_entry(&pending_index_key(old_status, key))
-            .await
-            .map_err(db_err)?;
-    }
-    if is_indexed(new_intent.status) {
-        dbtx.raw_insert_bytes(&pending_index_key(new_intent.status, key), &[])
-            .await
-            .map_err(db_err)?;
-    }
-    let value = encode_row(new_intent)?;
-    dbtx.raw_insert_bytes(ikey, &value).await.map_err(db_err)?;
+    write_intent_and_pending_index(dbtx, ikey, key, old_status, new_intent).await?;
     write_intent_ledger_row(dbtx, new_intent, now_ms, error).await?;
     Ok(())
 }
@@ -2884,6 +4210,52 @@ async fn ledger_upsert_in(
                 .await
                 .map_err(db_err)?;
         }
+    }
+    Ok(())
+}
+
+/// Reject the historical standalone raw writers when this transaction selects an intent-owned raw
+/// row.  The intent existence check and current-ledger-row selection deliberately share the caller's
+/// transaction: a delayed result from attempt N must not inspect one attempt and then mutate a
+/// retry's N+1 row after a separate snapshot/commit boundary.
+///
+/// Standalone raw rows have no intent key, and non-raw intent rows have no raw operation identity,
+/// so both remain available to the legacy writers that still own those production paths.
+async fn reject_legacy_intent_backed_raw_writer(
+    dbtx: &mut impl IDatabaseTransactionOpsCore,
+    key: &IdempotencyKey,
+    writer: &str,
+) -> Result<(), ExecError> {
+    let ikey = intent_key(key);
+    if dbtx.raw_get_bytes(&ikey).await.map_err(db_err)?.is_none() {
+        return Ok(());
+    }
+
+    let index_key = ledger_key_index(key);
+    let Some(seq_bytes) = dbtx.raw_get_bytes(&index_key).await.map_err(db_err)? else {
+        return Ok(());
+    };
+    let seq = read_be64(&seq_bytes).ok_or_else(|| {
+        ExecError::Permanent(format!("journal: corrupt ledger seq index for {}", key.0))
+    })?;
+    let row_key = ledger_row_key(seq);
+    let bytes = dbtx
+        .raw_get_bytes(&row_key)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            ExecError::Permanent(format!(
+                "journal: ledger index for {} points at a missing row (seq {seq})",
+                key.0
+            ))
+        })?;
+    let row: OperationRecord = decode_row_result("ledger row", &row_key, &bytes)?;
+    if raw_row_parts(&row.kind).is_some() {
+        return Err(ExecError::Permanent(format!(
+            "journal: legacy {writer} cannot mutate intent-backed raw operation {}; \
+             use an attempt-fenced raw writer",
+            key.0
+        )));
     }
     Ok(())
 }

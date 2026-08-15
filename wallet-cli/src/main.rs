@@ -836,8 +836,9 @@ async fn run_standalone(cli: Cli) -> Result<(), CliExit> {
     let open_ids = multi_client.federations();
 
     // Money/actor verbs run through the SAME `WalletClient` command path the daemon handlers use
-    // (actor + drivers + scheduler). The agent/diagnostic verbs (discover/probe/tick) and the live
-    // reads (balance/list-feds/status) stay Runtime-direct one-shots — validated, no actor needed.
+    // (actor + drivers; the one-shot standalone service keeps its scheduler OFF). The
+    // agent/diagnostic verbs (discover/probe/tick) and the live reads (balance/list-feds/status)
+    // stay Runtime-direct one-shots — validated, no actor needed.
     if is_actor_verb(&command) {
         return run_standalone_actor(
             command,
@@ -1609,18 +1610,21 @@ async fn actor_command(
         }
         Command::Reconcile => {
             // Mirror the daemon's `/v1/reconcile` handler exactly: actor-side intent re-drive
-            // first (idempotent; the actor registers the re-drive drivers itself), THEN the
-            // off-actor O(ledger) ledger repair (§10.3 / TL-4). The repair runs here — AFTER
-            // reconcile returns, OUTSIDE the actor's critical section — and its CAS hardening
-            // makes it a no-op against any row the actor already terminalized. Best-effort: a
-            // repair I/O fault is logged, never fails the button (the re-drive already committed).
+            // first, then the off-actor O(ledger) repair scan. Its raw Pay/Receive terminal
+            // intent status writes return through the actor. Best-effort: a repair I/O fault is
+            // logged, never fails the button (the re-drive already committed).
             // Standalone is often the ONLY recovery path (walletd is down — that's why the user
             // chose it); omitting the repair here would leave crash-orphaned ledger rows —
             // nonterminal after their intent stopped being pending/awaiting, which the actor
             // re-drive cannot discover — permanently stale in `history`/`show` with no daemon to
             // fix them later.
-            let report = client.reconcile().await.map_err(service_err_to_exit)?;
-            if let Err(error) = journal.repair_ledger(multi_client).await {
+            let report = client
+                .reconcile_durable()
+                .await
+                .map_err(service_err_to_exit)?;
+            if let Err(error) =
+                wallet_fedimint::repair_ledger_with_actor(journal, multi_client, client).await
+            {
                 // Diagnostics go to stderr (the CLI convention), matching the daemon's warn-log.
                 eprintln!(
                     "warning: reconcile: off-actor ledger repair faulted; continuing: {error:?}"
@@ -1736,13 +1740,17 @@ async fn await_standalone(
     timeout: u64,
 ) -> Result<(), CliExit> {
     let key = IdempotencyKey(key);
-    client.reconcile().await.map_err(service_err_to_exit)?;
-    // Off-actor ledger repair, mirroring the daemon (its scheduler runs this every cycle; a
-    // one-shot standalone process has no scheduler). Without it, a crash that left the intent
-    // terminal but its ledger row non-terminal would render "not terminal yet" FOREVER below —
-    // resolve_await reads intent terminality, the render reads the row. Best-effort like the
-    // daemon's: a repair fault must not fail the await (the re-drive above already committed).
-    if let Err(error) = journal.repair_ledger(multi_client).await {
+    client
+        .reconcile_durable()
+        .await
+        .map_err(service_err_to_exit)?;
+    // Off-actor ledger repair, mirroring the daemon (its scheduler runs this every cycle); raw
+    // Pay/Receive terminal intent updates return through the actor. Without it, a crash that
+    // left the intent terminal but its ledger row non-terminal would render "not terminal yet"
+    // forever below. Best-effort like the daemon's: a repair fault must not fail the await.
+    if let Err(error) =
+        wallet_fedimint::repair_ledger_with_actor(journal, multi_client, client).await
+    {
         eprintln!("warning: ledger repair failed: {error:?}");
     }
     let deadline = Instant::now() + Duration::from_secs(timeout);
@@ -2961,35 +2969,47 @@ fn print_show_record(r: &OperationRecord) {
 /// Print the recorded refusal arithmetic (§9.3), one line per figure the deciding site
 /// computed. Shared by the standalone `show` (over an `OperationRecord`) and the client `show`
 /// (over an `OperationView.refusal`) so both diagnose a refusal identically.
-pub(crate) fn print_refusal_diagnostics(diagnostics: &RefusalDiagnostics) {
+fn refusal_diagnostic_lines(diagnostics: &RefusalDiagnostics) -> Vec<String> {
+    let mut lines = Vec::new();
     if let Some(v) = diagnostics.source {
-        println!("source: {}", v.to_hex());
+        lines.push(format!("source: {}", v.to_hex()));
     }
     if let Some(v) = diagnostics.want {
-        println!("want_msat: {}", v.0);
+        lines.push(format!("want_msat: {}", v.0));
     }
     if let Some(v) = diagnostics.available {
-        println!("available_msat: {}", v.0);
+        lines.push(format!("available_msat: {}", v.0));
     }
     if let Some(v) = diagnostics.source_spendable {
-        println!("source_spendable_msat: {}", v.0);
+        lines.push(format!("source_spendable_msat: {}", v.0));
     }
     if let Some(v) = diagnostics.max_fee {
-        println!("max_fee_msat: {}", v.0);
+        lines.push(format!("max_fee_msat: {}", v.0));
     }
     if let Some(v) = diagnostics.max_fee_bps {
-        println!("max_fee_bps: {}", v);
+        lines.push(format!("max_fee_bps: {}", v));
     }
     if let Some(v) = diagnostics.cap_room {
-        println!("cap_room_msat: {}", v.0);
+        lines.push(format!("cap_room_msat: {}", v.0));
     }
     if let Some(v) = diagnostics.amount {
         // Distinct label: the row's headline `amount_msat` is `-` for a refusal (no operation
-        // amount), so a second `amount_msat` here would be a conflicting duplicate key.
-        println!("decision_amount_msat: {}", v.0);
+        // amount), so a second `amount_msat` here would be a conflicting duplicate key. This is
+        // what the allocator emitted, not a decision that necessarily reached admission.
+        lines.push(format!("emitted_amount_msat: {}", v.0));
+    }
+    if diagnostics.conflict_suppressed {
+        lines.push("conflict_suppressed: true".to_owned());
     }
     if let Some(v) = diagnostics.min_move {
-        println!("min_move_msat: {}", v.0);
+        lines.push(format!("min_move_msat: {}", v.0));
+    }
+    lines
+}
+
+pub(crate) fn print_refusal_diagnostics(diagnostics: &RefusalDiagnostics) {
+    for line in refusal_diagnostic_lines(diagnostics) {
+        println!("{line}");
     }
 }
 
@@ -3850,6 +3870,31 @@ mod tests {
     }
 
     // --- §11 history/show formatting ---
+
+    #[test]
+    fn refusal_display_labels_emitted_amount_and_conflict_suppression() {
+        let suppressed = refusal_diagnostic_lines(&RefusalDiagnostics {
+            amount: Some(Msat(0)),
+            conflict_suppressed: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            suppressed,
+            vec!["emitted_amount_msat: 0", "conflict_suppressed: true",]
+        );
+        assert!(
+            !suppressed
+                .iter()
+                .any(|line| line.starts_with("decision_amount")),
+            "the emitted amount is not a decision amount"
+        );
+
+        let genuine_zero = refusal_diagnostic_lines(&RefusalDiagnostics {
+            amount: Some(Msat(0)),
+            ..Default::default()
+        });
+        assert_eq!(genuine_zero, vec!["emitted_amount_msat: 0"]);
+    }
 
     fn ledger_record(
         kind: OperationKind,

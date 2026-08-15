@@ -25,7 +25,11 @@ re-validates the ported scheduler).
   flight can take HOURS (hold invoices, slow HTLC resolution), so **no money operation's
   network IO may ever block another operation's start**. Every money op is: (a) decide +
   journal the intent — serialized, ms-scale; (b) drive the IO in its own concurrent task —
-  journaling per-leg transitions as it goes; (c) journal the terminal — serialized again.
+  journaling per-leg transitions as it goes; (c) journal the terminal — ordinarily
+  serialized again. The narrow raw Pay/Receive/DirectInflow exception observes the network
+  first, then performs only its attempt-fenced DB terminal write under an actor-issued
+  short mutation lease; ending that lease invalidates balance facts for the action's
+  affected federations.
   "Starts immediately" means the wallet is never the bottleneck; LN settlement time is the
   network's business.
 - **P3 — local-only, authed.** 127.0.0.1 (configurable port) + a bearer token from a 0600
@@ -50,9 +54,11 @@ re-validates the ported scheduler).
                                             │ spawns + registers
                                             ▼
                             per-operation IO DRIVER tasks
-                            (LN legs; secs→hours; journal via
-                             Client commands; Drop guard
-                             deregisters on Ok / Err / panic)
+                            (LN legs; secs→hours; ordinary journal
+                             writes via Client commands; fenced raw
+                             terminal DB write under a short actor
+                             lease; Drop guard deregisters on
+                             Ok / Err / panic)
                                             │
                             in-flight registry:
                             std::sync::Mutex<HashMap<IntentKey, DriverEntry>>
@@ -69,13 +75,14 @@ must re-establish each one explicitly; the spec sections cited own the mechanism
 |---|---|---|---|
 | TL-1 | **Probe no-sweep isolation** (docs/archive/phase5-plan.md §5.0, lines 55-68 — "flagged as a Phase-6 precondition") | both probe legs ran synchronously in one process; nothing could spend from candidate `C` between legs, so leg OUT never sweeps pre-existing funds | a **per-fed probe hold** in the actor (§6a.5), with three sharpenings from spec review pass 1: (a) **durable, not registry-bound** — the hold predicate is the probe session's `in_flight` marker in the durable `0x08` record, so a panicked/abandoned driver leaves `C` held until the session resumes or terminalizes (the crash-total session already persists exactly this); (b) **retroactive** — `DecideProbe` DEFERS the probe when any in-flight intent already spends from `C` (visible in the same decide-time scan §6a.4 uses); (c) **evacuation preempts the hold** — `Evacuate(C→safe)` is exempt and drains `C` including the probe delta (rescuing real money outranks a ~20-sat accounting round); the probe then resolves umbrella-only `NoAttempt`/aborted with **no candidate demotion** (insufficient-funds-because-we-evacuated is our fault, not `C`'s). User pays from the spending fed are never affected |
 | TL-2 | **Weekly probe budget** (docs/archive/phase5-plan.md §5.1b rejection: "concurrent-runs budget overrun = v1-unreachable") | one process = one probe at a time; check-then-record could not race | budget check + umbrella-row journal happen in ONE actor command (§6a.2 `DecideProbe`) before the driver spawns — atomic by actor serialization; concurrent probes of different candidates are safe under the same reservations/holds |
-| TL-3 | **Exactly-one perform per intent** (phase1-spec "Single-writer guard": dir lock + `Pending→Executing` CAS) | the dir lock serialized processes; the CAS serialized apply-vs-reconcile within one | the CAS **stays** (belt and braces); all transitions now flow through the actor (single-threaded by construction); the registry adds the missing piece — an ABANDONED driver (perform-timeout) cannot be re-driven while its task lives (re-drive ⇔ no registry entry; Drop guard makes the entry's lifetime equal the task's, §6a.3) |
-| TL-4 | **Ledger repair vs concurrent writers** (phase4-impl-spec §546/§598: "single-writer by convention, but repair must not corrupt if that breaks") | one-shot process; repair could not overlap money ops | the **deliberate exception** to "the actor owns every journal write": `repair_ledger` is an O(ledger) op-log reconciliation of stuck raw-pay/receive/join/tick rows, so it must NOT run inside the actor's critical section (TL-6). The scheduler's `run_cycle` calls `journal.repair_ledger(mc)` DIRECTLY, off-actor, once per cycle right after the actor's intent-only `ReconcileDecide` (which re-drives orphans but does not repair ledger rows). Safety against the actor's concurrent transitions rests on the phase-4 repair CAS hardening — repair only advances a row it still finds non-terminal, so an actor transition that terminalizes it first makes repair a no-op. A repair I/O fault is logged and the cycle continues (best-effort; the intent re-drive already committed its own money-path progress). `POST /v1/reconcile` triggers the same off-actor repair after its actor reconcile |
+| TL-3 | **Exactly-one perform per intent** (phase1-spec "Single-writer guard": dir lock + `Pending→Executing` CAS) | the dir lock serialized processes; the CAS serialized apply-vs-reconcile within one | the CAS **stays** (belt and braces); ordinary intent transitions flow through the actor (single-threaded by construction). The fenced exceptions are the DB-only raw-terminal write under an actor-issued lease and the CAS-fenced actor sink for off-actor ledger repair. The registry adds the missing piece — an ABANDONED driver (perform-timeout) cannot be re-driven while its task lives (re-drive ⇔ no registry entry; Drop guard makes the entry's lifetime equal the task's, §6a.3) |
+| TL-4 | **Ledger repair vs concurrent writers** (phase4-impl-spec §546/§598: "single-writer by convention, but repair must not corrupt if that breaks") | one-shot process; repair could not overlap money ops | the ledger/op-log scan remains the **deliberate off-actor exception** because it is O(ledger) (TL-6), but raw Pay/Receive terminal **intent** synchronization returns through the actor. The scheduler, daemon reconcile endpoint, and standalone reconcile/await call `repair_ledger_with_actor` after actor-side durable reconciliation. Ledger advancement is attempt/sequence/status fenced; the actor sink rechecks the terminal ledger fence before changing the matching nonterminal intent. A repair I/O fault is logged and the cycle continues (best-effort; intent re-drive already committed its own money-path progress) |
 | TL-5 | **The watch loop never races itself** (docs/archive/phase5-plan.md §5.2.0: the loop "IS the single writer") | one loop, sequential cycles, occurrence advanced per cycle | exactly ONE workflow daemon task, started once at boot (§6a.5) — one decision cadence, though the money ops it spawns run concurrently like any others (owner ruling: an evacuation is just a send and never queues); occurrence semantics unchanged |
 | TL-6 | **O(ledger) per-cycle scans + coalescing bypass** (docs/archive/phase5-plan.md §5.2.8 deferrals) | bounded by short-lived processes / accepted for 5.2 | still deferred as performance (no money impact), BUT all O(ledger) reads move OFF-actor (§6a.2) so growth degrades throughput, never pay latency; the soak (§6a.9) is the instrument that decides if an index is needed |
 
-New invariant introduced by 6a itself: **phase-aware reservations** (§6a.4) — the async
-model's replacement for "the balance I probed is the balance I spend".
+New invariant introduced by 6a itself: **strict fresh-user reservations plus generation-fenced
+allocator artifact absorption** (§6a.4) — the async model's replacement for "the balance I probed
+is the balance I spend".
 
 ## 6a.2 The actor
 
@@ -93,7 +100,7 @@ enum Command {
         // re-drive driver right here (pass 10: attach means ENSURE DRIVEN, not wait for
         // the next reconcile); if terminal, reply terminal
         // (phase-1 dedup: Failed stays terminal). Only a genuinely new key proceeds to:
-        // sizing + caps + phase-aware reservations + probe-hold check (TL-1) +
+        // sizing + caps + strict nonterminal intent-status reservations + probe-hold check (TL-1) +
         // journal the Pending intent + register + spawn; returns the intent key.
         // Without the short-circuit, an idempotent retry's own reservation could refuse
         // itself against the original's.
@@ -104,6 +111,12 @@ enum Command {
         // where a concurrent C-spend breaks no-sweep). The hold exists before this
         // command returns.
     JournalTransition { key: IntentKey, t: Transition, reply: … },  // drivers' per-leg + terminal writes
+    SetOperationArtifact { key: IntentKey, attempt: u32, artifact: …, reply: … },
+    PutMove { key: IntentKey, attempt: u32, record: MoveRecord, reply: … },
+        // One-shot, DB-only reservation-release boundaries. A true fenced write bumps the
+        // action's balance generations before the reply; false changes nothing. An ambiguous
+        // write stales that pre-looked-up action; only an attempted mutation with no known
+        // action poisons all balance facts. No command spans network IO.
     // reads (all bounded; O(ledger) scans NEVER here)
     Snapshot { scope: SnapshotScope, reply: … },              // balances/policies for detached readers
     GetPolicy { reply: … },                                   // the DB Policy row
@@ -125,32 +138,33 @@ enum Command {
         // (pass 8): if the invoice artifact is ALREADY journaled — the idempotent-retry
         // case, where the durable BOLT11 exists — reply immediately, don't park.
     // scheduler bookkeeping
-    DecideTickRound { facts: ProbeFacts, route_failures: Vec<MoveRouteProblem>, reply: … },
+    DecideTickRound { facts: ProbeFacts, reply: … },
         // Returns a TickRound STAMPED with planned_generation = the actor's policy
         // generation at plan time (bumped on every accepted PutPolicy). The daemon carries
         // it back into CommitTick so a policy change during route validation is caught (P1).
-        // PURE decide: build_snapshot + allocator over sensed facts + accumulated route
-        // failures; returns candidate decisions; journals nothing. Its JOURNAL-side
+        // Prepares the actor-owned policy/generation facts, then plans the round OFF actor:
+        // plan_tick_round performs route pricing/validation there and returns one candidate
+        // round; it journals nothing. Its JOURNAL-side
         // inputs — the auto-join probe gate (joined − UserApproved via the 0x09
         // registry), active-probe verdicts, and the gate policy — are read INSIDE this
         // command (ms-scale journal reads), exactly as plan_tick reads them today
         // (pass 10: omitting them from the contract would let the daemon tick fund an
-        // auto-joined fed pre-probe). Only NETWORK facts arrive from the daemon. Spec review pass 2
-        // corrected pass 1 here: plan_tick's revision loop AWAITS NETWORK inside —
-        // first_move_route_problem → validate_executor_move_route (runtime.rs:2352, 2363)
-        // is the §15.6 gateway scan — so the LOOP lives in the workflow daemon:
-        //   daemon: probe_all (IO) → DecideTickRound (ms) → validate routes (IO) →
-        //   loop with failures → CommitTick when clean (or revisions exhausted).
-    CommitTick { decisions: Vec<AllocatorDecision>, planned_generation: u64, reply: … },
-        // POLICY-GENERATION GUARD FIRST (P1): if planned_generation != the actor's current
-        // policy generation, a PutPolicy landed during the daemon's route validation and
+        // auto-joined fed pre-probe). Only NETWORK facts arrive from the daemon. Route
+        // validation and any route re-planning are implementation details of the off-actor
+        // plan_tick_round call; the scheduler does not carry a route-failure vector or run a daemon
+        // revision loop. It performs one DecideTickRound followed by one CommitTick.
+    CommitTick { round: TickRound, balances: BTreeMap<FederationId, Msat>,
+                 balance_facts: BalanceFactsToken, tick_key: Option<IdempotencyKey>, reply: … },
+        // POLICY-GENERATION GUARD FIRST (P1): if round.planned_generation != the actor's
+        // current policy generation, a PutPolicy landed during daemon route validation and
         // these decisions were sized against superseded caps/targets — refuse the WHOLE
         // batch (RefuseReason::PolicySuperseded, journaling nothing), the next cycle replans
         // under the current policy. No money op is admitted on stale sizing.
-        // RE-CHECK then commit (spec review passes 3+5): the daemon-side revision loop
-        // takes network time, and user intents accepted meanwhile change the picture —
-        // so CommitTick re-runs THE SAME admission guard DecideOp uses (one shared
-        // function: §6a.4 reservations + per-fed caps + the TL-1 probe hold — pass 5
+        // RE-CHECK then commit (spec review passes 3+5): off-actor planning takes network
+        // time, and user intents accepted meanwhile change the picture —
+        // so CommitTick re-runs the same admission ARITHMETIC with its actor-tokenized
+        // phase-aware reservation view (DecideOp remains strict): §6a.4 reservations +
+        // per-fed caps + the TL-1 probe hold — pass 5
         // caught that a caps-only recheck would let an agent move spend from a held C)
         // against CURRENT state inside its critical section, applied SEQUENTIALLY across
         // the batch — each accepted decision folds into the running reservation view
@@ -163,11 +177,11 @@ enum Command {
         // concurrently exactly like user ops; there is NO agent lane and no queued
         // dispatch. The batch is safe concurrent because every decision's reservations
         // were folded in sequentially at this commit — the sizing already accounts for
-        // all of them). CommitTick also KEEPS the stale-occurrence guard
-        // (ensure_fresh_tick_decisions): a same-occurrence terminal replay fails the
-        // tick step LOUDLY, exactly today's semantics (pass 8) — the watch cycle's
-        // per-cycle occurrence advance makes it rare, never silent. Same philosophy as
-        // the phase-4 TOCTOU re-checks.
+        // all of them). CommitTick also keeps the stale-occurrence terminal replay guard:
+        // a same-occurrence terminal replay receives a recorded,
+        // per-decision conflict refusal while independent decisions in the same CommitTick
+        // continue. The watch cycle's per-cycle occurrence advance makes this rare, never
+        // silent. Same philosophy as the phase-4 TOCTOU re-checks.
     ReconcileDecide { reply: oneshot::Sender<ReconcileReport> },
         // TL-3/TL-4: orphan set = EXACTLY today's re-drive set minus live drivers —
         // (Pending ∨ Executing) ∧ no registry entry. journal.pending() already returns
@@ -233,46 +247,82 @@ One spawned task per in-flight money operation (user or agent — no special age
   mechanisms — deterministic op ids + lnv2 dedup + op-log backfill, live-validated at all
   four crash killpoints.
 
-## 6a.4 Phase-aware reservations (the new sizing invariant)
+## 6a.4 Journal-visible reservations (strict admission, phase-aware allocator)
 
-Sizing reads live balances (probe facts) PLUS journal-visible in-flight work. The rule —
-**reserve only what the balance has not already absorbed** (funding an lnv2 pay debits
-`spendable` the moment the outgoing contract is funded):
+Sizing reads live balances (probe facts) PLUS journal-visible in-flight work. There are two
+deliberately different projections over the same fail-closed
+`journal.reservation_intents()` scan (`Pending | Executing | Awaiting`):
 
-| In-flight state (journal) | Source fed reserves | Destination fed reserves (cap room) |
+1. **Strict user admission.** `DecideOp`, manual retry, generic `wallet-core` apply/admission,
+   and the executor's pre-fund recovery belt for user/probe work retain each nonterminal action's
+   complete reservation. This closes admission races when a caller has no actor-issued balance
+   authority. The pre-fund belt for an already-tokenized allocator goal reuses the allocator view,
+   reading artifacts before its subsequent live balance sample.
+2. **Tokenized allocator admission.** Route pricing, allocator planning, `CommitTick`, and
+   standalone tick under the exclusive database lock may absorb value proven by a validated raw
+   artifact or `MoveRecord` phase. This prevents Pay/Move money already removed from Fedimint
+   spendable from being subtracted a second time during a long settlement.
+
+The strict table remains:
+
+| Intent action and status | Source fed reserves | Destination fed reserves |
 |---|---|---|
-| Intent `Pending`/`Executing`, MoveRecord absent · `Created` · `Invoiced` | amount + fee_cap (spend not yet taken) | amount (undelivered credit counts toward the per-fed cap) |
-| `Sending` (pay issued ⇒ source already debited) | nothing (balance absorbed it) | amount (still undelivered) |
-| `Settled`/terminal · `Refunded` | nothing | nothing (balance reflects reality) |
-| `DirectInflow` `Awaiting` | n/a (no source spend) | amount toward cap room |
-| Raw `pay` (lnv2 send), pre-fund — **no send-op artifact journaled yet** | amount + fee cap (two concurrent pays from one fed must size against each other — the second 202 sees the first's reservation) | n/a |
-| Raw `pay`, post-fund — **send-op artifact journaled** · raw `receive` | nothing (balance absorbed it) | claim credit toward cap at decide time |
-| `Evacuate`, pre-fund | **nothing extra** — the amount IS the source's drain (fees sized inside it at perform time, `size_fresh_evacuation`; pre-reserving `amount + fee_cap` would refuse exactly the small dying-fed balances evacuation exists to drain — the allocator's §4.2 exemption, preserved verbatim; broad review) | amount toward cap room |
-| Probe umbrella (in-flight session) | per its legs, same table | per its legs + the TL-1 probe hold |
+| nonterminal `Move` or `Evacuate` | amount + fee_cap | amount |
+| nonterminal raw `pay` | amount + fee_cap | n/a |
+| nonterminal raw `receive` | n/a | amount |
+| nonterminal `DirectInflow` | n/a | amount |
+| `Join`, `Recover`, advisory refusal, or terminal `Done`/`Failed` | nothing | nothing |
+| Probe move legs | their underlying `Move` reservations | their underlying `Move` reservations plus the logical TL-1 probe hold |
 
-Implemented inside `DecideOp`'s critical section: reservations derive from
-**`journal.pending()` ∪ `journal.awaiting()`** — `Awaiting` is deliberately excluded from
-`pending()` (executor.rs:12-14, reconcile does not re-drive it), so an unpaid
-`DirectInflow` invoice would otherwise be invisible and a concurrent move into the same
-destination could jointly over-cap it when the payer eventually pays (spec review pass 1).
-Each intent's `MoveRecord` phase supplies the row; no new in-memory state to rebuild on
-restart. **For this scan to see raw ops, EVERY walletd money operation journals an Intent**
-(spec review pass 2): raw `pay`/`receive` gain intent kinds instead of being ledger-only —
-one uniform lifecycle (decide → intent → driver → terminal) for user pays, moves, inflows,
-and probes alike; the append-only ledger stays the audit layer on top, as today. Two
-concurrent raw pays from one fed therefore size against each other like any other pair.
-Two hardening rules from spec review pass 4: (a) a raw pay's **pre/post-fund boundary is a
-durable journal artifact** — the driver journals the lnv2 send op id via
-`JournalTransition` the moment the pay is issued, exactly as MoveRecords record their leg
-op ids, so restart/admission always knows which reservation row applies; (b) the
-reservation scan **fails CLOSED**: today's `Journal::pending()` is infallible
-(`-> Vec<Intent>`, executor.rs:133), so a storage read error could masquerade as "zero
-reservations" and admit an overdraw — walletd's decide path uses fallible
-`pending()`/`awaiting()` reads (greenfield: change the trait), and `DecideOp` REFUSES with
-a storage error when the scan errs, never sizing against an empty default. The allocator's same-tick `reserved`/`credited` maps stay for intra-decision
-batches; this table governs cross-operation sizing. Getting this table wrong in the strict
-direction re-creates the smoke_tick over-reservation failure (allocator refuses affordable
-moves); in the loose direction it can overdraw — goldens for every row (§6a.9).
+The allocator projection is:
+
+| Nonterminal action / trusted artifact phase | Source fed reserves | Destination fed reserves |
+|---|---|---|
+| raw `Pay`, no operation id | amount + fee_cap | n/a |
+| raw `Pay`, operation id present | nothing | n/a |
+| raw `Receive` | n/a | action amount |
+| `Move`/`Evacuate`, missing/invalid record or `Created` | action amount + fee_cap | action amount |
+| `Move`/`Evacuate`, `Invoiced` | record amount + record fee_cap | record amount |
+| `Move`/`Evacuate`, `Sending` | nothing | record amount |
+| `DirectInflow`, missing/invalid record or `Created`/impossible `Sending` | n/a | action amount |
+| `DirectInflow`, `Invoiced` | n/a | record amount |
+| trusted terminal move phase, or terminal Intent | nothing | nothing |
+
+A record is trusted only when its key, endpoints, `send_required` direction, and nonzero amount
+match the Intent action; `Move` and `DirectInflow` require exact amount/fee-cap equality, while
+an `Evacuate` may downsize only under its component-derived cap or, for a legacy action, retain
+its planned absolute cap. The phase's required receive/send artifacts must also be present (and
+impossible sender artifacts on a receive-only inflow are rejected). `Created` never downsizes the
+strict action. Missing, undecodable, mismatched, oversized, or impossible state falls back strict;
+it never fails open.
+
+Projected inbound has two deliberately separate meanings at every planning/admission boundary:
+**all** inbound promises consume hard per-federation cap room, while only wallet-delivered
+`Move`/`Evacuate` inbound credits the destination's spending/standby target shortfall. An unpaid
+external `Receive` or `DirectInflow` therefore cannot suppress a top-up. `Sending` releases only
+the source, never the destination promise. Commit-time validation uses the same target-credit
+arithmetic, including earlier accepted decisions in the same batch, so planning cannot repeatedly
+propose a full top-up that commit must reject.
+
+The phase-aware view is sound only with the balance generation that authorized it. Every service
+raw-artifact or `MoveRecord` write, except Runtime's composite direct terminal write, is a
+one-shot, DB-only actor command: the actor captures the matching Intent/action, performs the
+attempt-fenced journal write, and on a true write bumps every affected federation before replying
+or processing another command. A false attempt fence changes no generation. If the writer returns
+an ambiguous durability error after the actor captured the action, it conservatively bumps that
+action's affected generations (and a terminal `Join`/`Recover` also bumps the membership world);
+only a possibly-mutated write whose action is unknown poisons all balance facts. Thus `CommitTick`
+before the artifact sees the strict phase, while artifact first invalidates every older touching
+balance token. Runtime's excluded composite direct terminal write remains protected by the existing
+external terminal lease, which is never nested around an actor artifact command.
+
+`Awaiting` is deliberately excluded from operational `pending()` (reconcile does not re-drive
+subscription-owned work), so the reservation scan includes it explicitly. Every walletd money
+operation journals an Intent: raw `pay`/`receive`, moves, inflows, and probe legs share one
+lifecycle, with the append-only ledger as the audit layer. The allocator's same-tick
+`reserved`/`credited` maps remain for intra-decision batches; these tables govern cross-operation
+sizing. Getting the fallback loose can overdraw; keeping the allocator universally strict can size
+a shutdown evacuation to zero after an earlier send already reduced spendable (§6a.9).
 
 ## 6a.5 The watch scheduler = a workflow daemon
 
@@ -347,8 +397,8 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
 | join / approve / candidates | `POST /v1/join` · `/v1/approve` · `GET /v1/candidates` | join async **with the full Intent lifecycle** (kind `join`: decide → intent → driver → terminal; a crash after the 202 re-drives via reconcile like any operation — broad review; the ledger join row stays the audit layer) |
 | reconcile (admin) | `POST /v1/reconcile` | idempotent crash-recovery pass on demand — the "it's wedged" button |
 | policy | `GET /v1/policy` · `PUT /v1/policy` | the standing instruction's parameters (DB-stored `Policy` struct); PUT validates + journals the change, effective next decide |
-| discover / probe (manual) | — deferred from v1 | agent covers both; standalone CLI for one-offs |
-| tick (manual) | — deliberate omission | the scheduler owns cadence |
+| discover / probe (manual) | — no daemon endpoint | standalone CLI Runtime-direct one-offs; daemon scheduler drives the automated forms |
+| tick (manual) | — no daemon endpoint | standalone CLI Runtime-direct one-shot; the daemon scheduler owns recurring cadence |
 
 - **Error taxonomy (galtland layered results — house style, applied):** `wallet-api`
   errors keep three layers distinctly matchable, never flattened at the boundary:
@@ -418,14 +468,17 @@ URL + token from config/env); if the daemon isn't running the verb fails with a 
 "start walletd, or rerun with `--standalone`" error — never a silent fallback.
 **`--standalone` is a deliberate flag** (it takes the exclusive `db.lock`; a silent
 fallback would quietly block a supervisor-restarting daemon behind a lock race the user
-didn't choose): it spins up the same actor + driver components in-process (minus HTTP),
-runs the one command, shuts down — one code path, no legacy fork. `pay`/`move` print the
-operation key and `await-*` long-polls, preserving today's two-phase stdout contracts so
-the smoke scripts port mechanically. **The `watch` verb is DELETED** — the daemon IS the
-watch: redundant in client mode, a daemon-without-an-API in standalone mode (the 5.2c
-smoke is superseded by the 6a daemon gates, which re-validate the ported scheduler in its
-new home). Clear errors: daemon-not-running (with the two options), 401 (bad token),
-lock-held.
+didn't choose): money/actor verbs spin up the same actor + driver components in-process
+with the scheduler OFF, run one command, then shut down — one code path, no legacy fork.
+`discover`, `probe`, and `tick` are deliberately Runtime-direct one-shots instead. This is
+the isolated `--standalone tick` compatibility exception recorded by ADR-0031: it holds the
+exclusive DB lock and re-scans durable goals immediately before apply; it is not a resident
+host architecture. `pay`/`move` print the operation key and `await-*` long-polls, preserving
+today's two-phase stdout contracts so the smoke scripts port mechanically. **The `watch`
+verb is DELETED** — the daemon IS the watch: redundant in client mode, a daemon-without-an-API
+in standalone mode (the 5.2c smoke is superseded by the 6a daemon gates, which re-validate
+the ported scheduler in its new home). Clear errors: daemon-not-running (with the two
+options), 401 (bad token), lock-held.
 
 ## 6a.8 Lifecycle + observability
 

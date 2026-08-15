@@ -129,10 +129,11 @@ predicates:
 - **A shared route** — one gateway carrying both ends — should be served only by a gateway
   vetted by **both** federations. NOTE this is the INTENT, not today's behaviour: automated
   selection starts from the destination's list (`mc.gateways(&to)`) and validates the source end
-  only by fetching `routing_info` (`route_econ.rs:301-333`, `executor.rs:344-349`,
-  `multi_client.rs:958-964`), so a responsive gateway vetted only by the destination — or since
-  revoked by the source — can still carry an automated move. Closing that gap is work, not
-  vocabulary; until it is closed, do not cite this entry as though the invariant holds.
+  only by fetching `routing_info` (`route_econ::pair_economics`,
+  `FedimintExecutor::gateway_serves_route`, `MultiClient::validate_gateway`), so a responsive
+  gateway vetted only by the destination — or since revoked by the source — can still carry an
+  automated move. Closing that gap is work, not vocabulary; until it is closed, do not cite this
+  entry as though the invariant holds.
 - **A hop leg** is served by a gateway vetted by the **one** federation at that end.
   A hop's source leg and destination leg are judged separately, each against its own
   federation's list; neither gateway need be known to the other federation.
@@ -144,8 +145,9 @@ gateway gets abandoned for a dearer route:
 Genuine failures are: not vetted, does not validate, its quote errors or times out, no amount
 can be sized over it at all, or the best amount it CAN carry costs more in fees than it
 delivers, or it QUOTES BUT DOES NOT PERFORM — answering `routing_info` and fee quotes while
-hanging or rejecting the actual `receive`/`pay` (the request-level misbehaving double ADR-0030's
-responsiveness gate uses is exactly this shape). Quoting is not serving: without that term, strict
+then hanging or rejecting the actual `receive`/`pay`. ADR-0030 requires a request-level
+misbehaving double for that future gate; the current `hang_gateway.py` smoke double never answers
+at all and therefore proves only the broader timeout boundary. Quoting is not serving: without that term, strict
 swap-first reselects such a gateway every tick, or replays it once the receive has committed, and
 a viable hop is never reached. An implementation needs a bounded record of recent perform-level
 failures per gateway so a repeat offender stops counting as serving.
@@ -283,14 +285,16 @@ The user-facing unit of wallet activity — a pay, receive, move, join, probe �
 identified by its **operation key** and listed by `history`. Every API/CLI/app
 surface speaks of operations; EXECUTABLE operations are driven internally by an
 **Intent** — the money ones, and also `join` and `recover`
-(`wallet-cli/src/main.rs:1394-1400`, `wallet-fedimint/src/executor.rs:1258`).
+(`Action::is_executable` applied to `Intent::action`).
 _Avoid_: "intent" in any user-facing surface, "transaction"
 
 **Intent**:
 The internal durable, executable record inside an executable **Operation**'s
-lifecycle: an idempotency-keyed decision driven Pending → Executing → terminal,
-crash-resumable via reconcile. NOT money-only — `Action::Join`
-(`wallet-fedimint/src/runtime.rs:1025-1030`) and `Action::Recover` are `Intent`s
+lifecycle: an idempotency-keyed, decision-driven record that may be `Pending`,
+`Executing`, or subscription/external-payment-owned `Awaiting` until terminal,
+and is crash-resumable via reconcile. Reconcile does not re-perform `Awaiting`
+work. NOT money-only — `Action::Join`
+and `Action::Recover` pass `Action::is_executable` through `Intent::action`; they are `Intent`s
 too, which is why ADR-0030's await
 provenance rule has to distinguish "user-initiated" from "resolves a route"
 rather than treating those as the same test. Never appears in API type names or user copy.
@@ -304,9 +308,38 @@ never in a host config file.
 _Avoid_: "settings"/"config" for these (reserve those for host/deployment
 concerns like paths and ports, which do live in a config file)
 
+**Engine**:
+The wallet's resident decision-and-admission core: the engine-hosted service actor owns
+intent admission, runs the Allocator, and admits every host-driven **Intent** — plus the
+executor machinery it drives. In an engine-hosted service, every reservation-changing production
+raw artifact and `MoveRecord` write is a one-shot actor command which bumps the affected balance
+generations before later allocator authority. The narrow direct-write exceptions admit no fresh
+resident intent: the DB-only composite raw terminal write runs under an actor terminal lease, and
+the O(ledger) off-actor repair scan routes its reservation-releasing intent sink back through the
+actor/CAS fence. The isolated standalone runtime may write directly only while it holds the
+wallet's exclusive DB lock. Every resident **Host** embeds the same engine (ADR-0031). The isolated
+`wallet-cli --standalone tick` compatibility command is the documented
+admission exception: under the wallet's exclusive DB lock it plans and applies one phase-aware
+allocator batch through `Runtime`, with its own final conflict re-scan. It is not a second
+resident engine or the model for a future host. Admitting agent work anywhere
+else is reaching around the engine.
+_Avoid_: "backend"; "daemon" (walletd is a **Host** of the engine, not the
+engine)
 
+**Host**:
+The process that embeds, drives, and supervises the **Engine**: `walletd` on a
+server, the Android app on a phone. The host owns scheduling cadence (a
+resident loop, or platform wakes), restart supervision, and deployment config —
+it decides *when* the engine runs, never *what* the engine decides.
+_Avoid_: conflating with **Frontend** (walletd is a host that also transports
+two frontends)
 
-
-
-
-
+**Frontend**:
+A user surface over the engine's operation API — `wallet-cli`, the web UI, the
+Android UI. A resident frontend talks to the **Engine** (in-process, or through
+a **Host** like walletd) and never schedules, supervises, or admits work itself.
+The isolated `wallet-cli --standalone tick` compatibility mode is the documented
+exception: its one-shot process invokes `Runtime` directly under the exclusive
+DB lock; it is not the architecture for a resident frontend.
+_Avoid_: "client" (collides with the fedimint client), "app" for non-Android
+surfaces

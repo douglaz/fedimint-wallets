@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::{collections::BTreeSet, str::FromStr};
 use tokio::sync::Barrier;
 use wallet_core::{
-    apply, decide_and_journal, drive_to_terminal, project_reservations, reconcile, Action, Actor,
-    AllocatorDecision, DecideAndJournal, DiscoverySource, ExecError, ExecutionSummary, Executor,
-    FederationId, IdempotencyKey, Intent, IntentStatus, Journal, MockExecutor, Msat, Occurrence,
-    OperationKind, OperationStatus, PerformOutcome, ReasonCode,
+    apply, decide_and_journal, drive_intent_step, drive_to_terminal, project_reservations,
+    reconcile, Action, Actor, AllocatorDecision, DecideAndJournal, DiscoverySource, ExecError,
+    ExecutionSummary, Executor, FederationId, IdempotencyKey, Intent, IntentStatus, Journal,
+    MockExecutor, Msat, Occurrence, OperationKind, OperationStatus, PerformOutcome, ReasonCode,
 };
 use wallet_fedimint::{
     CandidateRecord, CandidateState, FederationInfo, FedimintJournal, GatewayUrl, Invoice,
@@ -151,7 +151,7 @@ async fn set_status_moves_between_indexes() {
     assert!(!has_key(&journal.failed().await, "k2"));
 
     journal
-        .set_status(&i.idempotency_key, IntentStatus::Failed, None)
+        .set_status(&i.idempotency_key, 0, IntentStatus::Failed, None)
         .await
         .expect("set_status");
 
@@ -181,6 +181,7 @@ async fn set_status_if_cas() {
     assert!(journal
         .set_status_if(
             &i.idempotency_key,
+            i.attempt,
             IntentStatus::Pending,
             IntentStatus::Executing,
         )
@@ -201,6 +202,7 @@ async fn set_status_if_cas() {
     assert!(!journal
         .set_status_if(
             &i.idempotency_key,
+            i.attempt,
             IntentStatus::Pending,
             IntentStatus::Executing,
         )
@@ -220,6 +222,7 @@ async fn set_status_if_cas() {
     assert!(journal
         .set_status_if(
             &i.idempotency_key,
+            i.attempt,
             IntentStatus::Executing,
             IntentStatus::Failed,
         )
@@ -231,7 +234,12 @@ async fn set_status_if_cas() {
     // An absent key never matches any `expected`.
     let missing = IdempotencyKey("no-such-key".to_string());
     assert!(!journal
-        .set_status_if(&missing, IntentStatus::Pending, IntentStatus::Executing)
+        .set_status_if(
+            &missing,
+            i.attempt,
+            IntentStatus::Pending,
+            IntentStatus::Executing
+        )
         .await
         .expect("set_status_if"));
 }
@@ -473,7 +481,7 @@ async fn move_record_roundtrip() {
 }
 
 #[tokio::test]
-async fn raw_pay_artifact_durably_ends_the_source_reservation() {
+async fn raw_pay_artifact_does_not_end_the_strict_source_reservation() {
     let journal = mem_journal();
     let mut pay = intent("raw-pay", IntentStatus::Pending);
     pay.action = Action::Pay {
@@ -489,15 +497,15 @@ async fn raw_pay_artifact_durably_ends_the_source_reservation() {
 
     let pending = journal.pending().await.expect("pending");
     assert_eq!(
-        project_reservations(&pending, |_| None).outbound(fed(1)),
+        project_reservations(&pending).outbound(fed(1)),
         Msat(102_000)
     );
 
     let operation_id = OperationId([9; 32]);
-    journal
-        .set_operation_artifact(&pay.idempotency_key, operation_id, None)
+    assert!(journal
+        .set_operation_artifact_if_attempt(&pay.idempotency_key, pay.attempt, operation_id, None,)
         .await
-        .expect("persist raw send artifact");
+        .expect("persist raw send artifact"));
     let reopened = journal
         .get(&pay.idempotency_key)
         .await
@@ -517,8 +525,242 @@ async fn raw_pay_artifact_durably_ends_the_source_reservation() {
         } if id == operation_id
     ));
     assert_eq!(
-        project_reservations(std::slice::from_ref(&reopened), |_| None).outbound(fed(1)),
-        Msat(0)
+        project_reservations(std::slice::from_ref(&reopened)).outbound(fed(1)),
+        Msat(102_000)
+    );
+}
+
+#[tokio::test]
+async fn delayed_raw_artifact_from_attempt_n_cannot_mutate_retry_n_plus_one() {
+    let journal = mem_journal();
+    let mut first = intent("pay:stale-artifact", IntentStatus::Pending);
+    first.action = Action::Pay {
+        from: fed(1),
+        invoice: Invoice("lnbc1fixture".into()),
+        amount: Msat(100_000),
+        fee_cap: Msat(2_000),
+        payment_hash: [7; 32],
+        gateway: None,
+    };
+    first.max_fee = Some(Msat(2_000));
+    journal.upsert(&first).await.expect("seed attempt N");
+
+    // Reconcile has terminalized N and the actor has durably replaced it with N+1 before N's
+    // delayed SDK result reaches the artifact sink.
+    journal
+        .set_status(
+            &first.idempotency_key,
+            0,
+            IntentStatus::Failed,
+            Some("repaired before delayed SDK result"),
+        )
+        .await
+        .expect("terminalize attempt N");
+    let mut retry = first.clone();
+    retry.attempt = 1;
+    retry.status = IntentStatus::Pending;
+    retry.operation_id = None;
+    journal
+        .retry_failed_intent(&retry)
+        .await
+        .expect("create attempt N+1");
+
+    assert!(!journal
+        .set_operation_artifact_if_attempt(
+            &first.idempotency_key,
+            first.attempt,
+            OperationId([9; 32]),
+            None,
+        )
+        .await
+        .expect("stale artifact is a benign compare failure"));
+    let current = journal
+        .get(&first.idempotency_key)
+        .await
+        .expect("read retry")
+        .expect("retry exists");
+    assert_eq!(current.attempt, 1);
+    assert_eq!(current.status, IntentStatus::Pending);
+    assert_eq!(current.operation_id, None);
+    let current_ledger = journal
+        .operation(&OperationRef::Key(first.idempotency_key.clone()))
+        .await
+        .expect("read retry ledger")
+        .expect("retry ledger exists");
+    assert!(matches!(
+        current_ledger.kind,
+        OperationKind::Pay { op_id: None, .. }
+    ));
+}
+
+#[tokio::test]
+async fn delayed_move_record_from_attempt_n_cannot_recreate_retry_cache() {
+    let journal = mem_journal();
+    let first = intent("move:stale-cache", IntentStatus::Pending);
+    journal.upsert(&first).await.expect("seed attempt N");
+    journal
+        .set_status(
+            &first.idempotency_key,
+            first.attempt,
+            IntentStatus::Failed,
+            Some("operator retries"),
+        )
+        .await
+        .expect("terminalize N");
+    let mut retry = first.clone();
+    retry.attempt = 1;
+    retry.status = IntentStatus::Pending;
+    journal
+        .retry_failed_intent(&retry)
+        .await
+        .expect("create attempt N+1 and reset its cache");
+
+    assert!(!journal
+        .put_move_if_attempt(
+            &first.idempotency_key,
+            first.attempt,
+            &move_record("move:stale-cache")
+        )
+        .await
+        .expect("late cache write is a benign compare failure"));
+    assert_eq!(
+        journal
+            .get_move(&first.idempotency_key)
+            .await
+            .expect("read cache"),
+        None,
+        "the old attempt must not recreate the cache reset for N+1"
+    );
+}
+
+#[tokio::test]
+async fn delayed_recovery_completion_from_attempt_n_cannot_publish_retry_n_plus_one() {
+    let journal = mem_journal();
+    let id = fed(0xD4);
+    let key = IdempotencyKey("recover:stale-completion".into());
+    let first = recover_intent(&key, id, "fed1recover");
+    let info = FederationInfo {
+        invite: "fed1recover".into(),
+        db_prefix: 91,
+        joined_at: 0,
+    };
+    journal.upsert(&first).await.expect("seed recovery N");
+    journal
+        .set_status(&key, 0, IntentStatus::Failed, Some("operator retries"))
+        .await
+        .expect("terminalize N");
+    let mut retry = first.clone();
+    retry.attempt = 1;
+    retry.status = IntentStatus::Pending;
+    journal
+        .retry_failed_intent(&retry)
+        .await
+        .expect("start recovery N+1");
+
+    assert!(!journal
+        .complete_recovery(&id, &info, &invite(), &key, first.attempt)
+        .await
+        .expect("late completion is a benign compare failure"));
+    assert_eq!(
+        journal
+            .get(&key)
+            .await
+            .expect("read retry")
+            .expect("retry")
+            .status,
+        IntentStatus::Pending
+    );
+    assert_eq!(journal.get_federation(&id).await.expect("registry"), None);
+}
+
+#[tokio::test]
+async fn delayed_join_outcome_from_attempt_n_cannot_stamp_retry_n_plus_one() {
+    let journal = mem_journal();
+    let mut first = intent("join:stale-outcome", IntentStatus::Executing);
+    first.action = Action::Join {
+        federation: fed(0xD5),
+        invite: "invite".into(),
+        membership_preexisting: false,
+    };
+    first.max_fee = None;
+    journal.upsert(&first).await.expect("seed join N");
+    journal
+        .set_status(
+            &first.idempotency_key,
+            0,
+            IntentStatus::Failed,
+            Some("operator retries"),
+        )
+        .await
+        .expect("terminalize N");
+    let mut retry = first.clone();
+    retry.attempt = 1;
+    retry.status = IntentStatus::Pending;
+    journal
+        .retry_failed_intent(&retry)
+        .await
+        .expect("start join N+1");
+
+    assert!(!journal
+        .record_join_outcome(&first.idempotency_key, first.attempt, true)
+        .await
+        .expect("late join result is a benign compare failure"));
+    assert_eq!(
+        journal
+            .get(&first.idempotency_key)
+            .await
+            .expect("read retry")
+            .expect("retry")
+            .status,
+        IntentStatus::Pending
+    );
+    assert_eq!(
+        journal
+            .operation(&OperationRef::Key(first.idempotency_key))
+            .await
+            .expect("read current ledger")
+            .expect("current ledger")
+            .status,
+        OperationStatus::Started
+    );
+}
+
+#[tokio::test]
+async fn awaiting_intent_rejects_pending_and_keeps_ledger_awaiting() {
+    let journal = mem_journal();
+    let awaiting = intent("move:awaiting-does-not-reset", IntentStatus::Awaiting);
+    journal
+        .upsert(&awaiting)
+        .await
+        .expect("seed awaiting intent");
+    assert!(matches!(
+        journal
+            .set_status(
+                &awaiting.idempotency_key,
+                awaiting.attempt,
+                IntentStatus::Pending,
+                None,
+            )
+            .await,
+        Err(ExecError::Permanent(_))
+    ));
+    assert_eq!(
+        journal
+            .get(&awaiting.idempotency_key)
+            .await
+            .expect("read intent")
+            .expect("intent")
+            .status,
+        IntentStatus::Awaiting
+    );
+    assert_eq!(
+        journal
+            .operation(&OperationRef::Key(awaiting.idempotency_key))
+            .await
+            .expect("read ledger")
+            .expect("ledger")
+            .status,
+        OperationStatus::Awaiting
     );
 }
 
@@ -534,11 +776,11 @@ async fn join_outcome_preserves_the_noop_audit_note_through_intent_completion() 
     join.max_fee = None;
     journal.upsert(&join).await.expect("upsert join intent");
     journal
-        .record_join_outcome(&join.idempotency_key, false)
+        .record_join_outcome(&join.idempotency_key, join.attempt, false)
         .await
         .expect("record join outcome");
     journal
-        .set_status(&join.idempotency_key, IntentStatus::Done, None)
+        .set_status(&join.idempotency_key, 0, IntentStatus::Done, None)
         .await
         .expect("complete join intent");
 
@@ -710,7 +952,7 @@ async fn recovery_registration_terminalizes_the_intent_atomically() {
     journal.upsert(&recovery).await.expect("upsert recovery");
 
     journal
-        .complete_recovery(&id, &info, &invite(), &key)
+        .complete_recovery(&id, &info, &invite(), &key, recovery.attempt)
         .await
         .expect("publish recovered federation");
 
@@ -793,7 +1035,7 @@ async fn complete_recovery_records_user_owned_candidate() {
             .await
             .expect("upsert recovery");
         journal
-            .complete_recovery(&id, &info, &invite(), &key)
+            .complete_recovery(&id, &info, &invite(), &key, 0)
             .await
             .expect("complete recovery");
         assert_eq!(
@@ -827,7 +1069,7 @@ async fn complete_recovery_records_user_owned_candidate() {
             .await
             .expect("upsert recovery");
         journal
-            .complete_recovery(&id, &info, &invite(), &key)
+            .complete_recovery(&id, &info, &invite(), &key, 0)
             .await
             .expect("complete recovery");
         assert_eq!(
@@ -1613,7 +1855,10 @@ async fn shared_database_handle_persists() {
     let i = intent("persist", IntentStatus::Pending);
     writer.upsert(&i).await.expect("upsert");
     let rec = move_record("persist");
-    writer.put_move(&rec).await.expect("put_move");
+    assert!(writer
+        .put_move_if_attempt(&i.idempotency_key, i.attempt, &rec)
+        .await
+        .expect("put_move"));
 
     // A fresh journal over the same Database sees everything the writer committed.
     let reader = FedimintJournal::new(db);
@@ -1674,20 +1919,26 @@ impl Journal for BarrierJournal {
     async fn set_status(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         status: IntentStatus,
         error: Option<&str>,
     ) -> Result<(), ExecError> {
-        self.inner.set_status(key, status, error).await
+        self.inner
+            .set_status(key, expected_attempt, status, error)
+            .await
     }
 
     async fn set_status_if(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         expected: IntentStatus,
         new: IntentStatus,
     ) -> Result<bool, ExecError> {
         self.barrier.wait().await;
-        self.inner.set_status_if(key, expected, new).await
+        self.inner
+            .set_status_if(key, expected_attempt, expected, new)
+            .await
     }
 
     async fn pending(&self) -> Result<Vec<Intent>, ExecError> {
@@ -1786,6 +2037,109 @@ impl Executor for BlockingExecutor {
 
         Ok(PerformOutcome::Done)
     }
+}
+
+/// A direct core drive holds attempt N in `perform` while an independent durable writer
+/// terminalizes and retries it.  This deliberately bypasses `ActorJournal`: the durable
+/// `FedimintJournal` itself must fence every late lifecycle write from N.
+#[tokio::test]
+async fn direct_durable_drive_cannot_overwrite_a_retried_attempt() {
+    let journal = Arc::new(mem_journal());
+    let first = intent("direct-stale-drive", IntentStatus::Pending);
+    journal.upsert(&first).await.expect("seed attempt N");
+
+    let executor = Arc::new(BlockingExecutor::new());
+    let drive_journal = Arc::clone(&journal);
+    let drive_executor = Arc::clone(&executor);
+    let drive_intent = first.clone();
+    let drive = tokio::spawn(async move {
+        let mut summary = ExecutionSummary::default();
+        let result = drive_intent_step(
+            drive_journal.as_ref(),
+            drive_executor.as_ref(),
+            &drive_intent,
+            &mut summary,
+        )
+        .await;
+        (result, summary)
+    });
+
+    // The core driver has atomically claimed N and is now blocked in the effect.
+    executor.first_entered.wait().await;
+    journal
+        .set_status(
+            &first.idempotency_key,
+            first.attempt,
+            IntentStatus::Failed,
+            Some("operator terminalized attempt N"),
+        )
+        .await
+        .expect("terminalize attempt N");
+    let regression = journal
+        .set_status(
+            &first.idempotency_key,
+            first.attempt,
+            IntentStatus::Pending,
+            None,
+        )
+        .await
+        .expect_err("a terminal attempt cannot regress");
+    assert!(matches!(
+        regression,
+        ExecError::Permanent(message) if message.contains("invalid status transition")
+    ));
+    let mut retry = first.clone();
+    retry.attempt += 1;
+    retry.status = IntentStatus::Pending;
+    retry.operation_id = None;
+    retry.invoice = None;
+    journal
+        .retry_failed_intent(&retry)
+        .await
+        .expect("create attempt N+1");
+
+    // An old gateway refresh may not replace the retried row, even before the blocked driver's
+    // delayed terminal write arrives.
+    let stale_upsert = journal
+        .upsert(&first)
+        .await
+        .expect_err("attempt-N upsert must not overwrite N+1");
+    assert!(matches!(
+        stale_upsert,
+        ExecError::Permanent(message) if message.contains("stale attempt")
+    ));
+    assert_eq!(
+        journal
+            .set_status_if(
+                &first.idempotency_key,
+                first.attempt,
+                IntentStatus::Pending,
+                IntentStatus::Executing,
+            )
+            .await,
+        Ok(false),
+        "a stale compare is a benign no-op"
+    );
+
+    executor.release_first.wait().await;
+    let (late_result, summary) = drive.await.expect("blocked drive joins");
+    assert!(matches!(
+        late_result,
+        Err(ExecError::Permanent(message)) if message.contains("stale attempt")
+    ));
+    assert_eq!(
+        summary.failed, 1,
+        "the late status write is surfaced to its old driver"
+    );
+
+    let current = journal
+        .get(&first.idempotency_key)
+        .await
+        .expect("read retry")
+        .expect("retry exists");
+    assert_eq!(current.attempt, retry.attempt);
+    assert_eq!(current.status, IntentStatus::Pending);
+    assert_eq!(current.operation_id, None);
 }
 
 /// The CAS itself cannot cover an intent that is ALREADY `Executing` (past the CAS claim,
@@ -2060,7 +2414,10 @@ async fn stored_rows_are_versioned_json_envelopes() {
         joined_at: 1_700_001_000,
     };
     journal.upsert(&i).await.expect("upsert intent");
-    journal.put_move(&rec).await.expect("put move");
+    assert!(journal
+        .put_move_if_attempt(&i.idempotency_key, i.attempt, &rec)
+        .await
+        .expect("put move"));
     journal
         .put_federation(&fed_id, &fed_info)
         .await
@@ -2172,7 +2529,7 @@ async fn awaiting_intents_are_scannable_for_resume() {
     // Once it returns Awaiting (invoice surfaced, payer external), it leaves pending() and
     // becomes discoverable by awaiting() for subscription rehydration (spec §9.3).
     journal
-        .set_status(&key, IntentStatus::Awaiting, None)
+        .set_status(&key, 0, IntentStatus::Awaiting, None)
         .await
         .expect("set awaiting");
     assert!(has_key(
@@ -2187,7 +2544,7 @@ async fn awaiting_intents_are_scannable_for_resume() {
 
     // The recv_op subscription finally settles it (→ Done): it leaves every index.
     journal
-        .set_status(&key, IntentStatus::Done, None)
+        .set_status(&key, 0, IntentStatus::Done, None)
         .await
         .expect("set done");
     assert!(!has_key(

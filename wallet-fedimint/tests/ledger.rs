@@ -11,15 +11,19 @@ use async_trait::async_trait;
 use fedimint_core::db::mem_impl::MemDatabase;
 use fedimint_core::db::{IDatabaseTransactionOpsCore, IRawDatabaseExt};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use wallet_core::{
-    Action, Actor, AllocatorDecision, DiscoverySource, EvacFeeCap, ExecError, FederationId,
-    FeeBreakdown, IdempotencyKey, Intent, IntentStatus, Journal, Msat, Occurrence, OperationKind,
-    OperationRecord, OperationStatus, RawOpUpdate, ReasonCode, RefusalDiagnostics, SourceStatus,
+    drive_intent_step, Action, Actor, AllocatorDecision, DiscoverySource, EvacFeeCap, ExecError,
+    ExecutionSummary, Executor, FederationId, FeeBreakdown, IdempotencyKey, Intent, IntentStatus,
+    Journal, Msat, Occurrence, OperationKind, OperationRecord, OperationStatus, PerformOutcome,
+    RawOpUpdate, ReasonCode, RefusalDiagnostics, SourceStatus,
 };
+use wallet_fedimint::journal::RawIntentTerminalSink;
 use wallet_fedimint::{
     assemble_move_record, FederationInfo, FedimintJournal, GatewayUrl, Invoice, LedgerRepairOracle,
     Leg, MoveParams, MovePhase, MoveRecord, OpArtifact, OperationId, OperationRef,
-    RawOpObservation, RawOperationRole, RawTerminal,
+    RawOpObservation, RawOperationRole, RawTerminal, JOIN_NOOP_REOPEN_NOTE,
 };
 
 const BASE: u64 = 1_700_000_000_000; // a base ms timestamp (divisible by 1000: joins the sec/ms math)
@@ -242,6 +246,149 @@ fn empty_oracle() -> MockOracle {
     MockOracle::default()
 }
 
+struct RetryDuringSink {
+    journal: FedimintJournal,
+    replacement: Intent,
+}
+
+#[async_trait]
+impl RawIntentTerminalSink for RetryDuringSink {
+    async fn set_raw_terminal(
+        &self,
+        key: &IdempotencyKey,
+        _fence: &wallet_fedimint::journal::RawIntentTerminalFence,
+        _status: IntentStatus,
+        _error: Option<String>,
+    ) -> Result<bool, ExecError> {
+        self.journal
+            .set_status(key, 0, IntentStatus::Failed, Some("operator retries"))
+            .await?;
+        self.journal.retry_failed_intent(&self.replacement).await?;
+        Ok(false)
+    }
+}
+
+/// The repair fence is captured before this oracle receives the observation request.  It retires
+/// attempt N while replying with N's terminal witness, exercising the scan/observation boundary:
+/// the repair must use the captured sequence and attempt correlation, not whatever now occupies
+/// the public key.
+struct RetryAfterObservationOracle {
+    journal: FedimintJournal,
+    replacement: Intent,
+    expected_correlation: IdempotencyKey,
+    observation: RawOpObservation,
+    correct_correlation_queries: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl LedgerRepairOracle for RetryAfterObservationOracle {
+    async fn find_op_by_correlation_key(
+        &self,
+        federation: FederationId,
+        correlation: &IdempotencyKey,
+    ) -> Result<Option<OperationId>, ExecError> {
+        if federation == fed(1) && *correlation == self.expected_correlation {
+            self.correct_correlation_queries
+                .fetch_add(1, Ordering::SeqCst);
+            Ok(Some(op(7)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn find_send_op_by_payment_hash(
+        &self,
+        _federation: FederationId,
+        _hash: [u8; 32],
+    ) -> Result<Option<OperationId>, ExecError> {
+        Ok(None)
+    }
+
+    async fn observe_op(
+        &self,
+        federation: FederationId,
+        operation: OperationId,
+    ) -> Result<RawOpObservation, ExecError> {
+        assert_eq!(federation, fed(1));
+        assert_eq!(operation, op(7));
+        self.journal
+            .set_status(
+                &self.replacement.idempotency_key,
+                0,
+                IntentStatus::Failed,
+                Some("operator retries after observation"),
+            )
+            .await?;
+        self.journal.retry_failed_intent(&self.replacement).await?;
+        Ok(self.observation.clone())
+    }
+}
+
+struct FailOnceSink {
+    journal: FedimintJournal,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl RawIntentTerminalSink for FailOnceSink {
+    async fn set_raw_terminal(
+        &self,
+        key: &IdempotencyKey,
+        fence: &wallet_fedimint::journal::RawIntentTerminalFence,
+        status: IntentStatus,
+        error: Option<String>,
+    ) -> Result<bool, ExecError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(ExecError::Retryable("deliberate sink fault".to_owned()));
+        }
+        self.journal
+            .set_raw_terminal_if_fenced(key, fence, status, error.as_deref())
+            .await
+    }
+}
+
+/// Exercises the narrow gap after repair's ledger write but before its intent-only sink CAS.
+/// An authoritative same-attempt artifact may supersede a SOFT terminal in-place; the sink must
+/// see that changed terminal status and leave the still-live reservation alone.
+struct SameAttemptSupersedingSink {
+    journal: FedimintJournal,
+    result: Arc<std::sync::Mutex<Option<bool>>>,
+}
+
+#[async_trait]
+impl RawIntentTerminalSink for SameAttemptSupersedingSink {
+    async fn set_raw_terminal(
+        &self,
+        key: &IdempotencyKey,
+        fence: &wallet_fedimint::journal::RawIntentTerminalFence,
+        status: IntentStatus,
+        error: Option<String>,
+    ) -> Result<bool, ExecError> {
+        let expected_attempt = self
+            .journal
+            .get(key)
+            .await?
+            .ok_or_else(|| ExecError::Permanent("test sink intent disappeared".to_owned()))?
+            .attempt;
+        assert!(
+            self.journal
+                .record_raw_observation_if_attempt(
+                    key,
+                    expected_attempt,
+                    op(7),
+                    &in_flight_send_obs(),
+                )
+                .await?
+        );
+        let result = self
+            .journal
+            .set_raw_terminal_if_fenced(key, fence, status, error.as_deref())
+            .await?;
+        *self.result.lock().expect("sink result lock") = Some(result);
+        Ok(result)
+    }
+}
+
 fn terminal_send_obs(succeeded: bool, send_fee: u64) -> RawOpObservation {
     RawOpObservation {
         terminal: Some(RawTerminal {
@@ -255,6 +402,28 @@ fn terminal_send_obs(succeeded: bool, send_fee: u64) -> RawOpObservation {
     }
 }
 
+fn repairable_pay_intent(key: IdempotencyKey, status: IntentStatus, attempt: u32) -> Intent {
+    Intent {
+        idempotency_key: key,
+        attempt,
+        action: Action::Pay {
+            from: fed(1),
+            invoice: Invoice("lnbc1repair".into()),
+            amount: Msat(50_000),
+            fee_cap: Msat(1_000),
+            payment_hash: [0xab; 32],
+            gateway: None,
+        },
+        max_fee: Some(Msat(1_000)),
+        status,
+        reason: ReasonCode::UserInitiated,
+        actor: Actor::User,
+        created_at_ms: BASE,
+        operation_id: Some(op(7)),
+        invoice: None,
+    }
+}
+
 fn in_flight_send_obs() -> RawOpObservation {
     RawOpObservation {
         terminal: None,
@@ -262,6 +431,93 @@ fn in_flight_send_obs() -> RawOpObservation {
         fees: FeeBreakdown::default(),
         invoice_amount: Some(Msat(50_000)),
         payment_hash: Some([0xab; 32]),
+    }
+}
+
+/// Replays the two raw sinks a fresh executor reaches after an SDK result returns.  It lets this
+/// durability test exercise the core driver's final status transition without a real federation.
+struct ReplayTerminalRawExecutor {
+    journal: FedimintJournal,
+    operation_id: OperationId,
+    observation: RawOpObservation,
+}
+
+#[async_trait]
+impl Executor for ReplayTerminalRawExecutor {
+    async fn perform(&self, intent: &Intent) -> Result<PerformOutcome, ExecError> {
+        if !self
+            .journal
+            .set_operation_artifact_if_attempt(
+                &intent.idempotency_key,
+                intent.attempt,
+                self.operation_id,
+                None,
+            )
+            .await?
+        {
+            return Err(ExecError::Retryable(
+                "artifact replay lost its attempt".to_owned(),
+            ));
+        }
+        if !self
+            .journal
+            .record_raw_observation_if_attempt(
+                &intent.idempotency_key,
+                intent.attempt,
+                self.operation_id,
+                &self.observation,
+            )
+            .await?
+        {
+            return Err(ExecError::Retryable(
+                "terminal observation replay lost its attempt".to_owned(),
+            ));
+        }
+        Ok(PerformOutcome::Done)
+    }
+}
+
+#[tokio::test]
+async fn raw_terminal_crash_window_redrive_converges_pending_and_executing_intents() {
+    for initial_status in [IntentStatus::Pending, IntentStatus::Executing] {
+        let journal = mem_ledger();
+        let key = key(match initial_status {
+            IntentStatus::Pending => "pay:crash-terminal-pending",
+            IntentStatus::Executing => "pay:crash-terminal-executing",
+            _ => unreachable!("test only drives non-terminal raw intents"),
+        });
+        let intent = repairable_pay_intent(key.clone(), initial_status, 0);
+        journal.upsert(&intent).await.expect("seed raw intent");
+        // Simulate the crash after the authoritative ledger write but before core's final
+        // `set_status(Done)`: the durable intent is still owned by this exact attempt/op.
+        assert!(journal
+            .record_raw_observation_if_attempt(&key, 0, op(7), &terminal_send_obs(true, 42))
+            .await
+            .expect("seed terminal ledger conclusion"));
+        let executor = ReplayTerminalRawExecutor {
+            journal: journal.clone(),
+            operation_id: op(7),
+            observation: terminal_send_obs(true, 42),
+        };
+        let mut summary = ExecutionSummary::default();
+        drive_intent_step(&journal, &executor, &intent, &mut summary)
+            .await
+            .expect("same-attempt raw re-drive converges");
+
+        assert_eq!(
+            journal
+                .get(&key)
+                .await
+                .expect("read converged intent")
+                .expect("intent exists")
+                .status,
+            IntentStatus::Done
+        );
+        assert_eq!(
+            status_of(&journal, &key).await,
+            OperationStatus::Succeeded,
+            "the immutable terminal ledger conclusion was not rewritten"
+        );
     }
 }
 
@@ -295,16 +551,19 @@ async fn raw_finalizer_completes_intent_and_ledger_from_one_observation() {
         .observations
         .insert((fed(1), operation_id.0), terminal_send_obs(true, 42));
 
-    assert!(journal
-        .finalize_raw_operation(
+    let prepared = journal
+        .prepare_raw_operation_terminal(
             &oracle,
             fed(1),
             operation_id,
             &key,
+            0,
             RawOperationRole::Send,
-            OperationStatus::Succeeded,
-            None,
         )
+        .await
+        .expect("prepare terminal observation");
+    assert!(journal
+        .finalize_raw_operation(&key, OperationStatus::Succeeded, None, prepared,)
         .await
         .expect("finalize")
         .is_empty());
@@ -320,6 +579,363 @@ async fn raw_finalizer_completes_intent_and_ledger_from_one_observation() {
     let row = op_of(&journal, &key).await;
     assert_eq!(row.status, OperationStatus::Succeeded);
     assert_eq!(row.fees.send_fee_quoted, Some(Msat(42)));
+}
+
+#[tokio::test]
+async fn raw_finalizer_retries_after_total_observation_failure() {
+    let journal = mem_ledger();
+    let key = key("pay:prepare-observation-retry");
+    let operation_id = op(7);
+    journal
+        .upsert(&repairable_pay_intent(
+            key.clone(),
+            IntentStatus::Awaiting,
+            0,
+        ))
+        .await
+        .expect("seed awaiting raw pay");
+
+    let error = match journal
+        .prepare_raw_operation_terminal(
+            &empty_oracle(),
+            fed(1),
+            operation_id,
+            &key,
+            0,
+            RawOperationRole::Send,
+        )
+        .await
+    {
+        Ok(_) => panic!("a total observe_op failure must surface to the awaiter"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, ExecError::Retryable(_)),
+        "the absent op-log observation is retriable: {error:?}"
+    );
+    assert_eq!(
+        journal
+            .get(&key)
+            .await
+            .expect("read intent")
+            .expect("intent")
+            .status,
+        IntentStatus::Awaiting,
+        "prepare must not release the reservation without an observation"
+    );
+    assert_eq!(
+        status_of(&journal, &key).await,
+        OperationStatus::Awaiting,
+        "prepare must not terminalize the ledger without an observation"
+    );
+
+    let mut recovered_oracle = MockOracle::default();
+    recovered_oracle
+        .observations
+        .insert((fed(1), operation_id.0), terminal_send_obs(true, 42));
+    let prepared = journal
+        .prepare_raw_operation_terminal(
+            &recovered_oracle,
+            fed(1),
+            operation_id,
+            &key,
+            0,
+            RawOperationRole::Send,
+        )
+        .await
+        .expect("second observation succeeds");
+    journal
+        .finalize_raw_operation(&key, OperationStatus::Succeeded, None, prepared)
+        .await
+        .expect("second observation terminalizes atomically");
+    assert_eq!(
+        journal
+            .get(&key)
+            .await
+            .expect("read intent")
+            .expect("intent")
+            .status,
+        IntentStatus::Done
+    );
+    let settled = op_of(&journal, &key).await;
+    assert_eq!(settled.status, OperationStatus::Succeeded);
+    assert_eq!(settled.fees.send_fee_quoted, Some(Msat(42)));
+}
+
+#[tokio::test]
+async fn raw_finalizer_rejects_an_in_flight_observation_without_releasing_reservation() {
+    let journal = mem_ledger();
+    let key = key("pay:prepare-in-flight");
+    journal
+        .upsert(&repairable_pay_intent(
+            key.clone(),
+            IntentStatus::Awaiting,
+            0,
+        ))
+        .await
+        .expect("seed awaiting raw pay");
+    let mut oracle = MockOracle::default();
+    oracle
+        .observations
+        .insert((fed(1), op(7).0), in_flight_send_obs());
+
+    let error = match journal
+        .prepare_raw_operation_terminal(&oracle, fed(1), op(7), &key, 0, RawOperationRole::Send)
+        .await
+    {
+        Ok(_) => panic!("an in-flight observation cannot prepare a terminal commit"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, ExecError::Retryable(_)), "{error:?}");
+    assert_eq!(
+        journal
+            .get(&key)
+            .await
+            .expect("read intent")
+            .expect("intent")
+            .status,
+        IntentStatus::Awaiting
+    );
+    assert_eq!(status_of(&journal, &key).await, OperationStatus::Awaiting);
+}
+
+#[tokio::test]
+async fn raw_finalizer_retries_a_correlation_noop_while_the_same_attempt_awaits() {
+    let journal = mem_ledger();
+    let key = key("pay:prepare-correlation-noop");
+    journal
+        .upsert(&repairable_pay_intent(
+            key.clone(),
+            IntentStatus::Awaiting,
+            0,
+        ))
+        .await
+        .expect("seed awaiting raw pay");
+
+    // The prepared operation belongs to neither the intent nor its ledger row. Preparation
+    // deliberately returns a no-op rather than trusting a foreign terminal observation; finalize
+    // must turn that into a retry while this exact reservation still needs an awaiter.
+    let prepared = journal
+        .prepare_raw_operation_terminal(
+            &empty_oracle(),
+            fed(1),
+            op(8),
+            &key,
+            0,
+            RawOperationRole::Send,
+        )
+        .await
+        .expect("foreign operation is a safe preparation no-op");
+    let error = journal
+        .finalize_raw_operation(&key, OperationStatus::Succeeded, None, prepared)
+        .await
+        .expect_err("same-attempt Awaiting must retain retry ownership");
+    assert!(
+        matches!(error, ExecError::Retryable(message) if message.contains("preparation no-op"))
+    );
+    assert_eq!(
+        journal
+            .get(&key)
+            .await
+            .expect("read intent")
+            .expect("intent")
+            .status,
+        IntentStatus::Awaiting
+    );
+    assert_eq!(status_of(&journal, &key).await, OperationStatus::Awaiting);
+}
+
+#[tokio::test]
+async fn raw_finalizer_rejects_a_status_contradicting_its_observation() {
+    let journal = mem_ledger();
+    let key = key("pay:prepare-status-mismatch");
+    journal
+        .upsert(&repairable_pay_intent(
+            key.clone(),
+            IntentStatus::Awaiting,
+            0,
+        ))
+        .await
+        .expect("seed awaiting raw pay");
+    let mut oracle = MockOracle::default();
+    oracle
+        .observations
+        .insert((fed(1), op(7).0), terminal_send_obs(true, 42));
+    let prepared = journal
+        .prepare_raw_operation_terminal(&oracle, fed(1), op(7), &key, 0, RawOperationRole::Send)
+        .await
+        .expect("prepare observed success");
+
+    let error = journal
+        .finalize_raw_operation(
+            &key,
+            OperationStatus::Failed,
+            Some("caller must not override the observer"),
+            prepared,
+        )
+        .await
+        .expect_err("caller status must agree with the observed terminal outcome");
+    assert!(matches!(error, ExecError::Permanent(_)), "{error:?}");
+    assert_eq!(
+        journal
+            .get(&key)
+            .await
+            .expect("read intent")
+            .expect("intent")
+            .status,
+        IntentStatus::Awaiting
+    );
+    assert_eq!(status_of(&journal, &key).await, OperationStatus::Awaiting);
+}
+
+#[tokio::test]
+async fn raw_finalizer_second_attempt_converges_ordinary_terminal_ledger_and_awaiting_intent() {
+    let journal = mem_ledger();
+    let key = key("pay:finalize-fence-retry");
+    journal
+        .upsert(&repairable_pay_intent(
+            key.clone(),
+            IntentStatus::Awaiting,
+            0,
+        ))
+        .await
+        .expect("seed awaiting raw pay");
+    // The first finalizer committed the ordinary ledger terminal write and crashed before it
+    // released the Awaiting intent.  The second finalizer must treat that exact terminal row as
+    // its idempotently satisfied ledger half, not strand the reservation waiting for repair.
+    assert!(journal
+        .record_raw_observation_if_attempt(&key, 0, op(7), &terminal_send_obs(true, 42))
+        .await
+        .expect("seed terminal conclusion"));
+    let mut oracle = MockOracle::default();
+    oracle
+        .observations
+        .insert((fed(1), op(7).0), terminal_send_obs(true, 42));
+    let prepared = journal
+        .prepare_raw_operation_terminal(&oracle, fed(1), op(7), &key, 0, RawOperationRole::Send)
+        .await
+        .expect("prepare matching observation");
+
+    journal
+        .finalize_raw_operation(&key, OperationStatus::Succeeded, None, prepared)
+        .await
+        .expect("second finalizer atomically releases the matching intent");
+    assert_eq!(
+        journal
+            .get(&key)
+            .await
+            .expect("read intent")
+            .expect("intent")
+            .status,
+        IntentStatus::Done
+    );
+    assert!(
+        !op_of(&journal, &key).await.repaired,
+        "the converged terminal was ordinary, not a repair"
+    );
+}
+
+#[tokio::test]
+async fn op_less_terminal_failed_finalizer_adopts_the_operation_before_failing_pay() {
+    let journal = mem_ledger();
+    let key = key("pay:finalizer-adopts-failed-op");
+    let operation_id = op(7);
+    let mut intent = repairable_pay_intent(key.clone(), IntentStatus::Awaiting, 0);
+    intent.operation_id = None;
+    journal.upsert(&intent).await.expect("seed op-less raw pay");
+
+    // The ledger/intent are correlated by this attempt's key, but the SDK identity was not
+    // persisted before the awaiter observed its terminal failure.
+    let mut oracle = MockOracle::default();
+    oracle
+        .by_key
+        .insert((fed(1), intent.operation_correlation_key().0), operation_id);
+    oracle
+        .observations
+        .insert((fed(1), operation_id.0), terminal_send_obs(false, 42));
+    let prepared = journal
+        .prepare_raw_operation_terminal(
+            &oracle,
+            fed(1),
+            operation_id,
+            &key,
+            0,
+            RawOperationRole::Send,
+        )
+        .await
+        .expect("prepare failed terminal observation");
+    journal
+        .finalize_raw_operation(
+            &key,
+            OperationStatus::Failed,
+            Some("SDK reported failed"),
+            prepared,
+        )
+        .await
+        .expect("finalize failed terminal observation");
+
+    let final_intent = journal
+        .get(&key)
+        .await
+        .expect("read final intent")
+        .expect("intent exists");
+    assert_eq!(final_intent.status, IntentStatus::Failed);
+    assert_eq!(
+        final_intent.operation_id,
+        Some(operation_id),
+        "the actor's manual-retry guard must see the committed failed Pay operation"
+    );
+}
+
+#[tokio::test]
+async fn stale_prepared_raw_finalizer_cannot_terminalize_retry_attempt_n_plus_one() {
+    let journal = mem_ledger();
+    let key = key("pay:stale-prepared-finalizer");
+    let operation_id = op(7);
+    let first = repairable_pay_intent(key.clone(), IntentStatus::Awaiting, 0);
+    journal.upsert(&first).await.expect("seed first attempt");
+    let mut oracle = MockOracle::default();
+    oracle
+        .observations
+        .insert((fed(1), operation_id.0), terminal_send_obs(true, 42));
+    let prepared = journal
+        .prepare_raw_operation_terminal(
+            &oracle,
+            fed(1),
+            operation_id,
+            &key,
+            0,
+            RawOperationRole::Send,
+        )
+        .await
+        .expect("prepare first attempt");
+
+    journal
+        .set_status(&key, 0, IntentStatus::Failed, Some("operator retries"))
+        .await
+        .expect("terminalize first attempt");
+    let mut retry = repairable_pay_intent(key.clone(), IntentStatus::Pending, 1);
+    retry.operation_id = None;
+    journal
+        .retry_failed_intent(&retry)
+        .await
+        .expect("start retry before stale finalization");
+
+    journal
+        .finalize_raw_operation(&key, OperationStatus::Succeeded, None, prepared)
+        .await
+        .expect("stale prepared finalizer benignly no-ops");
+    let current = journal
+        .get(&key)
+        .await
+        .expect("read")
+        .expect("retry exists");
+    assert_eq!(current.attempt, 1);
+    assert_eq!(current.status, IntentStatus::Pending);
+    assert_eq!(current.operation_id, None);
+    let row = op_of(&journal, &key).await;
+    assert!(!row.status.is_terminal());
+    assert!(matches!(row.kind, OperationKind::Pay { op_id: None, .. }));
 }
 
 fn terminal_recv_obs(recv_fee: u64) -> RawOpObservation {
@@ -475,6 +1091,97 @@ async fn record_update_advances_started_to_awaiting_then_terminal_is_immutable()
 }
 
 #[tokio::test]
+async fn delayed_legacy_record_update_from_attempt_n_rejects_retry_n_plus_one_unchanged() {
+    let j = mem_ledger();
+    let k = key("pay:legacy-update-retry");
+    let first = repairable_pay_intent(k.clone(), IntentStatus::Pending, 0);
+    j.upsert(&first).await.expect("seed attempt N");
+    j.set_status(&k, 0, IntentStatus::Failed, Some("attempt N failed"))
+        .await
+        .expect("terminalize attempt N");
+    let mut retry = repairable_pay_intent(k.clone(), IntentStatus::Pending, 1);
+    retry.operation_id = None;
+    j.retry_failed_intent(&retry)
+        .await
+        .expect("start attempt N+1");
+
+    let before_intent = j.get(&k).await.expect("read retry").expect("retry exists");
+    let before_ledger = op_of(&j, &k).await;
+    let error = j
+        .record_update(
+            &k,
+            RawOpUpdate {
+                op_id: Some(op(7)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("delayed legacy update must not mutate retry N+1");
+    assert!(
+        matches!(&error, ExecError::Permanent(message) if message.contains("record_update")
+            && message.contains("attempt-fenced")),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        j.get(&k).await.expect("read retry").expect("retry exists"),
+        before_intent,
+        "legacy attempt-N update must leave the N+1 intent unchanged"
+    );
+    assert_eq!(
+        op_of(&j, &k).await,
+        before_ledger,
+        "legacy attempt-N update must leave the N+1 ledger row unchanged"
+    );
+}
+
+#[tokio::test]
+async fn delayed_legacy_record_terminal_from_attempt_n_rejects_retry_n_plus_one_unchanged() {
+    let j = mem_ledger();
+    let k = key("pay:legacy-terminal-retry");
+    let first = repairable_pay_intent(k.clone(), IntentStatus::Pending, 0);
+    j.upsert(&first).await.expect("seed attempt N");
+    j.set_status(&k, 0, IntentStatus::Failed, Some("attempt N failed"))
+        .await
+        .expect("terminalize attempt N");
+    let mut retry = repairable_pay_intent(k.clone(), IntentStatus::Pending, 1);
+    retry.operation_id = None;
+    j.retry_failed_intent(&retry)
+        .await
+        .expect("start attempt N+1");
+
+    let before_intent = j.get(&k).await.expect("read retry").expect("retry exists");
+    let before_ledger = op_of(&j, &k).await;
+    let error = j
+        .record_terminal(
+            &k,
+            OperationStatus::Succeeded,
+            BASE + 1,
+            None,
+            Some(RawOpUpdate {
+                fees: Some(fees_send(42)),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("delayed legacy terminal must not mutate retry N+1");
+    assert!(
+        matches!(&error, ExecError::Permanent(message) if message.contains("record_terminal")
+            && message.contains("attempt-fenced")),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        j.get(&k).await.expect("read retry").expect("retry exists"),
+        before_intent,
+        "legacy attempt-N terminal must leave the N+1 intent unchanged"
+    );
+    assert_eq!(
+        op_of(&j, &k).await,
+        before_ledger,
+        "legacy attempt-N terminal must leave the N+1 ledger row unchanged"
+    );
+}
+
+#[tokio::test]
 async fn tick_row_started_then_terminal_carries_counts() {
     let j = mem_ledger();
     let k = key("tick:5:n");
@@ -552,7 +1259,8 @@ async fn record_refusals_persist_diagnostics_across_serialization() {
         max_fee: Some(Msat(500)),
         max_fee_bps: Some(100),
         cap_room: Some(Msat(40_000)),
-        amount: Some(Msat(9_500)),
+        amount: Some(Msat(0)),
+        conflict_suppressed: true,
         min_move: Some(Msat(0)),
     };
     let decision = AllocatorDecision {
@@ -585,7 +1293,8 @@ async fn record_refusals_persist_diagnostics_across_serialization() {
             assert_eq!(read_back.max_fee, Some(Msat(500)));
             assert_eq!(read_back.max_fee_bps, Some(100));
             assert_eq!(read_back.cap_room, Some(Msat(40_000)));
-            assert_eq!(read_back.amount, Some(Msat(9_500)));
+            assert_eq!(read_back.amount, Some(Msat(0)));
+            assert!(read_back.conflict_suppressed);
             assert_eq!(read_back.min_move, Some(Msat(0)));
         }
         other => panic!("expected a refusal row, got {other:?}"),
@@ -593,21 +1302,58 @@ async fn record_refusals_persist_diagnostics_across_serialization() {
 }
 
 #[test]
-fn refusal_diagnostics_missing_max_fee_bps_decodes_to_none() {
-    // A refusal row persisted before `max_fee_bps` existed (br-ljj.1/.2 wrote such rows to the
-    // live pilot journal) has no such key. Refusal rows are re-decoded on every `history` read,
-    // so document the persisted-row behavior directly.
+fn refusal_diagnostics_missing_observational_fields_decode_to_defaults() {
+    // Refusal rows are re-decoded on every `history` read. Rows persisted before
+    // `max_fee_bps`/`conflict_suppressed` existed omit those keys, so preserve their distinct
+    // legacy defaults directly.
     let mut json = serde_json::to_value(RefusalDiagnostics {
         source_spendable: Some(Msat(10_000)),
         max_fee_bps: Some(100),
         ..Default::default()
     })
     .expect("serialize");
-    json.as_object_mut().expect("object").remove("max_fee_bps");
+    let object = json.as_object_mut().expect("object");
+    object.remove("max_fee_bps");
+    object.remove("conflict_suppressed");
     let decoded: RefusalDiagnostics =
         serde_json::from_value(json).expect("legacy refusal row (no max_fee_bps) still decodes");
     assert_eq!(decoded.max_fee_bps, None);
+    assert!(!decoded.conflict_suppressed);
     assert_eq!(decoded.source_spendable, Some(Msat(10_000)));
+}
+
+#[tokio::test]
+async fn conflict_dropped_tick_row_records_an_observable_emitted_zero() {
+    let journal = mem_ledger();
+    let decision = AllocatorDecision {
+        action: Action::Move {
+            from: fed(1),
+            to: fed(2),
+            amount: Msat(50_000),
+            fee_cap: Msat(500),
+            gateway: None,
+        },
+        reason: ReasonCode::StandbyBelowTarget,
+        occurrence: Occurrence(7),
+        idempotency_key: key("move:held-conflict"),
+    };
+    journal
+        .record_tick_dropped_refusal(
+            &decision,
+            Occurrence(7),
+            BASE,
+            "decision move:held-conflict conflicts with allocator work already in flight",
+            true,
+        )
+        .await
+        .expect("record conflict drop");
+
+    let history = journal.history(10, None).await.expect("history");
+    let OperationKind::Refusal { diagnostics, .. } = &history[0].kind else {
+        panic!("expected refusal row: {:?}", history[0]);
+    };
+    assert_eq!(diagnostics.amount, Some(Msat(0)));
+    assert!(diagnostics.conflict_suppressed);
 }
 
 // --- §9.2 journal-integrated writes (same dbtx as the intent) ---
@@ -641,6 +1387,7 @@ async fn set_status_failed_records_the_executor_error_on_the_ledger_row() {
     j.upsert(&intent).await.expect("upsert");
     j.set_status(
         &intent.idempotency_key,
+        0,
         IntentStatus::Failed,
         Some("cap exceeded"),
     )
@@ -659,10 +1406,13 @@ async fn set_status_failed_falls_back_to_move_record_outcome() {
     j.upsert(&intent).await.expect("upsert");
     let mut mv = move_record_for("move:0102:2");
     mv.outcome = Some("stranded: debited, not credited".to_string());
-    j.put_move(&mv).await.expect("put_move");
+    assert!(j
+        .put_move_if_attempt(&intent.idempotency_key, intent.attempt, &mv)
+        .await
+        .expect("put_move"));
 
     // No executor string -> the ledger error falls back to the MoveRecord outcome (§9.2).
-    j.set_status(&intent.idempotency_key, IntentStatus::Failed, None)
+    j.set_status(&intent.idempotency_key, 0, IntentStatus::Failed, None)
         .await
         .expect("set_status");
     assert_eq!(
@@ -677,11 +1427,16 @@ async fn ledger_refreshes_fees_and_op_ids_from_the_move_row_on_non_terminal_writ
     let intent = move_intent("move:0102:3", IntentStatus::Pending);
     j.upsert(&intent).await.expect("upsert");
     // The executor persists the move record (recv/send op, gateway, fee quotes) BEFORE the flip.
-    j.put_move(&move_record_for("move:0102:3"))
+    assert!(j
+        .put_move_if_attempt(
+            &intent.idempotency_key,
+            intent.attempt,
+            &move_record_for("move:0102:3"),
+        )
         .await
-        .expect("put_move");
+        .expect("put_move"));
     // A NON-terminal status write must reflect the in-flight metadata (§9.2).
-    j.set_status(&intent.idempotency_key, IntentStatus::Awaiting, None)
+    j.set_status(&intent.idempotency_key, 0, IntentStatus::Awaiting, None)
         .await
         .expect("set_status");
 
@@ -729,9 +1484,12 @@ async fn a_clamped_evacuation_row_reports_the_cap_and_the_amount_it_executed() {
     let mut mv = move_record_for(k);
     mv.amount = executed;
     mv.fee_cap = enforced;
-    j.put_move(&mv).await.expect("put_move");
+    assert!(j
+        .put_move_if_attempt(&intent.idempotency_key, intent.attempt, &mv)
+        .await
+        .expect("put_move"));
 
-    j.set_status(&intent.idempotency_key, IntentStatus::Awaiting, None)
+    j.set_status(&intent.idempotency_key, 0, IntentStatus::Awaiting, None)
         .await
         .expect("set_status");
 
@@ -786,9 +1544,12 @@ async fn a_reconstructed_evacuation_row_reports_the_committed_cap_and_amount() {
         mv.fee_cap, enforced,
         "reassembly must recover the enforced cap"
     );
-    j.put_move(&mv).await.expect("put_move");
+    assert!(j
+        .put_move_if_attempt(&intent.idempotency_key, intent.attempt, &mv)
+        .await
+        .expect("put_move"));
 
-    j.set_status(&intent.idempotency_key, IntentStatus::Awaiting, None)
+    j.set_status(&intent.idempotency_key, 0, IntentStatus::Awaiting, None)
         .await
         .expect("set_status");
 
@@ -834,10 +1595,14 @@ async fn a_draft_move_row_does_not_freeze_its_pair_onto_the_terminal_row() {
     mv.recv_op = None;
     mv.send_op = None;
     mv.phase = MovePhase::Created;
-    j.put_move(&mv).await.expect("put_move");
+    assert!(j
+        .put_move_if_attempt(&intent.idempotency_key, intent.attempt, &mv)
+        .await
+        .expect("put_move"));
 
     j.set_status(
         &intent.idempotency_key,
+        0,
         IntentStatus::Failed,
         Some("destination is already at its cap"),
     )
@@ -1074,7 +1839,11 @@ async fn raw_negative_repair_keeps_the_intent_retriable_and_the_ledger_defeasibl
     .await
     .expect("seed raw intent and ledger row");
 
-    j.repair_ledger(&empty_oracle()).await.expect("repair");
+    let first = j
+        .repair_ledger(&empty_oracle())
+        .await
+        .expect("first repair");
+    assert_eq!(first.repaired, 1);
 
     let row = op_of(&j, &k).await;
     assert_eq!(row.status, OperationStatus::Failed);
@@ -1086,7 +1855,24 @@ async fn raw_negative_repair_keeps_the_intent_retriable_and_the_ledger_defeasibl
             .expect("intent exists")
             .status,
         IntentStatus::Pending,
-        "soft repair must leave the operation eligible for authoritative retry"
+        "pass 1 no-evidence soft repair must leave the operation eligible for authoritative retry"
+    );
+    let second = j
+        .repair_ledger(&empty_oracle())
+        .await
+        .expect("second terminal-row retry pass");
+    assert_eq!(
+        second.repaired, 0,
+        "the existing soft terminal is accounting history, not a second repair"
+    );
+    assert_eq!(
+        j.get(&k)
+            .await
+            .expect("read intent")
+            .expect("intent exists")
+            .status,
+        IntentStatus::Pending,
+        "terminal-row retry must never sink the deliberate RAW_NEVER_REACHED soft repair"
     );
 }
 
@@ -1258,6 +2044,192 @@ async fn repair_backfills_op_id_from_the_correlation_key() {
 }
 
 #[tokio::test]
+async fn repair_uses_captured_fence_across_observation_before_sink_cas() {
+    let j = mem_ledger();
+    let k = key("pay:repair-observation-fence");
+    let mut first = repairable_pay_intent(k.clone(), IntentStatus::Pending, 0);
+    let mut replacement = repairable_pay_intent(k.clone(), IntentStatus::Pending, 1);
+    first.operation_id = None;
+    replacement.operation_id = None;
+    j.upsert(&first).await.expect("seed first attempt");
+    let correct_correlation_queries = Arc::new(AtomicUsize::new(0));
+    let oracle = RetryAfterObservationOracle {
+        journal: j.clone(),
+        replacement,
+        expected_correlation: first.operation_correlation_key(),
+        observation: terminal_send_obs(true, 42),
+        correct_correlation_queries: Arc::clone(&correct_correlation_queries),
+    };
+
+    j.repair_ledger(&oracle)
+        .await
+        .expect("stale observation is a benign no-op");
+
+    assert_eq!(
+        correct_correlation_queries.load(Ordering::SeqCst),
+        1,
+        "the op-log lookup used attempt N's captured correlation key"
+    );
+    let current = j.get(&k).await.expect("read").expect("replacement exists");
+    assert_eq!(current.attempt, 1);
+    assert_eq!(current.status, IntentStatus::Pending);
+    assert_eq!(current.operation_id, None);
+    let current_row = op_of(&j, &k).await;
+    assert!(
+        !current_row.status.is_terminal(),
+        "N's witness must not terminalize N+1 after the oracle replaced the ledger row"
+    );
+    assert!(matches!(
+        current_row.kind,
+        OperationKind::Pay { op_id: None, .. }
+    ));
+}
+
+#[tokio::test]
+async fn repair_sink_cas_cannot_terminalize_retry_started_inside_sink() {
+    let j = mem_ledger();
+    let k = key("pay:repair-attempt-cas");
+    let first = repairable_pay_intent(k.clone(), IntentStatus::Pending, 0);
+    j.upsert(&first).await.expect("seed first attempt");
+    let mut replacement = repairable_pay_intent(k.clone(), IntentStatus::Pending, 1);
+    replacement.operation_id = None;
+    let mut oracle = MockOracle::default();
+    oracle
+        .observations
+        .insert((fed(1), op(7).0), terminal_send_obs(true, 42));
+    let sink = RetryDuringSink {
+        journal: j.clone(),
+        replacement,
+    };
+
+    j.repair_ledger_with_terminal_sink(&oracle, &sink)
+        .await
+        .expect("old repair is a benign no-op against retry");
+
+    let current = j.get(&k).await.expect("read").expect("replacement exists");
+    assert_eq!(current.attempt, 1);
+    assert_eq!(current.status, IntentStatus::Pending);
+    assert_eq!(current.operation_id, None);
+    let current_row = op_of(&j, &k).await;
+    assert!(
+        !current_row.status.is_terminal(),
+        "old N observation must not terminalize current N+1 ledger row"
+    );
+    assert!(matches!(
+        current_row.kind,
+        OperationKind::Pay { op_id: None, .. }
+    ));
+}
+
+#[tokio::test]
+async fn repair_sink_fence_rejects_same_attempt_soft_terminal_superseded_before_cas() {
+    let j = mem_ledger();
+    let k = key("pay:repair-same-attempt-supersession");
+    let mut intent = repairable_pay_intent(k.clone(), IntentStatus::Pending, 0);
+    intent.operation_id = None;
+    j.upsert(&intent).await.expect("seed intent-backed raw row");
+
+    // Hash attribution is deliberately SOFT, so an authoritative artifact is allowed to supersede
+    // this repaired terminal on the same ledger sequence.
+    let mut oracle = MockOracle::default();
+    oracle.by_hash.insert((fed(1), [0xab; 32]), op(7));
+    oracle
+        .observations
+        .insert((fed(1), op(7).0), terminal_send_obs(true, 42));
+    let sink_result = Arc::new(std::sync::Mutex::new(None));
+    let sink = SameAttemptSupersedingSink {
+        journal: j.clone(),
+        result: Arc::clone(&sink_result),
+    };
+
+    let summary = j
+        .repair_ledger_with_terminal_sink(&oracle, &sink)
+        .await
+        .expect("the stale sink CAS is a benign false result");
+    assert_eq!(
+        summary.repaired, 1,
+        "the original soft terminal was recorded"
+    );
+    assert_eq!(
+        *sink_result.lock().expect("sink result lock"),
+        Some(false),
+        "the post-repair sink CAS must reject the same-sequence supersession"
+    );
+    assert_eq!(
+        j.get(&k)
+            .await
+            .expect("read intent")
+            .expect("intent exists")
+            .status,
+        IntentStatus::Pending,
+        "the same-attempt authoritative supersession must leave its intent nonterminal"
+    );
+    let row = op_of(&j, &k).await;
+    assert_eq!(row.status, OperationStatus::Awaiting);
+    assert!(
+        !row.repaired,
+        "the authoritative artifact supersedes the soft terminal in place"
+    );
+}
+
+#[tokio::test]
+async fn repair_retries_terminal_intent_sink_after_first_sink_failure() {
+    let j = mem_ledger();
+    let k = key("pay:repair-sink-retry");
+    j.upsert(&repairable_pay_intent(k.clone(), IntentStatus::Pending, 0))
+        .await
+        .expect("seed raw intent");
+    let mut oracle = MockOracle::default();
+    oracle
+        .observations
+        .insert((fed(1), op(7).0), terminal_send_obs(true, 42));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let sink = FailOnceSink {
+        journal: j.clone(),
+        calls: Arc::clone(&calls),
+    };
+
+    let first = j
+        .repair_ledger_with_terminal_sink(&oracle, &sink)
+        .await
+        .expect("ledger terminal survives sink fault");
+    assert_eq!(
+        first.repaired, 1,
+        "the committed ledger terminal counts even while its intent sink is retried"
+    );
+    assert_eq!(status_of(&j, &k).await, OperationStatus::Succeeded);
+    assert_eq!(
+        j.get(&k).await.expect("intent").expect("exists").status,
+        IntentStatus::Pending,
+        "first sink failure leaves reservation live"
+    );
+
+    let second = j
+        .repair_ledger_with_terminal_sink(&oracle, &sink)
+        .await
+        .expect("second pass retries terminal sink");
+    assert_eq!(
+        second.repaired, 0,
+        "the second pass only synchronizes the already-counted terminal row"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        j.get(&k).await.expect("intent").expect("exists").status,
+        IntentStatus::Done
+    );
+    let third = j
+        .repair_ledger_with_terminal_sink(&oracle, &sink)
+        .await
+        .expect("terminal intent does not churn through the sink");
+    assert_eq!(third.repaired, 0);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the terminal-row retry remains available after a failed sink, but stops once its intent is terminal"
+    );
+}
+
+#[tokio::test]
 async fn repair_hash_dedup_terminal_is_soft_with_note() {
     let j = mem_ledger();
     let k = key("pay:0101:n");
@@ -1300,6 +2272,286 @@ async fn repair_hash_dedup_terminal_is_soft_with_note() {
         "the ambiguity is recorded: {:?}",
         rec.error
     );
+}
+
+#[tokio::test]
+async fn intent_backed_hash_dedup_repair_keeps_uncertainty_until_authoritative_observation() {
+    let j = mem_ledger();
+    let k = key("pay:hash-dedup-intent");
+    let mut intent = repairable_pay_intent(k.clone(), IntentStatus::Pending, 0);
+    intent.operation_id = None;
+    j.upsert(&intent).await.expect("seed intent-backed raw row");
+
+    let mut oracle = MockOracle::default();
+    oracle.by_hash.insert((fed(1), [0xab; 32]), op(7));
+    oracle
+        .observations
+        .insert((fed(1), op(7).0), terminal_send_obs(true, 42));
+    let summary = j.repair_ledger(&oracle).await.expect("hash-dedup repair");
+    assert_eq!(summary.repaired, 1);
+    assert_eq!(
+        j.get(&k)
+            .await
+            .expect("read intent")
+            .expect("intent")
+            .status,
+        IntentStatus::Done,
+        "the repair sink releases only the matching raw reservation"
+    );
+    assert_eq!(
+        j.get(&k)
+            .await
+            .expect("read intent")
+            .expect("intent")
+            .operation_id,
+        Some(op(7)),
+        "the fenced repair adopts its recovered operation before terminalizing the intent"
+    );
+
+    let public = j
+        .operation(&OperationRef::Key(k.clone()))
+        .await
+        .expect("public operation read")
+        .expect("ledger row");
+    assert_eq!(public.status, OperationStatus::Succeeded);
+    assert!(public.repaired, "hash-dedup attribution remains defeasible");
+    assert!(
+        public
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("correlated by payment hash")),
+        "public operation retains the hash-dedup uncertainty: {:?}",
+        public.error
+    );
+    let history = j.history(10, None).await.expect("public history");
+    let historical = history
+        .iter()
+        .find(|row| row.correlation_key == k)
+        .expect("current row is in history");
+    assert!(historical.repaired);
+    assert!(
+        historical
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("correlated by payment hash")),
+        "history exposes the same uncertainty: {:?}",
+        historical.error
+    );
+
+    // A later direct observation must not rewrite an already-terminal intent, even when the
+    // earlier repair was soft. The finalizer shares the lifecycle transition predicate with every
+    // other writer: terminal rows are immutable and a same-terminal observation is a no-op.
+    let prepared = j
+        .prepare_raw_operation_terminal(&oracle, fed(1), op(7), &k, 0, RawOperationRole::Send)
+        .await
+        .expect("authoritative observation prepares");
+    j.finalize_raw_operation(&k, OperationStatus::Succeeded, None, prepared)
+        .await
+        .expect("terminal observation is a benign no-op");
+    let authoritative = op_of(&j, &k).await;
+    assert!(authoritative.repaired);
+    assert!(authoritative
+        .error
+        .as_deref()
+        .is_some_and(|error| error.starts_with("correlated by payment hash")));
+}
+
+#[tokio::test]
+async fn intent_backed_failed_pay_repair_adopts_op_before_terminalizing_intent() {
+    let j = mem_ledger();
+    let k = key("pay:hash-dedup-failed-intent");
+    let mut intent = repairable_pay_intent(k.clone(), IntentStatus::Pending, 0);
+    intent.operation_id = None;
+    j.upsert(&intent).await.expect("seed intent-backed raw row");
+
+    let mut oracle = MockOracle::default();
+    oracle.by_hash.insert((fed(1), [0xab; 32]), op(7));
+    oracle
+        .observations
+        .insert((fed(1), op(7).0), terminal_send_obs(false, 42));
+
+    let summary = j.repair_ledger(&oracle).await.expect("failed hash repair");
+    assert_eq!(summary.repaired, 1);
+    let repaired = j
+        .get(&k)
+        .await
+        .expect("read intent")
+        .expect("intent exists");
+    assert_eq!(repaired.status, IntentStatus::Failed);
+    assert_eq!(
+        repaired.operation_id,
+        Some(op(7)),
+        "a terminal-failed Pay retains the recovered committed operation, so the public actor \
+         rejects its otherwise-unwinnable manual retry"
+    );
+}
+
+#[tokio::test]
+async fn raw_terminal_sink_rejects_intent_status_opposite_its_fenced_ledger_status() {
+    let j = mem_ledger();
+    let k = key("pay:fence-status-mismatch");
+    j.upsert(&repairable_pay_intent(k.clone(), IntentStatus::Pending, 0))
+        .await
+        .expect("seed raw pay");
+    assert!(j
+        .record_raw_observation_if_attempt(&k, 0, op(7), &terminal_send_obs(true, 42))
+        .await
+        .expect("seed succeeded fenced ledger row"));
+    let row = op_of(&j, &k).await;
+    let fence = wallet_fedimint::journal::RawIntentTerminalFence::new(
+        row.seq,
+        0,
+        fed(1),
+        Some(op(7)),
+        RawOperationRole::Send,
+        OperationStatus::Succeeded,
+    );
+
+    assert!(
+        !j.set_raw_terminal_if_fenced(&k, &fence, IntentStatus::Failed, None)
+            .await
+            .expect("opposite terminal transition is a rejected compare"),
+        "a public fence constructor must not authorize a Failed intent for a Succeeded ledger row"
+    );
+    assert_eq!(
+        j.get(&k)
+            .await
+            .expect("read intent")
+            .expect("intent exists")
+            .status,
+        IntentStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn raw_terminal_sink_rejects_conflicting_intent_operation_identity() {
+    let j = mem_ledger();
+    let k = key("pay:fence-op-conflict");
+    j.record_started(
+        &k,
+        pay_kind(fed(1)),
+        Actor::User,
+        ReasonCode::UserInitiated,
+        BASE,
+        None,
+    )
+    .await
+    .expect("seed standalone raw pay");
+    j.record_update(
+        &k,
+        RawOpUpdate {
+            op_id: Some(op(7)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("seed standalone recovered ledger operation");
+    j.record_terminal(&k, OperationStatus::Failed, BASE, Some("failed"), None)
+        .await
+        .expect("seed standalone failed ledger row");
+
+    let mut intent = repairable_pay_intent(k.clone(), IntentStatus::Pending, 0);
+    intent.operation_id = Some(op(8));
+    j.upsert(&intent).await.expect("seed raw pay intent");
+    // The raw ledger may be enriched by recovery independently of the intent. The fence proves
+    // this recovered op, but the sink must fail closed rather than overwrite another intent op.
+    let row = op_of(&j, &k).await;
+    let fence = wallet_fedimint::journal::RawIntentTerminalFence::new(
+        row.seq,
+        0,
+        fed(1),
+        Some(op(7)),
+        RawOperationRole::Send,
+        OperationStatus::Failed,
+    );
+
+    assert!(!j
+        .set_raw_terminal_if_fenced(&k, &fence, IntentStatus::Failed, None)
+        .await
+        .expect("conflicting operation is a rejected compare"));
+    let unchanged = j
+        .get(&k)
+        .await
+        .expect("read intent")
+        .expect("intent exists");
+    assert_eq!(unchanged.status, IntentStatus::Pending);
+    assert_eq!(unchanged.operation_id, Some(op(8)));
+}
+
+#[tokio::test]
+async fn hash_only_old_op_in_flight_then_failed_does_not_sink_or_adopt_live_retry_n_plus_one() {
+    let j = mem_ledger();
+    let k = key("pay:hash-failed-retry");
+    let mut first = repairable_pay_intent(k.clone(), IntentStatus::Pending, 0);
+    first.operation_id = None;
+    j.upsert(&first).await.expect("seed attempt N");
+    // This is the failed SDK operation to which the shared payment hash resolves.  The old
+    // intent intentionally has no operation id, reproducing the pre-sink identity gap.
+    assert!(j
+        .record_raw_observation_if_attempt(&k, first.attempt, op(7), &in_flight_send_obs())
+        .await
+        .expect("record N operation"));
+    j.set_status(&k, 0, IntentStatus::Failed, Some("N failed"))
+        .await
+        .expect("terminalize attempt N");
+    let mut retry = repairable_pay_intent(k.clone(), IntentStatus::Pending, 1);
+    retry.operation_id = None;
+    j.retry_failed_intent(&retry)
+        .await
+        .expect("start live retry N+1");
+
+    let mut oracle = MockOracle::default();
+    oracle.by_hash.insert((fed(1), [0xab; 32]), op(7));
+    oracle
+        .observations
+        .insert((fed(1), op(7).0), in_flight_send_obs());
+    let summary = j
+        .repair_ledger(&oracle)
+        .await
+        .expect("repair live retry while N remains in flight");
+    assert_eq!(
+        summary.repaired, 0,
+        "a hash-only in-flight result for N is not evidence for retry N+1"
+    );
+
+    let current = j.get(&k).await.expect("read retry").expect("retry exists");
+    assert_eq!(current.attempt, 1);
+    assert_eq!(current.status, IntentStatus::Pending);
+    assert_eq!(
+        current.operation_id, None,
+        "N+1 must not adopt N's in-flight operation"
+    );
+    let current_row = op_of(&j, &k).await;
+    assert_eq!(current_row.status, OperationStatus::Started);
+    assert!(matches!(
+        current_row.kind,
+        OperationKind::Pay { op_id: None, .. }
+    ));
+
+    // The same old operation subsequently fails. Neither hash-only observation identifies the
+    // current retry, so it remains unadopted until its attempt correlation or an artifact does.
+    oracle
+        .observations
+        .insert((fed(1), op(7).0), terminal_send_obs(false, 42));
+    let summary = j
+        .repair_ledger(&oracle)
+        .await
+        .expect("repair live retry after N fails");
+    assert_eq!(
+        summary.repaired, 0,
+        "a hash-only FAILED result for N is not evidence against retry N+1"
+    );
+
+    let current = j.get(&k).await.expect("read retry").expect("retry exists");
+    assert_eq!(current.attempt, 1);
+    assert_eq!(current.status, IntentStatus::Pending);
+    assert_eq!(current.operation_id, None, "N+1 must not adopt N's op");
+    let current_row = op_of(&j, &k).await;
+    assert_eq!(current_row.status, OperationStatus::Started);
+    assert!(matches!(
+        current_row.kind,
+        OperationKind::Pay { op_id: None, .. }
+    ));
 }
 
 #[tokio::test]
@@ -1667,6 +2919,127 @@ async fn repair_join_terminal_retry_supersedes_older_started_attempt() {
     assert!(
         !completed.repaired,
         "the authoritative terminal row is untouched"
+    );
+}
+
+#[tokio::test]
+async fn late_join_outcome_supersedes_repaired_join_superseded_failure() {
+    let j = FedimintJournal::with_clock(MemDatabase::new().into_database(), clock_base_plus_2h);
+    let federation = fed(1);
+    let old_key = key("join:0101:authoritative-winner");
+    let current_key = key("join:0101:late-outcome");
+    let join_intent = |idempotency_key: IdempotencyKey, status| Intent {
+        idempotency_key,
+        attempt: 0,
+        action: Action::Join {
+            federation,
+            invite: "invite".into(),
+            membership_preexisting: false,
+        },
+        max_fee: None,
+        status,
+        reason: ReasonCode::UserInitiated,
+        actor: Actor::User,
+        created_at_ms: BASE,
+        operation_id: None,
+        invoice: None,
+    };
+    let old = join_intent(old_key.clone(), IntentStatus::Executing);
+    let current = join_intent(current_key.clone(), IntentStatus::Executing);
+    j.upsert(&old).await.expect("seed old join");
+    j.set_status(&old_key, old.attempt, IntentStatus::Done, None)
+        .await
+        .expect("terminalize authoritative old join");
+    j.upsert(&current)
+        .await
+        .expect("seed current executing join");
+    j.put_federation(&federation, &fed_info((BASE + 1_000) / 1000))
+        .await
+        .expect("registry proves membership");
+
+    let summary = j.repair_ledger(&empty_oracle()).await.expect("repair");
+    assert_eq!(summary.repaired, 1);
+    let repaired = op_of(&j, &current_key).await;
+    assert_eq!(repaired.status, OperationStatus::Failed);
+    assert!(repaired.repaired);
+    assert_eq!(
+        repaired.error.as_deref(),
+        Some("superseded by a later join attempt")
+    );
+
+    assert!(
+        j.record_join_outcome(&current_key, current.attempt, true)
+            .await
+            .expect("late join outcome"),
+        "the real join outcome must supersede a defeasible repair"
+    );
+    let authoritative = op_of(&j, &current_key).await;
+    assert_eq!(authoritative.status, OperationStatus::Succeeded);
+    assert!(!authoritative.repaired);
+    assert_eq!(authoritative.error, None);
+
+    j.set_status(&current_key, current.attempt, IntentStatus::Done, None)
+        .await
+        .expect("intent can converge after its ledger outcome");
+    assert_eq!(
+        j.get(&current_key)
+            .await
+            .expect("read converged intent")
+            .expect("current intent")
+            .status,
+        IntentStatus::Done
+    );
+}
+
+#[tokio::test]
+async fn noop_join_outcome_supersedes_repaired_join_success() {
+    let j = FedimintJournal::with_clock(MemDatabase::new().into_database(), clock_base_plus_2h);
+    let federation = fed(1);
+    let intent = Intent {
+        idempotency_key: key("join:0101:repaired-noop"),
+        attempt: 0,
+        action: Action::Join {
+            federation,
+            invite: "invite".into(),
+            membership_preexisting: false,
+        },
+        max_fee: None,
+        status: IntentStatus::Executing,
+        reason: ReasonCode::UserInitiated,
+        actor: Actor::User,
+        created_at_ms: BASE,
+        operation_id: None,
+        invoice: None,
+    };
+    j.upsert(&intent).await.expect("seed executing join");
+    // This real repair path concludes that the live attempt created the registry entry, but its
+    // Succeeded conclusion remains defeasible until the join driver reports its actual outcome.
+    j.put_federation(&federation, &fed_info(BASE / 1000))
+        .await
+        .expect("registry proves membership");
+    let summary = j.repair_ledger(&empty_oracle()).await.expect("repair");
+    assert_eq!(summary.repaired, 1);
+    let repaired = op_of(&j, &intent.idempotency_key).await;
+    assert_eq!(repaired.status, OperationStatus::Succeeded);
+    assert!(repaired.repaired);
+    assert_eq!(repaired.error, None);
+
+    assert!(
+        j.record_join_outcome(&intent.idempotency_key, intent.attempt, false)
+            .await
+            .expect("authoritative no-op join outcome"),
+        "the authoritative no-op outcome must apply over a defeasible repair"
+    );
+    let authoritative = op_of(&j, &intent.idempotency_key).await;
+    assert_eq!(authoritative.status, OperationStatus::Succeeded);
+    assert!(
+        !authoritative.repaired,
+        "the authoritative no-op outcome must clear the repaired marker"
+    );
+    assert_eq!(
+        authoritative.error.as_deref(),
+        Some(JOIN_NOOP_REOPEN_NOTE),
+        "the authoritative no-op outcome must replace the repair conclusion with its exact note"
     );
 }
 

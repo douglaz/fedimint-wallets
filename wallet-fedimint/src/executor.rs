@@ -40,6 +40,7 @@ use crate::move_protocol::{
     MoveRole, MoveStep, OpArtifact,
 };
 use crate::multi_client::{MultiClient, ReceiveState, SendError, SendOutcome, SendState};
+use crate::service::WalletClient;
 use crate::types::{GatewayUrl, Invoice};
 use async_trait::async_trait;
 use fedimint_core::invite_code::InviteCode;
@@ -48,8 +49,8 @@ use std::collections::BTreeMap;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use wallet_core::{
-    Action, Actor, EvacFeeCap, ExecError, Executor, FederationId, Intent, Journal, Msat,
-    OperationId, PerformOutcome,
+    Action, Actor, AllocatorGoal, EvacFeeCap, ExecError, Executor, FederationId, Intent, Journal,
+    Msat, OperationId, PerformOutcome,
 };
 
 /// Pinned lnv2 requires the gateway-reduced incoming contract to be at least 5 sats
@@ -243,6 +244,19 @@ fn pre_fund_reservation_error(error: ExecError) -> ExecError {
     ))
 }
 
+fn stale_raw_attempt_artifact() -> ExecError {
+    ExecError::Retryable(
+        "raw operation artifact belongs to a stale or terminal attempt; retry from current intent"
+            .into(),
+    )
+}
+
+fn service_artifact_error(error: crate::service::ServiceError) -> ExecError {
+    ExecError::Retryable(format!(
+        "actor-routed artifact write failed closed: {error}"
+    ))
+}
+
 fn keep_cheapest_fitting<T>(
     best: Option<(Msat, T)>,
     candidate: (Msat, T),
@@ -281,6 +295,11 @@ pub struct FedimintExecutor {
     /// moves, but its snapshot can be stale by perform time and the operator verbs consult no cap
     /// at all — this is the belt that enforces the cap at the moment money actually moves.
     hard_cap: Option<Msat>,
+    /// Present for every production actor driver. One-shot artifact/phase writes route through it
+    /// so the actor advances balance generations before servicing another command; membership
+    /// work also uses it for its short final publication fence. Standalone/exclusive runtimes and
+    /// tests keep direct journal writes.
+    service_client: Option<WalletClient>,
 }
 
 impl FedimintExecutor {
@@ -295,6 +314,63 @@ impl FedimintExecutor {
             journal,
             pinned_gateway,
             hard_cap,
+            service_client: None,
+        }
+    }
+
+    pub(crate) fn with_service_client(mut self, service_client: WalletClient) -> Self {
+        self.service_client = Some(service_client);
+        self
+    }
+
+    async fn set_operation_artifact_if_attempt(
+        &self,
+        intent: &Intent,
+        operation_id: OperationId,
+        invoice: Option<&Invoice>,
+    ) -> Result<bool, ExecError> {
+        match self.service_client.as_ref() {
+            Some(client) => client
+                .set_operation_artifact_if_attempt(
+                    intent.idempotency_key.clone(),
+                    intent.attempt,
+                    operation_id,
+                    invoice,
+                )
+                .await
+                .map_err(service_artifact_error),
+            None => {
+                self.journal
+                    .set_operation_artifact_if_attempt(
+                        &intent.idempotency_key,
+                        intent.attempt,
+                        operation_id,
+                        invoice,
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn put_move_if_attempt(
+        &self,
+        intent: &Intent,
+        record: &MoveRecord,
+    ) -> Result<bool, ExecError> {
+        match self.service_client.as_ref() {
+            Some(client) => client
+                .put_move_if_attempt(
+                    intent.idempotency_key.clone(),
+                    intent.attempt,
+                    record.clone(),
+                )
+                .await
+                .map_err(service_artifact_error),
+            None => {
+                self.journal
+                    .put_move_if_attempt(&intent.idempotency_key, intent.attempt, record)
+                    .await
+            }
         }
     }
 
@@ -316,9 +392,25 @@ impl FedimintExecutor {
             .is_some();
         let rec = self.assemble_record(intent, &plan).await?;
         if had_cached_record || has_move_artifact(&rec) {
-            self.journal.put_move(&rec).await?;
+            // Backfill may race a manual retry after its op-log scan. The old record is useful to
+            // this caller, but must not recreate the cache that retry reset for the new attempt.
+            let _ = self.put_move_if_attempt(intent, &rec).await?;
         }
         Ok(Some(rec))
+    }
+
+    /// Persist a move artifact only while the `perform` snapshot still owns its public key.
+    /// Every write in the non-idempotent move state machine goes through this fence; a stale
+    /// result is retryable so core leaves any newer attempt untouched.
+    async fn put_move_for_intent(
+        &self,
+        intent: &Intent,
+        rec: &MoveRecord,
+    ) -> Result<(), ExecError> {
+        self.put_move_if_attempt(intent, rec)
+            .await?
+            .then_some(())
+            .ok_or_else(stale_raw_attempt_artifact)
     }
 
     /// Rebuild the derived [`MoveRecord`] FIRST (spec §7): merge the journaled cache, the
@@ -1016,9 +1108,12 @@ impl FedimintExecutor {
             .saturating_sub(committed_contract.0)
             .saturating_add(federation_quote.0);
         if actual_quote > fee_cap.0 {
-            self.journal
-                .set_operation_artifact(&intent.idempotency_key, operation_id, Some(invoice))
-                .await?;
+            if !self
+                .set_operation_artifact_if_attempt(intent, operation_id, Some(invoice))
+                .await?
+            {
+                return Err(stale_raw_attempt_artifact());
+            }
             return Err(ExecError::Permanent(format!(
                 "raw receive committed fee {actual_quote} msat exceeds fee cap {} msat",
                 fee_cap.0
@@ -1036,14 +1131,15 @@ impl FedimintExecutor {
             .get_move(&intent.idempotency_key)
             .await?
             .is_some_and(|record| {
-                matches!(
-                    record.phase,
-                    MovePhase::Sending
-                        | MovePhase::Settled
-                        | MovePhase::Refunded
-                        | MovePhase::Failed
-                        | MovePhase::Stranded
-                )
+                wallet_core::allocator_record_is_trusted(intent, &record)
+                    && matches!(
+                        record.phase,
+                        MovePhase::Sending
+                            | MovePhase::Settled
+                            | MovePhase::Refunded
+                            | MovePhase::Failed
+                            | MovePhase::Stranded
+                    )
             })
         {
             return Ok(());
@@ -1055,19 +1151,43 @@ impl FedimintExecutor {
             .await
             .map_err(pre_fund_reservation_error)?;
         in_flight.retain(|other| other.idempotency_key != intent.idempotency_key);
-        let mut records = BTreeMap::new();
-        for other in &in_flight {
-            if let Some(record) = self
-                .journal
-                .get_move(&other.idempotency_key)
-                .await
-                .map_err(pre_fund_reservation_error)?
-            {
-                records.insert(other.idempotency_key.clone(), record);
+        // Fresh user and probe work keeps the universal strict belt. A tokenized allocator intent
+        // must use the same absorption model which sized/admitted it, or this recovery check would
+        // double-subtract earlier issued sends from the subsequently sampled live balance.
+        //
+        // Read artifacts before balances: an old phase is conservatively strict, while a released
+        // phase proves its SDK side effect preceded the later live sample. Service writers also
+        // invalidate actor balance generations, and standalone owns the database exclusively.
+        let reservations = if AllocatorGoal::of_intent(intent).is_some() {
+            let mut records = BTreeMap::new();
+            for other in &in_flight {
+                if !matches!(
+                    other.action,
+                    Action::Move { .. } | Action::Evacuate { .. } | Action::DirectInflow { .. }
+                ) {
+                    continue;
+                }
+                match self.journal.get_move(&other.idempotency_key).await {
+                    Ok(Some(record)) => {
+                        records.insert(other.idempotency_key.clone(), record);
+                    }
+                    Ok(None) => {}
+                    Err(ExecError::Permanent(error)) => {
+                        tracing::warn!(
+                            key = %other.idempotency_key.0,
+                            %error,
+                            "allocator pre-fund admission: corrupt derived record; retaining strict reservation"
+                        );
+                    }
+                    Err(error @ ExecError::Retryable(_)) | Err(error @ ExecError::Unsupported) => {
+                        return Err(pre_fund_reservation_error(error));
+                    }
+                }
             }
-        }
-        let reservations =
-            wallet_core::project_reservations(&in_flight, |key| records.get(key).cloned());
+            wallet_core::project_allocator_reservations(&in_flight, &records)
+        } else {
+            wallet_core::project_reservations(&in_flight)
+        };
         let mut balances = BTreeMap::new();
         if let Some(source) = source {
             balances.insert(source, self.mc.balance(&source).await.map_err(retryable)?);
@@ -1102,22 +1222,37 @@ impl FedimintExecutor {
                     .await?
                 {
                     let observation = self.mc.observe_op(*from, operation_id).await?;
+                    // A hash can identify an older attempt.  A retry may only adopt a settled
+                    // success; an in-flight old payment remains ambiguous until it resolves, and
+                    // a failed old payment leaves this attempt free to issue its own SDK call.
+                    if intent.attempt > 0 && observation.terminal.is_none() {
+                        return Err(ExecError::Retryable(
+                            "payment hash is still in flight for an earlier attempt".into(),
+                        ));
+                    }
                     if observation
                         .terminal
                         .as_ref()
                         .is_none_or(|terminal| terminal.succeeded)
                     {
-                        self.journal
-                            .set_operation_artifact(&intent.idempotency_key, operation_id, None)
-                            .await?;
-                        if observation.terminal.is_some() {
-                            self.journal
-                                .record_raw_observation(
+                        if !self
+                            .set_operation_artifact_if_attempt(intent, operation_id, None)
+                            .await?
+                        {
+                            return Err(stale_raw_attempt_artifact());
+                        }
+                        if observation.terminal.is_some()
+                            && !self
+                                .journal
+                                .record_raw_observation_if_attempt(
                                     &intent.idempotency_key,
+                                    intent.attempt,
                                     operation_id,
                                     &observation,
                                 )
-                                .await?;
+                                .await?
+                        {
+                            return Err(stale_raw_attempt_artifact());
                         }
                         return Ok(if observation.terminal.is_some() {
                             PerformOutcome::Done
@@ -1183,9 +1318,12 @@ impl FedimintExecutor {
                     // op's own final state (a settled op's await resolves immediately).
                     SendOutcome::AlreadyInFlight(operation_id) => (operation_id, true),
                 };
-                self.journal
-                    .set_operation_artifact(&intent.idempotency_key, operation_id, None)
-                    .await?;
+                if !self
+                    .set_operation_artifact_if_attempt(intent, operation_id, None)
+                    .await?
+                {
+                    return Err(stale_raw_attempt_artifact());
+                }
                 return Ok(if already_in_flight {
                     PerformOutcome::AwaitingAlreadyInFlight
                 } else {
@@ -1233,13 +1371,12 @@ impl FedimintExecutor {
                         &invoice,
                     )
                     .await?;
-                    self.journal
-                        .set_operation_artifact(
-                            &intent.idempotency_key,
-                            operation_id,
-                            Some(&invoice),
-                        )
-                        .await?;
+                    if !self
+                        .set_operation_artifact_if_attempt(intent, operation_id, Some(&invoice))
+                        .await?
+                    {
+                        return Err(stale_raw_attempt_artifact());
+                    }
                     return Ok(PerformOutcome::AwaitingAlreadyInFlight);
                 }
                 self.enforce_pre_fund_admission(intent).await?;
@@ -1326,9 +1463,12 @@ impl FedimintExecutor {
                     &invoice,
                 )
                 .await?;
-                self.journal
-                    .set_operation_artifact(&intent.idempotency_key, operation_id, Some(&invoice))
-                    .await?;
+                if !self
+                    .set_operation_artifact_if_attempt(intent, operation_id, Some(&invoice))
+                    .await?
+                {
+                    return Err(stale_raw_attempt_artifact());
+                }
                 return Ok(PerformOutcome::Awaiting);
             }
             Action::Join {
@@ -1339,7 +1479,15 @@ impl FedimintExecutor {
                 let invite = InviteCode::from_str(invite).map_err(|error| {
                     ExecError::Permanent(format!("parsing federation invite: {error}"))
                 })?;
-                let outcome = self.mc.join(invite.clone()).await.map_err(retryable)?;
+                let outcome = match self.service_client.as_ref() {
+                    Some(client) => {
+                        self.mc
+                            .join_with_membership_lease(invite.clone(), client)
+                            .await
+                    }
+                    None => self.mc.join(invite.clone()).await,
+                }
+                .map_err(retryable)?;
                 let registered_invite = if *membership_preexisting || outcome.newly_joined {
                     None
                 } else {
@@ -1363,8 +1511,10 @@ impl FedimintExecutor {
                         .await?;
                 }
                 self.journal
-                    .record_join_outcome(&intent.idempotency_key, newly_joined)
-                    .await?;
+                    .record_join_outcome(&intent.idempotency_key, intent.attempt, newly_joined)
+                    .await?
+                    .then_some(())
+                    .ok_or_else(stale_raw_attempt_artifact)?;
                 return Ok(PerformOutcome::Done);
             }
             Action::Recover { invite, .. } => {
@@ -1381,10 +1531,24 @@ impl FedimintExecutor {
                 // recovers into a clean FRESH prefix; or the fed IS registered, and the
                 // refuse-if-registered guard makes the re-drive an honest, deterministic refusal.
                 // Either way it terminalizes and never double-recovers or wedges Pending forever.
-                self.mc
-                    .recover(invite, &intent.idempotency_key)
-                    .await
-                    .map_err(|error| ExecError::Permanent(error.to_string()))?;
+                match self.service_client.as_ref() {
+                    Some(client) => {
+                        self.mc
+                            .recover_with_membership_lease(
+                                invite,
+                                &intent.idempotency_key,
+                                intent.attempt,
+                                client,
+                            )
+                            .await
+                    }
+                    None => {
+                        self.mc
+                            .recover(invite, &intent.idempotency_key, intent.attempt)
+                            .await
+                    }
+                }
+                .map_err(|error| ExecError::Permanent(error.to_string()))?;
                 return Ok(PerformOutcome::Done);
             }
             Action::DirectInflow { .. }
@@ -1459,7 +1623,7 @@ impl FedimintExecutor {
                         Msat(0),
                         cap_rule.at(requote_delivered),
                     ) {
-                        self.journal.put_move(&rec).await?;
+                        self.put_move_for_intent(intent, &rec).await?;
                         let over_cap = format!(
                             "fee over cap (receive side {} msat exceeds the {} msat cap at the \
                              {} msat this would deliver)",
@@ -1486,7 +1650,7 @@ impl FedimintExecutor {
                     // Only the FIXED-invoice half moves forward. The send leg is re-quoted at Pay
                     // and its `Retryable` disposition rightly stays there.
                     if is_evacuate && grossed.receive_quote.0 > requote_delivered.0 {
-                        self.journal.put_move(&rec).await?;
+                        self.put_move_for_intent(intent, &rec).await?;
                         return Err(ExecError::Retryable(format!(
                             "the receive leg now costs more than this move delivers ({} msat of \
                              receive fee against {} msat delivered); refusing BEFORE minting so \
@@ -1529,7 +1693,7 @@ impl FedimintExecutor {
                     // set just above. A `DirectInflow` has no later `Pay` arm to re-derive that
                     // quote, so without this pre-op write a crash in that window would finalize its
                     // history with the receive quote blanked.
-                    self.journal.put_move(&rec).await?;
+                    self.put_move_for_intent(intent, &rec).await?;
                     let meta = MoveMeta {
                         move_id: intent.operation_correlation_key(),
                         role: MoveRole::Receive,
@@ -1600,7 +1764,7 @@ impl FedimintExecutor {
                         // re-check below would then admit a fee this net never entitled.
                         apply_evacuation_sizing(&mut rec, cap_rule, net_amount);
                     }
-                    self.journal.put_move(&rec).await?;
+                    self.put_move_for_intent(intent, &rec).await?;
                     // KILLPOINT: the MoveRecord (recv_op + invoice) is persisted and the receive
                     // leg is committed, but the irreversible `Pay` has not run. A crash here must
                     // resume straight into `Pay` (reattaching the fixed invoice), never re-mint.
@@ -1669,7 +1833,7 @@ impl FedimintExecutor {
                     // it and a completed move's history explains BOTH legs' fees. Equal to the value
                     // `CreateInvoice` stored, so this never disagrees with it.
                     rec.receive_fee_quoted = Some(receive_quote);
-                    self.journal.put_move(&rec).await?;
+                    self.put_move_for_intent(intent, &rec).await?;
                     // §15.5: Permanent ONLY when the FIXED receive quote alone exceeds the cap; a
                     // send re-quote spike is Retryable (a later attempt may quote lower — 15.4's
                     // expiry belt bounds the retry horizon), so a transient spike never terminally
@@ -1716,7 +1880,7 @@ impl FedimintExecutor {
                     maybe_crash("after-send-commit");
                     rec.send_op = Some(send_op);
                     rec.phase = MovePhase::Sending;
-                    self.journal.put_move(&rec).await?;
+                    self.put_move_for_intent(intent, &rec).await?;
                 }
                 MoveStep::AwaitSettle => {
                     // A `DirectInflow` reaching `AwaitSettle` on resume is still owned by its
@@ -1728,7 +1892,7 @@ impl FedimintExecutor {
                     // invoice without a separate reconcile (spec §9.2).
                     if !rec.send_required {
                         self.verify_recovered_receive_contract(&rec).await?;
-                        self.journal.put_move(&rec).await?;
+                        self.put_move_for_intent(intent, &rec).await?;
                         return Ok(PerformOutcome::Awaiting);
                     }
                     let from = rec.from.ok_or_else(|| {
@@ -1740,12 +1904,7 @@ impl FedimintExecutor {
 
                     // The SEND leg is authoritative (A pays → swap → preimage). Await it
                     // first; only on success wait on the now-fast receive claim.
-                    match self
-                        .mc
-                        .await_send(&from, send_op)
-                        .await
-                        .map_err(retryable)?
-                    {
+                    match await_committed_send_outcome(self.mc.await_send(&from, send_op).await)? {
                         SendState::Success(preimage) => {
                             // §3: A's payment SETTLED — persist the preimage FIRST, BEFORE awaiting
                             // the receive, so a crash after this point can never lose the evidence
@@ -1753,16 +1912,18 @@ impl FedimintExecutor {
                             // to recover a stranded move (see the `Stranded` note at the top of
                             // `move_protocol`). THEN await the receive.
                             rec.preimage = Some(preimage);
-                            self.journal.put_move(&rec).await?;
+                            self.put_move_for_intent(intent, &rec).await?;
                             let recv_op = rec.recv_op.ok_or_else(|| {
-                                ExecError::Permanent(
-                                    "send settled but the record has no receive op".into(),
+                                post_successful_send_destination_unknown(
+                                    "the record has no receive op",
                                 )
                             })?;
-                            // Transport faults bubble as `Retryable` via `map_err(retryable)` BEFORE
-                            // this decision — only an op-TERMINAL non-`Claimed` receive strands
-                            // (spec §3): the send debited the source but the destination was never
-                            // credited, which re-driving cannot fix.
+                            // After a successful send, ANY await error means the destination outcome
+                            // is still unobserved — including a typed local op-log validation error.
+                            // Retain the nonterminal intent: strict user admission stays
+                            // conservative, while allocator accounting absorbs the source debit in
+                            // the live balance and keeps the destination promise reserved. Only an
+                            // op-TERMINAL non-`Claimed` receive observation strands (spec §3).
                             // `settle_after_successful_send` maps it to `Stranded` (loud,
                             // terminal); the `Stranded` note at the top of `move_protocol` says
                             // what that observation does and does not establish.
@@ -1770,7 +1931,7 @@ impl FedimintExecutor {
                                 .mc
                                 .await_receive(&rec.to, recv_op)
                                 .await
-                                .map_err(retryable)?;
+                                .map_err(post_successful_send_destination_unknown)?;
                             let (phase, outcome) = settle_after_successful_send(receive_state);
                             rec.phase = phase;
                             rec.outcome = outcome;
@@ -1784,7 +1945,7 @@ impl FedimintExecutor {
                             rec.outcome = Some(msg);
                         }
                     }
-                    self.journal.put_move(&rec).await?;
+                    self.put_move_for_intent(intent, &rec).await?;
                 }
                 MoveStep::Done => return Ok(PerformOutcome::Done),
                 // A `Refunded`/`Failed`/`Stranded` phase is terminal (spec §7): the send
@@ -3143,6 +3304,35 @@ fn settle_after_successful_send(receive: ReceiveState) -> (MovePhase, Option<Str
     }
 }
 
+/// A successful send is durably evidenced before we ask about the destination. Until the receive
+/// await returns a terminal [`ReceiveState`], an absent receive-op reference or *any* await error
+/// leaves that destination outcome unknown — it is never evidence that the move failed. Returning
+/// `Retryable` keeps the intent nonterminal for reconciliation rather than writing a terminal Failed
+/// ledger row. Strict user admission stays conservative; allocator accounting absorbs the source
+/// debit in the live balance and keeps the destination promise reserved.
+fn post_successful_send_destination_unknown(detail: impl std::fmt::Display) -> ExecError {
+    ExecError::Retryable(format!(
+        "send settled but destination receive outcome is unknown: {detail}"
+    ))
+}
+
+/// A send operation has been committed, but its terminal outcome was not observed. An
+/// [`AwaitOperationError`] is an SDK/op-log structural observation failure, not proof that the
+/// remote payment failed or refunded. Keep this durable attempt nonterminal so its reservations
+/// remain until reconciliation observes [`SendState::Refunded`] or [`SendState::Failed`].
+///
+/// This differs from [`AwaitOperationError::into_exec_error`], whose structural classifications
+/// are correct for raw awaiters before a money operation is known to have been committed.
+fn await_committed_send_outcome(
+    result: Result<SendState, crate::multi_client::AwaitOperationError>,
+) -> Result<SendState, ExecError> {
+    result.map_err(|error| {
+        ExecError::Retryable(format!(
+            "committed send outcome is unknown; retaining the move attempt: {error}"
+        ))
+    })
+}
+
 /// The §15.7 never-over TOCTOU verdict: the lnv2 mint re-fetches the gateway fee and sizes the
 /// COMMITTED contract with it, so a fee change between our verified quote and the mint shows up as
 /// `committed != quoted`. A DROP mints a LARGER contract (the destination would net MORE than
@@ -3789,10 +3979,12 @@ mod tests {
         // The evacuation ordering trap: `assemble_record` resolves the gateway, and only THEN
         // does `size_fresh_evacuation` downsize the drain to what fits the evacuation cap.
         // A dying fed holding 10_000_000 msat whose destination has 8_000_000 of cap room emits
-        // `Evacuate { amount: 8_000_000, fee_cap: max_fee }` — an amount the source CAN afford,
-        // so the send dry-run prices it fine and the quote simply lands over the cap. Judging
-        // routes on that cap here would fail the evacuation `Retryable` every tick and the
-        // downsizing bisection would never run, stranding the balance.
+        // `Evacuate { amount: 8_000_000, fee_cap: planned base+bps cap }` — an amount the source
+        // CAN afford, so the send dry-run prices it fine and the quote can still land over the
+        // cap. The authoritative cap is base+bps at the quote's final delivered net, not the
+        // planned ask. Judging routes on the planned cap here would fail the evacuation
+        // `Retryable` every tick and the downsizing bisection would never run, stranding the
+        // balance.
         assert!(!move_amount_is_final(&Action::Evacuate {
             from: FED_A,
             to: FED_B,
@@ -3943,6 +4135,43 @@ mod tests {
         assert_eq!(
             gateway_from_cache_or_recovered(None, &send_plan, &key, &artifacts),
             None
+        );
+    }
+
+    #[test]
+    fn receive_only_artifact_rebuilds_recv_op_without_a_derived_cache() {
+        let key = IdempotencyKey("direct-inflow:recover-record".into());
+        let params = MoveParams {
+            key: key.clone(),
+            operation_key: key.clone(),
+            from: None,
+            to: FED_B,
+            amount: Msat(50_000),
+            fee_cap: Msat(1_000),
+            fee_cap_components: None,
+            gateway: recovered_receive_only_gateway(),
+            send_required: false,
+        };
+        let recv_op = crate::types::OperationId([0x53; 32]);
+        let artifacts = [OpArtifact {
+            move_id: key,
+            leg: Leg::Receive,
+            op_id: recv_op,
+            amount: Msat(50_000),
+            fee_cap: None,
+            invoice: Some(Invoice("lnbc1recoverrecord".into())),
+        }];
+
+        let recovered = assemble_move_record(params, &artifacts, None);
+        assert_eq!(
+            recovered.recv_op,
+            Some(recv_op),
+            "the op-log receive artifact repairs an absent derived MoveRecord"
+        );
+        assert_eq!(
+            next_step(&recovered),
+            MoveStep::AwaitSettle,
+            "a recovered receive-only move reattaches to its existing receive operation"
         );
     }
 
@@ -4339,6 +4568,133 @@ mod tests {
             msg.contains(crate::multi_client::RECEIVE_FAILURE_DETAIL),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn successful_send_with_unobserved_receive_stays_retryable_and_nonterminal() {
+        // This is the production classifier used by `AwaitSettle` AFTER it has persisted the
+        // preimage. In particular, do not replace this with `into_exec_error`: its structural
+        // classifications are right before a terminal send observation, but after this one source
+        // funds have paid and every destination-await error leaves the credit outcome unknown.
+        let operation = OperationId([0x07; 32]);
+        let errors = [
+            crate::multi_client::AwaitOperationError::Retryable("transport reset".into()),
+            crate::multi_client::AwaitOperationError::MissingOperation(operation),
+            crate::multi_client::AwaitOperationError::NotLightningOperation {
+                operation,
+                detail: "different module".into(),
+            },
+            crate::multi_client::AwaitOperationError::WrongOperationKind {
+                operation,
+                actual: "send",
+                expected: "receive",
+            },
+            crate::multi_client::AwaitOperationError::UnsupportedLnv2Module { federation: FED_B },
+        ];
+        for error in errors {
+            let classified = post_successful_send_destination_unknown(error);
+            assert!(
+                matches!(&classified, ExecError::Retryable(message) if message.contains("destination receive outcome is unknown")),
+                "a post-send receive error must retain the intent, not terminalize it: {classified:?}"
+            );
+        }
+        let missing_recv_op =
+            post_successful_send_destination_unknown("the record has no receive op");
+        assert!(
+            matches!(missing_recv_op, ExecError::Retryable(_)),
+            "a post-send missing receive op must retain the intent"
+        );
+
+        // The send evidence is already durable, but no terminal receive state has been observed:
+        // leave the move nonterminal with no failure outcome for the ledger to record. The normal
+        // `Retryable` keeps the attempt Pending. Strict user admission remains conservative, while
+        // allocator accounting absorbs the source debit in the live balance and retains the
+        // destination promise.
+        let rec = MoveRecord {
+            key: IdempotencyKey("move-retry-unobserved-receive".into()),
+            from: Some(FED_A),
+            to: FED_B,
+            amount: Msat(100_000),
+            fee_cap: Msat(2_000),
+            gateway: GatewayUrl("https://gw.example".into()),
+            send_required: true,
+            invoice: Some(Invoice("lnbc1retryreceive".into())),
+            recv_op: Some(operation),
+            send_op: Some(OperationId([0x08; 32])),
+            phase: MovePhase::Sending,
+            outcome: None,
+            preimage: Some(crate::types::Preimage([0x9a; 32])),
+            receive_fee_quoted: Some(Msat(120)),
+            send_fee_quoted: Some(Msat(340)),
+        };
+        assert_eq!(next_step(&rec), MoveStep::AwaitSettle);
+        assert_ne!(rec.phase, MovePhase::Failed);
+        assert_ne!(next_step(&rec), MoveStep::Failed);
+        assert!(
+            rec.outcome.is_none(),
+            "no Failed ledger error may be written before a terminal receive observation"
+        );
+    }
+
+    #[test]
+    fn committed_send_await_errors_retain_the_same_attempt_and_reservations() {
+        // This is the classifier on the `AwaitSettle` production path: `send_op` was persisted
+        // immediately after `pay` committed it. Unlike a raw typed await, even a local structural
+        // error cannot establish a remote refund/failure. Changing this classifier to
+        // `AwaitOperationError::into_exec_error` makes the structural cases below fail.
+        let operation = OperationId([0x47; 32]);
+        let errors = [
+            crate::multi_client::AwaitOperationError::Retryable("transport reset".into()),
+            crate::multi_client::AwaitOperationError::MissingOperation(operation),
+            crate::multi_client::AwaitOperationError::NotLightningOperation {
+                operation,
+                detail: "different module".into(),
+            },
+            crate::multi_client::AwaitOperationError::WrongOperationKind {
+                operation,
+                actual: "receive",
+                expected: "send",
+            },
+            crate::multi_client::AwaitOperationError::UnsupportedLnv2Module { federation: FED_A },
+        ];
+        let rec = MoveRecord {
+            key: IdempotencyKey("move-committed-send-await".into()),
+            from: Some(FED_A),
+            to: FED_B,
+            amount: Msat(100_000),
+            fee_cap: Msat(2_000),
+            gateway: GatewayUrl("https://gw.example".into()),
+            send_required: true,
+            invoice: Some(Invoice("lnbc1committedsendawait".into())),
+            recv_op: Some(OperationId([0x46; 32])),
+            send_op: Some(operation),
+            phase: MovePhase::Sending,
+            outcome: None,
+            preimage: None,
+            receive_fee_quoted: Some(Msat(120)),
+            send_fee_quoted: Some(Msat(340)),
+        };
+        assert_eq!(next_step(&rec), MoveStep::AwaitSettle);
+
+        for error in errors {
+            let classified = await_committed_send_outcome(Err(error));
+            assert!(
+                matches!(&classified, Err(ExecError::Retryable(_))),
+                "an unobserved committed send must retain the exact attempt: {classified:?}"
+            );
+            assert_eq!(
+                rec.send_op,
+                Some(operation),
+                "the committed send operation remains attached for reconciliation"
+            );
+            assert_eq!(rec.phase, MovePhase::Sending);
+            assert_eq!(rec.outcome, None);
+            assert_eq!(
+                next_step(&rec),
+                MoveStep::AwaitSettle,
+                "the move remains nonterminal and retains its reservations"
+            );
+        }
     }
 
     // ---- §15.11: DirectInflow hair-under records the DELIVERED net unconditionally ----------
@@ -4992,13 +5348,13 @@ mod tests {
     ///
     /// It cannot. The pending `Action` carries the `(base, bps)` pair `decide()` admitted it with
     /// and the executor recomputes from those, so a policy change only reaches evacuations decided
-    /// afterwards. Meanwhile the refusal stays `Retryable`, nothing terminalizes it, and watch
-    /// skips ticks while retryable work remains — so the intent retries the old cap indefinitely
-    /// and no fresh decision is ever taken. An operator following the old advice would believe
-    /// they had released stranded funds.
+    /// afterwards. Meanwhile the refusal stays `Retryable`, nothing terminalizes it, and it retries
+    /// the old cap indefinitely. br-p93 lets independent goals proceed, but conflict-suppresses a
+    /// recurring `Evacuate(A)` and allocator funding that touches A, so no fresh action for this
+    /// goal is created. An operator following the old advice would believe they had released
+    /// stranded funds.
     ///
-    /// Owner for the missing mechanism: `br-n8o` (no operator action releases a structural
-    /// refusal) and `br-p93` (one retryable intent suppresses ticks for every federation).
+    /// `br-n8o` owns terminalization/supersession; br-p93 is the conflict-suppression mechanism.
     #[tokio::test]
     async fn a_structural_refusal_says_a_policy_change_will_not_release_this_evacuation() {
         let route = TestRoute::new(gw(49_000, 2_500), gw(99_000, 2_500));
@@ -6162,6 +6518,60 @@ mod tests {
         // A range with no room above yields nothing rather than probing out of bounds.
         assert!(note_boundaries_above(140_000, 140_000).is_empty());
         assert!(note_boundaries_below(5_000, MINIMUM_INCOMING_CONTRACT_MSAT).is_empty());
+    }
+
+    #[test]
+    fn service_reservation_releasing_writers_use_actor_aware_helpers() {
+        let executor = include_str!("executor.rs");
+        let production = executor
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production executor source");
+        assert_eq!(
+            production
+                .matches(".set_operation_artifact_if_attempt(intent,")
+                .count(),
+            5,
+            "every raw artifact callsite must use the executor helper"
+        );
+        assert_eq!(
+            production
+                .matches(".put_move_if_attempt(&intent.idempotency_key")
+                .count(),
+            1,
+            "the only direct intent-backed MoveRecord write is the helper's standalone branch"
+        );
+        assert!(
+            production.contains("let _ = self.put_move_if_attempt(intent, &rec).await?;"),
+            "backfill must use the actor-aware MoveRecord helper"
+        );
+
+        let runtime = include_str!("runtime.rs");
+        let awaiter = runtime
+            .split("async fn service_await_direct_inflow")
+            .nth(1)
+            .expect("DirectInflow awaiter source")
+            .split("/// A fresh executor")
+            .next()
+            .expect("DirectInflow awaiter boundary");
+        assert!(
+            awaiter.contains(".service_executor_with_client(None, client.clone())")
+                && awaiter.contains(".backfill_move_record(&intent)"),
+            "service DirectInflow backfill must carry its actor client"
+        );
+
+        let actor = include_str!("service/actor.rs");
+        let ensure_driver = actor
+            .split("fn ensure_driver")
+            .nth(1)
+            .expect("ensure_driver source")
+            .split("async fn finish_driver")
+            .next()
+            .expect("ensure_driver boundary");
+        assert!(
+            ensure_driver.contains("runtime.service_executor_with_client("),
+            "every runtime-backed production intent driver must receive the actor writer client"
+        );
     }
 
     /// A minimal fresh-evacuation record, as `assemble_record` would build it before sizing runs.

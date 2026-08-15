@@ -109,15 +109,13 @@ for f in "$WALLET_CLI" "$WALLETD"; do
     exit 1
   fi
 done
-for c in fedimint-cli jq curl; do
-  command -v "$c" >/dev/null || { echo "FAIL: $c not on PATH" >&2; exit 1; }
-done
+command -v fedimint-cli >/dev/null || { echo "FAIL: fedimint-cli not on PATH" >&2; exit 1; }
 
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
 PORT=19738
-FUND_MSAT=800000          # A's working balance
-SPENDING_TARGET=300000    # A keeps this much (msat)
-STANDBY_TARGET=100000     # the autonomous fund sizes B to ~this (msat) — never over
+FUND_MSAT=3000000          # A's 3,000-sat working balance
+SPENDING_TARGET=1000000    # A keeps 1,000 sat
+STANDBY_TARGET=1000000     # 1,000 sat clears the live route-economic floor at the 300-bps move cap
 MAX_FEE=100000            # absolute cap for user money verbs/probe legs, not allocator funding (max_fee_bps_of_move: 300 bps)
 
 SANDBOX="$(mktemp -d)"
@@ -183,13 +181,14 @@ wsa policy set \
 echo "policy: pins A/B, targets ${SPENDING_TARGET}/${STANDBY_TARGET}, 5s cadence, 1s probe span"
 
 "$WALLETD" init >/dev/null
-TOKEN=$(cat "$DATA_DIR/token")
-BASE="http://127.0.0.1:$PORT"
-AUTH=(-H "Authorization: Bearer $TOKEN")
 
 wait_healthy() {
   for i in $(seq 1 60); do
-    curl -sf "${AUTH[@]}" "$BASE/v1/health" >/dev/null 2>&1 && return 0
+    # Use the product client for this chain's readiness check: client-mode `health` calls this
+    # same endpoint with the initialized pointer/token and fails non-zero until walletd is ready.
+    # (The exact launcher now supplies lock-pinned curl for the daemon/responsiveness/soak gates
+    # that need raw authenticated HTTP and timing.)
+    "$WALLET_CLI" health >/dev/null 2>&1 && return 0
     kill -0 "$WALLETD_PID" 2>/dev/null || { echo "FAIL: walletd died at startup" >&2; return 1; }
     sleep 0.2
   done

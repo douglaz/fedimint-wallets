@@ -203,8 +203,10 @@ the evidence is durable and the ledger says exactly what is and is not known.
        drops the result below `min_move` it refuses an otherwise-viable move outright.
        `amount + fee_cap ≤ budget` still holds, but a flat cap can no longer exceed a small
        surplus and refuse the whole move.
-       `Evacuate` alone still carries `fee_cap = snapshot.max_fee`; the
-       `debited[from] += amount + fee_cap` bound below is unchanged.
+       `Evacuate` instead carries `fee_cap = evac_fee_base_msat +
+       floor(amount * evac_fee_bps / 10_000)`. The executor recomputes that base+bps cap at
+       the final delivered net after fresh-evacuation sizing; the planned cap remains the
+       conservative same-tick debit bound below.
      - TopUp (standby → spending): `available = spendable − debited[src] − fee_cap`.
      - Standby funding (spending → standby): the surplus floor STAYS —
        `available = (spendable − target_spending_balance) − debited[src] − fee_cap` — the
@@ -222,8 +224,8 @@ the evidence is durable and the ledger says exactly what is and is not known.
      exists for it) or be silently downsized (Evacuate — 3.A's `size_fresh_evacuation`
      resizes at perform time; the reservation here is the planning-side complement, and the
      two interact: a reserved amount should rarely need downsizing). An evacuation may leave
-     ≤ `max_fee` behind when actual fees run lower — bounded, honest, and preferable to a
-     move that cannot execute.
+     no more than the planned base+bps cap behind when actual fees run lower — bounded,
+     honest, and preferable to a move that cannot execute.
    - Every emitted `Move`/`Evacuate` then records `credited[to] += amount` and
      `debited[from] += amount + fee_cap` — the conservative bound that makes any number of
      same-source moves provably non-overdrawing (fees are unknowable at decide time but
@@ -306,8 +308,9 @@ pub enum OperationStatus { Started, Awaiting, Succeeded, Failed }
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OperationKind {
     Join { fed: FederationId },
+    Recover { fed: FederationId },
     Receive { fed: FederationId, amount_invoiced: Msat, op_id: Option<OperationId>,
-              gateway: Option<GatewayUrl> },
+               gateway: Option<GatewayUrl> },
               // GROSS invoiced amount — the user's input, known BEFORE any resolution, so
               // the pre-call Started row is complete; the NET credit is
               // amount_invoiced − fees.receive_fee (lnv2 raw receive deducts fees from the
@@ -322,10 +325,33 @@ pub enum OperationKind {
     DirectInflow { to: FederationId, amount: Msat, recv_op: Option<OperationId>,
                    gateway: Option<GatewayUrl> },
     Move { from: FederationId, to: FederationId, amount: Msat,
-           send_op: Option<OperationId>, recv_op: Option<OperationId>,
-           gateway: Option<GatewayUrl>, evacuation: bool },
-    Refusal { fed: FederationId },
+            send_op: Option<OperationId>, recv_op: Option<OperationId>,
+            gateway: Option<GatewayUrl>, evacuation: bool },
+    Refusal { fed: FederationId, diagnostics: RefusalDiagnostics },
+    Probe { fed: FederationId, from: FederationId, amount_msat: Msat,
+            cost_msat: Option<Msat> },
     Tick { occurrence: Occurrence, decisions: u32, performed: u32, failed: u32 },
+    Discover { source: DiscoverySource, status: SourceStatus, found: u32,
+               structurally_passed: u32, rejected: u32 },
+    AutoJoin { considered: u32, joined: u32, blocked_concurrent: u32,
+               blocked_weekly: u32, blocked_lifetime: u32 },
+    Approve { fed: FederationId },
+}
+
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct RefusalDiagnostics {
+    pub source: Option<FederationId>,
+    pub want: Option<Msat>,
+    pub available: Option<Msat>,
+    pub source_spendable: Option<Msat>,
+    pub max_fee: Option<Msat>,
+    #[serde(default)]
+    pub max_fee_bps: Option<u16>,
+    pub cap_room: Option<Msat>,
+    pub amount: Option<Msat>,
+    #[serde(default)]
+    pub conflict_suppressed: bool,
+    pub min_move: Option<Msat>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -350,6 +376,7 @@ pub struct RawOpUpdate {
     pub invoice_amount: Option<Msat>,
     pub payment_hash: Option<[u8; 32]>,
     pub fees: Option<FeeBreakdown>,
+    pub fees_definitive: bool,
 }
 ```
 
@@ -395,8 +422,9 @@ Pure helpers, golden-tested in `wallet-core`:
 2. `Intent` gains `reason: ReasonCode`, `actor: Actor`, `created_at_ms: u64`.
    `Intent::from_decision(decision: &AllocatorDecision, actor: Actor, now_ms: u64)` — the two
    new parameters are threaded from `apply`:
-3. **Failure strings reach the ledger:** `Journal::set_status` gains an error parameter —
-   `set_status(key, status, error: Option<&str>)` (greenfield trait change; `MemJournal` and
+3. **Failure strings reach the ledger:** `Journal::set_status` gains its expected-attempt fence
+   and an error parameter — `set_status(key, expected_attempt, status, error: Option<&str>)`
+   (greenfield trait change; `MemJournal` and
    all test doubles updated mechanically). `drive()` passes the `ExecError`'s diagnostic
    string on the `Permanent`/`Unsupported` paths and `None` elsewhere — several permanent
    failures ("fee over cap", `Unsupported`, early bails) never reach a terminal `put_move`,
@@ -488,8 +516,10 @@ Public async methods on `FedimintJournal` (each one dbtx via the same helper):
   occurrence) land as `Failed` rows WITH their diagnostic string and zero-or-partial counts —
   a boolean "terminal" flag could only fake them as successful ticks.
 - `record_refusals(decisions, occurrence, now_ms)` — one `Refusal` row per advisory decision,
-  keyed by its EXISTING `refuse:` idempotency key (dedup across re-ticks of the same
-  occurrence is automatic via `0x06`).
+  keyed by its existing `refuse:<reason>:<fed>:<occurrence>` key or, for a withheld executable
+  candidate, its `conflict-suppressed:<candidate-key>:<reason>` key. Commit-time admission
+  drops of executable decisions are separate rows keyed
+  `tick-drop:<occurrence>:<decision-key>`; `0x06` deduplicates each exact key.
 - Scans: `history(limit, before_seq) -> Vec<OperationRecord>` (reverse `0x05` scan) and
   `operation(key | seq) -> Option<OperationRecord>`; poison-tolerant like every other scan
   (skip+warn undecodable rows, surface only storage errors).
@@ -649,7 +679,7 @@ wallet-cli show <correlation-key | seq> [--json]
 ```
 - `history` scans newest-first and prints ONE TAB-SEPARATED line per record to stdout:
   `seq<TAB>updated_at(RFC3339)<TAB>kind<TAB>status<TAB>amount_msat<TAB>recv_fee_msat<TAB>send_fee_quoted_msat<TAB>actor<TAB>reason<TAB>key`
-  where `kind` ∈ `join|receive|pay|direct-inflow|move|evacuation|refusal|tick`, `actor` ∈
+  where `kind` ∈ `join|recover|receive|pay|direct-inflow|move|evacuation|refusal|probe|tick|discover|autojoin|approve`, `actor` ∈
   `user|agent:<occurrence>`, `reason` = `reason_tag` (snake_case), unknown fields = `-`.
   The two fee columns are deliberately SEPARATE and the send column is NAMED quoted: the
   receive fee is exact ON `Succeeded` ROWS ONLY (elsewhere it is a quote too — §2.3/§7),

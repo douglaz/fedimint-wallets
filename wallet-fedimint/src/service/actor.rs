@@ -9,9 +9,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::Ordering;
 use tokio::task::JoinHandle;
 use wallet_core::{
-    admit_intent, probe_verdict, Action, ActiveProbeVerdict, Actor, AllocatorDecision,
-    AllocatorSnapshot, DecideAndJournal, IntentStatus, Journal, OperationKind, OperationStatus,
-    ProbePolicy, ReasonCode, Reservations, RouteEconomics, RouteStatus, ScorerPolicy,
+    admit_intent, intent_status_transition_allowed, probe_verdict, Action, ActiveProbeVerdict,
+    Actor, AllocatorDecision, AllocatorGoal, AllocatorSnapshot, DecideAndJournal, GoalBlockers,
+    IntentStatus, Journal, Occurrence, OperationKind, OperationStatus, ProbePolicy, ReasonCode,
+    Reservations, RouteEconomics, RouteStatus, ScorerPolicy,
 };
 
 struct PendingWaiter {
@@ -35,6 +36,23 @@ struct ProbeBudgetState {
     load_error: Option<String>,
 }
 
+/// Federations whose sampled balances can be invalidated by this action.
+///
+/// This single projection is shared by durable intent transitions, direct raw-terminal
+/// mutations, and commit-time freshness checks so those paths cannot drift apart.
+pub(super) fn balance_federations(action: &Action) -> BTreeSet<FederationId> {
+    match action {
+        Action::Move { from, to, .. } | Action::Evacuate { from, to, .. } => {
+            BTreeSet::from([*from, *to])
+        }
+        Action::DirectInflow { to, .. } | Action::Receive { to, .. } => BTreeSet::from([*to]),
+        Action::Pay { from, .. } => BTreeSet::from([*from]),
+        Action::Join { .. } | Action::Recover { .. } | Action::RefuseInflow { .. } => {
+            BTreeSet::new()
+        }
+    }
+}
+
 struct TickBatch {
     key: IdempotencyKey,
     decisions: u32,
@@ -43,6 +61,60 @@ struct TickBatch {
     failed: u32,
     error: Option<String>,
 }
+
+/// Whether a fresh Agent request may already have changed durable admission state when its caller
+/// receives an error.  CommitTick uses this to distinguish a proven pre-upsert failure from a
+/// requested write whose durability is known or conservatively unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreshMutationDisposition {
+    DefiniteNoMutation,
+    RequestedMutationPossible,
+    UnknownIdentityPoison,
+}
+
+/// The actor's internal error contract for the shared direct/CommitTick fresh admission path.
+/// Public direct callers receive only `error`; CommitTick additionally needs the mutation
+/// disposition before deciding whether a later sibling needs a goal/reservation fold.
+#[derive(Debug)]
+struct DecideOpError {
+    error: ServiceError,
+    disposition: FreshMutationDisposition,
+}
+
+impl DecideOpError {
+    fn definite(error: ServiceError) -> Self {
+        Self {
+            error,
+            disposition: FreshMutationDisposition::DefiniteNoMutation,
+        }
+    }
+
+    fn requested(error: ServiceError) -> Self {
+        Self {
+            error,
+            disposition: FreshMutationDisposition::RequestedMutationPossible,
+        }
+    }
+
+    fn into_service(self) -> ServiceError {
+        self.error
+    }
+}
+
+impl From<ServiceError> for DecideOpError {
+    fn from(error: ServiceError) -> Self {
+        Self::definite(error)
+    }
+}
+
+type PreparedTickRound = (
+    Arc<FedimintJournal>,
+    Option<Arc<Runtime>>,
+    ProbeFacts,
+    TickPolicy,
+    u64,
+    u64,
+);
 
 struct ActorState {
     runtime: Option<Arc<Runtime>>,
@@ -56,10 +128,51 @@ struct ActorState {
     /// Bumped on every accepted PutPolicy. A tick round is stamped with the value it
     /// planned under; CommitTick refuses if this has since advanced (§6a P1 ruling).
     policy_generation: u64,
+    /// Non-forgeable fresh-probe authority and non-wrapping policy identity. The authority is
+    /// stable for this actor; the version identity is replaced after each durable `PutPolicy`.
+    probe_policy_authority: Arc<()>,
+    probe_policy_version: Arc<()>,
+    /// Membership world view used by off-actor planning.  Unlike per-goal
+    /// admission counters it invalidates every plan after Join/Recover progress.
+    world_generation: u64,
+    world_generation_poisoned: bool,
+    /// Per-actor capability authority for terminal leases.  Epochs alone collide across actors,
+    /// so a lease must prove both its epoch and the actor which issued it before it can alter
+    /// balance generations or release the live fence.
+    external_terminal_authority: Arc<()>,
+    external_terminal_epoch: u64,
+    external_terminal_live: bool,
+    external_terminal_poisoned: bool,
+    /// Per-actor capability authority for membership-publication leases.  Epochs alone collide
+    /// across actors, so a lease must prove its issuer before it can advance the membership
+    /// world or release the live publication fence.
+    membership_authority: Arc<()>,
+    membership_epoch: u64,
+    membership_live: bool,
+    membership_poisoned: bool,
     probe_budget: ProbeBudgetState,
+    /// Exactly one detached recovery task reconciles all ownership made unknown by
+    /// post-`DriverFinished` journal-read faults.  The generation closes the race
+    /// between that task's durable scan and a later fault arriving on the actor.
+    ownership_recovery_active: bool,
+    ownership_recovery_generation: u64,
     policy_wake: tokio::sync::watch::Sender<u64>,
-    tick_balances: Option<(wallet_core::Occurrence, BTreeMap<FederationId, Msat>)>,
     tick_batches: Vec<TickBatch>,
+    /// Per-logical-goal admission counters.  Unlike the pending scan, these
+    /// deliberately retain a terminal admission long enough for an older
+    /// off-actor plan to see that it was superseded.
+    goal_admissions: BTreeMap<AllocatorGoal, u64>,
+    goal_admissions_poisoned: bool,
+    tick_token_authority: Arc<()>,
+    balance_generations: BTreeMap<FederationId, u64>,
+    balance_generations_poisoned: bool,
+    /// A durable intent transition completed but its affected balance facts could not be
+    /// identified.  Issuing a token after that would let a tick treat an unknown fact as fresh.
+    /// This is deliberately fail-closed rather than merely diagnostic.
+    balance_facts_poisoned: Option<String>,
+    balance_facts_authority: Arc<()>,
+    #[cfg(test)]
+    fail_after_fresh_admission: Option<IdempotencyKey>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -93,13 +206,35 @@ pub(super) async fn run(
         perform_timeout,
         generation: 0,
         policy_generation: 0,
+        probe_policy_authority: Arc::new(()),
+        probe_policy_version: Arc::new(()),
+        world_generation: 0,
+        world_generation_poisoned: false,
+        external_terminal_authority: Arc::new(()),
+        external_terminal_epoch: 0,
+        external_terminal_live: false,
+        external_terminal_poisoned: false,
+        membership_authority: Arc::new(()),
+        membership_epoch: 0,
+        membership_live: false,
+        membership_poisoned: false,
         probe_budget: ProbeBudgetState {
             entries: Vec::new(),
             load_error: Some("probe budget state is still loading".to_owned()),
         },
+        ownership_recovery_active: false,
+        ownership_recovery_generation: 0,
         policy_wake,
-        tick_balances: None,
         tick_batches: Vec::new(),
+        goal_admissions: BTreeMap::new(),
+        goal_admissions_poisoned: false,
+        tick_token_authority: Arc::new(()),
+        balance_generations: BTreeMap::new(),
+        balance_generations_poisoned: false,
+        balance_facts_poisoned: None,
+        balance_facts_authority: Arc::new(()),
+        #[cfg(test)]
+        fail_after_fresh_admission: None,
     };
 
     loop {
@@ -176,6 +311,83 @@ fn abort_loader(loader: &mut Option<JoinHandle<ProbeBudgetState>>) {
     }
 }
 
+fn reserve_action_for_commit(reservations: &mut Reservations, action: &Action) {
+    let outbound = match action {
+        Action::Move {
+            from,
+            amount,
+            fee_cap,
+            ..
+        }
+        | Action::Evacuate {
+            from,
+            amount,
+            fee_cap,
+            ..
+        }
+        | Action::Pay {
+            from,
+            amount,
+            fee_cap,
+            ..
+        } => Some((*from, Msat(amount.0.saturating_add(fee_cap.0)))),
+        _ => None,
+    };
+    if let Some((from, amount)) = outbound {
+        let slot = reservations.per_fed_outbound.entry(from).or_insert(Msat(0));
+        slot.0 = slot.0.saturating_add(amount.0);
+    }
+
+    let inbound = match action {
+        Action::Move { to, amount, .. }
+        | Action::Evacuate { to, amount, .. }
+        | Action::DirectInflow { to, amount, .. }
+        | Action::Receive { to, amount, .. } => Some((*to, *amount)),
+        _ => None,
+    };
+    if let Some((to, amount)) = inbound {
+        let slot = reservations.per_fed_inbound.entry(to).or_insert(Msat(0));
+        slot.0 = slot.0.saturating_add(amount.0);
+    }
+    let target_credit = match action {
+        Action::Move { to, amount, .. } | Action::Evacuate { to, amount, .. } => {
+            Some((*to, *amount))
+        }
+        _ => None,
+    };
+    if let Some((to, amount)) = target_credit {
+        let slot = reservations
+            .per_fed_target_credit
+            .entry(to)
+            .or_insert(Msat(0));
+        slot.0 = slot.0.saturating_add(amount.0);
+    }
+}
+
+/// A storage error after a fresh journal mutation is ambiguous: the write may have committed even
+/// though its caller observed an error.  Keep the remainder of this batch safe without treating a
+/// replay of an already-existing key as a second mutation.
+fn fold_unknown_fresh_commit_mutation(
+    blocked: &mut GoalBlockers,
+    commit_reservations: &mut Reservations,
+    decision: &AllocatorDecision,
+    occurrence: Occurrence,
+    decision_existed: bool,
+    mutation_unknown: bool,
+) {
+    if mutation_unknown && !decision_existed {
+        blocked.hold_decision(decision, Actor::Agent { occurrence });
+        reserve_action_for_commit(commit_reservations, &decision.action);
+    }
+}
+
+fn executable_destination(action: &Action) -> Option<FederationId> {
+    match action {
+        Action::Move { to, .. } | Action::Evacuate { to, .. } => Some(*to),
+        _ => None,
+    }
+}
+
 async fn wait_for_deadline(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -187,7 +399,13 @@ async fn wait_for_deadline(deadline: Option<Instant>) {
 /// reaches it through `DecideTickRound`, so route pricing and `decide()` cannot drift.
 #[derive(Clone, Debug)]
 pub(crate) struct PlannedTickRound {
+    /// What this tick may act on: everything `decide()` produced MINUS the work suppressed by the
+    /// conflict projection. Route preflight, apply and commit all read this list.
     pub(crate) decisions: Vec<AllocatorDecision>,
+    /// The decisions the conflict projection withheld (br-p93) — work whose logical goal another
+    /// intent already owns. Kept separately from admitted work because it did not complete route
+    /// preflight and can only supply the narrow source-associated pin voucher.
+    pub(crate) suppressed: Vec<AllocatorDecision>,
     pub(crate) probes: Vec<(FederationId, crate::probe::ProbeResult)>,
     pub(crate) active_probes: BTreeMap<FederationId, ActiveProbeVerdict>,
     pub(crate) snapshot: AllocatorSnapshot,
@@ -210,7 +428,7 @@ pub(crate) async fn plan_tick_round(
             .iter()
             .map(|(id, record)| (*id, record.state)),
     );
-    let reservations = project_reservations(journal).await?;
+    let reservations = project_allocator_reservations(journal).await?;
     let mut probes = probes;
     let mut priced = BTreeMap::<(FederationId, FederationId), RouteEconomics>::new();
     let mut invalidated = BTreeSet::new();
@@ -343,21 +561,59 @@ async fn plan_tick_off_actor(
     facts: ProbeFacts,
     policy: TickPolicy,
     planned_generation: u64,
+    planned_world_generation: u64,
 ) -> ServiceResult<TickRound> {
     let route_budget = facts
         .price_routes
         .then(|| crate::route_econ::RouteQuoteBudget::starting_at(facts.now_ms));
-    let round = plan_tick_round(
-        journal.as_ref(),
-        runtime.as_deref(),
-        facts.probes,
+    #[cfg(test)]
+    let fixture_round = runtime
+        .as_deref()
+        .and_then(Runtime::scheduler_tick_test_plan);
+    let round = {
+        #[cfg(test)]
+        if let Some(round) = fixture_round {
+            PlannedTickRound {
+                decisions: round.decisions,
+                suppressed: round.suppressed,
+                probes: round.probes,
+                active_probes: round.active_probes,
+                snapshot: round.snapshot,
+            }
+        } else {
+            plan_tick_round(
+                journal.as_ref(),
+                runtime.as_deref(),
+                facts.probes,
+                &policy,
+                facts.now_ms,
+                route_budget,
+            )
+            .await
+            .map_err(storage)?
+        }
+        #[cfg(not(test))]
+        {
+            plan_tick_round(
+                journal.as_ref(),
+                runtime.as_deref(),
+                facts.probes,
+                &policy,
+                facts.now_ms,
+                route_budget,
+            )
+            .await
+            .map_err(storage)?
+        }
+    };
+    let problems = pinned_input_problems(
         &policy,
-        facts.now_ms,
-        route_budget,
-    )
-    .await
-    .map_err(storage)?;
-    let problems = pinned_input_problems(&policy, &round.snapshot, &round.probes, &round.decisions);
+        &round.snapshot,
+        &round.probes,
+        &round.decisions,
+        &round.suppressed,
+        &policy.blocked,
+    );
     if !problems.is_empty() {
         return Err(ServiceError::Storage(format!(
             "tick: {}",
@@ -366,9 +622,11 @@ async fn plan_tick_off_actor(
     }
     Ok(TickRound {
         decisions: round.decisions,
+        occurrence: facts.occurrence,
         spending_fed: round.snapshot.spending_fed,
-        standby_fed: round.snapshot.standby_fed,
         planned_generation,
+        planned_world_generation,
+        admission_snapshot: facts.admission_snapshot,
     })
 }
 
@@ -466,7 +724,7 @@ async fn build_tick_round(
     snapshot.reservations = reservations.clone();
     if let (Some(runtime), Some(budget)) = (runtime, route_budget) {
         runtime
-            .price_missing_routes(&snapshot, budget, priced)
+            .price_missing_routes(&snapshot, budget, priced, &policy.blocked)
             .await;
     }
     snapshot.route_economics_by_pair = priced
@@ -474,9 +732,27 @@ async fn build_tick_round(
         .filter(|(pair, _)| !invalidated.contains(pair))
         .map(|(pair, economics)| (*pair, economics.clone()))
         .collect();
-    let decisions = wallet_core::decide(&snapshot, policy.occurrence);
+    // br-p93: withhold work that duplicates an in-flight allocator goal inside `decide`, BEFORE
+    // the allocator charges its intra-tick `credited`/`debited` reservations. A discarded
+    // evacuation must not consume destination room and thereby suppress an independent evacuation
+    // sharing that destination. This also happens before concrete route preflight and the revision
+    // loop above can run any I/O on the withheld work.
+    let actor = Actor::Agent {
+        occurrence: policy.occurrence,
+    };
+    let (decisions, suppressed) =
+        wallet_core::decide_with_blockers(&snapshot, policy.occurrence, &policy.blocked);
+    for decision in &suppressed {
+        tracing::warn!(
+            key = %decision.idempotency_key.0,
+            holder = ?policy.blocked.blocking_holder(decision, actor)
+                .map(|key| key.0.as_str()),
+            "tick: withholding a decision that conflicts with in-flight allocator work"
+        );
+    }
     Ok(PlannedTickRound {
         decisions,
+        suppressed,
         probes: probes.to_vec(),
         active_probes,
         snapshot,
@@ -520,17 +796,48 @@ pub(crate) async fn active_probe_verdicts(
     active
 }
 
-async fn project_reservations(journal: &FedimintJournal) -> Result<Reservations, ExecError> {
+async fn project_strict_reservations(journal: &FedimintJournal) -> Result<Reservations, ExecError> {
+    let intents = journal.reservation_intents().await?;
+    Ok(wallet_core::project_reservations(&intents))
+}
+
+/// Load the artifact-aware reservation view used only by tokenized allocator work.
+///
+/// An undecodable derived record cannot be trusted, but it also must not make the allocator fail
+/// open: omit it from the map so wallet-core applies the intent's strict action fallback. A
+/// transient database read still aborts planning/commit.
+async fn project_allocator_reservations(
+    journal: &FedimintJournal,
+) -> Result<Reservations, ExecError> {
     let intents = journal.reservation_intents().await?;
     let mut records = BTreeMap::new();
     for intent in &intents {
-        if let Some(record) = journal.get_move(&intent.idempotency_key).await? {
-            records.insert(intent.idempotency_key.clone(), record);
+        if !matches!(
+            intent.action,
+            Action::Move { .. } | Action::Evacuate { .. } | Action::DirectInflow { .. }
+        ) {
+            continue;
+        }
+        match journal.get_move(&intent.idempotency_key).await {
+            Ok(Some(record)) => {
+                records.insert(intent.idempotency_key.clone(), record);
+            }
+            Ok(None) => {}
+            Err(ExecError::Permanent(error)) => {
+                tracing::warn!(
+                    key = %intent.idempotency_key.0,
+                    %error,
+                    "allocator reservation: corrupt derived record; retaining strict action reservation"
+                );
+            }
+            Err(error @ ExecError::Retryable(_)) | Err(error @ ExecError::Unsupported) => {
+                return Err(error);
+            }
         }
     }
-    Ok(wallet_core::project_reservations(&intents, |key| {
-        records.get(key).cloned()
-    }))
+    Ok(wallet_core::project_allocator_reservations(
+        &intents, &records,
+    ))
 }
 
 impl ActorState {
@@ -563,37 +870,176 @@ impl ActorState {
                 transition,
                 reply,
             } => {
-                let refresh_budget = matches!(&transition, JournalTransition::Refresh)
-                    && self
-                        .probe_budget
-                        .entries
-                        .iter()
-                        .any(|entry| entry.key == key);
+                // Refresh is a read-bearing transition: even a key which no longer has an
+                // in-memory reservation must report a ledger-read fault to its driver.  That
+                // prevents a completed probe from releasing its sole owner before a later
+                // retry has observed its durable terminal row.
+                let refresh_budget = matches!(&transition, JournalTransition::Refresh);
+                // Capture the action before a durable mutation. Looking the intent up afterwards
+                // would both race an external writer and silently leave balance-fact tokens fresh
+                // when that read failed.
+                let balance_action = match self.transition_balance_action(&key, &transition).await {
+                    Ok(action) => action,
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        return;
+                    }
+                };
                 let resolve_waiters = transition_may_resolve(&transition);
-                let finished_generation = match &transition {
-                    JournalTransition::DriverFinished { generation } => Some(*generation),
+                let terminal_membership_transition = transition_terminal_status(&transition);
+                // `Applied` is the successful reply shape for both an intent write and
+                // process/probe bookkeeping.  Only the former invalidates balance facts:
+                // DriverFinished tears down a registry entry and Refresh re-reads a probe
+                // budget, neither changes an intent reservation.  In particular, do not
+                // mistake either for an unknown-action write and poison every later tick.
+                let intent_mutation = transition_is_intent_mutation(&transition);
+                let finished = match &transition {
+                    JournalTransition::DriverFinished {
+                        generation,
+                        expected_attempt,
+                        retry_awaiter,
+                    } => Some((*generation, *expected_attempt, *retry_awaiter)),
                     _ => None,
                 };
-                let result = self.apply_transition(&key, transition).await;
-                if result.is_ok() {
-                    if let Some(generation) = finished_generation {
+                let mut result = self.apply_transition(&key, transition).await;
+                if result.is_ok() && refresh_budget {
+                    result = self
+                        .refresh_probe_budget(&key)
+                        .await
+                        .map(|()| TransitionResult::Applied);
+                }
+                if let Ok(transition_result) = &result {
+                    // A failed CAS did not mutate durable state.  Refresh and DriverFinished are
+                    // probes/process bookkeeping respectively and intentionally have no action.
+                    if intent_mutation && transition_mutated(transition_result) {
+                        if let Some(action) = balance_action.as_ref() {
+                            self.record_balance_change(action);
+                            if terminal_membership_transition
+                                && matches!(action, Action::Join { .. } | Action::Recover { .. })
+                            {
+                                self.bump_world_generation();
+                            }
+                        } else {
+                            // A writer reporting a mutation without the identity captured before
+                            // that write means balance-fact invalidation is no longer knowable.
+                            // Fail closed rather than issuing a fresh-looking token.
+                            self.poison_balance_facts(format!(
+                                "intent transition {} reported a mutation without an affected action",
+                                key.0
+                            ));
+                        }
+                    }
+                    if let Some((generation, expected_attempt, retry_awaiter)) = finished {
                         if intake {
                             if let Some(client) = client {
-                                self.finish_driver(&key, generation, client).await;
+                                self.finish_driver(
+                                    &key,
+                                    generation,
+                                    expected_attempt,
+                                    retry_awaiter,
+                                    client,
+                                )
+                                .await;
                             }
                         } else {
                             driver::finish(&self.registry, &key, generation);
                         }
                     }
-                    if refresh_budget {
-                        self.refresh_probe_budget(&key).await;
-                    }
                     if resolve_waiters {
                         self.resolve_key(&key).await;
                     }
-                    self.observe_tick_outcome(&key, finished_generation.is_some())
-                        .await;
+                    self.observe_tick_outcome(&key, finished.is_some()).await;
+                } else if intent_mutation {
+                    // A writer can commit and then report an error.  The pre-write lookup names the
+                    // only balances which could have changed, so conservatively stale that scope
+                    // rather than permanently refusing unrelated balance facts.  Only an attempted
+                    // mutation with no known action has to fail closed globally.
+                    if let Some(action) = balance_action.as_ref() {
+                        self.record_balance_change(action);
+                        if terminal_membership_transition
+                            && matches!(action, Action::Join { .. } | Action::Recover { .. })
+                        {
+                            self.bump_world_generation();
+                        }
+                    } else {
+                        self.poison_balance_facts(format!(
+                            "intent transition {} returned an ambiguous durability error without an affected action",
+                            key.0
+                        ));
+                    }
                 }
+                let _ = reply.send(result);
+            }
+            Command::SetOperationArtifact {
+                key,
+                expected_attempt,
+                operation_id,
+                invoice,
+                reply,
+            } => {
+                let result = match self.artifact_write_action(&key, expected_attempt).await {
+                    Ok(Some(action)) => {
+                        match self
+                            .journal
+                            .set_operation_artifact_if_attempt(
+                                &key,
+                                expected_attempt,
+                                operation_id,
+                                invoice.as_ref(),
+                            )
+                            .await
+                        {
+                            Ok(changed) => {
+                                if changed {
+                                    self.record_balance_change(&action);
+                                    self.resolve_key(&key).await;
+                                }
+                                Ok(changed)
+                            }
+                            Err(error) => {
+                                // The attempt/action fence was read before this writer ran.  It may
+                                // have committed before returning Err, so stale exactly its source.
+                                self.record_balance_change(&action);
+                                Err(storage(error))
+                            }
+                        }
+                    }
+                    Ok(None) => Ok(false),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            Command::PutMove {
+                key,
+                expected_attempt,
+                record,
+                reply,
+            } => {
+                let result = match self.artifact_write_action(&key, expected_attempt).await {
+                    Ok(Some(action)) => {
+                        match self
+                            .journal
+                            .put_move_if_attempt(&key, expected_attempt, record.as_ref())
+                            .await
+                        {
+                            Ok(changed) => {
+                                if changed {
+                                    self.record_balance_change(&action);
+                                    self.resolve_key(&key).await;
+                                }
+                                Ok(changed)
+                            }
+                            Err(error) => {
+                                // As above, preserve other federations' usable balance facts while
+                                // conservatively invalidating both sides of this known move.
+                                self.record_balance_change(&action);
+                                Err(storage(error))
+                            }
+                        }
+                    }
+                    Ok(None) => Ok(false),
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
             Command::Snapshot { scope, reply } => {
@@ -622,47 +1068,87 @@ impl ActorState {
                 };
                 let _ = reply.send(result);
             }
+            Command::ReconcileDurable { reply } => {
+                let result = if intake {
+                    match client {
+                        Some(client) => self.reconcile_durable(client).await,
+                        None => Err(ServiceError::ActorStopped),
+                    }
+                } else {
+                    Err(ServiceError::ShuttingDown)
+                };
+                let _ = reply.send(result);
+            }
+            Command::RecoverDriverOwnership { reply } => {
+                let result = if intake {
+                    match client {
+                        Some(client) => self
+                            .reconcile_durable(client)
+                            .await
+                            .map(|_| self.ownership_recovery_generation),
+                        None => Err(ServiceError::ActorStopped),
+                    }
+                } else {
+                    Err(ServiceError::ShuttingDown)
+                };
+                let _ = reply.send(result);
+            }
+            Command::FinishDriverOwnershipRecovery { generation, reply } => {
+                let complete = self.ownership_recovery_active
+                    && generation == self.ownership_recovery_generation;
+                if complete {
+                    self.ownership_recovery_active = false;
+                }
+                let _ = reply.send(Ok(complete));
+            }
             Command::DecideTickRound { facts, reply } => {
                 if intake {
                     // Do the ms-scale bookkeeping on the actor turn, then price routes OFF the
                     // actor loop and reply from the spawned task, so the actor keeps serving
                     // admissions, driver transitions, waiter deadlines, and shutdown while the tick
                     // plans (ADR-0024). The scheduler still awaits this reply before it commits.
-                    let (journal, runtime, facts, policy, planned_generation) =
-                        self.prepare_tick_round(facts);
-                    tokio::spawn(async move {
-                        let result = plan_tick_off_actor(
+                    match self.prepare_tick_round(facts) {
+                        Ok((
                             journal,
                             runtime,
                             facts,
                             policy,
                             planned_generation,
-                        )
-                        .await;
-                        let _ = reply.send(result);
-                    });
+                            planned_world_generation,
+                        )) => {
+                            tokio::spawn(async move {
+                                let result = plan_tick_off_actor(
+                                    journal,
+                                    runtime,
+                                    facts,
+                                    policy,
+                                    planned_generation,
+                                    planned_world_generation,
+                                )
+                                .await;
+                                let _ = reply.send(result);
+                            });
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                        }
+                    }
                 } else {
                     let _ = reply.send(Err(ServiceError::ShuttingDown));
                 }
             }
             Command::CommitTick {
-                decisions,
+                round,
                 balances,
+                balance_facts,
                 tick_key,
-                planned_generation,
                 reply,
             } => {
                 let result = if intake {
                     match client {
                         Some(client) => {
-                            self.commit_tick(
-                                decisions,
-                                balances,
-                                tick_key,
-                                planned_generation,
-                                client,
-                            )
-                            .await
+                            self.commit_tick(round, balances, balance_facts, tick_key, client)
+                                .await
                         }
                         None => Err(ServiceError::ActorStopped),
                     }
@@ -671,8 +1157,42 @@ impl ActorState {
                 };
                 let _ = reply.send(result);
             }
+            #[cfg(test)]
+            Command::FailAfterFreshAdmissionForTest { key, reply } => {
+                self.fail_after_fresh_admission = Some(key);
+                let _ = reply.send(Ok(()));
+            }
+            Command::BeginExternalTerminalMutation { action, reply } => {
+                let result = self.begin_external_terminal_mutation(&action);
+                let _ = reply.send(result);
+            }
+            Command::EndExternalTerminalMutation { lease, reply } => {
+                let result = self.end_external_terminal_mutation(lease);
+                let _ = reply.send(result);
+            }
+            Command::BeginMembershipMutation { reply } => {
+                let result = self.begin_membership_mutation();
+                let _ = reply.send(result);
+            }
+            Command::EndMembershipMutation { lease, reply } => {
+                let result = self.end_membership_mutation(lease);
+                let _ = reply.send(result);
+            }
             Command::Shutdown { reply } => {
                 let _ = reply.send(Err(ServiceError::ShuttingDown));
+            }
+            Command::IssueTickPlanToken { reply } => {
+                let _ = reply.send(self.issue_tick_plan_token().await);
+            }
+            Command::IssueBalanceFactsToken { reply } => {
+                let _ = reply.send(self.issue_balance_facts_token());
+            }
+            Command::IssueProbePolicySnapshot { reply } => {
+                let _ = reply.send(Ok(ProbePolicySnapshot {
+                    authority: self.probe_policy_authority.clone(),
+                    version: self.probe_policy_version.clone(),
+                    policy: Arc::new(self.policy.clone()),
+                }));
             }
             Command::GetPolicy { reply } => {
                 let _ = reply.send(Ok(self.policy.clone()));
@@ -696,6 +1216,7 @@ impl ActorState {
                                 }
                                 self.policy = policy.clone();
                                 self.policy_generation = self.policy_generation.wrapping_add(1);
+                                self.probe_policy_version = Arc::new(());
                                 self.policy_wake.send_modify(|generation| {
                                     *generation = generation.wrapping_add(1);
                                 });
@@ -718,85 +1239,496 @@ impl ActorState {
     /// the commit-time drift guard intact: a `PutPolicy` that lands during the off-actor plan bumps
     /// the live generation, so the commit check refuses the now-stale batch — exactly as before,
     /// when planning ran on the actor turn and no `PutPolicy` could interleave at all.
-    fn prepare_tick_round(
-        &mut self,
-        facts: ProbeFacts,
-    ) -> (
-        Arc<FedimintJournal>,
-        Option<Arc<Runtime>>,
-        ProbeFacts,
-        TickPolicy,
-        u64,
-    ) {
-        let balances = facts_from_probes(&facts.probes);
-        self.remember_tick_balances(facts.occurrence, &balances);
+    fn prepare_tick_round(&mut self, facts: ProbeFacts) -> ServiceResult<PreparedTickRound> {
+        self.validate_tick_plan_token(&facts.admission_snapshot)?;
         let mut policy = TickPolicy::from(&self.policy);
         policy.occurrence = facts.occurrence;
         policy.now = facts.now_ms;
-        (
+        // The scheduler's cycle carries the blocker set its reconcile derived; the tick policy is
+        // where planning and route pricing both read it (br-p93).
+        // The capability carries the actor's own pending projection.  Callers'
+        // advisory facts cannot omit that baseline.
+        policy.blocked = facts.admission_snapshot.blocked.clone();
+        policy.blocked.extend(&facts.blocked);
+        Ok((
             Arc::clone(&self.journal),
             self.runtime.clone(),
             facts,
             policy,
             self.policy_generation,
-        )
+            self.world_generation,
+        ))
     }
 
-    fn remember_tick_balances(
+    async fn issue_tick_plan_token(&self) -> ServiceResult<super::GoalAdmissionSnapshot> {
+        if self.goal_admissions_poisoned {
+            return Err(ServiceError::Storage(
+                "tick admission watermark overflowed; refusing plans until restart".to_owned(),
+            ));
+        }
+        if self.world_generation_poisoned
+            || self.external_terminal_poisoned
+            || self.membership_poisoned
+        {
+            return Err(ServiceError::Storage(
+                "tick authority generation is poisoned; refusing plans until restart".to_owned(),
+            ));
+        }
+        if self.external_terminal_live || self.membership_live {
+            return Err(refused(
+                RefuseReason::Conflict,
+                "external terminal or membership mutation lease is in flight; refusing tick authority"
+                    .to_owned(),
+            ));
+        }
+        let pending = self.journal.pending().await.map_err(storage)?;
+        let blocked = GoalBlockers::from_intents(&pending);
+        Ok(super::GoalAdmissionSnapshot {
+            authority: Arc::clone(&self.tick_token_authority),
+            counters: self.goal_admissions.clone(),
+            blocked,
+            world_generation: self.world_generation,
+            membership_epoch: self.membership_epoch,
+        })
+    }
+
+    fn validate_tick_plan_token(
+        &self,
+        snapshot: &super::GoalAdmissionSnapshot,
+    ) -> ServiceResult<()> {
+        if self.goal_admissions_poisoned {
+            return Err(ServiceError::Storage(
+                "tick admission watermark overflowed; refusing commit".to_owned(),
+            ));
+        }
+        if self.world_generation_poisoned {
+            return Err(ServiceError::Storage(
+                "membership world generation overflowed; refusing commit".to_owned(),
+            ));
+        }
+        if self.external_terminal_poisoned
+            || self.external_terminal_live
+            || self.membership_poisoned
+            || self.membership_live
+            || snapshot.membership_epoch != self.membership_epoch
+        {
+            return Err(ServiceError::Storage(
+                "external terminal or membership mutation lease is in flight or superseded; refusing commit"
+                    .to_owned(),
+            ));
+        }
+        if !snapshot.is_issued_by(&self.tick_token_authority) {
+            return Err(ServiceError::Storage(
+                "tick: missing or foreign actor-issued admission token".to_owned(),
+            ));
+        }
+        if snapshot.world_generation != self.world_generation {
+            return Err(refused(
+                RefuseReason::Conflict,
+                format!(
+                    "tick token was issued for membership world generation {}, current is {}",
+                    snapshot.world_generation, self.world_generation
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Record this immediately after `decide_and_journal` has made a fresh
+    /// Agent allocator intent durable.  It intentionally precedes hold,
+    /// preemption and driver spawning: any of those later operations may fail
+    /// or terminalize, but an older off-actor plan must still see the
+    /// intervening admission.
+    fn record_goal_admission(&mut self, decision: &AllocatorDecision, actor: Actor) {
+        let Some(goal) = AllocatorGoal::of_decision(decision, actor) else {
+            return;
+        };
+        let counter = self.goal_admissions.entry(goal).or_insert(0);
+        match counter.checked_add(1) {
+            Some(next) => *counter = next,
+            None => {
+                self.goal_admissions_poisoned = true;
+                tracing::error!(
+                    ?goal,
+                    "agent admission watermark overflowed; future tick plans fail closed"
+                );
+            }
+        }
+    }
+
+    fn bump_world_generation(&mut self) {
+        match self.world_generation.checked_add(1) {
+            Some(next) => self.world_generation = next,
+            None => {
+                self.world_generation_poisoned = true;
+                tracing::error!(
+                    "membership world generation overflowed; future tick work fails closed"
+                );
+            }
+        }
+    }
+
+    fn record_membership_admission(&mut self, action: &Action) {
+        if matches!(action, Action::Join { .. } | Action::Recover { .. }) {
+            self.bump_world_generation();
+        }
+    }
+
+    fn begin_external_terminal_mutation(
         &mut self,
-        occurrence: wallet_core::Occurrence,
-        balances: &BTreeMap<FederationId, Msat>,
-    ) {
-        self.tick_balances = Some((occurrence, balances.clone()));
+        action: &Action,
+    ) -> ServiceResult<super::ExternalTerminalMutationLease> {
+        let balance_federations = balance_federations(action);
+        if balance_federations.is_empty() {
+            return Err(ServiceError::Storage(
+                "external terminal mutation requires a balance-affecting action".to_owned(),
+            ));
+        }
+        if self.external_terminal_poisoned || self.external_terminal_live {
+            return Err(refused(
+                RefuseReason::Conflict,
+                "external terminal mutation lease is already in flight".to_owned(),
+            ));
+        }
+        self.external_terminal_live = true;
+        Ok(super::ExternalTerminalMutationLease {
+            authority: Arc::clone(&self.external_terminal_authority),
+            epoch: self.external_terminal_epoch,
+            balance_federations,
+        })
+    }
+
+    fn end_external_terminal_mutation(
+        &mut self,
+        lease: super::ExternalTerminalMutationLease,
+    ) -> ServiceResult<()> {
+        if !Arc::ptr_eq(&lease.authority, &self.external_terminal_authority)
+            || !self.external_terminal_live
+            || lease.epoch != self.external_terminal_epoch
+        {
+            return Err(ServiceError::Storage(
+                "external terminal mutation lease is missing or stale; balance facts remain fenced while a valid lease may be in flight"
+                    .to_owned(),
+            ));
+        }
+        let Some(next_epoch) = self.external_terminal_epoch.checked_add(1) else {
+            self.external_terminal_poisoned = true;
+            return Err(ServiceError::Storage(
+                "external terminal mutation epoch overflowed; refusing until restart".to_owned(),
+            ));
+        };
+        for federation in lease.balance_federations {
+            self.bump_balance_generation(federation);
+        }
+        if self.balance_generations_poisoned {
+            return Err(ServiceError::Storage(
+                "balance-facts generation overflowed; refusing until restart".to_owned(),
+            ));
+        }
+        self.external_terminal_epoch = next_epoch;
+        self.external_terminal_live = false;
+        Ok(())
+    }
+
+    fn begin_membership_mutation(&mut self) -> ServiceResult<super::MembershipMutationLease> {
+        if self.membership_poisoned || self.membership_live {
+            return Err(refused(
+                RefuseReason::Conflict,
+                "membership mutation lease is already in flight; refusing tick authority"
+                    .to_owned(),
+            ));
+        }
+        self.membership_live = true;
+        Ok(super::MembershipMutationLease {
+            authority: Arc::clone(&self.membership_authority),
+            epoch: self.membership_epoch,
+        })
+    }
+
+    fn end_membership_mutation(
+        &mut self,
+        lease: super::MembershipMutationLease,
+    ) -> ServiceResult<()> {
+        if !Arc::ptr_eq(&lease.authority, &self.membership_authority)
+            || !self.membership_live
+            || lease.epoch != self.membership_epoch
+        {
+            self.membership_poisoned = true;
+            return Err(ServiceError::Storage(
+                "membership mutation lease is missing or stale; refusing ticks until restart"
+                    .to_owned(),
+            ));
+        }
+        let Some(next) = self.membership_epoch.checked_add(1) else {
+            self.membership_poisoned = true;
+            return Err(ServiceError::Storage(
+                "membership mutation epoch overflowed; refusing ticks until restart".to_owned(),
+            ));
+        };
+        // The authority remains live until both epoch and the allocator's membership world have
+        // advanced, so no old token can be relabelled between those two steps.
+        self.bump_world_generation();
+        self.membership_epoch = next;
+        self.membership_live = false;
+        Ok(())
+    }
+
+    fn admission_snapshot_conflicts(
+        &self,
+        snapshot: &super::GoalAdmissionSnapshot,
+        decision: &AllocatorDecision,
+        actor: Actor,
+    ) -> bool {
+        self.goal_admissions.iter().any(|(goal, current)| {
+            *current > snapshot.counters.get(goal).copied().unwrap_or_default()
+                && goal.conflicts_with_decision(decision, actor)
+        })
+    }
+
+    fn issue_balance_facts_token(&self) -> ServiceResult<super::BalanceFactsToken> {
+        if self.external_terminal_poisoned || self.external_terminal_live {
+            return Err(refused(
+                RefuseReason::Conflict,
+                "external terminal mutation lease is in flight; refusing balance facts".to_owned(),
+            ));
+        }
+        if let Some(reason) = &self.balance_facts_poisoned {
+            return Err(ServiceError::Storage(format!(
+                "tick balance facts are poisoned; refusing token: {reason}"
+            )));
+        }
+        if self.balance_generations_poisoned {
+            return Err(ServiceError::Storage(
+                "tick balance-facts generation overflowed; refusing samples".to_owned(),
+            ));
+        }
+        Ok(super::BalanceFactsToken {
+            authority: Arc::clone(&self.balance_facts_authority),
+            generations: self.balance_generations.clone(),
+        })
+    }
+
+    fn validate_balance_facts(&self, facts: &super::BalanceFactsToken) -> ServiceResult<()> {
+        if let Some(reason) = &self.balance_facts_poisoned {
+            return Err(ServiceError::Storage(format!(
+                "tick balance facts are poisoned; refusing commit: {reason}"
+            )));
+        }
+        if self.balance_generations_poisoned {
+            return Err(ServiceError::Storage(
+                "tick balance-facts generation overflowed; refusing commit".to_owned(),
+            ));
+        }
+        if !facts.is_issued_by(&self.balance_facts_authority) {
+            return Err(ServiceError::Storage(
+                "tick: missing or foreign actor-issued balance-facts token".to_owned(),
+            ));
+        }
+        if self.external_terminal_poisoned || self.external_terminal_live {
+            return Err(ServiceError::Storage(
+                "external terminal mutation lease is in flight or superseded; refusing commit"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn poison_balance_facts(&mut self, reason: String) {
+        tracing::error!(%reason, "balance-facts authority poisoned after intent transition");
+        self.balance_facts_poisoned.get_or_insert(reason);
+    }
+
+    /// Capture the action before a one-shot artifact write. An absent/stale attempt is the fenced
+    /// writer's ordinary false result; a read error aborts before any mutation.
+    async fn artifact_write_action(
+        &self,
+        key: &IdempotencyKey,
+        expected_attempt: u32,
+    ) -> ServiceResult<Option<Action>> {
+        self.journal.get(key).await.map_err(storage).map(|intent| {
+            intent
+                .filter(|intent| {
+                    intent.idempotency_key == *key && intent.attempt == expected_attempt
+                })
+                .map(|intent| intent.action)
+        })
+    }
+
+    /// Return the pre-write action for every durable transition which can alter a reservation or
+    /// balance fact.  Requiring this lookup before the write is intentional: if the row is absent
+    /// or unreadable we must not make a mutation whose affected federations are unknown.
+    async fn transition_balance_action(
+        &self,
+        key: &IdempotencyKey,
+        transition: &JournalTransition,
+    ) -> ServiceResult<Option<Action>> {
+        match transition {
+            JournalTransition::Upsert { intent, .. } => Ok(Some(intent.action.clone())),
+            // An absent CAS is a normal false comparison, not an unsafe mutation.  Preserve
+            // that no-op contract rather than rejecting it during the pre-write lookup.
+            JournalTransition::CompareAndSet { .. } => self
+                .journal
+                .get(key)
+                .await
+                .map_err(storage)
+                .map(|intent| intent.map(|intent| intent.action)),
+            JournalTransition::SetStatus { .. } | JournalTransition::SetRawTerminal { .. } => self
+                .journal
+                .get(key)
+                .await
+                .map_err(storage)?
+                .map(|intent| intent.action)
+                .ok_or_else(|| {
+                    ServiceError::Storage(format!(
+                        "intent {} disappeared before its durable transition",
+                        key.0
+                    ))
+                })
+                .map(Some),
+            JournalTransition::DriverFinished { .. } | JournalTransition::Refresh => Ok(None),
+        }
+    }
+
+    fn record_balance_change(&mut self, action: &Action) {
+        for federation in balance_federations(action) {
+            self.bump_balance_generation(federation);
+        }
+    }
+
+    fn bump_balance_generation(&mut self, federation: FederationId) {
+        let generation = self.balance_generations.entry(federation).or_insert(0);
+        match generation.checked_add(1) {
+            Some(next) => *generation = next,
+            None => self.balance_generations_poisoned = true,
+        }
+    }
+
+    fn balance_facts_changed_for(
+        generations_at_commit: &BTreeMap<FederationId, u64>,
+        facts: &super::BalanceFactsToken,
+        action: &Action,
+    ) -> bool {
+        balance_federations(action).into_iter().any(|federation| {
+            generations_at_commit
+                .get(&federation)
+                .copied()
+                .unwrap_or_default()
+                != facts
+                    .generations
+                    .get(&federation)
+                    .copied()
+                    .unwrap_or_default()
+        })
     }
 
     async fn commit_tick(
         &mut self,
-        decisions: Vec<AllocatorDecision>,
-        fresh_balances: Option<BTreeMap<FederationId, Msat>>,
+        round: super::TickRound,
+        balances: BTreeMap<FederationId, Msat>,
+        balance_facts: super::BalanceFactsToken,
         existing_tick_key: Option<IdempotencyKey>,
-        planned_generation: u64,
         client: &WalletClient,
     ) -> ServiceResult<CommitTickReport> {
+        let super::TickRound {
+            decisions,
+            occurrence,
+            planned_generation,
+            planned_world_generation,
+            admission_snapshot,
+            ..
+        } = round;
         // Policy-generation guard (§6a P1): a PutPolicy may have landed while the daemon
         // was validating routes over the network between DecideTickRound and here. These
         // decisions were sized against caps/targets the operator has since changed, so we
         // refuse the whole batch — journaling nothing — and let the next cycle replan
         // under the current policy. No money op is admitted on stale sizing.
         if planned_generation != self.policy_generation {
-            self.tick_balances = None;
+            let message = format!(
+                "tick planned under policy generation {planned_generation}, current is {}",
+                self.policy_generation
+            );
             let refused = decisions
                 .iter()
                 .map(|decision| TickRefusal {
                     key: decision.idempotency_key.clone(),
                     reason: RefuseReason::PolicySuperseded,
-                    message: format!(
-                        "tick planned under policy generation {planned_generation}, current is {}",
-                        self.policy_generation
-                    ),
+                    message: message.clone(),
                 })
                 .collect();
+            // The daemon opens its scheduler tick row before awaiting route pricing.  A policy
+            // edit may therefore supersede this plan after that row is Started; terminalize that
+            // already-open row instead of returning early and leaking Started forever.
+            if let Some(key) = existing_tick_key.as_ref() {
+                self.finish_tick_batch(TickBatch {
+                    key: key.clone(),
+                    decisions: decisions.len() as u32,
+                    pending: BTreeSet::new(),
+                    performed: 0,
+                    failed: decisions.len() as u32,
+                    error: Some(message),
+                })
+                .await;
+            }
             return Ok(CommitTickReport {
                 accepted: Vec::new(),
                 refused,
             });
         }
-        let occurrence = decisions
-            .first()
-            .map(|decision| decision.occurrence)
-            .or_else(|| {
-                self.tick_balances
-                    .as_ref()
-                    .map(|(occurrence, _)| *occurrence)
-            })
-            .ok_or_else(|| ServiceError::Storage("CommitTick: no decided round".to_owned()))?;
+        if self.world_generation_poisoned || planned_world_generation != self.world_generation {
+            let message = format!(
+                "tick planned under membership world generation {planned_world_generation}, current is {}",
+                self.world_generation
+            );
+            let refused = decisions
+                .iter()
+                .map(|decision| TickRefusal {
+                    key: decision.idempotency_key.clone(),
+                    reason: RefuseReason::Conflict,
+                    message: message.clone(),
+                })
+                .collect();
+            if let Some(key) = existing_tick_key.as_ref() {
+                self.finish_tick_batch(TickBatch {
+                    key: key.clone(),
+                    decisions: decisions.len() as u32,
+                    pending: BTreeSet::new(),
+                    performed: 0,
+                    failed: decisions.len() as u32,
+                    error: Some(message),
+                })
+                .await;
+            }
+            return Ok(CommitTickReport {
+                accepted: Vec::new(),
+                refused,
+            });
+        }
+        if let Err(error) = self.validate_tick_plan_token(&admission_snapshot) {
+            if let Some(key) = existing_tick_key.as_ref() {
+                self.record_tick_failed(key, &error.to_string()).await;
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.validate_balance_facts(&balance_facts) {
+            if let Some(key) = existing_tick_key.as_ref() {
+                self.record_tick_failed(key, &error.to_string()).await;
+            }
+            return Err(error);
+        }
+        // Freeze the comparison before any decision in this batch can itself
+        // advance a generation. Shared-destination independent work must not
+        // invalidate a later sibling merely because the first became durable.
+        let balance_generations_at_commit = self.balance_generations.clone();
         if decisions
             .iter()
             .any(|decision| decision.occurrence != occurrence)
         {
-            return Err(ServiceError::Storage(
-                "CommitTick: decisions span multiple occurrences".to_owned(),
-            ));
+            let error =
+                ServiceError::Storage("CommitTick: decisions span multiple occurrences".to_owned());
+            if let Some(key) = existing_tick_key.as_ref() {
+                self.record_tick_failed(key, &error.to_string()).await;
+            }
+            return Err(error);
         }
         let now = now_ms();
         let tick_key = existing_tick_key
@@ -810,43 +1742,267 @@ impl ActorState {
         {
             tracing::warn!(?error, "CommitTick: recording the Started tick row failed");
         }
-        if let Err(error) = self
-            .ensure_fresh_tick_decisions(&decisions, occurrence)
-            .await
-        {
-            self.record_tick_failed(&tick_key, &error.to_string()).await;
-            self.tick_balances = None;
-            return Err(error);
-        }
-        let balances = match fresh_balances {
-            Some(balances) => balances,
-            None => match self
-                .tick_balances
-                .as_ref()
-                .filter(|(planned, _)| *planned == occurrence)
-                .map(|(_, balances)| balances.clone())
-            {
-                Some(balances) => balances,
-                None => {
-                    let error = ServiceError::Storage(format!(
-                        "CommitTick: no decided balance facts for occurrence {}",
-                        occurrence.0
-                    ));
-                    self.record_tick_failed(&tick_key, &error.to_string()).await;
-                    self.tick_balances = None;
-                    return Err(error);
-                }
-            },
+        // br-p93, the final conflict check: re-derive the in-flight goals HERE rather than trust
+        // the set the caller planned against, so a batch that bypassed planning — or one whose
+        // plan raced work admitted since — still cannot re-issue an in-flight goal under a fresh
+        // occurrence. Fail-closed: an unreadable scan means the eligibility is unknown, which is a
+        // no-commit condition for the whole batch, exactly like a failed reconcile.
+        //
+        // The scan is taken once, but each decision this loop ADMITS is folded back in below, so
+        // the guard covers a batch carrying the same goal twice as well as one duplicating durable
+        // work. `decide_with_blockers` cannot emit that pair (one funding goal per designated
+        // destination, one evacuation per source, and `push_decision` dedups keys), but "a caller
+        // bypassed planning" is precisely the threat model this check exists for, and against that
+        // caller the pre-loop scan alone would admit both.
+        let mut blocked = match self.journal.pending().await {
+            Ok(pending) => GoalBlockers::from_intents(&pending),
+            Err(error) => {
+                let error = storage(error);
+                self.record_tick_failed(&tick_key, &error.to_string()).await;
+                return Err(error);
+            }
         };
         let mut report = CommitTickReport::default();
         let mut first_error = None;
         let mut failed = 0_u32;
+        // A commit-time target is reservation-aware, not merely balance-aware:
+        // pending user receives/direct inflows and already admitted earlier
+        // batch legs have promised inbound value even when the fresh probe has
+        // not observed it yet.
+        let mut commit_reservations = match project_allocator_reservations(&self.journal).await {
+            Ok(reservations) => reservations,
+            Err(error) => {
+                // The allocator reservation view still starts from a complete, fail-closed intent
+                // scan: if one intent row is unreadable, no executable decision may be admitted.
+                // Keep this a soft, per-decision tick refusal (the existing
+                // CommitTick API contract) while refusing the complete batch.
+                let message = storage(error).to_string();
+                report.refused.extend(
+                    decisions_to_apply(&decisions)
+                        .into_iter()
+                        .filter(|decision| decision.action.is_executable())
+                        .map(|decision| TickRefusal {
+                            key: decision.idempotency_key,
+                            reason: RefuseReason::StorageError,
+                            message: message.clone(),
+                        }),
+                );
+                if let Err(error) = self
+                    .journal
+                    .record_refusals(&decisions, occurrence, now)
+                    .await
+                {
+                    tracing::warn!(
+                        ?error,
+                        "CommitTick: recording advisory refusal rows after reservation fault failed"
+                    );
+                }
+                self.finish_tick_batch(TickBatch {
+                    key: tick_key,
+                    decisions: decisions.len() as u32,
+                    pending: BTreeSet::new(),
+                    performed: 0,
+                    failed: report.refused.len() as u32,
+                    error: Some(message),
+                })
+                .await;
+                return Ok(report);
+            }
+        };
         for decision in decisions_to_apply(&decisions) {
             // Advisory allocator decisions are durable refusal facts, not executable work.
             // `record_refusals` below is their single ledger writer, matching the standalone
-            // executor path's `apply_with_admission` projection.
+            // executor path's `apply_with_allocator_admission` projection.
             if !decision.action.is_executable() {
                 continue;
+            }
+            if let Some(destination) = executable_destination(&decision.action) {
+                if !balances.contains_key(&destination) {
+                    let message = format!(
+                        "decision {} has no fresh balance for destination {}",
+                        decision.idempotency_key.0,
+                        destination.to_hex()
+                    );
+                    report.refused.push(TickRefusal {
+                        key: decision.idempotency_key.clone(),
+                        reason: RefuseReason::Conflict,
+                        message: message.clone(),
+                    });
+                    if let Err(error) = self
+                        .journal
+                        .record_tick_dropped_refusal(&decision, occurrence, now, &message, false)
+                        .await
+                    {
+                        tracing::warn!(
+                            key = %decision.idempotency_key.0,
+                            ?error,
+                            "CommitTick: recording missing-destination refusal failed"
+                        );
+                    }
+                    continue;
+                }
+            }
+            if Self::balance_facts_changed_for(
+                &balance_generations_at_commit,
+                &balance_facts,
+                &decision.action,
+            ) {
+                let message = format!(
+                    "decision {} touches balance facts changed after the fresh sample",
+                    decision.idempotency_key.0
+                );
+                report.refused.push(TickRefusal {
+                    key: decision.idempotency_key.clone(),
+                    reason: RefuseReason::Conflict,
+                    message: message.clone(),
+                });
+                if let Err(error) = self
+                    .journal
+                    .record_tick_dropped_refusal(&decision, occurrence, now, &message, false)
+                    .await
+                {
+                    tracing::warn!(
+                        key = %decision.idempotency_key.0,
+                        ?error,
+                        "CommitTick: recording stale-balance-facts refusal failed"
+                    );
+                }
+                continue;
+            }
+            let decision_existed = match self.journal.get(&decision.idempotency_key).await {
+                Ok(Some(intent))
+                    if matches!(
+                        intent.status,
+                        IntentStatus::Done | IntentStatus::Awaiting | IntentStatus::Failed
+                    ) =>
+                {
+                    let message = format!(
+                        "tick decision {} already has terminal durable work",
+                        decision.idempotency_key.0
+                    );
+                    if let Err(error) = self
+                        .journal
+                        .record_tick_dropped_refusal(&decision, occurrence, now, &message, false)
+                        .await
+                    {
+                        tracing::warn!(key = %decision.idempotency_key.0, ?error, "CommitTick: recording terminal replay refusal failed");
+                    }
+                    report.refused.push(TickRefusal {
+                        key: decision.idempotency_key,
+                        reason: RefuseReason::Conflict,
+                        message,
+                    });
+                    continue;
+                }
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(error) => {
+                    let error = storage(error);
+                    self.record_tick_failed(&tick_key, &error.to_string()).await;
+                    return Err(error);
+                }
+            };
+            if blocked.blocks_decision(&decision, Actor::Agent { occurrence }) {
+                let message = format!(
+                    "decision {} conflicts with allocator work already in flight",
+                    decision.idempotency_key.0
+                );
+                tracing::warn!(key = %decision.idempotency_key.0, "{message}");
+                if let Err(error) = self
+                    .journal
+                    .record_tick_dropped_refusal(&decision, occurrence, now, &message, true)
+                    .await
+                {
+                    tracing::warn!(
+                        key = %decision.idempotency_key.0,
+                        ?error,
+                        "CommitTick: recording a conflict-suppressed decision failed"
+                    );
+                }
+                report.refused.push(TickRefusal {
+                    key: decision.idempotency_key,
+                    reason: RefuseReason::Conflict,
+                    message,
+                });
+                continue;
+            }
+            if self.admission_snapshot_conflicts(
+                &admission_snapshot,
+                &decision,
+                Actor::Agent { occurrence },
+            ) {
+                let message = format!(
+                    "decision {} conflicts with Agent work admitted after its eligibility snapshot",
+                    decision.idempotency_key.0
+                );
+                tracing::warn!(key = %decision.idempotency_key.0, "{message}");
+                if let Err(error) = self
+                    .journal
+                    .record_tick_dropped_refusal(&decision, occurrence, now, &message, true)
+                    .await
+                {
+                    tracing::warn!(
+                        key = %decision.idempotency_key.0,
+                        ?error,
+                        "CommitTick: recording a watermark-suppressed decision failed"
+                    );
+                }
+                report.refused.push(TickRefusal {
+                    key: decision.idempotency_key,
+                    reason: RefuseReason::Conflict,
+                    message,
+                });
+                continue;
+            }
+            if !decision_existed {
+                if let Some((to, amount, target)) = self.funding_target_for(&decision) {
+                    let Some(destination_balance) = balances.get(&to).copied() else {
+                        let message = format!(
+                            "decision {} has no fresh balance for destination {}",
+                            decision.idempotency_key.0,
+                            to.to_hex()
+                        );
+                        report.refused.push(TickRefusal {
+                            key: decision.idempotency_key,
+                            reason: RefuseReason::Conflict,
+                            message,
+                        });
+                        continue;
+                    };
+                    let shortfall = wallet_core::funding_shortfall(
+                        target,
+                        destination_balance,
+                        commit_reservations.target_credit(to),
+                        0,
+                    );
+                    if amount.0 > shortfall {
+                        let message = format!(
+                            "decision {} exceeds destination {}'s fresh target shortfall; replan",
+                            decision.idempotency_key.0,
+                            to.to_hex()
+                        );
+                        tracing::warn!(key = %decision.idempotency_key.0, "{message}");
+                        if let Err(error) = self
+                            .journal
+                            .record_tick_dropped_refusal(
+                                &decision, occurrence, now, &message, false,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                key = %decision.idempotency_key.0,
+                                ?error,
+                                "CommitTick: recording a fresh-target dropped decision failed"
+                            );
+                        }
+                        report.refused.push(TickRefusal {
+                            key: decision.idempotency_key,
+                            reason: RefuseReason::Conflict,
+                            message,
+                        });
+                        continue;
+                    }
+                }
             }
             let request = OpRequest {
                 decision: decision.clone(),
@@ -858,35 +2014,86 @@ impl ActorState {
                 // gate is for FRESH user admissions only, so this path never fails fast.
                 dest_unavailable: None,
             };
-            match self.decide_op(request, client).await {
-                Ok(decided) => report.accepted.push(decided.key),
-                Err(ServiceError::Refused { reason, message }) => {
-                    if let Err(error) = self
-                        .journal
-                        .record_tick_dropped_refusal(&decision, occurrence, now, &message)
-                        .await
-                    {
-                        tracing::warn!(
-                            key = %decision.idempotency_key.0,
-                            ?error,
-                            "CommitTick: recording a dropped-decision refusal failed"
-                        );
+            match self
+                .decide_op_with_allocator_reservations(request, client, Some(&commit_reservations))
+                .await
+            {
+                Ok(decided) => {
+                    // Now durable, so it holds its goal against the REST of this batch (br-p93).
+                    blocked.hold_decision(&decision, Actor::Agent { occurrence });
+                    if !decision_existed {
+                        reserve_action_for_commit(&mut commit_reservations, &decision.action);
                     }
-                    report.refused.push(TickRefusal {
-                        key: decision.idempotency_key,
-                        reason,
-                        message,
-                    });
+                    report.accepted.push(decided.key);
                 }
-                Err(error) => {
-                    failed = failed.saturating_add(1);
-                    tracing::warn!(
-                        key = %decision.idempotency_key.0,
-                        ?error,
-                        "CommitTick: decision failed; continuing batch"
-                    );
-                    if first_error.is_none() {
-                        first_error = Some(error);
+                Err(DecideOpError { error, disposition }) => {
+                    if disposition == FreshMutationDisposition::UnknownIdentityPoison {
+                        // A mismatched reread says the requested fresh identity cannot be safely
+                        // attributed.  The helper has poisoned future authority; this in-flight
+                        // batch must also stop before a later decision can bypass that fail-closed
+                        // boundary (including one conflicting only with the stored row).
+                        self.record_tick_failed(&tick_key, &error.to_string()).await;
+                        return Err(error);
+                    }
+
+                    // Only a known/potential requested fresh mutation holds its logical goal and
+                    // strict reservation for later siblings.  A re-read proving absence is a
+                    // pre-upsert fault, so folding it would create a phantom same-goal/source
+                    // refusal inside this batch.
+                    let requested_mutation =
+                        disposition == FreshMutationDisposition::RequestedMutationPossible;
+                    match error {
+                        ServiceError::Refused { reason, message } => {
+                            fold_unknown_fresh_commit_mutation(
+                                &mut blocked,
+                                &mut commit_reservations,
+                                &decision,
+                                occurrence,
+                                decision_existed,
+                                requested_mutation,
+                            );
+                            if let Err(error) = self
+                                .journal
+                                .record_tick_dropped_refusal(
+                                    &decision, occurrence, now, &message, false,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    key = %decision.idempotency_key.0,
+                                    ?error,
+                                    "CommitTick: recording a dropped-decision refusal failed"
+                                );
+                            }
+                            report.refused.push(TickRefusal {
+                                key: decision.idempotency_key,
+                                reason,
+                                message,
+                            });
+                        }
+                        error => {
+                            // Later fresh-path work (hold/preemption/driver setup) runs only
+                            // after a successful journal admission, and is marked requested above.
+                            // Definite pre-upsert faults still surface as the tick error but do
+                            // not manufacture a batch-local goal or reservation holder.
+                            fold_unknown_fresh_commit_mutation(
+                                &mut blocked,
+                                &mut commit_reservations,
+                                &decision,
+                                occurrence,
+                                decision_existed,
+                                requested_mutation,
+                            );
+                            failed = failed.saturating_add(1);
+                            tracing::warn!(
+                                key = %decision.idempotency_key.0,
+                                ?error,
+                                "CommitTick: decision failed; continuing batch"
+                            );
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                        }
                     }
                 }
             }
@@ -912,8 +2119,25 @@ impl ActorState {
         } else {
             self.tick_batches.push(batch);
         }
-        self.tick_balances = None;
         result
+    }
+
+    /// A scheduler funding move must still fit the destination's *fresh*
+    /// standing-target gap.  This mirrors the existing source-affordability
+    /// admission check without resizing or retargeting an actor-approved plan.
+    fn funding_target_for(
+        &self,
+        decision: &AllocatorDecision,
+    ) -> Option<(FederationId, Msat, Msat)> {
+        let Action::Move { to, amount, .. } = &decision.action else {
+            return None;
+        };
+        let target = match decision.reason {
+            ReasonCode::SpendingBelowTarget => self.policy.spending_target,
+            ReasonCode::StandbyBelowTarget => self.policy.standby_target,
+            _ => return None,
+        };
+        Some((*to, *amount, target))
     }
 
     async fn observe_tick_outcome(&mut self, key: &IdempotencyKey, driver_finished: bool) {
@@ -972,7 +2196,7 @@ impl ActorState {
     }
 
     async fn finish_tick_batch(&self, batch: TickBatch) {
-        let status = if batch.failed == 0 {
+        let status = if batch.failed == 0 && batch.error.is_none() {
             OperationStatus::Succeeded
         } else {
             OperationStatus::Failed
@@ -1019,54 +2243,65 @@ impl ActorState {
         }
     }
 
-    async fn ensure_fresh_tick_decisions(
-        &self,
-        decisions: &[AllocatorDecision],
-        occurrence: wallet_core::Occurrence,
-    ) -> ServiceResult<()> {
-        for decision in decisions_to_apply(decisions) {
-            if let Some(intent) = self
-                .journal
-                .get(&decision.idempotency_key)
-                .await
-                .map_err(storage)?
-            {
-                if matches!(
-                    intent.status,
-                    IntentStatus::Done | IntentStatus::Awaiting | IntentStatus::Failed
-                ) {
-                    return Err(ServiceError::Storage(format!(
-                        "tick: occurrence {} would replay already-terminal decision {}",
-                        occurrence.0, decision.idempotency_key.0
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-
     async fn decide_op(
         &mut self,
         req: OpRequest,
         client: &WalletClient,
     ) -> ServiceResult<DecidedOp> {
+        self.decide_op_with_allocator_reservations(req, client, None)
+            .await
+            .map_err(DecideOpError::into_service)
+    }
+
+    async fn decide_op_with_allocator_reservations(
+        &mut self,
+        req: OpRequest,
+        client: &WalletClient,
+        allocator_reservations: Option<&Reservations>,
+    ) -> Result<DecidedOp, DecideOpError> {
         let key = req.decision.idempotency_key.clone();
         if let Some(existing) = self.journal.get(&key).await.map_err(storage_refusal)? {
-            return self.decide_existing(req, existing, client).await;
+            return self
+                .decide_existing(req, existing, client)
+                .await
+                .map_err(DecideOpError::definite);
         }
         // FRESH branch: no existing intent for this key (the existing-key attach returned above,
-        // so this can never intercept an idempotent replay). If a dest-side handler flagged the
-        // destination as joined-but-not-open, fail fast with 503 instead of journaling a Pending
-        // row that would stall — the receive/direct-inflow driver on the invoice deadline, a move
-        // parked unfunded. Money-safe: nothing is debited before the destination opens. This is
-        // the single-owner, race-free placement — the actor has just determined fresh-vs-existing
-        // under exclusive ownership, so a benign staleness (the flag races `to` opening) only
-        // costs the caller a retry and can never lose an attach.
+        // so this can never intercept an idempotent replay). Goal-bearing agent decisions bypass
+        // CommitTick when callers use the public client directly, so project the durable live
+        // goals here too. The scan is deliberately after the attach path and before journaling:
+        // an unreadable live view is an unknown eligibility, while an existing key remains an
+        // idempotent re-drive rather than a second admission.
+        if AllocatorGoal::of_decision(&req.decision, req.actor).is_some() {
+            let blocked = self
+                .journal
+                .pending()
+                .await
+                .map(|pending| GoalBlockers::from_intents(&pending))
+                .map_err(storage_refusal)?;
+            if blocked.blocks_decision(&req.decision, req.actor) {
+                return Err(DecideOpError::definite(refused(
+                    RefuseReason::Conflict,
+                    format!(
+                        "decision {} conflicts with allocator work already in flight",
+                        key.0
+                    ),
+                )));
+            }
+        }
+        // If a dest-side handler flagged the destination as joined-but-not-open, fail fast with
+        // 503 instead of journaling a Pending row that would stall — the receive/direct-inflow
+        // driver on the invoice deadline, a move parked unfunded. Money-safe: nothing is debited
+        // before the destination opens. This is the single-owner, race-free placement — the actor
+        // has just determined fresh-vs-existing under exclusive ownership, so a benign staleness
+        // (the flag races `to` opening) only costs the caller a retry and can never lose an attach.
         if let Some(fed) = req.dest_unavailable {
-            return Err(ServiceError::DestinationUnavailable(format!(
-                "federation {} is joined but not currently open; it is reconnecting — retry shortly",
-                fed.to_hex()
-            )));
+            return Err(DecideOpError::definite(
+                ServiceError::DestinationUnavailable(format!(
+                    "federation {} is joined but not currently open; it is reconnecting — retry shortly",
+                    fed.to_hex()
+                )),
+            ));
         }
         if let Some(nonce) = req.probe_session_nonce.as_deref() {
             self.validate_probe_leg_session(&req.decision.action, nonce)
@@ -1076,33 +2311,85 @@ impl ActorState {
         let external_admission = counts_against_external_cap(&req.decision, req.actor);
         if external_admission && driver::external_len(&self.registry) >= EXTERNAL_DRIVER_CAP {
             tracing::warn!(key = %key.0, cap = EXTERNAL_DRIVER_CAP, "DecideOp: driver admission cap reached");
-            return Err(refused(
+            return Err(DecideOpError::definite(refused(
                 RefuseReason::Conflict,
                 format!("driver admission cap {EXTERNAL_DRIVER_CAP} reached"),
-            ));
+            )));
         }
 
         let hold = self.hold_disposition(&req).await?;
-        let decided = wallet_core::decide_and_journal(
-            self.journal.as_ref(),
-            &req.decision,
-            req.actor,
-            req.now_ms,
-            Some(&req.balances),
-            Some(self.policy.per_fed_cap),
-        )
-        .await
-        .map_err(refusal_from_exec)?;
+        // Do not map this error and return directly.  A journal `upsert` may have committed before
+        // reporting its storage error, so the fresh Agent path must resolve that ambiguity before
+        // handing the original typed refusal to either a direct caller or CommitTick.
+        let decide_result = match allocator_reservations {
+            Some(reservations) => {
+                wallet_core::decide_and_journal_with_allocator_reservations(
+                    self.journal.as_ref(),
+                    &req.decision,
+                    req.actor,
+                    req.now_ms,
+                    Some(&req.balances),
+                    Some(self.policy.per_fed_cap),
+                    reservations,
+                )
+                .await
+            }
+            None => {
+                wallet_core::decide_and_journal(
+                    self.journal.as_ref(),
+                    &req.decision,
+                    req.actor,
+                    req.now_ms,
+                    Some(&req.balances),
+                    Some(self.policy.per_fed_cap),
+                )
+                .await
+            }
+        };
+        let decided = match decide_result {
+            Ok(decided) => decided,
+            Err(exec_error) => {
+                let error = refusal_from_exec(exec_error);
+                if AllocatorGoal::of_decision(&req.decision, req.actor).is_some()
+                    && matches!(
+                        &error,
+                        ServiceError::Refused {
+                            reason: RefuseReason::StorageError,
+                            ..
+                        }
+                    )
+                {
+                    let disposition = self
+                        .resolve_ambiguous_fresh_agent_admission(&req, &key)
+                        .await;
+                    return Err(DecideOpError { error, disposition });
+                }
+                return Err(DecideOpError::definite(error));
+            }
+        };
         let intent = match decided {
             DecideAndJournal::Drive(intent) => *intent,
             DecideAndJournal::Skip | DecideAndJournal::TerminalFailed => {
-                return Err(ServiceError::Storage(format!(
+                return Err(DecideOpError::definite(ServiceError::Storage(format!(
                     "fresh intent {} unexpectedly resolved as an existing intent",
                     key.0
-                )))
+                ))));
             }
         };
-        self.apply_hold_disposition(hold, req.actor).await?;
+        self.record_goal_admission(&req.decision, req.actor);
+        self.record_membership_admission(&req.decision.action);
+        self.record_balance_change(&req.decision.action);
+        #[cfg(test)]
+        if self.fail_after_fresh_admission.as_ref() == Some(&key) {
+            self.fail_after_fresh_admission = None;
+            return Err(DecideOpError::requested(ServiceError::Storage(format!(
+                "injected post-fresh-admission failure for {}",
+                key.0
+            ))));
+        }
+        self.apply_hold_disposition(hold, req.actor)
+            .await
+            .map_err(DecideOpError::requested)?;
         self.ensure_driver(
             intent.clone(),
             client,
@@ -1114,6 +2401,63 @@ impl ActorState {
             status: intent.status,
             deduplicated: false,
         })
+    }
+
+    /// Resolve a typed storage error from the core fresh-Agent decision path.  Its `upsert` may
+    /// already be durable, while an earlier core read can fail before any write.  Re-read the exact
+    /// key so a known absence remains a definite non-admission.  A matching row is the one fresh
+    /// admission which must invalidate old allocator and balance-facts capabilities; the normal
+    /// success path below remains the only other place that records those bumps.
+    async fn resolve_ambiguous_fresh_agent_admission(
+        &mut self,
+        req: &OpRequest,
+        key: &IdempotencyKey,
+    ) -> FreshMutationDisposition {
+        match self.journal.get(key).await {
+            Ok(Some(intent)) if is_matching_fresh_agent_intent(&intent, req) => {
+                self.record_goal_admission(&req.decision, req.actor);
+                self.record_balance_change(&req.decision.action);
+                FreshMutationDisposition::RequestedMutationPossible
+            }
+            Ok(None) => {
+                // The storage fault was definitely before `upsert`; do not manufacture a
+                // watermark or stale otherwise-fresh balance facts.
+                FreshMutationDisposition::DefiniteNoMutation
+            }
+            Err(error) => {
+                // The requested goal and its affected balance identities remain known even though
+                // the exact durable row cannot be read.  Conservatively advance precisely those
+                // capabilities, rather than letting an old plan over-admit a possibly durable move.
+                tracing::warn!(
+                    key = %key.0,
+                    ?error,
+                    "fresh Agent upsert ambiguity reread failed; conservatively advancing known capabilities"
+                );
+                self.record_goal_admission(&req.decision, req.actor);
+                self.record_balance_change(&req.decision.action);
+                FreshMutationDisposition::RequestedMutationPossible
+            }
+            Ok(Some(intent)) => {
+                // A row at the requested key which is not the requested first Agent attempt is
+                // corrupt or externally concurrent.  Neither its allocator identity nor all of
+                // its balance effects are safe to infer from this failed fresh admission.  Refuse
+                // future authority narrowly instead of relabelling old tokens as current.
+                self.goal_admissions_poisoned = true;
+                self.balance_facts_poisoned.get_or_insert_with(|| {
+                    format!(
+                        "fresh Agent upsert ambiguity reread mismatched intent at key {}",
+                        key.0
+                    )
+                });
+                tracing::error!(
+                    key = %key.0,
+                    stored_actor = ?intent.actor,
+                    stored_reason = ?intent.reason,
+                    "fresh Agent upsert ambiguity reread found a mismatched intent; poisoning tick authority"
+                );
+                FreshMutationDisposition::UnknownIdentityPoison
+            }
+        }
     }
 
     async fn decide_existing(
@@ -1164,6 +2508,11 @@ impl ActorState {
                 .retry_failed_intent(&refreshed)
                 .await
                 .map_err(storage_refusal)?;
+            self.record_balance_change(&refreshed.action);
+            // This retry is durable before the subsequent hold/driver work.  Invalidate every
+            // old membership-world plan now: either later step may fail, but neither may relabel
+            // a plan minted before this Join/Recover retry.
+            self.record_membership_admission(&refreshed.action);
             self.apply_hold_disposition(hold, req.actor).await?;
             self.ensure_driver(refreshed.clone(), client, external_admission, None);
             return Ok(DecidedOp {
@@ -1224,7 +2573,7 @@ impl ActorState {
         intent: &Intent,
         balances: &BTreeMap<FederationId, Msat>,
     ) -> ServiceResult<()> {
-        let reservations = project_reservations(&self.journal)
+        let reservations = project_strict_reservations(&self.journal)
             .await
             .map_err(storage_refusal)?;
         admit_intent(
@@ -1360,7 +2709,7 @@ impl ActorState {
             )
             .await
             .map_err(storage)?;
-        self.refresh_probe_budget(&key).await;
+        self.refresh_probe_budget(&key).await?;
         Ok(())
     }
 
@@ -1369,7 +2718,6 @@ impl ActorState {
         candidate: ProbeCandidate,
         client: &WalletClient,
     ) -> ServiceResult<ProbeDecision> {
-        self.ensure_probe_budget_loaded()?;
         if let Some(session) = self
             .journal
             .probe_record(&candidate.federation)
@@ -1377,6 +2725,21 @@ impl ActorState {
             .map_err(storage)?
             .and_then(|record| record.in_flight)
         {
+            if let ProbeAdmission::ResumeOnly { expected_nonce } = &candidate.admission {
+                if session.nonce != *expected_nonce {
+                    return Err(refused(
+                        RefuseReason::Conflict,
+                        format!(
+                            "probe resume deferred: federation {} now has durable session {}, not \
+                             expected session {}",
+                            candidate.federation.to_hex(),
+                            session.nonce,
+                            expected_nonce
+                        ),
+                    ));
+                }
+            }
+            self.ensure_probe_budget_loaded()?;
             let key = probe_umbrella_key(&candidate.federation, &session.nonce);
             if !self
                 .probe_budget
@@ -1405,6 +2768,35 @@ impl ActorState {
             return Ok(decision);
         }
 
+        let fresh_policy = match &candidate.admission {
+            ProbeAdmission::Fresh(snapshot)
+                if snapshot
+                    .is_current_for(&self.probe_policy_authority, &self.probe_policy_version) =>
+            {
+                snapshot.policy().clone()
+            }
+            ProbeAdmission::Fresh(_) => {
+                return Err(refused(
+                    RefuseReason::PolicySuperseded,
+                    format!(
+                        "probe policy snapshot for federation {} is no longer current",
+                        candidate.federation.to_hex()
+                    ),
+                ));
+            }
+            ProbeAdmission::ResumeOnly { expected_nonce } => {
+                return Err(refused(
+                    RefuseReason::Conflict,
+                    format!(
+                        "probe resume deferred: federation {} no longer has expected durable \
+                         session {}",
+                        candidate.federation.to_hex(),
+                        expected_nonce
+                    ),
+                ));
+            }
+        };
+        self.ensure_probe_budget_loaded()?;
         let in_flight = self.journal.reservation_intents().await.map_err(storage)?;
         if in_flight
             .iter()
@@ -1423,8 +2815,8 @@ impl ActorState {
         let session = ProbeSession {
             nonce: ledger_nonce(),
             from: candidate.source,
-            amount_msat: self.policy.probe_amount.0,
-            leg_fee_cap_msat: self.policy.max_fee.0,
+            amount_msat: fresh_policy.probe_amount.0,
+            leg_fee_cap_msat: fresh_policy.max_fee.0,
             c_spendable_before_in_msat: candidate.baseline.0,
             out_net_msat: None,
             started_at_ms: candidate.now_ms,
@@ -1447,7 +2839,7 @@ impl ActorState {
                 OperationKind::Probe {
                     fed: candidate.federation,
                     from: candidate.source,
-                    amount_msat: self.policy.probe_amount,
+                    amount_msat: fresh_policy.probe_amount,
                     cost_msat: None,
                 },
                 candidate.actor,
@@ -1523,26 +2915,20 @@ impl ActorState {
         Ok(())
     }
 
-    async fn refresh_probe_budget(&mut self, key: &IdempotencyKey) {
-        let row = match self
+    async fn refresh_probe_budget(&mut self, key: &IdempotencyKey) -> ServiceResult<()> {
+        let row = self
             .journal
             .operation(&crate::journal::OperationRef::Key(key.clone()))
             .await
-        {
-            Ok(row) => row,
-            Err(error) => {
-                tracing::warn!(key = %key.0, ?error, "JournalTransition::Refresh: probe budget refresh failed");
-                return;
-            }
-        };
+            .map_err(storage)?;
         let Some(row) = row else {
-            return;
+            return Ok(());
         };
         let OperationKind::Probe { cost_msat, .. } = row.kind else {
-            return;
+            return Ok(());
         };
         if !matches!(row.actor, Actor::Agent { .. }) {
-            return;
+            return Ok(());
         }
         let reserved_msat = self
             .probe_budget
@@ -1571,6 +2957,7 @@ impl ActorState {
                 reserved_msat,
             });
         }
+        Ok(())
     }
 
     fn ensure_probe_driver(
@@ -1605,39 +2992,98 @@ impl ActorState {
         transition: JournalTransition,
     ) -> ServiceResult<TransitionResult> {
         match transition {
-            JournalTransition::Upsert(intent) => {
+            JournalTransition::Upsert {
+                expected_attempt,
+                intent,
+            } => {
                 if intent.idempotency_key != *key {
                     return Err(ServiceError::Storage(
                         "transition key does not match the intent key".to_owned(),
                     ));
                 }
+                let existing = self
+                    .journal
+                    .get(key)
+                    .await
+                    .map_err(storage)?
+                    .ok_or_else(|| {
+                        ServiceError::Storage(
+                            "transition Upsert cannot create an absent intent".to_owned(),
+                        )
+                    })?;
+                if existing.attempt != expected_attempt
+                    || intent.attempt != expected_attempt
+                    || existing.action != intent.action
+                    || existing.actor != intent.actor
+                    || existing.reason != intent.reason
+                    || existing.idempotency_key != intent.idempotency_key
+                    || existing.created_at_ms != intent.created_at_ms
+                    || existing.max_fee != intent.max_fee
+                    || existing.operation_id != intent.operation_id
+                    || existing.invoice != intent.invoice
+                {
+                    return Err(ServiceError::Storage(
+                        "transition Upsert changed immutable intent identity".to_owned(),
+                    ));
+                }
                 self.journal.upsert(&intent).await.map_err(storage)?;
                 Ok(TransitionResult::Applied)
             }
-            JournalTransition::CompareAndSet { expected, new } => self
+            JournalTransition::CompareAndSet {
+                expected_attempt,
+                expected,
+                new,
+            } => self
                 .journal
-                .set_status_if(key, expected, new)
+                .set_status_if(key, expected_attempt, expected, new)
                 .await
                 .map(TransitionResult::Compared)
                 .map_err(storage),
-            JournalTransition::SetStatus { status, error } => {
-                self.journal
-                    .set_status(key, status, error.as_deref())
-                    .await
-                    .map_err(storage)?;
-                Ok(TransitionResult::Applied)
-            }
-            JournalTransition::OperationArtifact {
-                operation_id,
-                invoice,
+            JournalTransition::SetRawTerminal {
+                fence,
+                status,
+                error,
+            } => self
+                .journal
+                .set_raw_terminal_if_fenced(key, &fence, status, error.as_deref())
+                .await
+                .map(TransitionResult::Compared)
+                .map_err(storage),
+            JournalTransition::SetStatus {
+                expected_attempt,
+                status,
+                error,
             } => {
-                self.journal
-                    .set_operation_artifact(key, operation_id, invoice.as_ref())
+                // Preserve the actor protocol's benign compare result for a late driver.  The
+                // durable writer repeats this shared predicate atomically, so this read is only
+                // the reply-shaping fast path, never the fence itself.
+                let Some(current) = self.journal.get(key).await.map_err(storage)? else {
+                    return Ok(TransitionResult::Compared(false));
+                };
+                if current.attempt != expected_attempt
+                    || !intent_status_transition_allowed(current.status, status)
+                {
+                    return Ok(TransitionResult::Compared(false));
+                }
+                match self
+                    .journal
+                    .set_status(key, expected_attempt, status, error.as_deref())
                     .await
-                    .map_err(storage)?;
+                {
+                    Ok(()) => Ok(TransitionResult::Applied),
+                    // `set_status` has no compare result.  Its error can be post-commit, and the
+                    // caller captured the action before entering this writer; propagate it so the
+                    // command handler invalidates that known action's balance facts.
+                    Err(error) => Err(storage(error)),
+                }
+            }
+            JournalTransition::DriverFinished { .. } => {
+                // This is process bookkeeping only.  In particular, do not refresh the intent
+                // before deregistering the finished generation: that read can fail, while the
+                // completion still must release local ownership so an out-of-actor recovery pass
+                // can rehydrate the durable work.
                 Ok(TransitionResult::Applied)
             }
-            JournalTransition::DriverFinished { .. } => Ok(TransitionResult::Applied),
             JournalTransition::Refresh => Ok(TransitionResult::Applied),
         }
     }
@@ -1650,7 +3096,7 @@ impl ActorState {
                 .await
                 .map(Snapshot::Intent)
                 .map_err(storage),
-            SnapshotScope::Reservations => project_reservations(&self.journal)
+            SnapshotScope::Reservations => project_strict_reservations(&self.journal)
                 .await
                 .map(Snapshot::Reservations)
                 .map_err(storage),
@@ -1667,8 +3113,26 @@ impl ActorState {
     }
 
     async fn reconcile(&mut self, client: &WalletClient) -> ServiceResult<ReconcileReport> {
-        let pending = self.journal.pending().await.map_err(storage)?;
+        let mut report = self.reconcile_durable(client).await?;
+        // Do not let tick ineligibility prevent crash recovery.  In particular a pending
+        // Join/Recover must regain its driver (and unrelated intents must be rehydrated) before
+        // this authoritative eligibility mint refuses the cycle.  A caller receiving this scoped
+        // error must skip planning, while the spawned drivers continue to converge durable work.
+        report.admission_snapshot = self.issue_tick_plan_token().await?;
+        Ok(report)
+    }
 
+    /// Rehydrate all durable live work without issuing scheduler authority.  Ownership
+    /// recovery uses this narrower operation because a tick-ineligible result is not a
+    /// storage failure and must not make its retry loop spin forever after rehydration.
+    async fn reconcile_durable(&mut self, client: &WalletClient) -> ServiceResult<ReconcileReport> {
+        let pending = self.journal.pending().await.map_err(storage)?;
+        // br-p93: project the in-flight allocator goals from the RAW scan, before the registry
+        // ownership filter below. An intent a live driver already owns is re-driven by nobody
+        // (`redriven` stays 0) yet is still very much in flight, so filtering first would let the
+        // next tick re-issue exactly the goal that driver is working on. A scan fault propagates
+        // as a reconcile failure, which the scheduler treats as unknown — no commit at all.
+        let blocked = GoalBlockers::from_intents(&pending);
         // Recovery may observe the crash window after an evacuation intent committed but
         // before its probe preemption committed. Resolve every such durable hold before
         // any orphan is allowed to drive, so a probe leg and its preempting evacuation
@@ -1697,21 +3161,17 @@ impl ActorState {
             .await?;
         }
 
-        let mut report = ReconcileReport::default();
+        let mut report = ReconcileReport {
+            blocked,
+            ..ReconcileReport::default()
+        };
         for mut intent in pending {
             // A probe session is the durable owner of its legs. Once that session has
             // resolved (including evacuation preemption), an orphaned leg is stale and
             // must not be re-driven on a later recovery pass.
             let probe_session_nonce = if intent.reason == wallet_core::ReasonCode::ActiveProbe {
                 let Some(nonce) = self.probe_leg_session_nonce(&intent).await? else {
-                    self.journal
-                        .set_status(
-                            &intent.idempotency_key,
-                            IntentStatus::Failed,
-                            Some("probe session is no longer active"),
-                        )
-                        .await
-                        .map_err(storage)?;
+                    self.fail_orphaned_probe_leg(&intent).await?;
                     continue;
                 };
                 Some(nonce)
@@ -1723,7 +3183,12 @@ impl ActorState {
             }
             if intent.status == IntentStatus::Executing {
                 self.journal
-                    .set_status(&intent.idempotency_key, IntentStatus::Pending, None)
+                    .set_status(
+                        &intent.idempotency_key,
+                        intent.attempt,
+                        IntentStatus::Pending,
+                        None,
+                    )
                     .await
                     .map_err(storage)?;
                 intent.status = IntentStatus::Pending;
@@ -1743,6 +3208,34 @@ impl ActorState {
             report.awaiters_rehydrated += 1;
         }
         Ok(report)
+    }
+
+    /// Terminalize a recovery-discovered probe leg whose durable session has already resolved.
+    ///
+    /// `Journal::set_status` has no compare result: `Ok(())` therefore means this invocation
+    /// changed the row and permits the usual scoped generation bump.  An error can follow a
+    /// committed transaction too; this intent already identifies the affected federations, so
+    /// preserve unrelated facts while conservatively advancing this action's generations.
+    async fn fail_orphaned_probe_leg(&mut self, intent: &Intent) -> ServiceResult<()> {
+        match self
+            .journal
+            .set_status(
+                &intent.idempotency_key,
+                intent.attempt,
+                IntentStatus::Failed,
+                Some("probe session is no longer active"),
+            )
+            .await
+        {
+            Ok(()) => {
+                self.record_balance_change(&intent.action);
+                Ok(())
+            }
+            Err(error) => {
+                self.record_balance_change(&intent.action);
+                Err(storage(error))
+            }
+        }
     }
 
     async fn probe_leg_session_nonce(&self, intent: &Intent) -> ServiceResult<Option<String>> {
@@ -1802,12 +3295,24 @@ impl ActorState {
                 external_admission,
             );
         } else {
+            // Every production driver carries the one-shot actor writer for raw artifacts and
+            // MoveRecords; Join/Recover additionally use it for their short publication fence.
+            // Detached tests/custom executors retain their supplied implementation.
+            let executor: Arc<dyn Executor> = self.runtime.as_ref().map_or_else(
+                || self.executor.clone(),
+                |runtime| {
+                    Arc::new(runtime.service_executor_with_client(
+                        Some(self.policy.per_fed_cap),
+                        client.clone(),
+                    ))
+                },
+            );
             driver::spawn_intent(
                 &self.registry,
                 generation,
                 intent,
                 self.journal.clone(),
-                self.executor.clone(),
+                executor,
                 client.clone(),
                 self.perform_timeout,
                 external_admission,
@@ -1820,6 +3325,8 @@ impl ActorState {
         &mut self,
         key: &IdempotencyKey,
         generation: u64,
+        expected_attempt: u32,
+        retry_awaiter: bool,
         client: &WalletClient,
     ) {
         let Some(finished) = driver::finish(&self.registry, key, generation) else {
@@ -1829,6 +3336,7 @@ impl ActorState {
             Ok(intent) => intent,
             Err(error) => {
                 tracing::warn!(key = %key.0, ?error, "DriverFinished: intent refresh failed");
+                self.schedule_ownership_recovery(client.clone());
                 return;
             }
         };
@@ -1843,14 +3351,86 @@ impl ActorState {
             driver::DriverKind::Awaiter { external_admission } => (*external_admission, None),
             driver::DriverKind::Probe { .. } => (false, None),
         };
-        let hand_off_awaiting = intent.status == IntentStatus::Awaiting
+        let same_attempt = intent.attempt == expected_attempt;
+        let hand_off_awaiting = same_attempt
+            && intent.status == IntentStatus::Awaiting
             && (matches!(&finished.kind, driver::DriverKind::Intent { .. })
                 || finished.redrive_requested);
         let honor_requested_redrive =
-            intent.status == IntentStatus::Pending && finished.redrive_requested;
-        if hand_off_awaiting || honor_requested_redrive {
+            same_attempt && intent.status == IntentStatus::Pending && finished.redrive_requested;
+        // A manual retry can replace attempt N while N's registered driver still owns the
+        // process-local slot.  Its admission marks that owner for redrive; once N finishes,
+        // hand the slot directly to the newer Pending attempt instead of requiring an unrelated
+        // reconcile pass.  Keep the same-attempt Pending case explicit above: it is only safe
+        // when a caller actually requested the redrive.
+        let hand_off_newer_pending_attempt =
+            !same_attempt && intent.status == IntentStatus::Pending && finished.redrive_requested;
+        let retry_same_awaiter = retry_awaiter
+            && matches!(&finished.kind, driver::DriverKind::Awaiter { .. })
+            && same_attempt
+            && intent.status == IntentStatus::Awaiting;
+        if hand_off_awaiting
+            || honor_requested_redrive
+            || hand_off_newer_pending_attempt
+            || retry_same_awaiter
+        {
             self.ensure_driver(intent, client, external_admission, probe_session_nonce);
         }
+    }
+
+    /// Recover ownership after a finished driver's post-removal intent refresh fails.  This task
+    /// deliberately runs outside the serial actor: database faults back off without delaying
+    /// unrelated accounting, while `reconcile` reads only durable live work and refuses to attach
+    /// a second driver when another owner won the race.
+    fn schedule_ownership_recovery(&mut self, client: WalletClient) {
+        self.ownership_recovery_generation = self.ownership_recovery_generation.wrapping_add(1);
+        if self.ownership_recovery_active {
+            return;
+        }
+        self.ownership_recovery_active = true;
+        tokio::spawn(async move {
+            let mut backoff = std::time::Duration::from_millis(25);
+            const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+            loop {
+                match client.recover_driver_ownership().await {
+                    Ok(generation) => {
+                        match client.finish_driver_ownership_recovery(generation).await {
+                            Ok(true) => return,
+                            // A later fault was queued while this task reconciled.  This same
+                            // task owns it too.  Pace this successful-but-stale scan exactly like
+                            // a failed scan: a persistent post-DriverFinished `get` fault must
+                            // not turn one coalesced worker into a tight durable-rescan loop.
+                            Ok(false) => {
+                                tracing::warn!(
+                                    ?backoff,
+                                    "DriverFinished ownership recovery generation changed; retrying"
+                                );
+                                tokio::time::sleep(backoff).await;
+                                backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
+                            }
+                            Err(ServiceError::ActorStopped | ServiceError::ShuttingDown) => return,
+                            Err(error) => {
+                                tracing::warn!(
+                                    ?error,
+                                    "DriverFinished ownership recovery completion failed"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    Err(ServiceError::ActorStopped | ServiceError::ShuttingDown) => return,
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            ?backoff,
+                            "DriverFinished ownership recovery failed; retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
+                    }
+                }
+            }
+        });
     }
 
     fn next_generation(&mut self) -> u64 {
@@ -2116,15 +3696,6 @@ fn intent_status_label(status: IntentStatus) -> &'static str {
     }
 }
 
-fn facts_from_probes(
-    probes: &[(FederationId, crate::probe::ProbeResult)],
-) -> BTreeMap<FederationId, Msat> {
-    probes
-        .iter()
-        .map(|(id, probe)| (*id, Msat(probe.spendable_msat)))
-        .collect()
-}
-
 fn counts_against_external_cap(decision: &wallet_core::AllocatorDecision, actor: Actor) -> bool {
     actor == Actor::User
         && decision.reason != wallet_core::ReasonCode::ActiveProbe
@@ -2348,11 +3919,53 @@ fn transition_may_resolve(transition: &JournalTransition) -> bool {
         JournalTransition::CompareAndSet { new, .. } => {
             matches!(new, IntentStatus::Done | IntentStatus::Failed)
         }
-        JournalTransition::OperationArtifact { invoice, .. } => invoice.is_some(),
         JournalTransition::DriverFinished { .. } => true,
-        JournalTransition::Upsert(_) => true,
-        JournalTransition::SetStatus { .. } | JournalTransition::Refresh => true,
+        JournalTransition::Upsert { .. } => true,
+        JournalTransition::SetStatus { .. }
+        | JournalTransition::SetRawTerminal { .. }
+        | JournalTransition::Refresh => true,
     }
+}
+
+fn transition_terminal_status(transition: &JournalTransition) -> bool {
+    match transition {
+        JournalTransition::CompareAndSet { new, .. } => {
+            matches!(new, IntentStatus::Done | IntentStatus::Failed)
+        }
+        JournalTransition::SetStatus { status, .. } => {
+            matches!(status, IntentStatus::Done | IntentStatus::Failed)
+        }
+        JournalTransition::SetRawTerminal { status, .. } => {
+            matches!(status, IntentStatus::Done | IntentStatus::Failed)
+        }
+        JournalTransition::Upsert { intent, .. } => {
+            matches!(intent.status, IntentStatus::Done | IntentStatus::Failed)
+        }
+        JournalTransition::DriverFinished { .. } | JournalTransition::Refresh => false,
+    }
+}
+
+/// Whether a successful transition actually changed an intent.  Keep this separate from
+/// `transition_may_resolve`: a false CAS is a successful request/response but not a durable
+/// mutation.
+fn transition_mutated(result: &TransitionResult) -> bool {
+    match result {
+        TransitionResult::Compared(changed) => *changed,
+        TransitionResult::Applied => true,
+    }
+}
+
+/// Whether this transition can write an intent row.  Keep this separate from reply
+/// shape: [`JournalTransition::DriverFinished`] and [`JournalTransition::Refresh`]
+/// deliberately return `Applied` so their registry/waiter/probe handling still runs.
+fn transition_is_intent_mutation(transition: &JournalTransition) -> bool {
+    matches!(
+        transition,
+        JournalTransition::Upsert { .. }
+            | JournalTransition::CompareAndSet { .. }
+            | JournalTransition::SetStatus { .. }
+            | JournalTransition::SetRawTerminal { .. }
+    )
 }
 
 pub(super) fn storage(error: ExecError) -> ServiceError {
@@ -2365,6 +3978,17 @@ pub(super) fn storage(error: ExecError) -> ServiceError {
 
 fn storage_refusal(error: ExecError) -> ServiceError {
     as_storage_refusal(storage(error))
+}
+
+/// A row discovered after a failed fresh upsert is evidence for the requested admission only when
+/// it is still that exact first Agent intent.  A key match alone is insufficient: a mismatched row
+/// must fail closed rather than receive this request's allocator watermark.
+fn is_matching_fresh_agent_intent(intent: &Intent, req: &OpRequest) -> bool {
+    intent.idempotency_key == req.decision.idempotency_key
+        && intent.attempt == 0
+        && intent.action == req.decision.action
+        && intent.reason == req.decision.reason
+        && intent.actor == req.actor
 }
 
 fn as_storage_refusal(error: ServiceError) -> ServiceError {
@@ -2461,6 +4085,7 @@ mod route_blocked_designation_tests {
     fn round(snapshot: AllocatorSnapshot, decisions: Vec<AllocatorDecision>) -> PlannedTickRound {
         PlannedTickRound {
             decisions,
+            suppressed: vec![],
             probes: vec![],
             active_probes: BTreeMap::new(),
             snapshot,

@@ -303,12 +303,17 @@ scheduler-dead daemon as healthy.
 - **A pay came back `refunded`/failed after submission.** lnv2 permits ONE payment
   attempt per invoice: the wallet refuses a retry of that same invoice by design
   ("already consumed its single payment attempt"). Get a fresh invoice from the payee.
-- **The Lightning gateway is unavailable.** Automated movement STOPS: every move and every
-  evacuation needs one gateway serving both federations, and a second gateway is a deliberate
-  non-goal, so there is no alternate route. Funds are not at risk — nothing is in flight, balances
-  are untouched, and the allocator refuses rather than half-moving — but do not expect evacuation
-  to rescue you from a gateway outage, because it depends on the same gateway. Wait for it to
-  return; if it will not, moving funds is a manual operation.
+- **No validating Lightning route (`Unroutable`).** For a priced `Unroutable` pair, no candidate
+  has `routing_info` that validates at both ends. Absent an explicit override, the implementation
+  scans the destination federation's vetted list; an override is the sole candidate. Source-
+  federation vetted-list membership is not yet required (`br-s0e`). The two-gateway Lightning-hop
+  fallback for `Evacuate` remains planned and unshipped; routine `Move` has no such fallback.
+  Inspect history and reconcile any work that had already started before treating the outage as a
+  fresh refusal. Wait for a validating route to return; if none will, moving funds is a manual
+  operation.
+- **A validated route is too expensive (`UneconomicAtAnySize`).** Live quotes proved that no move
+  size fits the proportional fee cap. This is not a gateway outage: change the cap or route before
+  expecting fresh automated movement to resume.
 - **A federation signals shutdown.** The scheduler evacuates on its own (the 6a chain
   gate proves the path). Verify with `wallet-cli history | grep evacuation`, and check
   the destination fed's balance grew accordingly.

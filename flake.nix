@@ -91,6 +91,9 @@
         packages = {
           default = walletd;
           inherit walletd wallet-cli;
+          # Exact devimint launches enter the pinned Fedimint devshell through the runbook's
+          # `run_exact_nix_develop`, which explicitly layers this lock-pinned curl package in.
+          curl = pkgs.curl;
 
           # OCI image for the k8s deployment. The image carries the nix closure, so the
           # binaries run as-built — no musl cross, no base-image glibc matching. busybox

@@ -145,6 +145,32 @@ refuse_ambient_rust_build_overrides() {
 
 run_exact_nix_develop() (
   set -euo pipefail
+  if [[ -z "${WALLETS_REPO:-}" || ! -d "$WALLETS_REPO" ]]; then
+    echo "refusing exact Nix environment: WALLETS_REPO must name the wallets checkout" >&2
+    exit 1
+  fi
+  if [[ "${1:-}" != "-c" || "$#" -lt 2 ]]; then
+    echo "usage: run_exact_nix_develop -c command [args...]" >&2
+    exit 1
+  fi
+  # Resolve before Nix sanitizes PATH. `type -P` deliberately ignores a shell function or alias;
+  # inside the Fedimint checkout an unqualified `nix` can otherwise resolve to its `nix/`
+  # directory. Keep one canonical executable for both the outer devshell and inner curl shell.
+  local nix_bin
+  nix_bin="$(type -P nix || true)"
+  if [[ "$nix_bin" != /* || ! -f "$nix_bin" || ! -x "$nix_bin" ]]; then
+    echo "refusing exact Nix environment: nix must resolve to an absolute executable file" >&2
+    exit 1
+  fi
+  nix_bin="$(command readlink -f -- "$nix_bin")" || {
+    echo "refusing exact Nix environment: cannot canonicalize nix executable" >&2
+    exit 1
+  }
+  if [[ "$nix_bin" != /* || ! -f "$nix_bin" || ! -x "$nix_bin" ]]; then
+    echo "refusing exact Nix environment: canonical nix is not an executable file" >&2
+    exit 1
+  fi
+  shift
   if [[ -v HOME ]]; then export HOME; fi
   if [[ -v USER ]]; then export USER; fi
   if [[ -v TERM ]]; then export TERM; fi
@@ -153,7 +179,10 @@ run_exact_nix_develop() (
   if [[ -v FEDIMINT_REPO ]]; then export FEDIMINT_REPO; fi
   if [[ -v FEDIMINT_WORKTREE ]]; then export FEDIMINT_WORKTREE; fi
   if [[ -v SMOKE_SCRIPT ]]; then export SMOKE_SCRIPT; fi
-  command nix develop -i \
+  # The Fedimint devshell supplies the daemons but not curl. Daemon, responsiveness, and soak
+  # smokes use curl for authenticated HTTP and timing, not merely readiness, so layer the
+  # wallets flake's lock-pinned package explicitly rather than falling back to ambient PATH.
+  "$nix_bin" develop -i \
     -k HOME \
     -k USER \
     -k TERM \
@@ -162,7 +191,7 @@ run_exact_nix_develop() (
     -k FEDIMINT_REPO \
     -k FEDIMINT_WORKTREE \
     -k SMOKE_SCRIPT \
-    "$@"
+    -c "$nix_bin" shell "$WALLETS_REPO#curl" -c "$@"
 )
 
 run_exact_cargo() (
@@ -588,8 +617,10 @@ if [[ -e "$FEDIMINT_WORKTREE/.shrc.local" || -L "$FEDIMINT_WORKTREE/.shrc.local"
 fi
 ```
 - The nix devshell provides the external daemons: **bitcoind 31.0, lnd 0.19.3, esplora,
-  lncli**, and the toolchain (cargo 1.93). esplora is NOT on the system PATH — you MUST be
-  in `nix develop`.
+  lncli**, and the toolchain (cargo 1.93). `run_exact_nix_develop` additionally layers
+  `"$WALLETS_REPO#curl"` from this repository's locked nixpkgs revision, so every exact
+  launch has the same explicit curl rather than an ambient binary. esplora is NOT on the
+  system PATH — you MUST be in `nix develop`.
 - The **pinned Fedimint devshell** derives `REPO_ROOT` from the git top-level of the directory
   that invokes it. Invoked from the pin worktree, its release builds land in
   `$FEDIMINT_WORKTREE/target-nix/release`. Exact live recipes enter Nix through

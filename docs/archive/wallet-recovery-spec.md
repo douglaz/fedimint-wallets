@@ -112,10 +112,19 @@ Sibling of `join`/`join_inner` (`multi_client.rs:151-255`):
    later seeds it as `AutoJoined`; under default policy no such fed is eligible as a spending source,
    so **automated allocation stays disabled for every recovered federation**. Recovery is a
    deliberate user action, so it confers user ownership just like `join`. This write is part of the
-   same atomic `complete_recovery` dbtx as the registry row + intent terminalization.
-7. On failure: the operation terminalizes as failed with the SDK's error; the fresh unregistered
-   partition is abandoned inert (free, per D3). The operator may simply retry — each attempt gets a
-   clean prefix.
+   same atomic `complete_recovery` dbtx as the registry row + intent terminalization. Under the
+   recovery reservation, `join_lock`, and actor membership lease, await that transaction before
+   publishing the exact reopened client into the process map. There is no await or cancellation
+   point between observing `Ok(true)` and insertion: an explicit error or cancellation while the
+   transaction is pending never exposes a handle. An ambiguous durable commit may leave a
+   registered-but-unopened row; ending the lease invalidates older authority, and the scheduler's
+   whole-world check skips money work until its normal open path restores the handle.
+7. On a failure known to precede the atomic publication commit (SDK replay, reopen, or an explicit
+   noncommit), the operation terminalizes as failed with the SDK's error; the fresh unregistered
+   partition is abandoned inert (free, per D3), and a deliberate retry gets a clean prefix. A
+   commit-then-error ambiguity is the exception described above: atomic `Done` + registry may have
+   won, the later `Failed` fence loses, and the registered partition must be reopened rather than
+   recovered into another prefix.
 
 **Concurrency — the open path must respect the recovery reservation (adversarial review):** the
 in-memory `active_recoveries` reservation must be honored by EVERY open path, not just `join_inner`.
