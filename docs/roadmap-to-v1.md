@@ -30,8 +30,8 @@ either outcome (the ledger, hardening, UI, and recovery serve a single-fed walle
   for discovery-driven funding decisions ([phase5-plan.md](./archive/phase5-plan.md)).
 - **Phase 5.1 — discovery: COMPLETE (2026-07-09)** — source-agnostic candidate pipeline (Observer HTTP + Manual; Nostr deferred), the `0x09` candidate registry, and the probe GATE wiring: an agent-discovered/auto-joined federation is fundable only after a sustained active-probe PASS (operator-tunable), never on discovery alone. Live devimint exit gate passed ([phase5-plan.md](./archive/phase5-plan.md)).
 - **Phase 6a — `walletd` daemon + local API: COMPLETE (2026-07).** The 24/7 single-owner daemon (axum on 127.0.0.1 + bearer-token file) owns the DB and runs the watch scheduler; `wallet-cli` is a thin client (client mode default, `--standalone` explicit; the `watch` verb is gone — the daemon IS the watch). The fully-async intent model holds: route pricing and all network IO run OFF the actor, so a mid-flight (hours-long LN hold) payment never blocks another operation's start (ADR-0024). The responsiveness gate (`POST /v1/pay` reaches its first external call <250 ms under load) and the 24h+ soak passed; deployed as `walletd` (systemd + k8s) for the real-sats pilot ([phase6a-plan.md](./phase6a-plan.md), [real-sats-pilot-runbook.md](./real-sats-pilot-runbook.md)).
-- **Seed recovery (Phase 7 partial): COMPLETE.** A wallet restores each federation's ecash balance from the 12-word seed alone (fedimint recovery) — the SUCCESS path is live-validated on devimint ([ADR-0025](./adr/0025-recovery-fresh-partition-seed-is-the-backup-unit.md)). Complete-or-fail semantics (a failed module recovery terminalizes rather than hanging forever) are unit-tested only; the live failure gate needs a fault hook in the fedimint fork and is deferred ([recovery-failure-gate-analysis.md](./recovery-failure-gate-analysis.md)). The seed is the backup unit; the encrypted app-state/history backup and seed encryption-at-rest remain deferred — see Phase 7 and [ADR-0026](./adr/0026-seed-at-rest-encryption-headless.md).
-- **Route economics: COMPLETE.** Before each committable tick the allocator prices the designated funding pair through the cheapest gateway serving both ends and floors moves at that route's economic break-even, ending the uneconomic sub-viable churn a flat/proportional cap could not. Current pin: `douglaz/fedimint` `72b1e5b` (`wallet-pin/iroh-recovery-tpe8838`: iroh long-poll + recovery-complete-or-fail + #8838 single-share TPE).
+- **Seed recovery (Phase 7 partial): COMPLETE.** A wallet restores each federation's ecash balance from the 12-word seed **plus the joined federation IDs/invites** (fedimint recovery) — the SUCCESS path is live-validated on devimint ([ADR-0025](./adr/0025-recovery-fresh-partition-seed-is-the-backup-unit.md)). Complete-or-fail semantics (a failed module recovery terminalizes rather than hanging forever) are unit-tested only; the live failure gate needs a fault hook in the fedimint fork and is deferred ([recovery-failure-gate-analysis.md](./recovery-failure-gate-analysis.md)). The seed plus federation set is the backup unit; the encrypted app-state/history backup and seed encryption-at-rest remain deferred — see Phase 7 and [ADR-0026](./adr/0026-seed-at-rest-encryption-headless.md).
+- **Route economics: COMPLETE.** Before each committable tick, unless live allocator work conflict-blocks the designated funding pair, the allocator attempts to price it. Absent an explicit gateway override, candidates come from the destination federation's vetted list; an override is the sole candidate. Pricing validates `routing_info` at both ends and chooses the cheapest validated candidate. A `Routable` pair gets its economic floor, never below the protocol floor; `Unroutable`/`UneconomicAtAnySize` blocks funding. An absent candidate list, bounded-scan miss, quote error, or indeterminate floor can instead leave the pair unpriced and permissively fall back to the protocol floor. Requiring destination-list candidates to appear on the source federation's vetted list remains `br-s0e`. Current pin: `douglaz/fedimint` `72b1e5b` (`wallet-pin/iroh-recovery-tpe8838`: iroh long-poll + recovery-complete-or-fail + #8838 single-share TPE).
 
 ## Sequence
 
@@ -51,11 +51,11 @@ reconstructible from `wallet-cli history`.
 5.0, the empirical sats-spending active probe, is complete: the wallet can mint on a
 candidate, redeem the probe delta back to the spending federation, and cache a durable
 sustained-window verdict. That proves the trust gate ADR-0017 requires before any
-discovery-driven funding. Next is the candidate universe (`ObserverClient` + Nostr
-kind-38173, untrusted, probe-gated per ADR-0017/0019/0020) and the self-running loop
-(`wallet-cli watch`: interval + reactive `federation_expiry_timestamp` subscription; probe
-TTL cache). Every agent action lands in the ledger from day one. Until 5.1 wires discovery
-into the gate, discovered federations are surface/manual-join only.
+discovery-driven funding. The former `wallet-cli watch` loop (interval + reactive
+`federation_expiry_timestamp` subscription and probe-TTL cache) was migrated into
+`walletd`'s scheduler in Phase 6a; the standalone `watch` verb was deleted. Every agent
+action lands in the ledger. Discovery now feeds the probe gate; discovered federations are
+not funded on discovery alone.
 **Gate:** discover → structural floor → ACTIVE probe → score → rebalance runs unattended
 against devimint, fully recorded; a candidate failing only the active probe is never funded.
 
@@ -118,8 +118,9 @@ budget 5-6 real JNI/platform modules; auth-to-send holds agent intents pending b
 approval (the deleted `requires_auth` concept returns HERE, not earlier).
 
 ### Phase 7 — durability + recovery — PARTIAL (seed recovery landed; encryption + app-state backup deferred)
-Seed recovery of ecash is DONE (see "Where we are"): a seed-only restore rebuilds each
-federation's balance with complete-or-fail semantics, live-gated on devimint (ADR-0025).
+Seed recovery of ecash is DONE (see "Where we are"): the seed plus the joined federation
+IDs/invites rebuild each federation's balance with complete-or-fail semantics, live-gated on
+devimint (ADR-0025).
 What remains, deferred: seed encryption AT REST — for the headless daemon a
 passphrase-derived or KMS/HSM key, NOT the mobile Android Keystore path
 ([ADR-0026](./adr/0026-seed-at-rest-encryption-headless.md)) — and the encrypted
@@ -134,7 +135,8 @@ illiquid, censored) instrumented with real-world availability data before claimi
 Honest scope (per `fedimint-mechanics.md`): fedimint seed recovery restores ECASH per
 federation — NOT operation history, in-flight coordination, or the journal/ledger. So Phase 7
 adds an **encrypted app-state backup** (journal + ledger + federation registry — the same
-`[0x00]` partition) alongside the seed; a seed-only restore recovers funds, resumes what the
+`[0x00]` partition) alongside the seed plus federation set; a restore with only that recovery
+unit recovers funds, resumes what the
 per-fed clients self-resume, and starts the ledger with an explicit "history begins at
 restore" row — never silently pretending continuity. **Gate:** device-loss drill both ways —
 (a) with app-state backup: funds + full history restored, in-flight ops explained; (b) seed
@@ -152,29 +154,38 @@ default; finalize the ADR-0017 probe-gating selection spec alongside the legal o
 
 ## Non-goals (decided, not deferred)
 
-**A second Lightning gateway is a NON-GOAL.** Both pilot federations route through one gateway,
-and that is the shape v1 ships with. Do not propose registering an alternate gateway as
-resilience work, and do not treat the single gateway as a gap awaiting closure — it was
-considered and declined.
+**A two-gateway Lightning route is a NON-GOAL for normal movement.** Each v1 move resolves one
+gateway from the destination federation's registered list and validates that gateway on both
+federations; it does not require one fixed gateway. Registering an alternate candidate can improve
+availability without creating a two-gateway route. This is not yet the stronger `serves` invariant:
+current selection does not independently require the source federation's vetted list to contain the
+gateway (`br-s0e` owns that remaining source-membership gate).
 
 What that makes permanent, rather than temporary:
 
-- **The wallet's real invariant is "one gateway serves both federations."** Every move and every
-  evacuation resolves a SINGLE gateway that serves both ends (`resolve_move_gateway` and
-  `resolve_fallback_move_gateway` both return one `GatewayUrl`, gated on `gateway_serves_route`).
-  There is no two-gateway path in the code today. One IS planned for evacuation only — see the
-  next bullet — so do not read this invariant as permanent.
+- **The implemented invariant is "one gateway validates at both ends."** Every move and every
+  implemented evacuation resolves a SINGLE gateway that validates on both federations
+  (`resolve_move_gateway` and `resolve_fallback_move_gateway` both return one `GatewayUrl`, gated
+  on `gateway_serves_route`). The candidate still comes from the destination's registered list;
+  source-list membership is not yet enforced. There is no implemented two-gateway path today; the
+  evacuation-only fallback described next remains unbuilt.
 - **Evacuation is the one exception, per
-  [ADR-0029](./adr/0029-evacuation-must-be-executable.md):** when no gateway serves both
-  federations it may fall back to a real Lightning hop through two different gateways. That is
-  best-effort, not a guarantee, and it does not change the balance cap. `Move` keeps the swap-only
-  path.
-- **If that gateway is unavailable, automated movement stops.** Funds are not at risk — nothing
-  is in flight and balances are untouched — but the allocator cannot rebalance and cannot
-  evacuate until it returns. Evacuation is therefore NOT an escape hatch from a gateway outage;
-  it depends on the same gateway.
-- Federation choice must account for this, but the constraint is **a shared gateway, not a
-  particular one**: any gateway registered on both federations satisfies it. Preferring
+  [ADR-0029](./adr/0029-evacuation-must-be-executable.md):** when no gateway validates on both
+  federations it is intended to fall back to a real Lightning hop through two different gateways.
+  That evacuation-only fallback is still unbuilt; when implemented it will be best-effort, not a
+  guarantee, and will not change the balance cap. `Move` keeps the swap-only path.
+- **A route outage is `Unroutable`, not `UneconomicAtAnySize`.** A priced `Unroutable` pair has
+  no candidate whose `routing_info` validates at both ends: absent an explicit override,
+  selection scans the destination federation's vetted list; an override is the sole candidate.
+  Source federation vetted-list membership is still not required (`br-s0e`).
+  `UneconomicAtAnySize` instead has a validated route whose live quotes prove no move size fits
+  the proportional cap; it needs a cap or route change, not merely a gateway return. Earlier work
+  can still be in flight during an outage, so inspect `history` and reconcile before concluding
+  that balances are untouched. Until the two-gateway evacuation fallback is built, evacuation has
+  the same one-validating-gateway requirement.
+- Federation choice must account for this, but the current constraint is **one gateway that validates
+  on both federations, not a particular gateway**. The future `serves` rule additionally requires
+  vetted-list membership on both sides. Preferring
   federations that the operator's OWN gateway serves is a tradeoff, not a requirement, and it
   cuts against the point of the wallet — spreading across independent federations while routing
   them all through infrastructure one party runs re-centralises what is being diversified, and

@@ -292,7 +292,8 @@ fn route_economics_are_keyed_by_ordered_pair() {
 fn an_evacuation_is_never_blocked_by_route_economics() {
     // Draining a dying federation must not be gated on a fee model — an uneconomic route is a
     // reason to pay more, not to abandon the balance. The evacuation is emitted with the pair's
-    // gateway (a cheaper starting point for `perform`) and its ABSOLUTE `max_fee` cap unchanged.
+    // gateway (a cheaper starting point for `perform`) and its planned base+bps evacuation cap.
+    // The executor recomputes that cap at the final delivered net if fresh sizing reduces it.
     let mut snapshot = snap!([fed!(1, 50_000, true, true, true), fed!(2, 30_000, true, false, true)], Some(id!(1)), Some(id!(2)), 100_000, 100_000, 0, 6300);
     snapshot.min_move = Msat(5_000);
     snapshot.route_economics_by_pair = BTreeMap::from([route!(1, 2, gateway!("https://dear.example"), 900_000, RouteStatus::UneconomicAtAnySize)]);
@@ -429,6 +430,158 @@ fn refusal_with_no_usable_source_records_available_none() {
     // no usable source (`source`/`available` are None) — unlike the source-derived figures.
     assert_eq!(diag.max_fee_bps, Some(GOLDEN_MOVE_BPS));
     assert_eq!(diag.amount, Some(Msat(0)));
+    assert!(!diag.conflict_suppressed, "a genuine zero must not look suppressed");
+}
+
+#[test]
+fn conflict_suppressed_move_reports_zero_emitted_amount_in_shortfall_refusal() {
+    // The spending fed can cover only part of the standby's shortfall. A prior-occurrence move
+    // already owns FundInto(standby), so this pass withholds the newly sized move. The ordinary
+    // shortfall refusal still exists, but its `amount` must describe what THIS pass emitted: zero,
+    // not the nonzero move parked in the diagnostic-only `suppressed` vector.
+    let snapshot = snap!([fed!(1, 120_000, true, false, true), fed!(2, 0, true, false, true)], Some(id!(1)), Some(id!(2)), 1_000_000, 100_000, 100_000, 9400);
+    let holder = AllocatorDecision {
+        action: move_action!(3, 2, 1),
+        reason: ReasonCode::StandbyBelowTarget,
+        occurrence: occ(0),
+        idempotency_key: move_key(3, 2, 0),
+    };
+    let intent = Intent::from_decision(&holder, Actor::Agent { occurrence: occ(0) }, 0);
+    let blocked = GoalBlockers::from_intents([&intent]);
+
+    let (decisions, suppressed) = decide_with_blockers(&snapshot, occ(1), &blocked);
+    assert!(suppressed.iter().any(|decision| matches!(
+        decision.action,
+        Action::Move { from, to, amount: Msat(19_802), .. } if from == id!(1) && to == id!(2)
+    )), "the allocator still sizes the withheld partial move for diagnostics");
+    let diag = first_refusal_diagnostics(&decisions);
+    assert_eq!(diag.available, Some(Msat(19_802)));
+    assert_eq!(diag.amount, Some(Msat(0)), "no move was emitted alongside the refusal");
+    assert!(
+        diag.conflict_suppressed,
+        "the row must explain why its emitted amount is zero"
+    );
+    let candidate = suppressed
+        .iter()
+        .find(|decision| matches!(decision.action, Action::Move { .. }))
+        .expect("the suppressed executable funding candidate");
+    let refusal = decisions
+        .iter()
+        .find(|decision| {
+            matches!(
+                decision.action,
+                Action::RefuseInflow { diagnostics, .. } if diagnostics.conflict_suppressed
+            )
+        })
+        .expect("the correlated suppression refusal");
+    assert_eq!(
+        refusal.idempotency_key.0,
+        format!(
+            "conflict-suppressed:{}:standby_below_target",
+            candidate.idempotency_key.0
+        ),
+        "the advisory row identifies the exact suppressed executable candidate"
+    );
+}
+
+#[test]
+fn fully_fundable_conflict_suppressed_move_coemits_a_zero_refusal() {
+    // A full-sized candidate used to vanish from the decision list because it did not independently
+    // have a shortfall.  Conflict suppression is itself a durable explanation, even when the source
+    // could have filled the entire target.
+    let snapshot = snap!([fed!(1, 1_000_000, true, false, true), fed!(2, 0, true, false, true)], Some(id!(1)), Some(id!(2)), 1_000_000, 0, 900_000, 9401);
+    let holder = AllocatorDecision {
+        action: move_action!(3, 2, 1),
+        reason: ReasonCode::StandbyBelowTarget,
+        occurrence: occ(0),
+        idempotency_key: move_key(3, 2, 0),
+    };
+    let intent = Intent::from_decision(&holder, Actor::Agent { occurrence: occ(0) }, 0);
+    let blocked = GoalBlockers::from_intents([&intent]);
+
+    let (decisions, suppressed) = decide_with_blockers(&snapshot, occ(1), &blocked);
+    assert!(suppressed.iter().any(|decision| matches!(
+        decision.action,
+        Action::Move { from, to, amount: Msat(900_000), .. } if from == id!(1) && to == id!(2)
+    )), "the fully fundable candidate remains separately diagnostic");
+    let diag = first_refusal_diagnostics(&decisions);
+    assert_eq!(diag.source, Some(id!(1)));
+    assert_eq!(diag.want, Some(Msat(900_000)));
+    assert_eq!(diag.available, Some(Msat(990_099)));
+    assert_eq!(diag.cap_room, Some(Msat(1_000_000)));
+    assert_eq!(diag.amount, Some(Msat(0)));
+    assert!(diag.conflict_suppressed);
+    let candidate = suppressed
+        .iter()
+        .find(|decision| matches!(decision.action, Action::Move { .. }))
+        .expect("the suppressed executable funding candidate");
+    let refusal = decisions
+        .iter()
+        .find(|decision| {
+            matches!(
+                decision.action,
+                Action::RefuseInflow { diagnostics, .. } if diagnostics.conflict_suppressed
+            )
+        })
+        .expect("the correlated suppression refusal");
+    assert_eq!(
+        refusal.idempotency_key.0,
+        format!(
+            "conflict-suppressed:{}:standby_below_target",
+            candidate.idempotency_key.0
+        )
+    );
+}
+
+#[test]
+fn conflict_suppressed_evacuation_coemits_a_zero_refusal() {
+    let snapshot = snap!([fed!(1, 900_000, true, true, true), fed!(2, 0, true, false, true)], Some(id!(2)), Some(id!(2)), 1_000_000, 0, 0, 9402);
+    let holder = AllocatorDecision {
+        action: evacuate!(1, 2, 1),
+        reason: ReasonCode::ShutdownNotice,
+        occurrence: occ(0),
+        idempotency_key: evac_key(1, 2, 0),
+    };
+    let intent = Intent::from_decision(&holder, Actor::Agent { occurrence: occ(0) }, 0);
+    let blocked = GoalBlockers::from_intents([&intent]);
+
+    let (decisions, suppressed) = decide_with_blockers(&snapshot, occ(1), &blocked);
+    assert!(suppressed.iter().any(|decision| matches!(
+        decision.action,
+        Action::Evacuate { from, to, amount: Msat(900_000), .. } if from == id!(1) && to == id!(2)
+    )), "the withheld evacuation remains separately diagnostic");
+    let diag = first_refusal_diagnostics(&decisions);
+    assert_eq!(diag.source, Some(id!(1)));
+    assert_eq!(diag.want, None);
+    assert_eq!(diag.available, Some(Msat(900_000)));
+    assert_eq!(diag.source_spendable, Some(Msat(900_000)));
+    assert_eq!(diag.max_fee, None);
+    assert_eq!(diag.max_fee_bps, None);
+    assert_eq!(diag.cap_room, Some(Msat(1_000_000)));
+    assert_eq!(diag.amount, Some(Msat(0)));
+    assert!(diag.conflict_suppressed);
+    assert_eq!(diag.min_move, None);
+    let candidate = suppressed
+        .iter()
+        .find(|decision| matches!(decision.action, Action::Evacuate { .. }))
+        .expect("the suppressed executable evacuation candidate");
+    let refusal = decisions
+        .iter()
+        .find(|decision| {
+            matches!(
+                decision.action,
+                Action::RefuseInflow { diagnostics, .. } if diagnostics.conflict_suppressed
+            )
+        })
+        .expect("the correlated suppression refusal");
+    assert_eq!(
+        refusal.idempotency_key.0,
+        format!(
+            "conflict-suppressed:{}:shutdown_notice",
+            candidate.idempotency_key.0
+        ),
+        "the evacuation destination is encoded by its exact candidate key"
+    );
 }
 
 #[test]
@@ -781,7 +934,7 @@ fn evacuation_into_standby_plus_topup_never_exceed_cap() {
     // §4.2: fed 1 evacuates into the standby (fed 2) while fed 2 is ALSO topped up from the
     // spending surplus (fed 3) in the same tick. The `credited` reservation makes the
     // standby-funding move see the evacuation's pending inbound, so their joint credit fills
-    // fed 2 to exactly the cap and the residual want is refused as OverCap.
+    // fed 2 to exactly the cap without emitting a stale target shortfall refusal.
     let snapshot = snap!([fed!(1, 10_000, true, true, true), fed!(2, 70_000, true, false, true), fed!(3, 100_000, true, false, true)], Some(id!(3)), Some(id!(2)), 100_000, 50_000, 100_000, 200);
     let decisions = decide(&snapshot, occ(1));
     assert_eq!(
@@ -789,7 +942,6 @@ fn evacuation_into_standby_plus_topup_never_exceed_cap() {
         vec![
             AllocatorDecision { action: evacuate!(1, 2, 10_000), reason: ReasonCode::ShutdownNotice, occurrence: occ(1), idempotency_key: evac_key(1, 2, 1) },
             AllocatorDecision { action: move_action!(3, 2, 20_000), reason: ReasonCode::StandbyBelowTarget, occurrence: occ(1), idempotency_key: move_key(3, 2, 1) },
-            AllocatorDecision { action: refuse!(2, ReasonCode::OverCap), reason: ReasonCode::OverCap, occurrence: occ(1), idempotency_key: refuse_key(2, ReasonCode::OverCap, 1) },
         ]
     );
     let into_standby: u64 = evac_amounts_into(&decisions, id!(2)) + move_amounts_into(&decisions, id!(2));
@@ -844,17 +996,21 @@ fn scorer_rejected_fed_is_never_an_evacuation_destination() {
 }
 
 #[test]
-fn cross_operation_reservations_only_change_source_availability_and_cap_room() {
+fn wallet_delivered_reservations_credit_the_destination_target() {
     // The outbound reservation must still BIND the move for this golden to prove anything about
     // source availability. Under br-ljj.2's proportional reserve the source keeps far more of its
     // budget than the old flat `− max_fee 500` left it, so the reservation is sized to bind:
-    // budget = 900 − 600 = 300, available = max_fundable(300, 100) = 298, below the 400 want.
-    // want stays 400 (500 target − 100 spendable), NOT 200 — the 200 speculative inbound on the
-    // destination is deliberately not credited toward its target, only against its cap room.
+    // budget = 900 − 600 = 300, available = max_fundable(300, 100) = 298, above the residual
+    // 200 want. Wallet-delivered pending inbound is committed target credit, not merely
+    // cap-room accounting.
     let mut snapshot = snap!([fed!(1, 100, true, false, true), fed!(2, 900, true, false, true)], Some(id!(1)), Some(id!(2)), 1_000, 500, 0, 600);
     snapshot
         .reservations
         .per_fed_inbound
+        .insert(id!(1), msat!(200));
+    snapshot
+        .reservations
+        .per_fed_target_credit
         .insert(id!(1), msat!(200));
     snapshot
         .reservations
@@ -865,14 +1021,18 @@ fn cross_operation_reservations_only_change_source_availability_and_cap_room() {
     assert!(
         decisions.iter().any(|decision| matches!(
             decision.action,
-            Action::Move { amount: Msat(298), .. }
+            Action::Move { amount: Msat(200), .. }
         )),
-        "the source reservation reduces available funds without treating speculative inbound as target credit"
+        "the pending inbound leaves only the residual target shortfall to fund"
     );
 
     snapshot
         .reservations
         .per_fed_inbound
+        .insert(id!(1), msat!(900));
+    snapshot
+        .reservations
+        .per_fed_target_credit
         .insert(id!(1), msat!(900));
     assert!(decide(&snapshot, occ(1))
         .iter()
@@ -880,12 +1040,12 @@ fn cross_operation_reservations_only_change_source_availability_and_cap_room() {
 }
 
 #[test]
-fn speculative_receive_reservation_does_not_suppress_a_needed_top_up() {
+fn pending_external_receive_reservation_does_not_reduce_top_up() {
     let mut snapshot = snap!([fed!(1, 100, true, false, true), fed!(2, 2_000, true, false, true)], Some(id!(1)), Some(id!(2)), 1_100, 500, 0, 601);
     snapshot
         .reservations
         .per_fed_inbound
-        .insert(id!(1), msat!(500));
+        .insert(id!(1), msat!(100));
 
     assert!(decide(&snapshot, occ(1)).iter().any(|decision| matches!(
         decision.action,
@@ -894,6 +1054,36 @@ fn speculative_receive_reservation_does_not_suppress_a_needed_top_up() {
             amount: Msat(400),
             ..
         } if to == id!(1)
+    )));
+}
+
+#[test]
+fn pending_external_inbound_does_not_reduce_standby_funding() {
+    let mut snapshot = snap!(
+        [
+            fed!(1, 100, true, false, true),
+            fed!(2, 1_000, true, false, true)
+        ],
+        Some(id!(2)),
+        Some(id!(1)),
+        2_000,
+        400,
+        500,
+        602
+    );
+    snapshot
+        .reservations
+        .per_fed_inbound
+        .insert(id!(1), msat!(100));
+
+    assert!(decide(&snapshot, occ(1)).iter().any(|decision| matches!(
+        decision.action,
+        Action::Move {
+            from,
+            to,
+            amount: Msat(400),
+            ..
+        } if from == id!(2) && to == id!(1)
     )));
 }
 

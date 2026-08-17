@@ -1184,10 +1184,12 @@ async fn standalone_policy_get_set_and_health_roundtrip() {
         out.stdout
     );
 
-    // `reconcile` runs the actor re-drive AND the off-actor ledger repair (mirroring the daemon's
-    // `/v1/reconcile` handler, which is `client.reconcile()` + `journal.repair_ledger`). Against the
-    // empty store both are no-ops, so it exits 0 with zero counts — pinning that the standalone
-    // recovery path (the only one when walletd is down) actually runs the repair without faulting.
+    // `reconcile` routes the durable re-drive through the actor, then runs the off-actor ledger
+    // repair scan; its raw Pay/Receive terminal writes return through that actor. This mirrors
+    // the daemon's `/v1/reconcile` handler (`client.reconcile_durable()` plus
+    // `repair_ledger_with_actor`). Against the empty store both are no-ops, so it exits 0 with
+    // zero counts — pinning that the standalone recovery path (the only one when walletd is
+    // down) actually runs the repair without faulting.
     let out = run_raw(&dir, &["--standalone", "--data-dir", data_arg, "reconcile"]).await;
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
     assert!(

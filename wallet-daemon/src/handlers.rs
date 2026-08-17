@@ -27,8 +27,8 @@ use wallet_core::{
 };
 use wallet_fedimint::{
     direct_inflow_nonce_key, join_intent_key, move_key, parse_invoice, raw_pay_key,
-    raw_receive_key, recover_intent_key, AwaitOutcome, Invoice, MultiClient, OpRequest,
-    OperationRef, Snapshot, SnapshotScope, TickPolicy,
+    raw_receive_key, recover_intent_key, repair_ledger_with_actor, AwaitOutcome, Invoice,
+    MultiClient, OpRequest, OperationRef, Snapshot, SnapshotScope, TickPolicy,
 };
 
 /// Wall-clock unix millis for the actor's decide-time clock. Display/ordering material only —
@@ -555,13 +555,14 @@ struct ReconcileResponse {
 
 pub async fn reconcile(State(state): State<AppState>) -> Result<impl IntoResponse, HttpError> {
     // Actor-side intent re-drive first (idempotent; overlapping calls coalesce — the actor
-    // registers the re-drive drivers itself). Then the off-actor O(ledger) ledger repair
-    // (TL-4): it must NOT run inside the actor's critical section, and its CAS hardening makes
-    // it a no-op against any row the actor already terminalized. Best-effort — a repair I/O
-    // fault is logged, never fails the button (the intent re-drive already committed).
-    let report = state.client.reconcile().await?;
+    // registers the re-drive drivers itself). Then run the off-actor O(ledger) repair scan;
+    // its raw Pay/Receive terminal intent status writes re-enter through the actor. Best-effort
+    // — a repair I/O fault is logged, never fails the button (the re-drive already committed).
+    let report = state.client.reconcile_durable().await?;
     if let Some(mc) = state.mc.as_ref() {
-        if let Err(error) = state.journal.repair_ledger(mc.as_ref()).await {
+        if let Err(error) =
+            repair_ledger_with_actor(state.journal.as_ref(), mc.as_ref(), &state.client).await
+        {
             tracing::warn!(
                 ?error,
                 "reconcile: off-actor ledger repair faulted; continuing"
@@ -826,9 +827,11 @@ fn operation_view(record: &OperationRecord) -> OperationView {
         reason: reason_tag(record.reason).to_owned(),
         operation_key: record.correlation_key.0.clone(),
         error: record.error.clone(),
-        // Only a refusal that actually recorded figures carries a `refusal` object; a
-        // figure-less refusal (plain over-cap, no-destination evacuation, tick-drop) maps to
-        // `None` so the wire omits the field entirely rather than emitting eight nulls.
+        // Only a refusal that actually recorded diagnostics carries a `refusal` object; the
+        // default/figure-less refusal (plain over-cap, no-destination evacuation, ordinary
+        // tick-drop) maps to `None` so the wire omits the field entirely rather than emitting
+        // a collection of null/default diagnostic fields.
+        // Conflict-suppressed tick drops carry observational diagnostics and remain populated.
         refusal: match &record.kind {
             OperationKind::Refusal { diagnostics, .. } if diagnostics.is_populated() => {
                 Some(*diagnostics)
@@ -839,17 +842,21 @@ fn operation_view(record: &OperationRecord) -> OperationView {
 }
 
 /// `operation_view`, then mask the narrow recovery commit→insert window. `MultiClient::recover`
-/// terminalizes the recovery intent (→ `Succeeded`) and only THEN inserts the live client, so for a
-/// few microseconds an operation-status read sees `Succeeded` while `/v1/balance` still omits the
-/// fed (absent from `federations()` until the insert). The recovery reservation is held across that
-/// window, so while `is_recovering(fed)` holds, keep reporting the same in-progress `Started` the op
-/// showed throughout the replay — status and balance then agree, and it advances to `Succeeded` on
-/// the next poll once the client is installed. Money-safe and self-correcting either way.
+/// terminalizes the recovery intent (→ `Succeeded`) before it synchronously inserts the reopened
+/// client, so for a few microseconds an operation-status read sees `Succeeded` while
+/// `/v1/balance` still omits the fed (absent from `federations()` until the insert). The recovery
+/// reservation is held across that window, so while `recovery_handle_missing(fed)` holds, keep
+/// reporting the same in-progress `Started` the op showed throughout the replay — status and
+/// balance then agree. A commit-then-error or restart can extend the gap until the scheduler reopens
+/// the registered partition; the mask stops as soon as that handle is installed.
 fn operation_view_masked(record: &OperationRecord, mc: &Option<Arc<MultiClient>>) -> OperationView {
     let mut view = operation_view(record);
     if view.status == OperationStatusDto::Succeeded {
         if let OperationKind::Recover { fed } = &record.kind {
-            if mc.as_ref().is_some_and(|mc| mc.is_recovering(fed)) {
+            if mc
+                .as_ref()
+                .is_some_and(|mc| mc.recovery_handle_missing(fed))
+            {
                 view.status = OperationStatusDto::Started;
             }
         }
@@ -970,8 +977,8 @@ mod tests {
 
     #[test]
     fn operation_view_carries_populated_refusal_and_omits_figure_less() {
-        // A figure-less refusal maps to no wire object (so `skip_serializing_if` omits it);
-        // a populated one is carried. Guards the `is_populated` gate against a silent revert —
+        // A default/figure-less refusal maps to no wire object (so `skip_serializing_if` omits
+        // it); a populated one is carried. Guards the `is_populated` gate against a silent revert —
         // the always-equal `PartialEq` means a DTO round-trip alone would not catch it.
         let empty = operation_view(&refusal_record(RefusalDiagnostics::default()));
         assert!(empty.refusal.is_none());
@@ -983,6 +990,17 @@ mod tests {
         assert_eq!(
             populated.refusal.expect("populated refusal carried").want,
             Some(Msat(50_000))
+        );
+
+        let conflict_only = operation_view(&refusal_record(RefusalDiagnostics {
+            conflict_suppressed: true,
+            ..Default::default()
+        }));
+        assert!(
+            conflict_only
+                .refusal
+                .expect("conflict suppression is observational data")
+                .conflict_suppressed
         );
     }
 }

@@ -183,8 +183,11 @@ Rules (load-bearing):
   embed the key in `custom_meta`, update the row with the `op_id` post-call;
   `await-receive`/`await-send` advance the row to terminal via the correlation key; reconcile
   backfills/repairs rows per §3 rule 5.
-- `Runtime::tick` writes the `Tick` row + `Refusal` rows for advisory decisions (deduped by
-  their existing `refuse:` idempotency keys).
+- `Runtime::tick` writes the `Tick` row + `Refusal` rows for advisory decisions, keyed either
+  `refuse:<reason>:<fed>:<occurrence>` or
+  `conflict-suppressed:<candidate-key>:<reason>`. A commit-time rejection of an executable
+  decision is instead a distinct `tick-drop:<occurrence>:<decision-key>` row; all three key
+  forms deduplicate through the correlation-key index.
 
 ## 5. Query surface (wallet-cli; the Android activity screen reads the same API)
 

@@ -22,9 +22,10 @@
 
 use crate::discovery::{
     auto_join_kind, discover_kind, discovery_actor, run_discover_pass_bounded_with_rotation,
-    run_discover_pass_bounded_with_rotation_and_probe_policy, AutoJoinAttempt, AutoJoinCounts,
-    CandidateSource, DiscoverPassResume, DiscoverReport, DiscoveryBackend, PreviewedCandidate,
-    DISCOVERY_REASON,
+    run_discover_pass_bounded_with_rotation_and_probe_policy,
+    run_discover_pass_bounded_with_rotation_and_probe_policy_with_membership_lease,
+    AutoJoinAttempt, AutoJoinCounts, CandidateSource, DiscoverPassResume, DiscoverReport,
+    DiscoveryBackend, PreviewedCandidate, DISCOVERY_REASON,
 };
 use crate::executor::FedimintExecutor;
 use crate::journal::{
@@ -37,9 +38,9 @@ use crate::multi_client::{
 };
 use crate::probe::{assemble_facts, assemble_status, FedimintProbeRunner, ProbeResult};
 use crate::route_econ::RouteQuoteBudget;
+use crate::service::{ProbeAdmission, ProbeCandidate, ProbePolicySnapshot, WalletClient};
 use crate::tick::{
-    build_snapshot, decisions_to_apply, pinned_input_problems, ScoredFed, StatusReport, TickPolicy,
-    TickReport,
+    build_snapshot, decisions_to_apply, ScoredFed, StatusReport, TickPolicy, TickReport,
 };
 use crate::types::{GatewayUrl, Invoice};
 use async_trait::async_trait;
@@ -60,10 +61,10 @@ use wallet_core::{
     probe_budget_ok, probe_budget_usage, probe_next_due_at, probe_pass_expiry_anchor_ms,
     probe_verdict, probe_wake_due_ms, score, Action, ActiveProbeVerdict, Actor,
     AdaptiveSleepDeadlines, AllocatorDecision, AllocatorSnapshot, DiscoveryPolicy, ExecError,
-    ExecutionSummary, Executor, FederationFacts, FederationId, IdempotencyKey, Intent,
-    IntentStatus, Journal, Module, Msat, Occurrence, OperationId, OperationKind, OperationRecord,
-    OperationStatus, PerformOutcome, ProbeAttempt, ProbeBudgetUsage, ProbePolicy, ReasonCode,
-    ScorerPolicy, WatchPolicy,
+    ExecutionSummary, Executor, FederationFacts, FederationId, GoalBlockers, IdempotencyKey,
+    Intent, IntentStatus, Journal, Module, Msat, Occurrence, OperationId, OperationKind,
+    OperationRecord, OperationStatus, PerformOutcome, ProbeAttempt, ProbeBudgetUsage, ProbePolicy,
+    ReasonCode, Reservations, ScorerPolicy, WatchPolicy,
 };
 
 /// Wall-clock in unix millis for the ledger's `created_at_ms` (§8/§9.4). `seq` is the
@@ -160,6 +161,21 @@ pub struct ReconcileSummary {
     pub retryable: usize,
     pub awaiting: usize,
     pub awaiting_keys: Vec<IdempotencyKey>,
+    /// The logical allocator goals still owned by durable work when this pass finished (br-p93),
+    /// projected from the FINAL `Pending`/`Executing` scan rather than from the counts above: a
+    /// retryable failure and a live driver leave the same durable evidence, and only the durable
+    /// state can say which goals a following tick must withhold.
+    ///
+    /// This value REPORTS the standalone path's eligibility; it does not carry it. `watch_once`
+    /// reads it to log what the tick will suppress, and each seam that ACTS on the suppression
+    /// re-derives the same projection from the same durable source with
+    /// [`GoalBlockers::from_intents`]: `plan_tick` before route pricing, `tick` again before
+    /// apply. Those later scans are strictly fresher and equally fail-closed — work admitted since
+    /// this pass appears in them, and work that SETTLED since is a legitimate recurrence — so
+    /// re-deriving never narrows the suppression below what is still in flight. The daemon,
+    /// whose reconcile and tick are separate actor round-trips, does carry its equivalent
+    /// ([`crate::service::ReconcileReport::blocked`]) onto the cycle's `TickPolicy`.
+    pub blocked: GoalBlockers,
 }
 
 #[derive(Clone, Debug)]
@@ -194,9 +210,7 @@ impl WatchCycleReport {
                     && report.summary.terminal_failed_skipped == 0
                     && report.summary.retryable == 0
             }
-            WatchTickOutcome::SkippedPendingRetry { .. }
-            | WatchTickOutcome::SkippedReconcileFailed
-            | WatchTickOutcome::Failed(_) => false,
+            WatchTickOutcome::SkippedReconcileFailed | WatchTickOutcome::Failed(_) => false,
         };
         let probes_noop = self.probes.iter().all(|probe| {
             matches!(
@@ -225,7 +239,9 @@ pub enum WatchReconcileOutcome {
 #[derive(Clone, Debug)]
 pub enum WatchTickOutcome {
     Ran(TickReport),
-    SkippedPendingRetry { retryable: usize },
+    /// Reconcile itself faulted, so which goals are in flight is UNKNOWN. This is the only
+    /// remaining global skip (br-p93): a successful reconcile always ticks, projected through the
+    /// conflict-scoped blocker set it derived.
     SkippedReconcileFailed,
     Failed(String),
 }
@@ -264,6 +280,18 @@ struct ProbeScheduleContext {
     budget_ok: bool,
     budget_reset_ms: Option<u64>,
     fresh_probe_defer_until_ms: Option<u64>,
+}
+
+struct ProbeScheduleInput {
+    candidate: FederationId,
+    source: Option<FederationId>,
+    verdict: ActiveProbeVerdict,
+    due_ms: u64,
+    /// The exact durable identity observed while building this schedule input. Keeping the
+    /// session here prevents a retained item from silently becoming fresh if the journal changes
+    /// before the service actor sees it.
+    session: Option<ProbeSession>,
+    post_in_resume: bool,
 }
 
 impl ProbeScheduleContext {
@@ -322,12 +350,98 @@ impl ProbeScheduleContext {
 }
 
 #[derive(Clone, Debug)]
-struct TickPlan {
-    raw_probes: Vec<(FederationId, ProbeResult)>,
-    probes: Vec<(FederationId, ProbeResult)>,
-    active_probes: BTreeMap<FederationId, ActiveProbeVerdict>,
-    snapshot: AllocatorSnapshot,
-    decisions: Vec<AllocatorDecision>,
+pub(crate) struct TickPlan {
+    pub(crate) raw_probes: Vec<(FederationId, ProbeResult)>,
+    pub(crate) probes: Vec<(FederationId, ProbeResult)>,
+    pub(crate) active_probes: BTreeMap<FederationId, ActiveProbeVerdict>,
+    pub(crate) snapshot: AllocatorSnapshot,
+    /// The decisions this tick may act on (conflict-suppressed work already removed).
+    pub(crate) decisions: Vec<AllocatorDecision>,
+    /// Work conflict projection withheld before route preflight. Only the pinned-input check reads
+    /// it, separately from `decisions`, because it is not executable endpoint evidence.
+    pub(crate) suppressed: Vec<AllocatorDecision>,
+    /// Durable rebalance endpoints observed while planning. `status` reports against this planning
+    /// view; `tick` re-scans and uses a fresh value after its final conflict retention.
+    pub(crate) blockers: GoalBlockers,
+}
+
+/// Why a detached service awaiter stopped before terminalizing its durable intent.
+///
+/// A retryable subscription or persistence fault retains await ownership. A structurally invalid
+/// durable intent must instead be terminalized through the actor, or it would remain Awaiting with
+/// an endless succession of local awaiters.
+#[derive(Debug)]
+pub(crate) enum AwaitFailure {
+    Retryable(String),
+    Permanent(String),
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TestAwaitOutcome {
+    Retryable,
+    Permanent,
+    Done,
+}
+
+/// Test-only terminal SDK states used to exercise the real raw Pay/Receive await continuation.
+///
+/// This is intentionally separate from [`TestAwaitOutcome`]: the latter stops before an SDK
+/// observation, while these values enter the post-observation correlation/finalization path.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TestTerminalAwaitState {
+    SendSucceeded,
+    ReceiveClaimed,
+}
+
+/// A local error injected only after the test terminal SDK observation above.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TestPostObservationFault {
+    PreparePermanent,
+    FinalizeStatusMismatch,
+}
+
+impl AwaitFailure {
+    fn retryable_error(error: anyhow::Error) -> Self {
+        Self::Retryable(format!("{error:#}"))
+    }
+
+    fn retryable_exec(error: ExecError) -> Self {
+        Self::Retryable(format!("{error:?}"))
+    }
+
+    fn retryable_service_error(error: crate::service::ServiceError) -> Self {
+        Self::Retryable(error.to_string())
+    }
+
+    /// An SDK typed-await validation fault happens before an operation terminal state was
+    /// observed. Its explicit classification may therefore safely tell the actor whether the
+    /// durable attempt is structurally invalid or should retain await ownership.
+    fn from_await_operation(error: crate::multi_client::AwaitOperationError) -> Self {
+        Self::from_exec(error.into_exec_error())
+    }
+
+    /// Once `await_send`/`await_receive` returned a terminal SDK state, an error in our
+    /// correlation, preparation, or journal-finalization work is local uncertainty, not evidence
+    /// that the operation failed. Retain this attempt's await ownership even when that local API
+    /// reports `Permanent`/`Unsupported`: the externally observed operation may have succeeded.
+    fn post_terminal_observation_exec(error: ExecError) -> Self {
+        Self::Retryable(format!("post-terminal-observation local fault: {error:?}"))
+    }
+
+    fn permanent(message: String) -> Self {
+        Self::Permanent(message)
+    }
+
+    fn from_exec(error: ExecError) -> Self {
+        match error {
+            ExecError::Retryable(message) => Self::Retryable(message),
+            ExecError::Permanent(message) => Self::Permanent(message),
+            ExecError::Unsupported => Self::Permanent("await operation is unsupported".to_owned()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -412,6 +526,42 @@ pub struct Runtime {
     hard_cap: Option<Msat>,
     /// Per-`perform` wall-clock deadline (§15.9). `None` disables the deadline.
     perform_timeout: Option<Duration>,
+    /// Unit-test seam for exercising the standalone watch/tick commit path without live guardians.
+    #[cfg(test)]
+    test_executor: Option<Arc<wallet_core::MockExecutor>>,
+    /// A preplanned round paired with `test_executor`; production always calls `plan_tick` normally.
+    #[cfg(test)]
+    test_tick_plan: std::sync::Mutex<Option<TickPlan>>,
+    /// Test-only sampled probe view for exercising the production scheduler's post-plan paths.
+    /// It is separate from `test_tick_plan`: the scheduler samples both before planning and again
+    /// when a stale designation must be re-derived.
+    #[cfg(test)]
+    test_probe_all: std::sync::Mutex<Option<Vec<(FederationId, ProbeResult)>>>,
+    /// Deterministic detached-awaiter outcomes for service-driver classification tests.
+    #[cfg(test)]
+    test_await_outcomes: std::sync::Mutex<std::collections::VecDeque<TestAwaitOutcome>>,
+    /// Typed pre-observation await failures for service classification tests.
+    #[cfg(test)]
+    test_await_operation_errors:
+        std::sync::Mutex<std::collections::VecDeque<crate::multi_client::AwaitOperationError>>,
+    /// Terminal states injected at the precise SDK-observation boundary for raw awaiter tests.
+    #[cfg(test)]
+    test_terminal_await_states:
+        std::sync::Mutex<std::collections::VecDeque<TestTerminalAwaitState>>,
+    /// A local post-observation fault; its error class must never terminalize the actor attempt.
+    #[cfg(test)]
+    test_post_observation_faults:
+        std::sync::Mutex<std::collections::VecDeque<TestPostObservationFault>>,
+    /// Test-only hold at the awaiter handoff, used to inspect retained ownership before a
+    /// successor runs.
+    #[cfg(test)]
+    test_awaiter_retry_hold: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
+    /// One-shot designation-read fault seam for the production scheduler's degraded-cycle test.
+    #[cfg(test)]
+    test_scheduler_designation_failures: std::sync::atomic::AtomicUsize,
+    /// Hold one service probe after actor admission but before its exact durable-session read.
+    #[cfg(test)]
+    test_service_probe_start_hold: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 impl Runtime {
@@ -428,7 +578,140 @@ impl Runtime {
             pinned_gateway,
             hard_cap,
             perform_timeout,
+            #[cfg(test)]
+            test_executor: None,
+            #[cfg(test)]
+            test_tick_plan: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_probe_all: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_await_outcomes: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            test_await_operation_errors: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            test_terminal_await_states: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            test_post_observation_faults: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            test_awaiter_retry_hold: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_scheduler_designation_failures: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            test_service_probe_start_hold: std::sync::Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_tick_test_fixture(
+        &mut self,
+        executor: Arc<wallet_core::MockExecutor>,
+        plan: TickPlan,
+    ) {
+        self.test_executor = Some(executor);
+        *self
+            .test_tick_plan
+            .lock()
+            .expect("tick test-plan mutex poisoned") = Some(plan);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_scheduler_probe_fixture(&self, probes: Vec<(FederationId, ProbeResult)>) {
+        *self
+            .test_probe_all
+            .lock()
+            .expect("scheduler probe fixture mutex poisoned") = Some(probes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_awaiter_test_outcomes(
+        &self,
+        outcomes: impl IntoIterator<Item = TestAwaitOutcome>,
+    ) {
+        *self
+            .test_await_outcomes
+            .lock()
+            .expect("awaiter test-outcomes mutex poisoned") = outcomes.into_iter().collect();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_awaiter_test_operation_errors(
+        &self,
+        errors: impl IntoIterator<Item = crate::multi_client::AwaitOperationError>,
+    ) {
+        *self
+            .test_await_operation_errors
+            .lock()
+            .expect("awaiter operation-error test mutex poisoned") = errors.into_iter().collect();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_post_observation_awaiter_test_fixture(
+        &self,
+        terminal_states: impl IntoIterator<Item = TestTerminalAwaitState>,
+        faults: impl IntoIterator<Item = TestPostObservationFault>,
+    ) {
+        *self
+            .test_terminal_await_states
+            .lock()
+            .expect("terminal await-state test mutex poisoned") =
+            terminal_states.into_iter().collect();
+        *self
+            .test_post_observation_faults
+            .lock()
+            .expect("post-observation await-fault test mutex poisoned") =
+            faults.into_iter().collect();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_awaiter_retry_for_test(&self) -> Arc<tokio::sync::Notify> {
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *self
+            .test_awaiter_retry_hold
+            .lock()
+            .expect("awaiter retry-hold test mutex poisoned") = Some(hold.clone());
+        hold
+    }
+
+    /// Keep awaiter retry pacing outside the actor. Tests can hold this exact handoff to inspect
+    /// the retained Awaiting attempt before releasing the successor.
+    pub(crate) async fn service_awaiter_retry_delay(&self) {
+        #[cfg(test)]
+        let test_hold = {
+            self.test_awaiter_retry_hold
+                .lock()
+                .expect("awaiter retry-hold test mutex poisoned")
+                .clone()
+        };
+        #[cfg(test)]
+        if let Some(hold) = test_hold {
+            hold.notified().await;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_scheduler_designations_for_test(&self, count: usize) {
+        self.test_scheduler_designation_failures
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_service_probe_start_for_test(&self) -> Arc<tokio::sync::Notify> {
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *self
+            .test_service_probe_start_hold
+            .lock()
+            .expect("service-probe start-hold mutex poisoned") = Some(hold.clone());
+        hold
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scheduler_tick_test_plan(&self) -> Option<TickPlan> {
+        self.test_tick_plan
+            .lock()
+            .expect("tick test-plan mutex poisoned")
+            .clone()
     }
 
     /// Service-layer journal handle used for actor decisions and lifecycle transitions.
@@ -440,15 +723,17 @@ impl Runtime {
         self.mc.clone()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn service_due_probes(
         &self,
         spending: Option<FederationId>,
         tick_policy: &TickPolicy,
         watch_policy: &WatchPolicy,
         sampled_balances: &BTreeMap<FederationId, Msat>,
+        fresh_policy: Option<&ProbePolicySnapshot>,
         now_ms: u64,
         occurrence: Occurrence,
-    ) -> anyhow::Result<(Vec<(FederationId, FederationId, Msat)>, bool)> {
+    ) -> anyhow::Result<(Vec<ProbeCandidate>, bool)> {
         let context = self.probe_schedule_context(now_ms, watch_policy).await?;
         let inputs = self
             .probe_schedule_inputs(
@@ -461,14 +746,23 @@ impl Runtime {
             .await?;
         let mut resumed = Vec::new();
         let mut fresh = Vec::new();
-        for (candidate, source, _verdict, due_ms, post_in_resume) in inputs {
+        for input in inputs {
+            let ProbeScheduleInput {
+                candidate,
+                source,
+                verdict: _,
+                due_ms,
+                session,
+                post_in_resume: _,
+            } = input;
             let Some(source) = source else {
                 continue;
             };
-            if !post_in_resume && due_ms > now_ms {
+            let retained = session.is_some();
+            if !retained && due_ms > now_ms {
                 continue;
             }
-            if !post_in_resume && !context.budget_ok {
+            if !retained && !context.budget_ok {
                 self.record_watch_probe_skip(
                     candidate,
                     source,
@@ -481,19 +775,31 @@ impl Runtime {
                 .map_err(exec_err)?;
                 continue;
             }
-            if let Some(session) = self
-                .journal
-                .probe_record(&candidate)
-                .await
-                .map_err(exec_err)?
-                .and_then(|record| record.in_flight)
-            {
-                resumed.push((candidate, source, Msat(session.c_spendable_before_in_msat)));
+            if let Some(session) = session {
+                resumed.push(ProbeCandidate {
+                    federation: candidate,
+                    source,
+                    baseline: Msat(session.c_spendable_before_in_msat),
+                    actor: Actor::Agent { occurrence },
+                    now_ms,
+                    admission: ProbeAdmission::ResumeOnly {
+                        expected_nonce: session.nonce,
+                    },
+                });
             } else if let Some(baseline) = fresh_probe_baseline(
                 self.mc.has_client(&candidate),
                 sampled_balances.get(&candidate).copied(),
             ) {
-                fresh.push((candidate, source, baseline));
+                if let Some(snapshot) = fresh_policy {
+                    fresh.push(ProbeCandidate {
+                        federation: candidate,
+                        source,
+                        baseline,
+                        actor: Actor::Agent { occurrence },
+                        now_ms,
+                        admission: ProbeAdmission::Fresh(snapshot.clone()),
+                    });
+                }
             } else {
                 tracing::warn!(
                     federation = %candidate.to_hex(),
@@ -519,75 +825,431 @@ impl Runtime {
         )
     }
 
+    /// Build the production executor for an actor driver. Artifact and phase writes use one-shot
+    /// actor commands; membership publication uses the same client for its short final fence.
+    pub(crate) fn service_executor_with_client(
+        &self,
+        hard_cap: Option<Msat>,
+        client: WalletClient,
+    ) -> FedimintExecutor {
+        self.service_executor(hard_cap).with_service_client(client)
+    }
+
     pub(crate) fn service_perform_timeout(&self) -> Option<Duration> {
         self.perform_timeout
     }
 
     /// Reattach the subscription-owned side of a service intent. The issued operation
     /// artifact is authoritative; this path never mints or pays again.
-    pub(crate) async fn service_await_intent(&self, intent: &Intent) -> anyhow::Result<()> {
+    pub(crate) async fn service_await_intent(
+        &self,
+        intent: &Intent,
+        client: &WalletClient,
+    ) -> Result<(), AwaitFailure> {
+        #[cfg(test)]
+        let test_outcome = {
+            // A queued terminal SDK state exercises the production continuation below. Do not
+            // let the coarse whole-awaiter seam consume its successor outcome first.
+            let terminal_state_pending = !self
+                .test_terminal_await_states
+                .lock()
+                .expect("terminal await-state test mutex poisoned")
+                .is_empty();
+            (!terminal_state_pending)
+                .then(|| {
+                    self.test_await_outcomes
+                        .lock()
+                        .expect("awaiter test-outcomes mutex poisoned")
+                        .pop_front()
+                })
+                .flatten()
+        };
+        #[cfg(test)]
+        if let Some(outcome) = test_outcome {
+            return match outcome {
+                TestAwaitOutcome::Retryable => Err(AwaitFailure::Retryable(
+                    "injected retryable await failure".to_owned(),
+                )),
+                TestAwaitOutcome::Permanent => Err(AwaitFailure::Permanent(
+                    "injected permanent await failure".to_owned(),
+                )),
+                TestAwaitOutcome::Done => client
+                    .journal_transition(
+                        intent.idempotency_key.clone(),
+                        crate::service::JournalTransition::SetStatus {
+                            expected_attempt: intent.attempt,
+                            status: IntentStatus::Done,
+                            error: None,
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(AwaitFailure::retryable_service_error),
+            };
+        }
         let key = &intent.idempotency_key;
         match &intent.action {
             Action::DirectInflow { .. } => {
-                let _ = self.await_move(key, None).await?;
+                self.service_await_direct_inflow(key, client).await?;
             }
             Action::Pay { from, .. } => {
                 let operation_id = intent.operation_id.ok_or_else(|| {
-                    anyhow::anyhow!("awaiting raw pay {} has no send operation id", key.0)
+                    AwaitFailure::permanent(format!(
+                        "awaiting raw pay {} has no send operation id",
+                        key.0
+                    ))
                 })?;
-                let (status, error) = match self.mc.await_send(from, operation_id).await? {
+                let (status, error) = match self.service_await_send(from, operation_id).await? {
                     SendState::Success(_) => (OperationStatus::Succeeded, None),
                     SendState::Refunded => {
                         (OperationStatus::Failed, Some("send refunded".to_owned()))
                     }
                     SendState::Failed(error) => (OperationStatus::Failed, Some(error)),
                 };
-                self.journal
-                    .finalize_raw_operation(
+                // Correlation proof and settlement observation may use the SDK.  Complete them
+                // before acquiring the actor lease, which protects only the final journal write.
+                let prepared = self
+                    .journal
+                    .prepare_raw_operation_terminal(
                         self.mc.as_ref(),
                         *from,
                         operation_id,
                         key,
+                        intent.attempt,
                         RawOperationRole::Send,
-                        status,
-                        error.as_deref(),
                     )
+                    .await;
+                #[cfg(test)]
+                let prepared = self.inject_post_observation_prepare_fault_for_test(prepared);
+                #[cfg(test)]
+                let prepared =
+                    self.prepare_for_post_observation_finalize_fault_test(prepared, intent.attempt);
+                let prepared = prepared.map_err(AwaitFailure::post_terminal_observation_exec)?;
+                let lease = client
+                    .begin_external_terminal_mutation(intent.action.clone())
                     .await
-                    .map_err(exec_err)?;
+                    .map_err(AwaitFailure::retryable_service_error)?;
+                let result = self
+                    .journal
+                    .finalize_raw_operation(key, status, error.as_deref(), prepared)
+                    .await;
+                #[cfg(test)]
+                let result = self.inject_post_observation_finalize_fault_for_test(result);
+                let result = result.map_err(AwaitFailure::post_terminal_observation_exec);
+                let end = client
+                    .end_external_terminal_mutation(lease)
+                    .await
+                    .map_err(AwaitFailure::retryable_service_error);
+                result?;
+                end?;
             }
             Action::Receive { to, .. } => {
                 let operation_id = intent.operation_id.ok_or_else(|| {
-                    anyhow::anyhow!("awaiting raw receive {} has no receive operation id", key.0)
+                    AwaitFailure::permanent(format!(
+                        "awaiting raw receive {} has no receive operation id",
+                        key.0
+                    ))
                 })?;
-                let (status, error) = match self.mc.await_receive(to, operation_id).await? {
+                let (status, error) = match self.service_await_receive(to, operation_id).await? {
                     ReceiveState::Claimed => (OperationStatus::Succeeded, None),
                     ReceiveState::Expired => {
                         (OperationStatus::Failed, Some("receive expired".to_owned()))
                     }
                     ReceiveState::Failed(error) => (OperationStatus::Failed, Some(error)),
                 };
-                self.journal
-                    .finalize_raw_operation(
+                let prepared = self
+                    .journal
+                    .prepare_raw_operation_terminal(
                         self.mc.as_ref(),
                         *to,
                         operation_id,
                         key,
+                        intent.attempt,
                         RawOperationRole::Receive,
-                        status,
-                        error.as_deref(),
                     )
+                    .await;
+                #[cfg(test)]
+                let prepared = self.inject_post_observation_prepare_fault_for_test(prepared);
+                #[cfg(test)]
+                let prepared =
+                    self.prepare_for_post_observation_finalize_fault_test(prepared, intent.attempt);
+                let prepared = prepared.map_err(AwaitFailure::post_terminal_observation_exec)?;
+                let lease = client
+                    .begin_external_terminal_mutation(intent.action.clone())
                     .await
-                    .map_err(exec_err)?;
+                    .map_err(AwaitFailure::retryable_service_error)?;
+                let result = self
+                    .journal
+                    .finalize_raw_operation(key, status, error.as_deref(), prepared)
+                    .await;
+                #[cfg(test)]
+                let result = self.inject_post_observation_finalize_fault_for_test(result);
+                let result = result.map_err(AwaitFailure::post_terminal_observation_exec);
+                let end = client
+                    .end_external_terminal_mutation(lease)
+                    .await
+                    .map_err(AwaitFailure::retryable_service_error);
+                result?;
+                end?;
             }
-            _ => anyhow::bail!("intent {} has no subscription-owned await path", key.0),
+            _ => {
+                return Err(AwaitFailure::permanent(format!(
+                    "intent {} has no subscription-owned await path",
+                    key.0
+                )));
+            }
         }
         Ok(())
     }
 
+    /// Await a raw send operation for a service awaiter. Test terminal states enter the same
+    /// continuation as the production SDK result, rather than using the coarse whole-awaiter
+    /// outcome seam.
+    async fn service_await_send(
+        &self,
+        from: &FederationId,
+        operation_id: OperationId,
+    ) -> Result<SendState, AwaitFailure> {
+        #[cfg(test)]
+        if let Some(error) = self
+            .test_await_operation_errors
+            .lock()
+            .expect("awaiter operation-error test mutex poisoned")
+            .pop_front()
+        {
+            return Err(AwaitFailure::from_await_operation(error));
+        }
+        #[cfg(test)]
+        if let Some(state) = self
+            .test_terminal_await_states
+            .lock()
+            .expect("terminal await-state test mutex poisoned")
+            .pop_front()
+        {
+            return match state {
+                TestTerminalAwaitState::SendSucceeded => {
+                    Ok(SendState::Success(wallet_core::Preimage([0; 32])))
+                }
+                TestTerminalAwaitState::ReceiveClaimed => {
+                    panic!("receive terminal test state used for raw Pay awaiter")
+                }
+            };
+        }
+        self.mc
+            .await_send(from, operation_id)
+            .await
+            .map_err(AwaitFailure::from_await_operation)
+    }
+
+    /// Await a raw receive operation for a service awaiter. See [`Self::service_await_send`] for
+    /// why the test seam is at the terminal-state boundary.
+    async fn service_await_receive(
+        &self,
+        to: &FederationId,
+        operation_id: OperationId,
+    ) -> Result<ReceiveState, AwaitFailure> {
+        #[cfg(test)]
+        if let Some(error) = self
+            .test_await_operation_errors
+            .lock()
+            .expect("awaiter operation-error test mutex poisoned")
+            .pop_front()
+        {
+            return Err(AwaitFailure::from_await_operation(error));
+        }
+        #[cfg(test)]
+        if let Some(state) = self
+            .test_terminal_await_states
+            .lock()
+            .expect("terminal await-state test mutex poisoned")
+            .pop_front()
+        {
+            return match state {
+                TestTerminalAwaitState::SendSucceeded => {
+                    panic!("send terminal test state used for raw Receive awaiter")
+                }
+                TestTerminalAwaitState::ReceiveClaimed => Ok(ReceiveState::Claimed),
+            };
+        }
+        self.mc
+            .await_receive(to, operation_id)
+            .await
+            .map_err(AwaitFailure::from_await_operation)
+    }
+
+    /// Inject the preparation failure only after the real preparation result was obtained, so the
+    /// test exercises the production post-observation classification at that call site.
+    #[cfg(test)]
+    fn inject_post_observation_prepare_fault_for_test<T>(
+        &self,
+        prepared: Result<T, ExecError>,
+    ) -> Result<T, ExecError> {
+        if self.take_post_observation_fault_for_test(TestPostObservationFault::PreparePermanent) {
+            Err(ExecError::Permanent(
+                "injected post-observation prepare fault".to_owned(),
+            ))
+        } else {
+            prepared
+        }
+    }
+
+    /// The in-memory runtime fixture intentionally has no SDK client, so its genuine preparation
+    /// can fail while trying to read an op-log row. A finalizer-stage fault still needs to execute
+    /// the real finalizer and lease-release path; use an unfenced preparation only for that narrow
+    /// test fixture after the real preparation expression has run.
+    #[cfg(test)]
+    fn prepare_for_post_observation_finalize_fault_test(
+        &self,
+        prepared: Result<crate::journal::PreparedRawOperationTerminal, ExecError>,
+        expected_attempt: u32,
+    ) -> Result<crate::journal::PreparedRawOperationTerminal, ExecError> {
+        if prepared.is_err()
+            && self.has_post_observation_fault_for_test(
+                TestPostObservationFault::FinalizeStatusMismatch,
+            )
+        {
+            Ok(crate::journal::PreparedRawOperationTerminal::unfenced_for_test(expected_attempt))
+        } else {
+            prepared
+        }
+    }
+
+    /// Inject a post-finalizer persistence fault after the actor lease has been acquired. The
+    /// real finalizer still runs and the caller still ends that lease before classifying its
+    /// result.
+    #[cfg(test)]
+    fn inject_post_observation_finalize_fault_for_test<T>(
+        &self,
+        finalized: Result<T, ExecError>,
+    ) -> Result<T, ExecError> {
+        if self
+            .take_post_observation_fault_for_test(TestPostObservationFault::FinalizeStatusMismatch)
+        {
+            Err(ExecError::Permanent(
+                "injected post-observation raw terminal status mismatch".to_owned(),
+            ))
+        } else {
+            finalized
+        }
+    }
+
+    #[cfg(test)]
+    fn take_post_observation_fault_for_test(&self, expected: TestPostObservationFault) -> bool {
+        let mut faults = self
+            .test_post_observation_faults
+            .lock()
+            .expect("post-observation await-fault test mutex poisoned");
+        if faults.front().is_some_and(|fault| *fault == expected) {
+            faults.pop_front();
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn has_post_observation_fault_for_test(&self, expected: TestPostObservationFault) -> bool {
+        self.test_post_observation_faults
+            .lock()
+            .expect("post-observation await-fault test mutex poisoned")
+            .front()
+            .is_some_and(|fault| *fault == expected)
+    }
+
+    /// Service-only DirectInflow awaiter.  All network waiting happens before
+    /// acquiring the actor lease; only the terminal MoveRecord + intent writes are
+    /// protected by it.
+    async fn service_await_direct_inflow(
+        &self,
+        key: &IdempotencyKey,
+        client: &WalletClient,
+    ) -> Result<(), AwaitFailure> {
+        let intent = self
+            .journal
+            .get(key)
+            .await
+            .map_err(AwaitFailure::retryable_exec)?
+            .ok_or_else(|| AwaitFailure::permanent(format!("no intent found for key {}", key.0)))?;
+        if matches!(intent.status, IntentStatus::Done | IntentStatus::Failed) {
+            return Ok(());
+        }
+        if intent.status != IntentStatus::Awaiting {
+            return Err(AwaitFailure::permanent(format!(
+                "intent {} is not awaiting",
+                key.0
+            )));
+        }
+        // The MoveRecord is a derived cache (§9.2), so reconstruct it from the op-log before
+        // treating a missing receive leg as durable corruption. Its pre-network cache write is
+        // actor-routed; the later composite terminal writes remain under the existing external
+        // lease and therefore must stay direct (never nest a second actor mutation gate).
+        let record = self
+            .service_executor_with_client(None, client.clone())
+            .backfill_move_record(&intent)
+            .await
+            .map_err(AwaitFailure::from_exec)?
+            .ok_or_else(|| {
+                AwaitFailure::permanent(format!("intent {} is not an executable move", key.0))
+            })?;
+        let recv_op = record.recv_op.ok_or_else(|| {
+            AwaitFailure::permanent(format!(
+                "awaiting intent {} has no receive op to finalize",
+                key.0
+            ))
+        })?;
+        let state = self
+            .mc
+            .await_receive(&record.to, recv_op)
+            .await
+            .map_err(AwaitFailure::from_await_operation)?;
+        let lease = client
+            .begin_external_terminal_mutation(intent.action.clone())
+            .await
+            .map_err(AwaitFailure::retryable_service_error)?;
+        let result: Result<(), AwaitFailure> = async {
+            match state {
+                ReceiveState::Claimed => {
+                    self.settle_move(&record, intent.attempt, MovePhase::Settled, None)
+                        .await
+                        .map_err(AwaitFailure::retryable_error)?;
+                    self.finalize(key, intent.attempt, IntentStatus::Done)
+                        .await
+                        .map_err(AwaitFailure::retryable_error)?;
+                }
+                ReceiveState::Expired => {
+                    let message = "receive invoice expired before payment".to_owned();
+                    self.settle_move(&record, intent.attempt, MovePhase::Failed, Some(message))
+                        .await
+                        .map_err(AwaitFailure::retryable_error)?;
+                    self.finalize(key, intent.attempt, IntentStatus::Failed)
+                        .await
+                        .map_err(AwaitFailure::retryable_error)?;
+                }
+                ReceiveState::Failed(message) => {
+                    self.settle_move(&record, intent.attempt, MovePhase::Failed, Some(message))
+                        .await
+                        .map_err(AwaitFailure::retryable_error)?;
+                    self.finalize(key, intent.attempt, IntentStatus::Failed)
+                        .await
+                        .map_err(AwaitFailure::retryable_error)?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        let end = client
+            .end_external_terminal_mutation(lease)
+            .await
+            .map_err(AwaitFailure::retryable_service_error);
+        result?;
+        end
+    }
+
     /// A fresh executor sharing this runtime's clients + journal + pinned gateway + hard cap.
-    /// Cheap (`Arc` clones); made per call so each verb gets a `&self`-only executor. Used
-    /// DIRECTLY for the non-`perform` helper calls (`backfill_move_record` /
-    /// `validate_direct_inflow_amount`); the `perform`-driving paths wrap it via
+    /// Cheap (`Arc` clones); made per call so each standalone verb gets a `&self`-only executor.
+    /// Standalone helper calls (`backfill_move_record` / `validate_direct_inflow_amount`) use it
+    /// directly under the exclusive DB lock; service helpers instead use
+    /// [`Self::service_executor_with_client`]. The `perform`-driving standalone paths wrap it via
     /// [`Self::driving_executor`] to apply the tick deadline.
     fn executor(&self) -> FedimintExecutor {
         FedimintExecutor::new(
@@ -734,21 +1396,33 @@ impl Runtime {
         // crash in `await_move` interrupted (spec §9.5): if `settle_move` wrote a terminal record
         // phase but the process died before the intent CAS landed, the intent is stuck Awaiting
         // over already-final receive state. Finish that transition here before reporting status.
-        let mut status = self
-            .journal
-            .get(&key)
-            .await
-            .map_err(exec_err)?
-            .map(|i| i.status);
+        let current_intent = self.journal.get(&key).await.map_err(exec_err)?;
+        let mut status = current_intent.as_ref().map(|intent| intent.status);
         let record = self.journal.get_move(&key).await.map_err(exec_err)?;
         if status == Some(IntentStatus::Awaiting) {
             match record.as_ref().map(|rec| rec.phase) {
                 Some(MovePhase::Settled) => {
-                    self.finalize(&key, IntentStatus::Done).await?;
+                    self.finalize(
+                        &key,
+                        current_intent
+                            .as_ref()
+                            .expect("Awaiting intent was read")
+                            .attempt,
+                        IntentStatus::Done,
+                    )
+                    .await?;
                     status = Some(IntentStatus::Done);
                 }
                 Some(MovePhase::Failed) => {
-                    self.finalize(&key, IntentStatus::Failed).await?;
+                    self.finalize(
+                        &key,
+                        current_intent
+                            .as_ref()
+                            .expect("Awaiting intent was read")
+                            .attempt,
+                        IntentStatus::Failed,
+                    )
+                    .await?;
                     status = Some(IntentStatus::Failed);
                 }
                 _ => {}
@@ -1114,33 +1788,38 @@ impl Runtime {
             // Reconcile faulted, so the pending-move state is unknown. Running the tick
             // now could re-issue a still-`Pending` prior-occurrence move under this
             // cycle's fresh occurrence (a distinct idempotency key). Fail safe: skip the
-            // tick and let the next cycle re-drive once reconcile succeeds.
+            // tick and let the next cycle re-drive once reconcile succeeds. This is the ONE
+            // remaining global skip — unknown eligibility, not merely blocked eligibility.
             WatchReconcileOutcome::Failed(_) => {
                 tracing::warn!("watch: reconcile failed; skipping tick to avoid duplicate intents");
                 WatchTickOutcome::SkippedReconcileFailed
             }
-            WatchReconcileOutcome::Ran(summary) if summary.retryable > 0 => {
-                tracing::warn!(
-                    retryable = summary.retryable,
-                    "watch: skipping tick while retryable pending work remains"
-                );
-                WatchTickOutcome::SkippedPendingRetry {
-                    retryable: summary.retryable,
+            // Reconcile succeeded, so the durable state IS known: tick, projected through the
+            // goals that pass left in flight (br-p93). Only work duplicating one of those goals
+            // is withheld; every independent decision proceeds, including for another federation
+            // whose evacuation is the whole reason the wallet must stay responsive.
+            WatchReconcileOutcome::Ran(summary) => {
+                // Reported, not carried: `tick` re-derives this projection from the same durable
+                // source at plan time and again before apply, which is strictly fresher than a
+                // set snapshotted here. See `ReconcileSummary::blocked`.
+                if !summary.blocked.is_empty() {
+                    tracing::info!(
+                        blocked = ?summary.blocked.goals(),
+                        "watch: ticking with the in-flight allocator goals suppressed"
+                    );
+                }
+                match self.tick(&cycle_tick_policy).await {
+                    Ok(report) => WatchTickOutcome::Ran(report),
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "watch: tick failed; continuing cycle");
+                        WatchTickOutcome::Failed(e.to_string())
+                    }
                 }
             }
-            WatchReconcileOutcome::Ran(_) => match self.tick(&cycle_tick_policy).await {
-                Ok(report) => WatchTickOutcome::Ran(report),
-                Err(e) => {
-                    tracing::warn!(error = ?e, "watch: tick failed; continuing cycle");
-                    WatchTickOutcome::Failed(e.to_string())
-                }
-            },
         };
         let spending = match &tick {
             WatchTickOutcome::Ran(report) => report.spending_fed,
-            WatchTickOutcome::SkippedPendingRetry { .. }
-            | WatchTickOutcome::SkippedReconcileFailed
-            | WatchTickOutcome::Failed(_) => self
+            WatchTickOutcome::SkippedReconcileFailed | WatchTickOutcome::Failed(_) => self
                 .status(&cycle_tick_policy)
                 .await
                 .map(|status| status.spending_fed)
@@ -1249,6 +1928,7 @@ impl Runtime {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn service_discover_cycle(
         &self,
         sources: &[Box<dyn CandidateSource>],
@@ -1257,17 +1937,19 @@ impl Runtime {
         watch_policy: &WatchPolicy,
         occurrence: Occurrence,
         now: u64,
+        membership_client: Option<&crate::service::WalletClient>,
     ) -> anyhow::Result<()> {
         let state = self.journal.get_watch_state().await.map_err(exec_err)?;
         if !discovery_due(&state, watch_policy, now) {
             return Ok(());
         }
         let nonce = ledger_nonce();
-        match run_discover_pass_bounded_with_rotation_and_probe_policy(
+        match run_discover_pass_bounded_with_rotation_and_probe_policy_with_membership_lease(
             sources,
             discovery_policy,
             probe_policy,
             self,
+            membership_client,
             now,
             &nonce,
             watch_policy,
@@ -1399,7 +2081,10 @@ impl Runtime {
             Ok(spending) => spending,
             Err(e) => {
                 tracing::warn!(error = ?e, "watch: designation failed while computing probe deadlines");
-                tick_policy.spending_fed
+                // A pin is policy, not fresh designation evidence. Retained sessions still carry
+                // their durable `session.from`, while fresh probes remain source-less and cannot be
+                // admitted until a later successful designation.
+                None
             }
         };
         let context_storage;
@@ -1410,7 +2095,7 @@ impl Runtime {
                 &context_storage
             }
         };
-        for (candidate, source, _verdict, due_ms, post_in_resume) in self
+        for input in self
             .probe_schedule_inputs(
                 spending,
                 &tick_policy.probe_gate_policy,
@@ -1420,6 +2105,14 @@ impl Runtime {
             )
             .await?
         {
+            let ProbeScheduleInput {
+                candidate,
+                source,
+                verdict: _,
+                due_ms,
+                session,
+                post_in_resume: _,
+            } = input;
             if source.is_none() {
                 continue;
             }
@@ -1429,7 +2122,7 @@ impl Runtime {
             if registry_owned_probes.contains(&candidate) {
                 continue;
             }
-            let mut wake_ms = if post_in_resume {
+            let mut wake_ms = if session.is_some() {
                 due_ms
             } else {
                 let budget_due_ms = probe_wake_due_ms(
@@ -1478,7 +2171,16 @@ impl Runtime {
                 &context.last_invocations,
             )
             .await?;
-        for (candidate, source, verdict, due_ms, post_in_resume) in inputs {
+        for input in inputs {
+            let ProbeScheduleInput {
+                candidate,
+                source,
+                verdict,
+                due_ms,
+                session,
+                post_in_resume: _,
+            } = input;
+            let retained = session.is_some();
             let Some(source) = source else {
                 reports.push(WatchProbeReport {
                     fed: candidate,
@@ -1488,19 +2190,19 @@ impl Runtime {
                 });
                 continue;
             };
-            let outcome = if !post_in_resume && due_ms > now {
+            let outcome = if !retained && due_ms > now {
                 if verdict == ActiveProbeVerdict::Passed {
                     WatchProbeOutcome::Passed
                 } else {
                     WatchProbeOutcome::NotDue
                 }
-            } else if !post_in_resume
+            } else if !retained
                 && context
                     .fresh_probe_defer_until_ms
                     .is_some_and(|defer_until| defer_until > now)
             {
                 WatchProbeOutcome::DeferredByInFlight
-            } else if !post_in_resume && !context.budget_ok {
+            } else if !retained && !context.budget_ok {
                 let reason = "watch probe skipped: weekly probe budget exhausted";
                 if let Err(e) = self
                     .record_watch_probe_skip(
@@ -1572,15 +2274,7 @@ impl Runtime {
         watch_policy: &WatchPolicy,
         now_ms: u64,
         last_invocations: &BTreeMap<(FederationId, FederationId), u64>,
-    ) -> anyhow::Result<
-        Vec<(
-            FederationId,
-            Option<FederationId>,
-            ActiveProbeVerdict,
-            u64,
-            bool,
-        )>,
-    > {
+    ) -> anyhow::Result<Vec<ProbeScheduleInput>> {
         let mut out = Vec::new();
         for candidate in self.auto_joined_candidates().await? {
             let record = self
@@ -1595,13 +2289,14 @@ impl Runtime {
                     Some(spending) if candidate != spending => spending,
                     Some(_) => continue,
                     None => {
-                        out.push((
+                        out.push(ProbeScheduleInput {
                             candidate,
-                            None,
-                            ActiveProbeVerdict::NeverProbed,
-                            now_ms,
-                            false,
-                        ));
+                            source: None,
+                            verdict: ActiveProbeVerdict::NeverProbed,
+                            due_ms: now_ms,
+                            session: None,
+                            post_in_resume: false,
+                        });
                         continue;
                     }
                 },
@@ -1624,13 +2319,20 @@ impl Runtime {
             if post_in_resume {
                 due_ms = now_ms;
             }
-            out.push((candidate, Some(source), verdict, due_ms, post_in_resume));
+            out.push(ProbeScheduleInput {
+                candidate,
+                source: Some(source),
+                verdict,
+                due_ms,
+                session: record.in_flight,
+                post_in_resume,
+            });
         }
         // Resume retained in-flight probe sessions before starting fresh probes: a failed
         // resume defers fresh probes for the rest of the cycle, so in-flight money-moving
         // work is always driven to completion first. Stable sort keeps the deterministic
         // per-candidate order within each group.
-        out.sort_by_key(|input| !input.4);
+        out.sort_by_key(|input| !input.post_in_resume);
         Ok(out)
     }
 
@@ -1762,21 +2464,33 @@ impl Runtime {
         policy: &ProbePolicy,
         actor: Actor,
     ) -> anyhow::Result<ProbeReport> {
-        self.active_probe_inner(candidate, from, policy, actor, self.hard_cap, None)
+        self.active_probe_inner(candidate, from, policy, actor, self.hard_cap, None, None)
             .await
     }
 
     /// Service probe orchestration. Probe session/verdict mechanics stay here, while
     /// each money leg enters through the service actor's shared admission guard.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn service_active_probe(
         &self,
         candidate: FederationId,
         from: FederationId,
+        expected_session_nonce: String,
         policy: &ProbePolicy,
         actor: Actor,
         per_fed_cap: Msat,
         client: crate::service::WalletClient,
     ) -> anyhow::Result<ProbeReport> {
+        #[cfg(test)]
+        let start_hold = self
+            .test_service_probe_start_hold
+            .lock()
+            .expect("service-probe start-hold mutex poisoned")
+            .take();
+        #[cfg(test)]
+        if let Some(hold) = start_hold {
+            hold.notified().await;
+        }
         self.active_probe_inner(
             candidate,
             from,
@@ -1784,10 +2498,12 @@ impl Runtime {
             actor,
             Some(per_fed_cap),
             Some(client),
+            Some(expected_session_nonce),
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn active_probe_inner(
         &self,
         candidate: FederationId,
@@ -1796,6 +2512,7 @@ impl Runtime {
         actor: Actor,
         hard_cap: Option<Msat>,
         service_client: Option<crate::service::WalletClient>,
+        expected_session_nonce: Option<String>,
     ) -> anyhow::Result<ProbeReport> {
         let record = self
             .journal
@@ -1808,9 +2525,25 @@ impl Runtime {
             .unwrap_or_default();
 
         // §5.0.5 step 0: resume FIRST — an in-flight session owns this invocation (its
-        // parameters, including `from`, are fixed); the fresh path below must not run.
-        let (mut session, resuming) = match record.and_then(|r| r.in_flight) {
-            Some(session) => {
+        // parameters, including `from`, are fixed). Service drivers additionally carry the exact
+        // actor-approved nonce and can never enter the standalone fresh branch if that durable
+        // session clears or is replaced before this detached task runs.
+        let durable_session = record.and_then(|r| r.in_flight);
+        let (mut session, resuming) = match (expected_session_nonce, durable_session) {
+            (Some(expected), Some(session)) if session.nonce == expected => (session, true),
+            (Some(expected), Some(session)) => {
+                anyhow::bail!(
+                    "service probe session changed after actor admission: expected {}, found {}",
+                    expected,
+                    session.nonce
+                );
+            }
+            (Some(expected), None) => {
+                anyhow::bail!(
+                    "service probe session cleared after actor admission: expected {expected}"
+                );
+            }
+            (None, Some(session)) => {
                 if session.from != from {
                     tracing::warn!(
                         session_from = %session.from.to_hex(),
@@ -1820,7 +2553,7 @@ impl Runtime {
                 }
                 (session, true)
             }
-            None => {
+            (None, None) => {
                 // Fresh probe: sample the no-sweep BASELINE before anything else. An
                 // unopened candidate reads 0 — safe, because the preflight below refuses
                 // it before any money path (leg OUT, the only baseline consumer, is
@@ -2560,21 +3293,25 @@ impl Runtime {
 
         let outcome = match self.mc.await_receive(&rec.to, recv_op).await? {
             ReceiveState::Claimed => {
-                self.settle_move(&rec, MovePhase::Settled, None).await?;
-                self.finalize(key, IntentStatus::Done).await?;
+                self.settle_move(&rec, intent.attempt, MovePhase::Settled, None)
+                    .await?;
+                self.finalize(key, intent.attempt, IntentStatus::Done)
+                    .await?;
                 FinalizeOutcome::Done
             }
             ReceiveState::Expired => {
                 let msg = "receive invoice expired before payment".to_string();
-                self.settle_move(&rec, MovePhase::Failed, Some(msg.clone()))
+                self.settle_move(&rec, intent.attempt, MovePhase::Failed, Some(msg.clone()))
                     .await?;
-                self.finalize(key, IntentStatus::Failed).await?;
+                self.finalize(key, intent.attempt, IntentStatus::Failed)
+                    .await?;
                 FinalizeOutcome::Failed(msg)
             }
             ReceiveState::Failed(msg) => {
-                self.settle_move(&rec, MovePhase::Failed, Some(msg.clone()))
+                self.settle_move(&rec, intent.attempt, MovePhase::Failed, Some(msg.clone()))
                     .await?;
-                self.finalize(key, IntentStatus::Failed).await?;
+                self.finalize(key, intent.attempt, IntentStatus::Failed)
+                    .await?;
                 FinalizeOutcome::Failed(msg)
             }
         };
@@ -2608,8 +3345,18 @@ impl Runtime {
         // §9.4: re-drive pending() only; Failed/Permanent stay terminal, Awaiting is skipped.
         // Wrap the drive with the §15.9 per-perform deadline (the backfill above uses the raw
         // executor, since it makes no `perform` call).
-        let driving = self.driving_executor();
-        let exec = wallet_core::reconcile(self.journal.as_ref(), &driving).await;
+        #[cfg(test)]
+        let exec = if let Some(executor) = &self.test_executor {
+            wallet_core::reconcile(self.journal.as_ref(), executor.as_ref()).await
+        } else {
+            let driving = self.driving_executor();
+            wallet_core::reconcile(self.journal.as_ref(), &driving).await
+        };
+        #[cfg(not(test))]
+        let exec = {
+            let driving = self.driving_executor();
+            wallet_core::reconcile(self.journal.as_ref(), &driving).await
+        };
 
         // §10.3: repair stuck non-terminal ledger rows (raw pay/recv, join, tick) from op-log +
         // registry evidence. Best-effort — a repair I/O fault must not fail the whole reconcile
@@ -2630,6 +3377,11 @@ impl Runtime {
 
         // §9.3: surface the Awaiting set so the operator drives `await-move` for each.
         let awaiting = self.journal.awaiting().await.map_err(exec_err)?;
+        // br-p93: project the logical goals still owned by durable work, from the FINAL scan —
+        // after the re-drive above, so work that settled in this pass no longer blocks its own
+        // recurrence. A scan fault propagates: an unknown durable state must fail the whole
+        // reconcile (and with it the tick), never degrade to an empty, permissive blocker set.
+        let blocked = GoalBlockers::from_intents(&self.journal.pending().await.map_err(exec_err)?);
         Ok(ReconcileSummary {
             performed: exec.performed,
             failed: exec.failed,
@@ -2640,12 +3392,14 @@ impl Runtime {
                 .into_iter()
                 .map(|intent| intent.idempotency_key)
                 .collect(),
+            blocked,
         })
     }
 
     /// ONE orchestrator tick (Phase 2 step 2.2, `docs/archive/phase2-plan.md`): probe every open
     /// federation → build the `AllocatorSnapshot` (via `build_snapshot` — `score()` +
-    /// designation) → `decide()` → `wallet_core::apply` the decisions through the
+    /// designation) → [`wallet_core::decide_with_blockers`] →
+    /// [`wallet_core::apply_with_allocator_admission`] the decisions through the
     /// [`FedimintExecutor`], which performs the resulting `Move`s AND `Evacuate`s (each a
     /// send-required move, synchronous to `Done`). Advisory `RefuseInflow` decisions are
     /// surfaced in the returned [`TickReport`] but never executed (`apply` skips them via
@@ -2675,19 +3429,74 @@ impl Runtime {
         // exists, so a storage fault there can error out AFTER the `Started` row was written.
         // Terminalize the tick `Failed` on that path too, or `history/show` leaves it in-flight
         // until reconcile repairs it an hour later (§10.4), same as the bail paths below.
-        let plan = match self.plan_tick(policy).await {
+        let mut plan = match self.plan_tick(policy).await {
             Ok(plan) => plan,
             Err(e) => {
                 self.record_tick_failed(&tick_key, &e.to_string()).await;
                 return Err(e);
             }
         };
+        // The final conflict check before anything is journaled (br-p93). `plan_tick` derived the
+        // same conflict model from durable state before route pricing, so this normally removes
+        // nothing; re-scan here so work admitted while planning was doing network I/O still blocks
+        // a duplicate. A scan fault makes eligibility unknown and therefore fails the whole tick
+        // closed. Advisory decisions carry no goal and are never touched.
+        let actor = Actor::Agent {
+            occurrence: policy.occurrence,
+        };
+        let blocked = match self.allocator_goal_blockers().await {
+            Ok(blocked) => blocked,
+            Err(error) => {
+                self.record_tick_failed(&tick_key, &error.to_string()).await;
+                return Err(error);
+            }
+        };
+        let mut newly_suppressed = Vec::new();
+        plan.decisions.retain(|decision| {
+            let conflicts = blocked.blocks_decision(decision, actor);
+            // Planning already logged (and skipped the route I/O for) everything it withheld, so
+            // anything caught HERE was admitted while this tick was doing network I/O. Say so:
+            // the daemon's equivalent seam records a `Conflict` refusal, and a race that silently
+            // shrinks a planned batch is the one an operator has no other trace of.
+            if conflicts {
+                newly_suppressed.push(decision.clone());
+                tracing::warn!(
+                    key = %decision.idempotency_key.0,
+                    "tick: withholding a decision that began conflicting with allocator work while planning"
+                );
+            }
+            !conflicts
+        });
+        // The final re-scan can race work admitted while planning was doing route I/O. Preserve
+        // every resulting nonzero executable drop as the actor does at commit time: this is
+        // auxiliary observability, so a journal fault is loud but must not turn the tick's
+        // otherwise-safe conflict suppression into a failed money operation.
+        for decision in &newly_suppressed {
+            let message = format!(
+                "decision {} conflicts with allocator work already in flight",
+                decision.idempotency_key.0
+            );
+            if let Err(error) = self
+                .journal
+                .record_tick_dropped_refusal(decision, policy.occurrence, now_ms(), &message, true)
+                .await
+            {
+                tracing::warn!(
+                    key = %decision.idempotency_key.0,
+                    ?error,
+                    "tick: recording a conflict-suppressed decision failed"
+                );
+            }
+        }
+        plan.suppressed.extend(newly_suppressed);
         // A tick is a money op: an operator-pinned fed that could not be sensed or failed the
         // lnv2/probe gate this pass means the requested rebalance was NOT evaluated. Fail LOUDLY
         // (non-zero exit) rather than let `decide` degrade it to an advisory `RefuseInflow` that
         // `apply` skips, which would report a false success to a scheduler gating on the exit code.
         // Both bail paths land a `Failed` tick row WITH the diagnostic before returning (§10.4).
-        let problems = pinned_input_problems(policy, &plan.snapshot, &plan.probes, &plan.decisions);
+        // The check receives admitted and suppressed work separately. The fresh scan above moves a
+        // race-lost decision into `suppressed` before this authoritative pin check.
+        let problems = Self::pinned_input_problems(policy, &plan, &blocked);
         if !problems.is_empty() {
             let error = format!("tick: {}", problems.join("; "));
             self.record_tick_failed(&tick_key, &error).await;
@@ -2700,25 +3509,49 @@ impl Runtime {
             self.record_tick_failed(&tick_key, &e.to_string()).await;
             return Err(e);
         }
-        let executor = self.driving_executor();
         let balances = plan
             .snapshot
             .federations
             .iter()
             .map(|fed| (fed.id, fed.balance.spendable))
             .collect::<BTreeMap<_, _>>();
-        let summary = wallet_core::apply_with_admission(
-            self.journal.as_ref(),
-            &executor,
-            &decisions_to_apply(&plan.decisions),
-            Actor::Agent {
-                occurrence: policy.occurrence,
-            },
-            now_ms(),
-            Some(&balances),
-            Some(policy.per_fed_cap),
-        )
-        .await;
+        let to_apply = decisions_to_apply(&plan.decisions);
+        #[cfg(test)]
+        let summary = match &self.test_executor {
+            Some(executor) => {
+                self.apply_tick_decisions(
+                    executor.as_ref(),
+                    &to_apply,
+                    actor,
+                    &balances,
+                    policy,
+                    plan.snapshot.reservations.clone(),
+                )
+                .await
+            }
+            None => {
+                self.apply_tick_decisions(
+                    &self.driving_executor(),
+                    &to_apply,
+                    actor,
+                    &balances,
+                    policy,
+                    plan.snapshot.reservations.clone(),
+                )
+                .await
+            }
+        };
+        #[cfg(not(test))]
+        let summary = self
+            .apply_tick_decisions(
+                &self.driving_executor(),
+                &to_apply,
+                actor,
+                &balances,
+                policy,
+                plan.snapshot.reservations.clone(),
+            )
+            .await;
 
         // §10.4: one `Refusal` row per advisory decision, then terminalize the tick with its
         // decision/apply counts. Both are auxiliary recordings — log a fault, never fail the tick.
@@ -2783,8 +3616,7 @@ impl Runtime {
         let plan = self.plan_tick(policy).await?;
         // Surface (do NOT bail on) any pinned-input problem the equivalent `tick` would fail on, so
         // the operator sees BOTH the warning and the full scored view that explains it.
-        for problem in pinned_input_problems(policy, &plan.snapshot, &plan.probes, &plan.decisions)
-        {
+        for problem in Self::pinned_input_problems(policy, &plan, &plan.blockers) {
             tracing::warn!("status: {problem}");
         }
         match self
@@ -2846,18 +3678,61 @@ impl Runtime {
         })
     }
 
+    /// Return the pin diagnostics for this planned round. Conflict-suppressed decisions still
+    /// count: their logical rebalance was evaluated, even though durable work already owns it.
+    fn pinned_input_problems(
+        policy: &TickPolicy,
+        plan: &TickPlan,
+        blockers: &GoalBlockers,
+    ) -> Vec<String> {
+        crate::tick::pinned_input_problems(
+            policy,
+            &plan.snapshot,
+            &plan.probes,
+            &plan.decisions,
+            &plan.suppressed,
+            blockers,
+        )
+    }
+
     /// Probe, then use the actor-owned planner — the same implementation the daemon runs through
     /// `DecideTickRound`.
     ///
     /// Pinned-input problems are NOT raised here: `tick` bails on them and `status` reports them,
     /// so the decision belongs to the caller.
     async fn plan_tick(&self, policy: &TickPolicy) -> anyhow::Result<TickPlan> {
-        let raw_probes = self.probe_all().await;
+        #[cfg(test)]
+        if let Some(plan) = self
+            .test_tick_plan
+            .lock()
+            .expect("tick test-plan mutex poisoned")
+            .clone()
+        {
+            return Ok(plan);
+        }
+        self.plan_tick_from_probes(policy, self.probe_all().await)
+            .await
+    }
+
+    /// Plan standalone tick/status work from already collected probes. Unlike the daemon's
+    /// reconcile-carrying policy, standalone callers have no preceding blocker report, so this
+    /// helper derives the durable conflict projection before route pricing and allocation.
+    async fn plan_tick_from_probes(
+        &self,
+        policy: &TickPolicy,
+        raw_probes: Vec<(FederationId, ProbeResult)>,
+    ) -> anyhow::Result<TickPlan> {
+        // A direct standalone `tick`/`status` has no preceding reconcile report. Derive its
+        // conflict projection here rather than trusting `TickPolicy::default()`'s empty set, so
+        // every Runtime entry point drops blocked funding pairs before route quotes and blocked
+        // decisions before concrete preflight. An unreadable scan fails closed.
+        let mut policy = policy.clone();
+        policy.blocked = self.allocator_goal_blockers().await?;
         let round = crate::service::plan_tick_round(
             self.journal.as_ref(),
             Some(self),
             raw_probes.clone(),
-            policy,
+            &policy,
             now_ms(),
             Some(RouteQuoteBudget::starting_at(now_ms())),
         )
@@ -2865,22 +3740,66 @@ impl Runtime {
         .map_err(exec_err)?;
         Ok(TickPlan {
             raw_probes,
+            suppressed: round.suppressed,
             probes: round.probes,
             active_probes: round.active_probes,
             snapshot: round.snapshot,
             decisions: round.decisions,
+            blockers: policy.blocked,
         })
+    }
+
+    /// The standalone tick's money seam. The admission arguments — the tick's own fresh balances
+    /// and the per-fed cap — are written ONCE here, so the `#[cfg(test)]` executor swap in `tick`
+    /// chooses only WHICH executor drives the batch and can never drift into admitting the batch
+    /// on terms production does not use.
+    async fn apply_tick_decisions<E: Executor>(
+        &self,
+        executor: &E,
+        decisions: &[AllocatorDecision],
+        actor: Actor,
+        balances: &BTreeMap<FederationId, Msat>,
+        policy: &TickPolicy,
+        reservations: Reservations,
+    ) -> ExecutionSummary {
+        wallet_core::apply_with_allocator_admission(
+            self.journal.as_ref(),
+            executor,
+            decisions,
+            actor,
+            now_ms(),
+            Some(balances),
+            Some(policy.per_fed_cap),
+            reservations,
+        )
+        .await
+    }
+
+    /// The standalone path's conflict projection, from the same durable `pending()` scan the
+    /// daemon's reconcile uses. Fail-closed: an unreadable scan is an unknown eligibility, which
+    /// every caller turns into a refusal to plan or apply rather than an empty, permissive set.
+    async fn allocator_goal_blockers(&self) -> anyhow::Result<GoalBlockers> {
+        self.journal
+            .pending()
+            .await
+            .map(|pending| GoalBlockers::from_intents(&pending))
+            .map_err(exec_err)
     }
 
     /// Price the funding pairs of `snapshot` that `priced` does not already cover, in place
     /// (`route_econ::price_missing_pairs`). `None` budget = no route I/O at all, which the
     /// allocator reads as the permissive `min_move` fallback. The pinned gateway is threaded
-    /// through so an operator pin OVERRIDES route selection (§Q4).
+    /// through so an operator pin OVERRIDES route selection (§Q4). `blocked` drops the pairs
+    /// that conflict with allocator work already in flight, so quotes are never spent on work
+    /// this tick cannot emit anyway (br-p93). A held funding goal leaves its REVERSE pair and
+    /// every other independent pair priceable; a live evacuation owns either direction touching
+    /// its unreserved source balance.
     pub(crate) async fn price_missing_routes(
         &self,
         snapshot: &AllocatorSnapshot,
         budget: &mut RouteQuoteBudget,
         priced: &mut BTreeMap<(FederationId, FederationId), wallet_core::RouteEconomics>,
+        blocked: &GoalBlockers,
     ) {
         crate::route_econ::price_missing_pairs(
             self.mc.as_ref(),
@@ -2888,6 +3807,7 @@ impl Runtime {
             snapshot,
             budget,
             priced,
+            blocked,
         )
         .await
     }
@@ -2898,6 +3818,18 @@ impl Runtime {
         scorer_policy: &ScorerPolicy,
         probes: &[(FederationId, ProbeResult)],
     ) -> anyhow::Result<Option<FederationId>> {
+        #[cfg(test)]
+        if self
+            .test_scheduler_designation_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            anyhow::bail!("injected scheduler designation read fault");
+        }
         let auto_joined = self.auto_joined_candidates().await?;
         let preliminary = build_snapshot(
             probes,
@@ -3147,6 +4079,15 @@ impl Runtime {
     /// strand the whole tick. A skipped fed simply drops out of the snapshot — the allocator then
     /// cannot fund it or from it, which is the safe degradation (never a bad move).
     pub(crate) async fn probe_all(&self) -> Vec<(FederationId, ProbeResult)> {
+        #[cfg(test)]
+        if let Some(probes) = self
+            .test_probe_all
+            .lock()
+            .expect("scheduler probe fixture mutex poisoned")
+            .clone()
+        {
+            return probes;
+        }
         let runner =
             FedimintProbeRunner::with_pinned_gateway(self.mc.clone(), self.pinned_gateway.clone());
         let mut probes = Vec::new();
@@ -3168,6 +4109,7 @@ impl Runtime {
     async fn settle_move(
         &self,
         rec: &MoveRecord,
+        expected_attempt: u32,
         phase: MovePhase,
         outcome: Option<String>,
     ) -> anyhow::Result<()> {
@@ -3176,14 +4118,28 @@ impl Runtime {
         if outcome.is_some() {
             settled.outcome = outcome;
         }
-        self.journal.put_move(&settled).await.map_err(exec_err)
+        self.journal
+            .put_move_if_attempt(&rec.key, expected_attempt, &settled)
+            .await
+            .map_err(exec_err)?
+            .then_some(())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "move record attempt was superseded before finalization; leaving current attempt unchanged"
+                )
+            })
     }
 
     /// CAS the intent from `Awaiting` to a terminal status. `Ok(false)` means a concurrent
     /// finalize already moved it (idempotent) — not an error.
-    async fn finalize(&self, key: &IdempotencyKey, new: IntentStatus) -> anyhow::Result<()> {
+    async fn finalize(
+        &self,
+        key: &IdempotencyKey,
+        expected_attempt: u32,
+        new: IntentStatus,
+    ) -> anyhow::Result<()> {
         self.journal
-            .set_status_if(key, IntentStatus::Awaiting, new)
+            .set_status_if(key, expected_attempt, IntentStatus::Awaiting, new)
             .await
             .map_err(exec_err)?;
         Ok(())
@@ -3306,13 +4262,14 @@ impl DiscoveryBackend for Runtime {
         })
     }
 
-    async fn join_as_agent(
+    async fn join_as_agent_with_membership_lease(
         &self,
         id: FederationId,
         invite: fedimint_core::invite_code::InviteCode,
         occurrence: Occurrence,
         now_ms: u64,
         join_timeout: Duration,
+        membership_client: Option<&crate::service::WalletClient>,
     ) -> AutoJoinAttempt {
         let key = IdempotencyKey(format!("join:{}:{}", id.to_hex(), ledger_nonce()));
         if let Err(e) = self
@@ -3329,7 +4286,15 @@ impl DiscoveryBackend for Runtime {
         {
             return AutoJoinAttempt::Failed(exec_err(e));
         }
-        let outcome = match self.mc.join_before_deadline(invite, join_timeout).await {
+        let join = match membership_client {
+            Some(client) => {
+                self.mc
+                    .join_before_deadline_with_membership_lease(invite, join_timeout, client)
+                    .await
+            }
+            None => self.mc.join_before_deadline(invite, join_timeout).await,
+        };
+        let outcome = match join {
             Ok(JoinDeadlineOutcome::Joined(outcome)) => outcome,
             Ok(JoinDeadlineOutcome::DeadlineElapsed) => {
                 tracing::warn!(
@@ -4277,6 +5242,7 @@ mod tests {
         journal
             .set_status(
                 &decision.idempotency_key,
+                0,
                 IntentStatus::Failed,
                 Some("original terminal reason"),
             )
@@ -4330,7 +5296,7 @@ mod tests {
             .await
             .expect("journal intent");
         journal
-            .set_status(&key, IntentStatus::Failed, Some("original join failure"))
+            .set_status(&key, 0, IntentStatus::Failed, Some("original join failure"))
             .await
             .expect("terminalize intent");
 
@@ -4681,12 +5647,11 @@ mod tests {
             .await
             .expect("upsert intent");
         journal
-            .put_move(&direct_inflow_record(
-                key.clone(),
-                FED_A,
-                MovePhase::Settled,
-                None,
-            ))
+            .put_move_if_attempt(
+                &key,
+                0,
+                &direct_inflow_record(key.clone(), FED_A, MovePhase::Settled, None),
+            )
             .await
             .expect("put move");
 
@@ -4714,12 +5679,16 @@ mod tests {
             .await
             .expect("upsert intent");
         journal
-            .put_move(&direct_inflow_record(
-                key.clone(),
-                FED_A,
-                MovePhase::Failed,
-                Some("receive invoice expired before payment"),
-            ))
+            .put_move_if_attempt(
+                &key,
+                0,
+                &direct_inflow_record(
+                    key.clone(),
+                    FED_A,
+                    MovePhase::Failed,
+                    Some("receive invoice expired before payment"),
+                ),
+            )
             .await
             .expect("put move");
 
@@ -4749,12 +5718,16 @@ mod tests {
             .await
             .expect("upsert intent");
         journal
-            .put_move(&direct_inflow_record(
-                key.clone(),
-                to,
-                MovePhase::Failed,
-                Some("receive invoice expired before payment"),
-            ))
+            .put_move_if_attempt(
+                &key,
+                0,
+                &direct_inflow_record(
+                    key.clone(),
+                    to,
+                    MovePhase::Failed,
+                    Some("receive invoice expired before payment"),
+                ),
+            )
             .await
             .expect("put move");
 
@@ -4870,10 +5843,86 @@ mod tests {
         assert_eq!(report.occurrence, Occurrence(1));
     }
 
+    /// `status` reports the blocker view captured while planning, but `tick` must validate after
+    /// its final durable re-scan. A stale planning holder must not hide a currently-unheld raw pin.
     #[tokio::test]
-    async fn watch_once_skips_tick_when_reconcile_leaves_retryable_pending_work() {
-        let (runtime, journal) = runtime_fixture().await;
-        let decision = tick_move_decision("move-retryable-pending", FED_A, FED_B);
+    async fn tick_uses_fresh_blockers_for_pin_validation_after_planning() {
+        let (mut runtime, _) = runtime_fixture().await;
+        let stale = tick_move_decision("move:stale-a-b", FED_A, FED_B);
+        let mut stale_blockers = GoalBlockers::default();
+        stale_blockers.hold_decision(
+            &stale,
+            Actor::Agent {
+                occurrence: Occurrence(0),
+            },
+        );
+        let mut raw_a = raw_probe_with_expiry(false, None, None);
+        raw_a.gateway_available = false;
+        runtime.set_tick_test_fixture(
+            Arc::new(wallet_core::MockExecutor::new()),
+            TickPlan {
+                raw_probes: vec![],
+                probes: vec![(FED_A, raw_a)],
+                active_probes: BTreeMap::new(),
+                snapshot: AllocatorSnapshot {
+                    federations: vec![wallet_core::FederationStatus {
+                        id: FED_A,
+                        balance: wallet_core::FedBalance {
+                            spendable: Msat(0),
+                            in_flight: Msat(0),
+                            claimable: Msat(0),
+                            reserved_fee: Msat(0),
+                        },
+                        probed_ok: true,
+                        reputation: 0,
+                        shutdown_notice: false,
+                        healthy: true,
+                        eligible_to_fund: true,
+                    }],
+                    spending_fed: Some(FED_A),
+                    standby_fed: None,
+                    per_fed_cap: Msat(1_000_000),
+                    target_spending_balance: Msat(0),
+                    standby_target: Msat(0),
+                    max_fee: Msat(1_000),
+                    max_fee_bps_of_move: 100,
+                    evac_fee_base_msat: Msat(0),
+                    evac_fee_bps: 100,
+                    min_move: Msat(5_000),
+                    route_economics_by_pair: BTreeMap::new(),
+                    reservations: wallet_core::Reservations::default(),
+                    now: 1,
+                },
+                decisions: vec![],
+                suppressed: vec![],
+                blockers: stale_blockers,
+            },
+        );
+
+        let error = runtime
+            .tick(&TickPolicy {
+                spending_fed: Some(FED_A),
+                ..TickPolicy::default()
+            })
+            .await
+            .expect_err("the fresh empty scan must not inherit the stale plan's pin relaxation");
+        assert!(
+            error.to_string().contains("failed the lnv2/probe gate")
+                && error.to_string().contains(&FED_A.to_hex()),
+            "{error}"
+        );
+    }
+
+    /// br-p93, STANDALONE path: a permanently retryable agent funding move no longer suppresses
+    /// the whole cycle. The tick RUNS, withholds a fresh key for that goal, and commits an
+    /// independent evacuation through the real `tick` apply/journal lifecycle. The preplanned
+    /// round and mock executor replace only guardian I/O, which a unit fixture cannot provide.
+    /// Fails against the old `summary.retryable > 0` global skip.
+    #[tokio::test]
+    async fn watch_once_runs_the_tick_and_suppresses_only_the_conflicting_goal() {
+        let (mut runtime, journal) = runtime_fixture().await;
+        let stuck = IdempotencyKey(format!("move:{}:{}:0", FED_A.to_hex(), FED_B.to_hex()));
+        let decision = tick_move_decision(&stuck.0, FED_A, FED_B);
         journal
             .upsert(&Intent::from_decision(
                 &decision,
@@ -4884,36 +5933,422 @@ mod tests {
             ))
             .await
             .expect("seed pending move");
+        let occurrence = Occurrence(1);
+        let reissued = IdempotencyKey(format!(
+            "move:{}:{}:{}",
+            FED_A.to_hex(),
+            FED_B.to_hex(),
+            occurrence.0
+        ));
+        let mut reissued_decision = tick_move_decision(&reissued.0, FED_A, FED_B);
+        reissued_decision.occurrence = occurrence;
+        let independent = IdempotencyKey(format!(
+            "evac:{}:{}:{}",
+            FED_C.to_hex(),
+            FED_A.to_hex(),
+            occurrence.0
+        ));
+        let mut independent_decision = tick_evacuate_decision(&independent.0, FED_C, FED_A);
+        independent_decision.occurrence = occurrence;
+        let snapshot = AllocatorSnapshot {
+            federations: vec![
+                wallet_core::FederationStatus {
+                    id: FED_A,
+                    balance: wallet_core::FedBalance {
+                        spendable: Msat(0),
+                        in_flight: Msat(0),
+                        claimable: Msat(0),
+                        reserved_fee: Msat(0),
+                    },
+                    probed_ok: true,
+                    reputation: 0,
+                    shutdown_notice: false,
+                    healthy: true,
+                    eligible_to_fund: true,
+                },
+                wallet_core::FederationStatus {
+                    id: FED_B,
+                    balance: wallet_core::FedBalance {
+                        spendable: Msat(0),
+                        in_flight: Msat(0),
+                        claimable: Msat(0),
+                        reserved_fee: Msat(0),
+                    },
+                    probed_ok: true,
+                    reputation: 0,
+                    shutdown_notice: false,
+                    healthy: true,
+                    eligible_to_fund: true,
+                },
+                wallet_core::FederationStatus {
+                    id: FED_C,
+                    balance: wallet_core::FedBalance {
+                        spendable: Msat(100_000),
+                        in_flight: Msat(0),
+                        claimable: Msat(0),
+                        reserved_fee: Msat(0),
+                    },
+                    probed_ok: true,
+                    reputation: 0,
+                    shutdown_notice: true,
+                    healthy: false,
+                    eligible_to_fund: false,
+                },
+            ],
+            spending_fed: Some(FED_A),
+            standby_fed: Some(FED_B),
+            per_fed_cap: Msat(1_000_000),
+            target_spending_balance: Msat(0),
+            standby_target: Msat(0),
+            max_fee: Msat(1_000),
+            max_fee_bps_of_move: 100,
+            evac_fee_base_msat: Msat(0),
+            evac_fee_bps: 100,
+            min_move: Msat(5_000),
+            route_economics_by_pair: BTreeMap::new(),
+            reservations: wallet_core::Reservations::default(),
+            now: 1,
+        };
+        let executor = Arc::new(wallet_core::MockExecutor::new());
+        executor.fail_retryable(&stuck.0);
+        let mut unavailable_a_probe = raw_probe_with_expiry(false, None, None);
+        unavailable_a_probe.gateway_available = false;
+        runtime.set_tick_test_fixture(
+            executor.clone(),
+            TickPlan {
+                raw_probes: vec![],
+                // FED_A is pinned but fails its own coarse gateway probe. Its only rebalance is
+                // moved into `suppressed` by `tick`'s fresh re-scan; pin checking receives that
+                // non-preflighted work separately from the retained `decisions`.
+                probes: vec![(FED_A, unavailable_a_probe)],
+                active_probes: BTreeMap::new(),
+                snapshot,
+                decisions: vec![reissued_decision.clone(), independent_decision.clone()],
+                suppressed: vec![],
+                blockers: GoalBlockers::default(),
+            },
+        );
         let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
 
         let report = runtime
             .watch_once(
-                &TickPolicy::default(),
+                &TickPolicy {
+                    per_fed_cap: Msat(1_000_000),
+                    spending_fed: Some(FED_A),
+                    ..TickPolicy::default()
+                },
                 &due_discovery_watch_policy(),
                 &sources,
                 &DiscoveryPolicy::default(),
-                true,
+                false,
             )
             .await
             .expect("watch cycle continues after retryable reconcile");
 
-        assert!(matches!(
-            &report.reconcile,
-            WatchReconcileOutcome::Ran(summary) if summary.retryable == 1
-        ));
-        assert!(matches!(
-            &report.tick,
-            WatchTickOutcome::SkippedPendingRetry { retryable: 1 }
-        ));
-        assert!(matches!(&report.discover, WatchDiscoverOutcome::Ran(_)));
-        assert_eq!(report.occurrence, Occurrence(1));
-        let rows = journal.history(usize::MAX, None).await.expect("history");
-        assert!(
-            !rows
-                .iter()
-                .any(|row| matches!(row.kind, OperationKind::Tick { .. })),
-            "a retryable pending move must not start a fresh tick occurrence"
+        let WatchReconcileOutcome::Ran(summary) = &report.reconcile else {
+            panic!("reconcile ran: {:?}", report.reconcile);
+        };
+        assert_eq!(summary.retryable, 1, "the stuck goal is still retryable");
+        // The eligibility the tick is projected through: this goal, and only this goal.
+        assert_eq!(
+            summary.blocked.goals(),
+            BTreeSet::from([wallet_core::AllocatorGoal::FundInto(FED_B)]),
+            "reconcile projects the one in-flight goal"
         );
+        let WatchTickOutcome::Ran(tick) = &report.tick else {
+            panic!(
+                "retryable pending work must not skip the tick wallet-wide: {:?}",
+                report.tick
+            );
+        };
+        assert_eq!(tick.decisions, vec![independent_decision]);
+        assert_eq!(tick.summary.performed, 1, "the independent goal commits");
+        assert!(matches!(&report.discover, WatchDiscoverOutcome::Disabled));
+        assert_eq!(report.occurrence, occurrence);
+
+        let rows = journal.history(usize::MAX, None).await.expect("history");
+        let ticks = rows
+            .iter()
+            .filter(|row| matches!(row.kind, OperationKind::Tick { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ticks.len(),
+            1,
+            "the cycle starts exactly one fresh tick row: {rows:#?}"
+        );
+        assert!(
+            ticks[0].status.is_terminal(),
+            "the fresh tick row is terminalized: {:?}",
+            ticks[0]
+        );
+
+        // The blocked goal is not re-issued: the only intent for it remains the stuck one.
+        let pending = journal.pending().await.expect("pending");
+        assert_eq!(
+            pending
+                .iter()
+                .map(|intent| intent.idempotency_key.clone())
+                .collect::<Vec<_>>(),
+            vec![stuck.clone()],
+            "no fresh-occurrence intent was created for the suppressed goal"
+        );
+        assert!(
+            journal
+                .get(&reissued)
+                .await
+                .expect("read the fresh blocked key")
+                .is_none(),
+            "the old logical goal is not re-issued under the fresh occurrence"
+        );
+        let tick_drop = IdempotencyKey(format!("tick-drop:{}:{}", occurrence.0, reissued.0));
+        assert!(matches!(
+            journal
+                .operation(&crate::journal::OperationRef::Key(tick_drop))
+                .await
+                .expect("read the final-rescan tick-drop refusal")
+                .expect("Runtime::tick persists the newly conflicting decision")
+                .kind,
+            OperationKind::Refusal { diagnostics, .. }
+                if diagnostics.amount == Some(Msat(0)) && diagnostics.conflict_suppressed
+        ));
+        assert_eq!(
+            journal
+                .get(&independent)
+                .await
+                .expect("read the independent intent")
+                .map(|intent| intent.status),
+            Some(IntentStatus::Done),
+            "the independent goal is durably committed and performed"
+        );
+        assert_eq!(
+            executor.performed_keys(),
+            vec![independent],
+            "the mock records only the independent goal's successful perform"
+        );
+    }
+
+    /// br-p93, the standalone derivation `plan_tick` and `tick` both re-run: it reads the durable
+    /// `pending()` scan, so a live AGENT evacuation holds its goal while a user operation
+    /// journaled beside it holds nothing — a user retry must never be suppressed because the
+    /// agent has similar work in flight, and the daemon's reconcile projects from the same scan.
+    #[tokio::test]
+    async fn the_standalone_blocker_projection_reads_durable_agent_work_only() {
+        let (runtime, journal) = runtime_fixture().await;
+        assert!(
+            runtime
+                .allocator_goal_blockers()
+                .await
+                .expect("an empty journal projects an empty set")
+                .is_empty(),
+            "nothing in flight blocks nothing"
+        );
+
+        let evacuation = tick_evacuate_decision("evac:standalone", FED_A, FED_B);
+        journal
+            .upsert(&Intent::from_decision(
+                &evacuation,
+                Actor::Agent {
+                    occurrence: Occurrence(3),
+                },
+                0,
+            ))
+            .await
+            .expect("seed the agent evacuation");
+        let user_move = tick_move_decision("move:user", FED_B, FED_C);
+        journal
+            .upsert(&Intent::from_decision(&user_move, Actor::User, 0))
+            .await
+            .expect("seed the user move");
+
+        let blocked = runtime
+            .allocator_goal_blockers()
+            .await
+            .expect("project the durable scan");
+        assert_eq!(
+            blocked.goals(),
+            BTreeSet::from([wallet_core::AllocatorGoal::Evacuate(FED_A)]),
+            "only the agent's own allocator work holds a goal"
+        );
+        assert_eq!(
+            blocked
+                .holder(wallet_core::AllocatorGoal::Evacuate(FED_A))
+                .map(|key| key.0.as_str()),
+            Some("evac:standalone"),
+            "the holding key is the durable intent's own"
+        );
+    }
+
+    /// The standalone raw-probe seam retains planning blockers for pin validation. A held A -> B
+    /// evacuation suppresses its current nonzero recurrence but co-emits a refusal; C -> B must
+    /// still remain eligible.
+    #[tokio::test]
+    async fn standalone_planner_derives_blockers_before_reserving_evacuation_room() {
+        let (mut runtime, journal) = runtime_fixture().await;
+        let stuck = AllocatorDecision {
+            action: Action::Evacuate {
+                from: FED_A,
+                to: FED_B,
+                amount: Msat(400_000),
+                fee_cap: Msat(0),
+                gateway: None,
+                fee_cap_components: None,
+            },
+            reason: ReasonCode::ShutdownNotice,
+            occurrence: Occurrence(10),
+            idempotency_key: IdempotencyKey("evac:standalone-held-a".to_owned()),
+        };
+        journal
+            .upsert(&Intent::from_decision(
+                &stuck,
+                Actor::Agent {
+                    occurrence: Occurrence(10),
+                },
+                0,
+            ))
+            .await
+            .expect("seed durable A evacuation");
+        // This in-memory Runtime has no open federations/gateway to validate. A terminal record
+        // under C's prospective key is not a blocker, but makes normal concrete preflight take
+        // its existing-intent path so this test reaches the raw-probe planner's durable-blocker
+        // projection rather than its unrelated no-gateway revision loop.
+        let independent_key = IdempotencyKey(format!(
+            "evac:{}:{}:{}",
+            FED_C.to_hex(),
+            FED_B.to_hex(),
+            Occurrence(11).0
+        ));
+        let independent = AllocatorDecision {
+            action: Action::Evacuate {
+                from: FED_C,
+                to: FED_B,
+                amount: Msat(500_000),
+                fee_cap: Msat(0),
+                gateway: None,
+                fee_cap_components: None,
+            },
+            reason: ReasonCode::ShutdownNotice,
+            occurrence: Occurrence(11),
+            idempotency_key: independent_key.clone(),
+        };
+        journal
+            .upsert(&Intent::from_decision(
+                &independent,
+                Actor::Agent {
+                    occurrence: Occurrence(11),
+                },
+                0,
+            ))
+            .await
+            .expect("seed terminal C key for route-preflight isolation");
+        journal
+            .set_status(&independent_key, 0, IntentStatus::Done, None)
+            .await
+            .expect("terminalize C key");
+        let policy = TickPolicy {
+            per_fed_cap: Msat(1_000_000),
+            target_spending_balance: Msat(0),
+            standby_target: Msat(0),
+            spending_fed: Some(FED_A),
+            standby_fed: Some(FED_B),
+            occurrence: Occurrence(11),
+            ..TickPolicy::default()
+        };
+        let mut dying_a = raw_probe_with_expiry(true, None, None);
+        dying_a.spendable_msat = 0;
+        // A is a source-only pin with no coarse gateway of its own. Its current evacuation is
+        // conflict-suppressed, so only the stored planning blocker can relax this raw pin.
+        dying_a.gateway_available = false;
+        dying_a.spendable_msat = 500_000;
+        let mut healthy_b = raw_probe_with_expiry(false, None, None);
+        healthy_b.spendable_msat = 0;
+        let mut dying_c = raw_probe_with_expiry(true, None, None);
+        dying_c.spendable_msat = 500_000;
+
+        let plan = runtime
+            .plan_tick_from_probes(
+                &policy,
+                vec![(FED_A, dying_a), (FED_B, healthy_b), (FED_C, dying_c)],
+            )
+            .await
+            .expect("standalone plan with one held evacuation and one independent evacuation");
+
+        assert!(
+            !plan.decisions.iter().any(
+                |decision| matches!(decision.action, Action::Evacuate { from, .. } if from == FED_A)
+            ),
+            "held A must produce no fresh executable recurrence: {:#?}",
+            plan.decisions
+        );
+        let refusal = plan
+            .decisions
+            .iter()
+            .find(|decision| {
+                matches!(
+                    decision.action,
+                    Action::RefuseInflow {
+                        fed,
+                        reason: ReasonCode::ShutdownNotice,
+                        diagnostics,
+                    } if fed == FED_A
+                        && diagnostics.available == Some(Msat(100_000))
+                        && diagnostics.amount == Some(Msat(0))
+                        && diagnostics.conflict_suppressed
+                )
+            })
+            .cloned()
+            .expect("standalone decision list retains the withheld evacuation's refusal");
+        let candidate = plan
+            .suppressed
+            .iter()
+            .find(|decision| matches!(decision.action, Action::Evacuate { from, to, .. } if from == FED_A && to == FED_B))
+            .expect("the exact withheld evacuation candidate");
+        assert_eq!(
+            refusal.idempotency_key.0,
+            format!(
+                "conflict-suppressed:{}:shutdown_notice",
+                candidate.idempotency_key.0
+            )
+        );
+        assert!(
+            plan.decisions.iter().any(|decision| matches!(
+                decision.action,
+                Action::Evacuate {
+                    from,
+                    to,
+                    amount: Msat(500_000),
+                    ..
+                } if from == FED_C && to == FED_B
+            )),
+            "the independent C evacuation must retain B's 500k room: {:#?}",
+            plan.decisions
+        );
+        assert!(
+            Runtime::pinned_input_problems(&policy, &plan, &plan.blockers).is_empty(),
+            "the paired held A evacuation advisory vouches for its unusable source-only pin"
+        );
+        // Exercise Runtime::tick rather than the journal helper directly: the standalone tick
+        // must carry the planner's advisory decision through its own history lifecycle.
+        runtime.set_tick_test_fixture(
+            Arc::new(wallet_core::MockExecutor::new()),
+            TickPlan {
+                decisions: vec![refusal.clone()],
+                ..plan
+            },
+        );
+        runtime
+            .tick(&policy)
+            .await
+            .expect("standalone tick records its suppression refusal");
+        assert!(matches!(
+            journal
+                .operation(&crate::journal::OperationRef::Key(refusal.idempotency_key))
+                .await
+                .expect("read standalone suppression refusal")
+                .expect("Runtime::tick records the standalone decision list")
+                .kind,
+            OperationKind::Refusal { diagnostics, .. }
+                if diagnostics.amount == Some(Msat(0)) && diagnostics.conflict_suppressed
+        ));
     }
 
     #[tokio::test]
@@ -5146,14 +6581,87 @@ mod tests {
                 &tick_policy,
                 &WatchPolicy::default(),
                 &BTreeMap::new(),
+                None,
                 now,
                 Occurrence(1),
             )
             .await
             .expect("service probe schedule");
 
-        assert_eq!(due, vec![(FED_B, FED_A, Msat(0))]);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].federation, FED_B);
+        assert_eq!(due[0].source, FED_A);
+        assert_eq!(due[0].baseline, Msat(0));
+        assert!(matches!(
+            &due[0].admission,
+            ProbeAdmission::ResumeOnly { expected_nonce }
+                if expected_nonce == "00000000000000660000000000000000"
+        ));
         assert!(resuming);
+    }
+
+    #[tokio::test]
+    async fn service_scheduler_resumes_a_pre_in_session_after_the_budget_is_lowered() {
+        let (runtime, journal) = runtime_fixture().await;
+        journal
+            .put_federation(&FED_B, &federation_info())
+            .await
+            .expect("put auto-joined fed");
+        let gate_policy = ProbePolicy::default();
+        seed_pre_leg_probe_session(journal.as_ref(), FED_B, FED_A, &gate_policy).await;
+        let tick_policy = TickPolicy {
+            probe_gate_policy: gate_policy,
+            ..TickPolicy::default()
+        };
+        let watch_policy = WatchPolicy {
+            probe_budget: ProbeBudget {
+                max_probe_attempts_per_week: 0,
+                max_probe_spend_per_week_msat: 0,
+            },
+            ..WatchPolicy::default()
+        };
+        let now = now_ms();
+
+        let (due, resuming) = runtime
+            .service_due_probes(
+                None,
+                &tick_policy,
+                &watch_policy,
+                &BTreeMap::new(),
+                None,
+                now,
+                Occurrence(1),
+            )
+            .await
+            .expect("service probe schedule");
+
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].federation, FED_B);
+        assert_eq!(due[0].source, FED_A);
+        assert!(matches!(
+            &due[0].admission,
+            ProbeAdmission::ResumeOnly { expected_nonce }
+                if expected_nonce == "00000000000000770000000000000000"
+        ));
+        assert!(
+            resuming,
+            "an already-admitted session bypasses the later fresh budget gate"
+        );
+        let deadlines = runtime
+            .service_watch_deadlines(
+                &tick_policy,
+                &watch_policy,
+                now,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                false,
+            )
+            .await
+            .expect("retained-session deadlines");
+        assert!(
+            deadlines.probe_due_ms.iter().any(|due_ms| *due_ms <= now),
+            "the lowered fresh budget must not defer retained probe money"
+        );
     }
 
     #[tokio::test]
@@ -5257,6 +6765,114 @@ mod tests {
         assert_eq!(fresh_probe_baseline(true, None), None);
         assert_eq!(fresh_probe_baseline(true, Some(Msat(42))), Some(Msat(42)));
         assert_eq!(fresh_probe_baseline(false, None), Some(Msat(0)));
+    }
+
+    #[tokio::test]
+    async fn service_due_probes_requires_current_spending_for_fresh_work_but_resumes_durable_source(
+    ) {
+        use fedimint_core::invite_code::InviteCode;
+        use fedimint_core::util::SafeUrl;
+        use fedimint_core::PeerId;
+        use std::str::FromStr as _;
+
+        fn auto_joined_candidate(id: FederationId) -> crate::CandidateRecord {
+            let fed_id = fedimint_core::config::FederationId::from_str(&id.to_hex())
+                .expect("valid federation id");
+            crate::CandidateRecord {
+                id,
+                invite: InviteCode::new(
+                    SafeUrl::parse("https://service-due-probes.example").expect("valid URL"),
+                    PeerId::from(0),
+                    fed_id,
+                    None,
+                ),
+                source: wallet_core::DiscoverySource::Manual,
+                discovered_at_ms: 0,
+                structural: crate::StructuralOutcome::Passed,
+                structural_checked_at_ms: 0,
+                state: CandidateState::AutoJoined,
+                updated_at_ms: 0,
+            }
+        }
+
+        let (runtime, journal) = runtime_fixture().await;
+        journal
+            .put_federation(&FED_B, &federation_info())
+            .await
+            .expect("seed fresh auto-joined membership");
+        journal
+            .put_candidate(&auto_joined_candidate(FED_B))
+            .await
+            .expect("seed fresh auto-joined candidate");
+        let gate_policy = ProbePolicy::default();
+        let tick_policy = TickPolicy {
+            spending_fed: Some(FED_A),
+            probe_gate_policy: gate_policy.clone(),
+            ..TickPolicy::default()
+        };
+        let now = now_ms();
+        let (fresh_due, fresh_resuming) = runtime
+            .service_due_probes(
+                None,
+                &tick_policy,
+                &WatchPolicy::default(),
+                &BTreeMap::from([(FED_B, Msat(19))]),
+                None,
+                now,
+                Occurrence(1),
+            )
+            .await
+            .expect("service probe schedule");
+        assert!(
+            fresh_due.is_empty(),
+            "a degraded cycle must not use tick_policy.spending_fed to launch fresh FED_B work"
+        );
+        assert!(!fresh_resuming);
+
+        journal
+            .put_federation(&FED_C, &federation_info())
+            .await
+            .expect("seed retained auto-joined membership");
+        journal
+            .put_candidate(&auto_joined_candidate(FED_C))
+            .await
+            .expect("seed retained auto-joined candidate");
+        let retained = ProbeSession {
+            nonce: "00000000000000DD0000000000000000".to_owned(),
+            from: FED_D,
+            amount_msat: gate_policy.amount_msat,
+            leg_fee_cap_msat: gate_policy.leg_fee_cap_msat,
+            c_spendable_before_in_msat: 73,
+            out_net_msat: None,
+            started_at_ms: now,
+        };
+        journal
+            .begin_probe_session(&FED_C, &retained)
+            .await
+            .expect("seed retained probe session");
+        let (due, resuming) = runtime
+            .service_due_probes(
+                None,
+                &tick_policy,
+                &WatchPolicy::default(),
+                &BTreeMap::from([(FED_B, Msat(19))]),
+                None,
+                now,
+                Occurrence(1),
+            )
+            .await
+            .expect("service retained probe schedule");
+
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].federation, FED_C);
+        assert_eq!(due[0].source, FED_D);
+        assert_eq!(due[0].baseline, Msat(73));
+        assert!(matches!(
+            &due[0].admission,
+            ProbeAdmission::ResumeOnly { expected_nonce }
+                if expected_nonce == &retained.nonce
+        ));
+        assert!(resuming, "the sole due probe is a retained session");
     }
 
     #[tokio::test]
@@ -6472,12 +8088,11 @@ mod tests {
             .await
             .expect("upsert intent");
         journal
-            .put_move(&direct_inflow_record(
-                key.clone(),
-                to,
-                MovePhase::Settled,
-                None,
-            ))
+            .put_move_if_attempt(
+                &key,
+                0,
+                &direct_inflow_record(key.clone(), to, MovePhase::Settled, None),
+            )
             .await
             .expect("put move");
 

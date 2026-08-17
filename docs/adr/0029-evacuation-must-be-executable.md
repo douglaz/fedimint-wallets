@@ -77,10 +77,11 @@ exceeds `SEND_FEE_LIMIT` (base 100 sats — `lnv2-client/src/lib.rs:590`, limit 
 `gateway_api.rs:209`) while the receive leg is refused against `RECEIVE_FEE_LIMIT` (base 50 sats —
 `lib.rs:905`, limit at `gateway_api.rs:223`). A 199-sat-base gateway therefore cannot execute, and the evacuation fails
 rather than burning — but WITH DIFFERENT TERMINAL CLASSES by split, and the send-heavy one is the
-worse shape. A receive-heavy split fails pre-commit and maps `Retryable` (`executor.rs:1378`). A
-send-heavy split fails at the send limit, and `GatewayFeeExceedsLimit` is a route rejection that
-`map_send_error` classifies **`Permanent`** (`multi_client.rs:1396-1401`, `executor.rs:2125-2127`,
-used by the Pay arm at `:1505-1507`) — so the intent terminally FAILS with a committed receive
+worse shape. A receive-heavy split fails pre-commit in `MultiClient::receive` and maps `Retryable`.
+A send-heavy split fails at the send limit, and `GatewayFeeExceedsLimit` is a route rejection that
+`MultiClient::pay` identifies with `is_route_send_rejection` and maps to
+`SendError::RouteRejected`; the executor's `map_send_error` then classifies it
+**`Permanent`** — so the intent terminally FAILS with a committed receive
 outstanding, and because the occurrence advances each watch cycle and `idem_evac` embeds it, a
 fresh `Evacuate` is emitted and repeats the mint-then-fail loop. No burn either way; do not write
 a test or runbook expectation asserting `Retryable` for the send-heavy case. WHICH leg refuses depends on the split, and the

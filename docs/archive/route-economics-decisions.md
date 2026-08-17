@@ -6,11 +6,11 @@ by [ADR-0029](../adr/0029-evacuation-must-be-executable.md) and ADR-0030.** No p
 this doc. It authorises an implementation bead. All file:line refs were verified against `main`
 post br-ljj.2 and have not been re-verified since.
 
-> **Q4 no longer holds.** ADR-0030 removes the daemon pin entirely: automated routing — the
-> scheduler, allocator, probes and evacuation — resolves only from the vetted list and can never
-> be pinned. The `route_econ.rs` pinned branch this document's Q4 specifies is deleted, not
-> re-prioritised. The surviving `--gateway` is an operator break-glass on money verbs, which
-> route economics never runs for. Read Q4 below as history.
+> **Q4 no longer holds as a target.** ADR-0030's accepted destination removes the daemon pin:
+> automated routing — scheduler, allocator, probes and evacuation — resolves only from the vetted
+> list. That target is not the current tree: `route_econ.rs` still has its pinned branch until
+> `br-remove-gateway-pin-yjw` ships. Read Q4 below as historical authority for the current branch,
+> not as the accepted end state.
 >
 > **Q1 is superseded for `Evacuate` only.** It mandates a single `Option<GatewayUrl>` on
 > `Action::Evacuate`; ADR-0029 gives evacuation a two-gateway hop, so it needs a route KIND plus
@@ -80,7 +80,8 @@ cap check fails the move (Retryable → park/refuse), which is the correct, mone
 re-resolution is safe precisely because the cap, not the gateway, is the backstop. Prefer the
 preselected gateway (avoids a re-quote and pins the economically-validated route in the common
 case); fall back to the cheapest validating gateway (see the adjacent finding) under the same
-cap when it's gone.
+cap when it's gone. Retryability is never reservation-release evidence: the allocator retains
+whatever the latest trusted durable artifact phase still leaves outstanding.
 
 ## Q3 — How is `min_viable_amount` searched?
 **Decision: a FIXED small quote set per pair (~4: send-fed, send-gateway, recv-fed,

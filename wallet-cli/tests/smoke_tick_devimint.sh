@@ -149,12 +149,12 @@ fi
 command -v fedimint-cli >/dev/null || { echo "FAIL: fedimint-cli not on PATH (run inside dev-fed --exec)" >&2; exit 1; }
 
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
-FUND_MSAT=500000       # fund fed A with 500 sat via direct-inflow (must exceed target + move + fees)
-SPENDING_TARGET=100000 # keep >=100 sat on the spending fed; A's SURPLUS above this funds the standby
-STANDBY_TARGET=100000  # fund the empty standby toward 100 sat -> the expected fund-standby move size
+FUND_MSAT=3000000        # fund A with 3,000 sat (must exceed both 1,000-sat targets + move fees)
+SPENDING_TARGET=1000000  # keep >=1,000 sat on the spending fed; the surplus funds the standby
+STANDBY_TARGET=1000000   # 1,000 sat clears the live route-economic floor at the 300-bps move cap
 MAX_FEE=100000         # 100 sat: absolute cap for user money verbs/probe legs, not allocator funding (max_fee_bps_of_move: 300 bps).
 RECV_SLACK=1000        # 1 sat — bounds lnv2 receive-fee-quote under-estimate on B (per the other smokes)
-A_FEE_HEADROOM=50000   # 50 sat — generous upper bound on the TOTAL move fee A pays on top of the move
+A_FEE_HEADROOM=250000  # 250 sat — generous upper bound on the TOTAL move fee A pays on top of the move
 
 DATA_DIR="$(mktemp -d)"
 DI_ERR="$(mktemp)"

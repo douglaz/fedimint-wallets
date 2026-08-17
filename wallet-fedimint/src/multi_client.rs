@@ -9,6 +9,7 @@ use crate::journal::{
     FederationInfo, FedimintJournal, LedgerRepairOracle, RawOpObservation, RawTerminal,
 };
 use crate::move_protocol::{Leg, MoveMeta, OpArtifact};
+use crate::service::WalletClient;
 use crate::types::{GatewayUrl, Invoice, OperationId, Preimage};
 use async_trait::async_trait;
 use fedimint_bip39::{Bip39RootSecretStrategy, Mnemonic};
@@ -53,6 +54,40 @@ const CLIENT_PREFIX_TAG: u8 = 0x01;
 /// any) drops on the early return and no fresh db partition was allocated yet.
 const PREVIEW_UNDER_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Terminalize a recovery before publishing its exact reopened client in this process.
+///
+/// The caller holds the recovery reservation and `join_lock`; membership callers also hold their
+/// actor membership lease. `complete` is awaited while the client remains absent from `clients`.
+/// Only after it returns `Ok(())` do we take the synchronous map lock and insert, with no await or
+/// cancellation point in between. Thus an explicit completion error or cancellation while it is
+/// pending never exposes the handle. A durable-commit ambiguity may instead leave a registered but
+/// unopened row; ending the lease invalidates older authority, and the scheduler's whole-world
+/// check skips money work until its normal open path restores that handle.
+async fn complete_recovery_then_insert_client<T, F, Fut>(
+    clients: &RwLock<BTreeMap<FederationId, Arc<T>>>,
+    id: FederationId,
+    client: Arc<T>,
+    complete: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    complete().await?;
+
+    {
+        let mut clients = clients.write().expect("client map lock poisoned");
+        if clients.contains_key(&id) {
+            anyhow::bail!(
+                "federation {} went live during recovery; refusing to replace the live client",
+                id.to_hex()
+            );
+        }
+        clients.insert(id, client);
+    }
+    Ok(())
+}
+
 /// One fedimint client per joined federation. `db` is the CLIENT store — each client `i`
 /// at `[0x01] ++ u32_le(db_prefix)`, plus fedimint's own client secret — while the app
 /// journal lives in its OWN separate `Database` (see [`Self::new`] for why co-locating
@@ -89,6 +124,12 @@ pub struct MultiClient {
     /// settlement calls (send_payment, invoice fetch inside the lnv2 state machines)
     /// keep their path — that latency is async settlement, not responsiveness.
     gateway_http: reqwest::Client,
+    /// Scheduler tests can exercise the real retry-open call site without a guardian-backed SDK
+    /// client.  This is test-only state: production membership remains exclusively `clients`.
+    #[cfg(test)]
+    test_open_results: RwLock<BTreeMap<u32, FederationId>>,
+    #[cfg(test)]
+    test_opened_federations: RwLock<BTreeSet<FederationId>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +198,10 @@ impl MultiClient {
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .expect("static reqwest client configuration cannot fail"),
+            #[cfg(test)]
+            test_open_results: RwLock::new(BTreeMap::new()),
+            #[cfg(test)]
+            test_opened_federations: RwLock::new(BTreeSet::new()),
         }
     }
 
@@ -164,7 +209,7 @@ impl MultiClient {
     /// [`FederationInfo`] row. Idempotent: a federation already joined (in-memory, or
     /// recorded in the journal from a previous run) is opened instead of re-joined.
     pub async fn join(&self, invite: InviteCode) -> anyhow::Result<JoinOutcome> {
-        match self.join_inner(invite, None).await? {
+        match self.join_inner(invite, None, None).await? {
             JoinDeadlineOutcome::Joined(outcome) => Ok(outcome),
             JoinDeadlineOutcome::DeadlineElapsed => {
                 unreachable!("unbounded joins do not install a deadline")
@@ -177,14 +222,50 @@ impl MultiClient {
         invite: InviteCode,
         deadline: Duration,
     ) -> anyhow::Result<JoinDeadlineOutcome> {
-        self.join_inner(invite, Some(JoinDeadline::new(deadline)))
+        self.join_inner(invite, Some(JoinDeadline::new(deadline)), None)
             .await
+    }
+
+    /// As [`Self::join_before_deadline`], but lets the service fence only the final registry and
+    /// process-map publication. Preview and SDK join remain outside actor authority.
+    pub(crate) async fn join_before_deadline_with_membership_lease(
+        &self,
+        invite: InviteCode,
+        deadline: Duration,
+        membership_client: &WalletClient,
+    ) -> anyhow::Result<JoinDeadlineOutcome> {
+        self.join_inner(
+            invite,
+            Some(JoinDeadline::new(deadline)),
+            Some(membership_client),
+        )
+        .await
+    }
+
+    /// The user-operation path supplies the actor client so the short durable registry +
+    /// process-map publication is fenced from tick authority.  Preparation (preview and SDK join)
+    /// deliberately remains outside that lease.
+    pub(crate) async fn join_with_membership_lease(
+        &self,
+        invite: InviteCode,
+        membership_client: &WalletClient,
+    ) -> anyhow::Result<JoinOutcome> {
+        match self
+            .join_inner(invite, None, Some(membership_client))
+            .await?
+        {
+            JoinDeadlineOutcome::Joined(outcome) => Ok(outcome),
+            JoinDeadlineOutcome::DeadlineElapsed => {
+                unreachable!("unbounded joins do not install a deadline")
+            }
+        }
     }
 
     async fn join_inner(
         &self,
         invite: InviteCode,
         deadline: Option<JoinDeadline>,
+        membership_client: Option<&WalletClient>,
     ) -> anyhow::Result<JoinDeadlineOutcome> {
         let id = bridge_federation_id(invite.federation_id());
 
@@ -211,7 +292,8 @@ impl MultiClient {
             // already hold `join_lock` here, so call the locked body directly (the lock is not
             // re-entrant).
             return Ok(JoinDeadlineOutcome::Joined(JoinOutcome::opened(
-                self.open_one_locked(&info).await?,
+                self.open_one_locked_with_membership_lease(&info, membership_client)
+                    .await?,
             )));
         }
 
@@ -271,14 +353,38 @@ impl MultiClient {
             db_prefix,
             joined_at: unix_now(),
         };
-        self.journal
-            .put_federation(&joined_id, &info)
-            .await
-            .map_err(|e| anyhow::anyhow!("persisting federation registry: {e:?}"))?;
-        self.clients
-            .write()
-            .expect("client map lock poisoned")
-            .insert(joined_id, client);
+        // This is the only new-membership publication in join.  Do not move the lease
+        // upward: preview/join are network waits and must not block unrelated tick work.
+        let lease = match membership_client {
+            Some(client) => {
+                Some(client.begin_membership_mutation().await.map_err(|error| {
+                    anyhow::anyhow!("beginning membership publication: {error}")
+                })?)
+            }
+            None => None,
+        };
+        let publication: anyhow::Result<()> = async {
+            self.journal
+                .put_federation(&joined_id, &info)
+                .await
+                .map_err(|e| anyhow::anyhow!("persisting federation registry: {e:?}"))?;
+            self.clients
+                .write()
+                .expect("client map lock poisoned")
+                .insert(joined_id, client);
+            Ok(())
+        }
+        .await;
+        let lease_end = match (membership_client, lease) {
+            (Some(client), Some(lease)) => client
+                .end_membership_mutation(lease)
+                .await
+                .map_err(|error| anyhow::anyhow!("ending membership publication: {error}")),
+            (None, None) => Ok(()),
+            _ => unreachable!("membership client and lease are paired"),
+        };
+        publication?;
+        lease_end?;
         Ok(JoinDeadlineOutcome::Joined(JoinOutcome {
             id: joined_id,
             newly_joined: true,
@@ -313,6 +419,36 @@ impl MultiClient {
         &self,
         invite: InviteCode,
         recovery_key: &IdempotencyKey,
+        recovery_attempt: u32,
+    ) -> anyhow::Result<FederationId> {
+        self.recover_inner(invite, recovery_key, recovery_attempt, None)
+            .await
+    }
+
+    /// As [`Self::recover`], but fences only the final registry/client publication with actor
+    /// membership authority.  The potentially long seed replay and partition reopening precede it.
+    pub(crate) async fn recover_with_membership_lease(
+        &self,
+        invite: InviteCode,
+        recovery_key: &IdempotencyKey,
+        recovery_attempt: u32,
+        membership_client: &WalletClient,
+    ) -> anyhow::Result<FederationId> {
+        self.recover_inner(
+            invite,
+            recovery_key,
+            recovery_attempt,
+            Some(membership_client),
+        )
+        .await
+    }
+
+    async fn recover_inner(
+        &self,
+        invite: InviteCode,
+        recovery_key: &IdempotencyKey,
+        recovery_attempt: u32,
+        membership_client: Option<&WalletClient>,
     ) -> anyhow::Result<FederationId> {
         let id = bridge_federation_id(invite.federation_id());
 
@@ -405,19 +541,43 @@ impl MultiClient {
                 id.to_hex()
             );
         }
-        // Publish the registry row, record durable user ownership, and terminalize this recovery's
-        // intent atomically (D4.6). Otherwise a crash after registration but before the driver's
-        // ordinary Done write would reopen this client on startup and re-drive the still-Executing
-        // action into the refuse-if-registered path, falsely reporting a completed recovery as
-        // failed.
-        self.journal
-            .complete_recovery(&id, &info, &invite, recovery_key)
-            .await
-            .map_err(|e| anyhow::anyhow!("committing recovered federation: {e:?}"))?;
-        self.clients
-            .write()
-            .expect("client map lock poisoned")
-            .insert(id, client);
+        // The completed replay is now a usable client, but neither it nor the durable federation
+        // row is visible yet.  Fence precisely this publication; acquiring before recovery replay
+        // would turn a slow guardian into global tick unavailability.
+        let lease = match membership_client {
+            Some(client) => Some(
+                client
+                    .begin_membership_mutation()
+                    .await
+                    .map_err(|error| anyhow::anyhow!("beginning recovery publication: {error}"))?,
+            ),
+            None => None,
+        };
+        let publication =
+            complete_recovery_then_insert_client(&self.clients, id, client, || async {
+                // `complete_recovery` is the final await before process publication. Its `Ok(true)`
+                // result flows synchronously to the map insert in the helper, leaving no
+                // cancellation point between durable completion and publication.
+                self.journal
+                    .complete_recovery(&id, &info, &invite, recovery_key, recovery_attempt)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("committing recovered federation: {e:?}"))?
+                    .then_some(())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("recovery intent attempt was superseded before completion")
+                    })
+            })
+            .await;
+        let lease_end = match (membership_client, lease) {
+            (Some(client), Some(lease)) => client
+                .end_membership_mutation(lease)
+                .await
+                .map_err(|error| anyhow::anyhow!("ending recovery publication: {error}")),
+            (None, None) => Ok(()),
+            _ => unreachable!("membership client and lease are paired"),
+        };
+        publication?;
+        lease_end?;
         Ok(id)
     }
 
@@ -432,13 +592,14 @@ impl MultiClient {
             .contains(id)
     }
 
-    /// Whether a recovery of `id` is in flight — the reservation is held from before the fresh
-    /// partition is allocated until AFTER `recover` inserts the live client. The daemon reads this
-    /// so a terminal recovery status is not reported while `/v1/balance` still omits the fed: in the
-    /// window between `complete_recovery`'s commit (which terminalizes the intent) and the in-memory
-    /// client insert, the op would otherwise read succeeded with the fed not yet open.
-    pub fn is_recovering(&self, id: &FederationId) -> bool {
-        self.recovery_in_progress(id)
+    /// Whether a durably recovered federation currently lacks a process handle.
+    ///
+    /// During the ordinary success path this is only the synchronous commit→insert window. It can
+    /// last longer after a commit-then-error or across restart, until the scheduler's whole-world
+    /// open path restores the registered partition. The daemon uses this to keep operation status
+    /// aligned with `/v1/balance` availability.
+    pub fn recovery_handle_missing(&self, id: &FederationId) -> bool {
+        !self.federations().contains(id)
     }
 
     fn ensure_recovery_not_in_progress(&self, id: &FederationId) -> anyhow::Result<()> {
@@ -489,6 +650,29 @@ impl MultiClient {
         Ok(())
     }
 
+    /// As [`Self::open_all`], but fences each successful process-map insertion independently.
+    /// Opening a client can wait on the network, so the actor authority is acquired only by
+    /// [`Self::open_one_locked_with_membership_lease`] immediately before that insertion.
+    pub(crate) async fn open_all_with_membership_lease(
+        &self,
+        feds: &[FederationInfo],
+        membership_client: &WalletClient,
+    ) -> anyhow::Result<()> {
+        for info in feds {
+            if let Err(e) = self
+                .open_one_with_membership_lease(info, membership_client)
+                .await
+            {
+                tracing::warn!(
+                    db_prefix = info.db_prefix,
+                    error = ?e,
+                    "multi_client: skipping federation that failed to open"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// This federation's spendable balance, at msat granularity.
     pub async fn balance(&self, id: &FederationId) -> anyhow::Result<Msat> {
         let client = self
@@ -504,12 +688,26 @@ impl MultiClient {
 
     /// Every federation this `MultiClient` currently holds an open client for.
     pub fn federations(&self) -> Vec<FederationId> {
-        self.clients
+        let federations = self
+            .clients
             .read()
             .expect("client map lock poisoned")
             .keys()
             .copied()
-            .collect()
+            .collect::<BTreeSet<_>>();
+        #[cfg(test)]
+        let federations = {
+            let mut federations = federations;
+            federations.extend(
+                self.test_opened_federations
+                    .read()
+                    .expect("test opened federation lock poisoned")
+                    .iter()
+                    .copied(),
+            );
+            federations
+        };
+        federations.into_iter().collect()
     }
 
     pub fn spawn_expiry_wake_tasks(
@@ -565,10 +763,19 @@ impl MultiClient {
     }
 
     pub(crate) fn has_client(&self, id: &FederationId) -> bool {
-        self.clients
+        let opened = self
+            .clients
             .read()
             .expect("client map lock poisoned")
-            .contains_key(id)
+            .contains_key(id);
+        #[cfg(test)]
+        let opened = opened
+            || self
+                .test_opened_federations
+                .read()
+                .expect("test opened federation lock poisoned")
+                .contains(id);
+        opened
     }
 
     /// Whether `id` has a durable registry row — open OR registered-but-unopened. Recovery refuses
@@ -595,10 +802,60 @@ impl MultiClient {
         self.open_one_locked(info).await
     }
 
+    async fn open_one_with_membership_lease(
+        &self,
+        info: &FederationInfo,
+        membership_client: &WalletClient,
+    ) -> anyhow::Result<FederationId> {
+        let _join_guard = self.join_lock.lock().await;
+        self.open_one_locked_with_membership_lease(info, Some(membership_client))
+            .await
+    }
+
     /// The body of [`Self::open_one`], assuming `join_lock` is ALREADY held by the caller so that
     /// the `has_client` checks and the open+insert are serialized against every other join/open of
     /// the same federation.
     async fn open_one_locked(&self, info: &FederationInfo) -> anyhow::Result<FederationId> {
+        self.open_one_locked_with_membership_lease(info, None).await
+    }
+
+    /// Open an already-registered partition, optionally fencing only the final process-map insert.
+    /// The SDK open above it can wait on the network, so it must never hold membership authority.
+    async fn open_one_locked_with_membership_lease(
+        &self,
+        info: &FederationInfo,
+        membership_client: Option<&WalletClient>,
+    ) -> anyhow::Result<FederationId> {
+        #[cfg(test)]
+        {
+            let test_open = {
+                self.test_open_results
+                    .read()
+                    .expect("test open result lock poisoned")
+                    .get(&info.db_prefix)
+                    .copied()
+            };
+            if let Some(id) = test_open {
+                if self.has_client(&id) {
+                    return Ok(id);
+                }
+                let lease = membership_client
+                    .expect("scheduler retry-open tests require membership authority")
+                    .begin_membership_mutation()
+                    .await
+                    .map_err(|error| anyhow::anyhow!("beginning test open publication: {error}"))?;
+                self.test_opened_federations
+                    .write()
+                    .expect("test opened federation lock poisoned")
+                    .insert(id);
+                membership_client
+                    .expect("scheduler retry-open tests require membership authority")
+                    .end_membership_mutation(lease)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("ending test open publication: {error}"))?;
+                return Ok(id);
+            }
+        }
         // Honor the recovery reservation on THIS path too, not just `join_inner` (D4 concurrency):
         // the watch scheduler calls `open_all` → `open_one` for every registered-but-unopened fed
         // each cycle, and a fed whose recovery is in flight owns its fresh partition until `recover`
@@ -645,11 +902,17 @@ impl MultiClient {
             }
             return Ok(id);
         }
-        self.clients
-            .write()
-            .expect("client map lock poisoned")
-            .insert(id, client);
+        Self::insert_client_with_membership_lease(&self.clients, id, client, membership_client)
+            .await?;
         Ok(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_retry_open_fixture(&self, db_prefix: u32, id: FederationId) {
+        self.test_open_results
+            .write()
+            .expect("test open result lock poisoned")
+            .insert(db_prefix, id);
     }
 
     /// Open a partition whose module recovery has COMPLETED into a fully-materialized client.
@@ -668,6 +931,37 @@ impl MultiClient {
             )
             .await
             .map(Arc::new)
+    }
+
+    /// Publish an already-opened client into a process map. The caller has completed every
+    /// potentially long SDK operation; actor authority covers only this membership visibility
+    /// change and advances its epoch before returning.
+    async fn insert_client_with_membership_lease<T>(
+        clients: &RwLock<BTreeMap<FederationId, Arc<T>>>,
+        id: FederationId,
+        client: Arc<T>,
+        membership_client: Option<&WalletClient>,
+    ) -> anyhow::Result<()> {
+        let lease = match membership_client {
+            Some(client) => {
+                Some(client.begin_membership_mutation().await.map_err(|error| {
+                    anyhow::anyhow!("beginning membership publication: {error}")
+                })?)
+            }
+            None => None,
+        };
+        clients
+            .write()
+            .expect("client map lock poisoned")
+            .insert(id, client);
+        match (membership_client, lease) {
+            (Some(client), Some(lease)) => client
+                .end_membership_mutation(lease)
+                .await
+                .map_err(|error| anyhow::anyhow!("ending membership publication: {error}")),
+            (None, None) => Ok(()),
+            _ => unreachable!("membership client and lease are paired"),
+        }
     }
 
     /// The next unused `db_prefix`: one past the highest already recorded in the
@@ -819,16 +1113,19 @@ impl MultiClient {
         &self,
         id: &FederationId,
         op: OperationId,
-    ) -> anyhow::Result<ReceiveState> {
-        let client = self.client(id)?;
+    ) -> Result<ReceiveState, AwaitOperationError> {
+        let client = self.client(id).map_err(AwaitOperationError::retryable)?;
         // Guard the typed await against a swapped op-id (a send op handed to the receive
         // await): the lnv2 helper would panic decoding the other leg's cached outcome, or
         // hang on an in-flight op whose state machine never yields a receive state.
         ensure_lnv2_op_kind(&client, op, Lnv2OpKind::Receive).await?;
-        let lnv2 = client.get_first_module::<LightningClientModule>()?;
+        let lnv2 = client
+            .get_first_module::<LightningClientModule>()
+            .map_err(|_| AwaitOperationError::UnsupportedLnv2Module { federation: *id })?;
         let state = lnv2
             .await_final_receive_operation_state(unbridge_op_id(op))
-            .await?;
+            .await
+            .map_err(AwaitOperationError::retryable)?;
         Ok(map_receive_state(state))
     }
 
@@ -838,15 +1135,18 @@ impl MultiClient {
         &self,
         id: &FederationId,
         op: OperationId,
-    ) -> anyhow::Result<SendState> {
-        let client = self.client(id)?;
+    ) -> Result<SendState, AwaitOperationError> {
+        let client = self.client(id).map_err(AwaitOperationError::retryable)?;
         // Symmetric guard to `await_receive`: a receive op-id handed to the send await would
         // panic/hang inside the lnv2 helper; fail cleanly on the mismatch instead.
         ensure_lnv2_op_kind(&client, op, Lnv2OpKind::Send).await?;
-        let lnv2 = client.get_first_module::<LightningClientModule>()?;
+        let lnv2 = client
+            .get_first_module::<LightningClientModule>()
+            .map_err(|_| AwaitOperationError::UnsupportedLnv2Module { federation: *id })?;
         let state = lnv2
             .await_final_send_operation_state(unbridge_op_id(op))
-            .await?;
+            .await
+            .map_err(AwaitOperationError::retryable)?;
         Ok(map_send_state(state))
     }
 
@@ -1348,6 +1648,79 @@ pub enum SendState {
     Failed(String),
 }
 
+/// Failure from an lnv2 typed await.
+///
+/// This deliberately does not use an opaque `anyhow::Error` for local op-log validation.  A raw
+/// `Pay`/`Receive` intent with a swapped, absent, or non-lnv2 operation id must fail its exact
+/// attempt rather than respawn awaiters forever.
+#[derive(Debug)]
+pub enum AwaitOperationError {
+    Retryable(String),
+    MissingOperation(OperationId),
+    NotLightningOperation {
+        operation: OperationId,
+        detail: String,
+    },
+    WrongOperationKind {
+        operation: OperationId,
+        actual: &'static str,
+        expected: &'static str,
+    },
+    UnsupportedLnv2Module {
+        federation: FederationId,
+    },
+}
+
+impl AwaitOperationError {
+    fn retryable(error: impl std::fmt::Display) -> Self {
+        Self::Retryable(error.to_string())
+    }
+
+    pub(crate) fn into_exec_error(self) -> ExecError {
+        match self {
+            Self::Retryable(message) => ExecError::Retryable(message),
+            error => ExecError::Permanent(error.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for AwaitOperationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retryable(message) => write!(f, "{message}"),
+            Self::MissingOperation(operation) => {
+                write!(
+                    f,
+                    "no operation found for id {}",
+                    unbridge_op_id(*operation).fmt_full()
+                )
+            }
+            Self::NotLightningOperation { operation, detail } => write!(
+                f,
+                "operation {} is not an lnv2 lightning operation: {detail}",
+                unbridge_op_id(*operation).fmt_full()
+            ),
+            Self::WrongOperationKind {
+                operation,
+                actual,
+                expected,
+            } => write!(
+                f,
+                "operation {} is a {actual} operation, not a {expected} — await it with \
+                 `await-{actual}` instead",
+                unbridge_op_id(*operation).fmt_full()
+            ),
+            Self::UnsupportedLnv2Module { federation } => write!(
+                f,
+                "federation {} does not provide an lnv2 lightning module",
+                federation.to_hex()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AwaitOperationError {}
+
 /// Why an lnv2 `send` produced no [`SendOutcome`] (spec §15.4). Split so the executor can tell a
 /// DETERMINISTIC rejection from a transport fault. Route rejections remain distinct from immutable
 /// invoice rejections so raw pay may adopt a new pre-fund route without changing the frozen move
@@ -1804,28 +2177,27 @@ async fn ensure_lnv2_op_kind(
     client: &ClientHandleArc,
     op: OperationId,
     expected: Lnv2OpKind,
-) -> anyhow::Result<()> {
+) -> Result<(), AwaitOperationError> {
     let fed_op = unbridge_op_id(op);
     let entry = client
         .operation_log()
         .get_operation(fed_op)
         .await
-        .ok_or_else(|| anyhow::anyhow!("no operation found for id {}", fed_op.fmt_full()))?;
-    let meta = entry.try_meta::<LightningOperationMeta>().map_err(|e| {
-        anyhow::anyhow!(
-            "operation {} is not an lnv2 lightning operation: {e}",
-            fed_op.fmt_full()
-        )
-    })?;
+        .ok_or(AwaitOperationError::MissingOperation(op))?;
+    let meta = entry
+        .try_meta::<LightningOperationMeta>()
+        .map_err(|error| AwaitOperationError::NotLightningOperation {
+            operation: op,
+            detail: error.to_string(),
+        })?;
     let actual = Lnv2OpKind::of(&meta);
-    anyhow::ensure!(
-        actual == expected,
-        "operation {} is a {} operation, not a {} — await it with `await-{}` instead",
-        fed_op.fmt_full(),
-        actual.label(),
-        expected.label(),
-        actual.label(),
-    );
+    if actual != expected {
+        return Err(AwaitOperationError::WrongOperationKind {
+            operation: op,
+            actual: actual.label(),
+            expected: expected.label(),
+        });
+    }
     Ok(())
 }
 
@@ -1882,6 +2254,7 @@ mod tests {
     use fedimint_core::db::mem_impl::MemDatabase;
     use fedimint_core::db::IRawDatabaseExt as _;
     use fedimint_core::PeerId;
+    use wallet_core::{Journal as _, Occurrence};
     // `FromStr` (for `FederationId::from_str` / `Bolt11Invoice::from_str`) comes in via
     // `use super::*` — the module already imports it for `pay`.
 
@@ -2090,6 +2463,59 @@ mod tests {
     }
 
     #[test]
+    fn typed_await_operation_errors_classify_without_message_matching() {
+        #[derive(Clone, Copy, Debug)]
+        enum ExpectedExecClass {
+            Retryable,
+            Permanent,
+        }
+
+        let operation = OperationId([0xB1; 32]);
+        let federation = FederationId([0xB2; 32]);
+        let cases = [
+            (
+                AwaitOperationError::Retryable("transport reset".to_owned()),
+                ExpectedExecClass::Retryable,
+            ),
+            (
+                AwaitOperationError::MissingOperation(operation),
+                ExpectedExecClass::Permanent,
+            ),
+            (
+                AwaitOperationError::NotLightningOperation {
+                    operation,
+                    detail: "different module".to_owned(),
+                },
+                ExpectedExecClass::Permanent,
+            ),
+            (
+                AwaitOperationError::WrongOperationKind {
+                    operation,
+                    actual: "receive",
+                    expected: "send",
+                },
+                ExpectedExecClass::Permanent,
+            ),
+            (
+                AwaitOperationError::UnsupportedLnv2Module { federation },
+                ExpectedExecClass::Permanent,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            let actual = error.into_exec_error();
+            assert!(
+                matches!(
+                    (actual, expected),
+                    (ExecError::Retryable(_), ExpectedExecClass::Retryable)
+                        | (ExecError::Permanent(_), ExpectedExecClass::Permanent)
+                ),
+                "typed await error must preserve its execution classification"
+            );
+        }
+    }
+
+    #[test]
     fn receive_state_maps_every_final_state() {
         assert_eq!(
             map_receive_state(FinalReceiveOperationState::Claimed),
@@ -2236,7 +2662,7 @@ mod tests {
         // ... yet recovery refuses at the pre-lock registration check, before any network preview
         // or partition write.
         let refused = multi_client
-            .recover(invite, &IdempotencyKey("recover:registered".to_string()))
+            .recover(invite, &IdempotencyKey("recover:registered".to_string()), 0)
             .await;
         assert!(refused.is_err());
         let message = refused.unwrap_err().to_string();
@@ -2244,6 +2670,202 @@ mod tests {
             message.contains("still registered"),
             "registered-but-unopened recovery must refuse with the 'still registered' message, \
              was: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_client_stays_absent_until_completion_then_publishes_after_atomic_done() {
+        let journal = Arc::new(FedimintJournal::new(MemDatabase::new().into_database()));
+        let fed_id = fedimint_core::config::FederationId::dummy();
+        let id = bridge_federation_id(fed_id);
+        let invite = InviteCode::new(
+            SafeUrl::parse("https://recovery-order.example").expect("valid url"),
+            PeerId::from(0),
+            fed_id,
+            None,
+        );
+        let info = FederationInfo {
+            invite: invite.to_string(),
+            db_prefix: 17,
+            joined_at: 1,
+        };
+        let key = IdempotencyKey("recover:insert-before-done".to_owned());
+        let mut intent = wallet_core::Intent::from_decision(
+            &wallet_core::AllocatorDecision {
+                action: wallet_core::Action::Recover {
+                    federation: id,
+                    invite: invite.to_string(),
+                },
+                reason: wallet_core::ReasonCode::UserInitiated,
+                occurrence: wallet_core::Occurrence(0),
+                idempotency_key: key.clone(),
+            },
+            wallet_core::Actor::User,
+            1,
+        );
+        intent.status = wallet_core::IntentStatus::Executing;
+        journal
+            .upsert(&intent)
+            .await
+            .expect("seed executing recovery");
+
+        // `()` stands in for the already-reopened handle. The generic ordering helper lets this
+        // test pause the real durable completion transaction while every process-map consumer
+        // (including scheduler/probe callers) can only observe this shared map as absent.
+        let clients = Arc::new(RwLock::new(BTreeMap::<FederationId, Arc<()>>::new()));
+        let reopened_client = Arc::new(());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task_clients = Arc::clone(&clients);
+        let task_reopened_client = Arc::clone(&reopened_client);
+        let task_journal = Arc::clone(&journal);
+        let task_invite = invite.clone();
+        let task_info = info.clone();
+        let task_key = key.clone();
+        let task = tokio::spawn(async move {
+            complete_recovery_then_insert_client(
+                &task_clients,
+                id,
+                task_reopened_client,
+                || async {
+                    let _ = started_tx.send(());
+                    release_rx
+                        .await
+                        .expect("test releases completion transaction");
+                    task_journal
+                        .complete_recovery(&id, &task_info, &task_invite, &task_key, 0)
+                        .await
+                        .map_err(|error| anyhow::anyhow!("completion transaction: {error:?}"))?
+                        .then_some(())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("recovery completion lost its executing intent")
+                        })
+                },
+            )
+            .await
+        });
+
+        started_rx
+            .await
+            .expect("completion is paused before the durable transaction");
+        assert!(
+            !clients.read().expect("client map lock").contains_key(&id),
+            "no process-map consumer can observe the recovered handle before durable completion"
+        );
+        assert_eq!(
+            journal
+                .get(&key)
+                .await
+                .expect("read paused recovery")
+                .expect("recovery intent exists")
+                .status,
+            wallet_core::IntentStatus::Executing,
+            "the paused completion leaves the membership intent nonterminal"
+        );
+
+        release_tx.send(()).expect("release completion transaction");
+        task.await
+            .expect("registration task does not panic")
+            .expect("durable completion succeeds");
+        assert_eq!(
+            journal
+                .get(&key)
+                .await
+                .expect("read completed recovery")
+                .expect("recovery intent exists")
+                .status,
+            wallet_core::IntentStatus::Done
+        );
+        assert_eq!(
+            journal
+                .get_federation(&id)
+                .await
+                .expect("read completed federation registry"),
+            Some(info),
+            "the client is published only after recovery's registry transaction commits"
+        );
+        let published = clients
+            .read()
+            .expect("client map lock")
+            .get(&id)
+            .cloned()
+            .expect("successful Done/registry completion publishes a client");
+        assert!(
+            Arc::ptr_eq(&published, &reopened_client),
+            "successful completion publishes the exact reopened client, not another handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_client_cancellation_while_completion_is_pending_never_publishes() {
+        let id = FederationId([43; 32]);
+        let clients = Arc::new(RwLock::new(BTreeMap::<FederationId, Arc<()>>::new()));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task_clients = Arc::clone(&clients);
+        let task = tokio::spawn(async move {
+            complete_recovery_then_insert_client(&task_clients, id, Arc::new(()), || async move {
+                let _ = started_tx.send(());
+                std::future::pending::<anyhow::Result<()>>().await
+            })
+            .await
+        });
+
+        started_rx
+            .await
+            .expect("completion is pending before durable completion");
+        assert!(
+            !clients.read().expect("client map lock").contains_key(&id),
+            "a pending completion has not process-published its handle"
+        );
+
+        task.abort();
+        let cancelled = task.await.expect_err("aborting the task must cancel it");
+        assert!(
+            cancelled.is_cancelled(),
+            "the completion await was cancelled"
+        );
+        assert!(
+            !clients.read().expect("client map lock").contains_key(&id),
+            "cancelling while completion is pending never process-publishes the handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_client_completion_failure_never_publishes() {
+        let id = FederationId([42; 32]);
+        let clients = RwLock::new(BTreeMap::<FederationId, Arc<()>>::new());
+        let result = complete_recovery_then_insert_client(&clients, id, Arc::new(()), || async {
+            Err(anyhow::anyhow!("injected recovery completion failure"))
+        })
+        .await;
+
+        assert!(result.is_err(), "the completion failure reaches recovery");
+        assert!(
+            !clients.read().expect("client map lock").contains_key(&id),
+            "an explicit completion failure never process-publishes the recovered handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_status_mask_tracks_handle_presence_not_the_live_reservation() {
+        let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
+        let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
+        let multi_client = MultiClient::new(db, journal_db, mnemonic).await;
+        let id = FederationId([44; 32]);
+
+        assert!(
+            multi_client.recovery_handle_missing(&id),
+            "a durable recovery with no process handle stays masked even after its reservation drops"
+        );
+        multi_client
+            .test_opened_federations
+            .write()
+            .expect("test opened federation lock")
+            .insert(id);
+        assert!(
+            !multi_client.recovery_handle_missing(&id),
+            "the mask clears as soon as retry-open restores the handle"
         );
     }
 
@@ -2287,6 +2909,63 @@ mod tests {
             "open_one must skip a reserved fed via the recovery reservation, not attempt the open"
         );
         assert!(!multi_client.has_client(&id));
+    }
+
+    #[tokio::test]
+    async fn final_open_publication_invalidates_a_preexisting_tick_token() {
+        let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
+        let mnemonic = Mnemonic::from_entropy(&[3u8; 16]).expect("valid 12-word entropy");
+        let multi_client = Arc::new(MultiClient::new(db, journal_db.clone(), mnemonic).await);
+        let journal = Arc::new(FedimintJournal::new(journal_db));
+        let runtime = crate::runtime::Runtime::new(
+            Arc::clone(&multi_client),
+            journal.clone(),
+            None,
+            None,
+            None,
+        );
+        let service = crate::service::WalletService::start_without_scheduler(runtime)
+            .await
+            .expect("start actor-only service");
+        let actor_client = service.client();
+        let old_token = actor_client
+            .issue_tick_plan_token()
+            .await
+            .expect("token before retry-open publication");
+        let clients = RwLock::new(BTreeMap::<FederationId, Arc<()>>::new());
+        let published = FederationId([42; 32]);
+
+        // This is the exact final-insert helper used by scheduler retry-open after its SDK open;
+        // it is not a manual actor begin/end. The pre-existing token must not survive the map
+        // publication that changes the scheduler's membership world.
+        MultiClient::insert_client_with_membership_lease(
+            &clients,
+            published,
+            Arc::new(()),
+            Some(&actor_client),
+        )
+        .await
+        .expect("publish opened client");
+        assert!(clients
+            .read()
+            .expect("client map lock")
+            .contains_key(&published));
+        assert!(
+            actor_client
+                .decide_tick_round(crate::service::ProbeFacts {
+                    probes: Vec::new(),
+                    occurrence: Occurrence(1),
+                    now_ms: 1,
+                    price_routes: false,
+                    blocked: wallet_core::GoalBlockers::default(),
+                    admission_snapshot: old_token,
+                })
+                .await
+                .is_err(),
+            "retry-open publication must invalidate the token minted before it"
+        );
+        service.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]

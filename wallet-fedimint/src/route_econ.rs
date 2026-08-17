@@ -10,7 +10,9 @@ use fedimint_core::runtime;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::Duration;
-use wallet_core::{AllocatorSnapshot, FederationId, Msat, RouteEconomics, RouteStatus};
+use wallet_core::{
+    AllocatorSnapshot, FederationId, GoalBlockers, Msat, RouteEconomics, RouteStatus,
+};
 
 const PPM: u128 = crate::fee::UNSOLVABLE_GATEWAY_PPM as u128;
 const BPS: u128 = 10_000;
@@ -260,8 +262,9 @@ pub(crate) async fn price_missing_pairs(
     snapshot: &AllocatorSnapshot,
     budget: &mut RouteQuoteBudget,
     priced: &mut BTreeMap<(FederationId, FederationId), RouteEconomics>,
+    blocked: &GoalBlockers,
 ) {
-    for (from, to) in funding_pairs(snapshot) {
+    for (from, to) in funding_pairs(snapshot, blocked) {
         if priced.contains_key(&(from, to)) {
             continue;
         }
@@ -391,13 +394,24 @@ fn federation_quote_sample(maximum: Msat, max_fee_bps_of_move: u16) -> Msat {
     )
 }
 
-fn funding_pairs(snapshot: &AllocatorSnapshot) -> Vec<(FederationId, FederationId)> {
-    match (snapshot.spending_fed, snapshot.standby_fed) {
+/// The ordered pairs a tick could fund, minus work conflicting with an in-flight allocator goal
+/// (br-p93). A stuck top-up removes only pairs funding the same destination, so the reverse remains
+/// priceable. A live evacuation removes either direction touching its source, whose unreserved
+/// balance the evacuation owns until it terminalizes.
+fn funding_pairs(
+    snapshot: &AllocatorSnapshot,
+    blocked: &GoalBlockers,
+) -> Vec<(FederationId, FederationId)> {
+    let pairs = match (snapshot.spending_fed, snapshot.standby_fed) {
         (Some(spending), Some(standby)) if spending != standby => {
             vec![(standby, spending), (spending, standby)]
         }
         _ => Vec::new(),
-    }
+    };
+    pairs
+        .into_iter()
+        .filter(|(from, to)| !blocked.blocks_funding_pair(*from, *to))
+        .collect()
 }
 
 fn maximum_funding_amount(
@@ -413,18 +427,22 @@ fn maximum_funding_amount(
     let (want, protected) =
         if snapshot.spending_fed == Some(to) && snapshot.standby_fed == Some(from) {
             (
-                snapshot
-                    .target_spending_balance
-                    .0
-                    .saturating_sub(destination.balance.spendable.0),
+                wallet_core::funding_shortfall(
+                    snapshot.target_spending_balance,
+                    destination.balance.spendable,
+                    snapshot.reservations.target_credit(to),
+                    0,
+                ),
                 0,
             )
         } else if snapshot.standby_fed == Some(to) && snapshot.spending_fed == Some(from) {
             (
-                snapshot
-                    .standby_target
-                    .0
-                    .saturating_sub(destination.balance.spendable.0),
+                wallet_core::funding_shortfall(
+                    snapshot.standby_target,
+                    destination.balance.spendable,
+                    snapshot.reservations.target_credit(to),
+                    0,
+                ),
                 snapshot.target_spending_balance.0,
             )
         } else {
@@ -449,6 +467,256 @@ fn maximum_funding_amount(
 mod tests {
     use super::*;
     use crate::fee;
+    use wallet_core::{
+        Action, Actor, AllocatorDecision, FedBalance, FederationStatus, IdempotencyKey, Intent,
+        Occurrence, ReasonCode, Reservations,
+    };
+
+    const SPENDING: FederationId = FederationId([0xA1; 32]);
+    const STANDBY: FederationId = FederationId([0xB2; 32]);
+
+    /// A two-federation snapshot whose SPENDING fed is below target (so `(standby, spending)` is
+    /// a fundable pair) and whose standby is at target (so the reverse pair prices nothing).
+    fn underfunded_spending_snapshot() -> AllocatorSnapshot {
+        let status = |id, spendable| FederationStatus {
+            id,
+            balance: FedBalance {
+                spendable: Msat(spendable),
+                in_flight: Msat(0),
+                claimable: Msat(0),
+                reserved_fee: Msat(0),
+            },
+            probed_ok: true,
+            reputation: 0,
+            shutdown_notice: false,
+            healthy: true,
+            eligible_to_fund: true,
+        };
+        AllocatorSnapshot {
+            federations: vec![status(SPENDING, 100_000), status(STANDBY, 5_000_000)],
+            spending_fed: Some(SPENDING),
+            standby_fed: Some(STANDBY),
+            per_fed_cap: Msat(10_000_000),
+            target_spending_balance: Msat(1_000_000),
+            standby_target: Msat(1_000_000),
+            max_fee: Msat(50_000),
+            max_fee_bps_of_move: 300,
+            evac_fee_base_msat: Msat(200_000),
+            evac_fee_bps: 300,
+            min_move: Msat(5_000),
+            route_economics_by_pair: BTreeMap::new(),
+            reservations: Reservations::default(),
+            now: 0,
+        }
+    }
+
+    /// A pending agent funding move into `to`, i.e. the in-flight goal `FundInto(to)`.
+    fn funding_in_flight(from: FederationId, to: FederationId) -> Intent {
+        funding_in_flight_amount(from, to, Msat(900_000))
+    }
+
+    fn funding_in_flight_amount(from: FederationId, to: FederationId, amount: Msat) -> Intent {
+        Intent::from_decision(
+            &AllocatorDecision {
+                action: Action::Move {
+                    from,
+                    to,
+                    amount,
+                    fee_cap: Msat(27_000),
+                    gateway: None,
+                },
+                reason: ReasonCode::SpendingBelowTarget,
+                occurrence: Occurrence(1),
+                idempotency_key: IdempotencyKey(format!(
+                    "move:{}:{}:1",
+                    from.to_hex(),
+                    to.to_hex()
+                )),
+            },
+            Actor::Agent {
+                occurrence: Occurrence(1),
+            },
+            0,
+        )
+    }
+
+    #[test]
+    fn maximum_funding_amount_prices_only_the_residual_after_pending_inbound() {
+        let mut snapshot = underfunded_spending_snapshot();
+        snapshot.reservations = wallet_core::project_reservations(&[funding_in_flight_amount(
+            STANDBY,
+            SPENDING,
+            Msat(400_000),
+        )]);
+
+        assert_eq!(
+            maximum_funding_amount(&snapshot, STANDBY, SPENDING),
+            Msat(500_000),
+            "the pending inbound credit has already covered part of the spending shortfall"
+        );
+    }
+
+    #[test]
+    fn maximum_funding_amount_is_zero_when_pending_inbound_fully_covers_the_shortfall() {
+        let mut snapshot = underfunded_spending_snapshot();
+        snapshot.reservations =
+            wallet_core::project_reservations(&[funding_in_flight(STANDBY, SPENDING)]);
+
+        assert_eq!(
+            maximum_funding_amount(&snapshot, STANDBY, SPENDING),
+            Msat(0),
+            "route pricing must not quote another funding move after the pending inbound covers it"
+        );
+    }
+
+    #[test]
+    fn external_inbound_keeps_the_full_target_shortfall_but_consumes_cap_room() {
+        let mut snapshot = underfunded_spending_snapshot();
+        snapshot
+            .reservations
+            .per_fed_inbound
+            .insert(SPENDING, Msat(400_000));
+
+        assert_eq!(
+            maximum_funding_amount(&snapshot, STANDBY, SPENDING),
+            Msat(900_000),
+            "an unpaid external inbound is not target credit"
+        );
+
+        snapshot.per_fed_cap = Msat(600_000);
+        assert_eq!(
+            maximum_funding_amount(&snapshot, STANDBY, SPENDING),
+            Msat(100_000),
+            "the same external inbound still consumes hard-cap room"
+        );
+    }
+
+    fn evacuation_in_flight(from: FederationId, to: FederationId) -> Intent {
+        Intent::from_decision(
+            &AllocatorDecision {
+                action: Action::Evacuate {
+                    from,
+                    to,
+                    amount: Msat(1),
+                    fee_cap: Msat(1),
+                    gateway: None,
+                    fee_cap_components: None,
+                },
+                reason: ReasonCode::ShutdownNotice,
+                occurrence: Occurrence(1),
+                idempotency_key: IdempotencyKey(format!(
+                    "evac:{}:{}:1",
+                    from.to_hex(),
+                    to.to_hex()
+                )),
+            },
+            Actor::Agent {
+                occurrence: Occurrence(1),
+            },
+            0,
+        )
+    }
+
+    #[test]
+    fn a_blocked_funding_destination_drops_only_its_own_ordered_pair() {
+        let snapshot = underfunded_spending_snapshot();
+        let both = vec![(STANDBY, SPENDING), (SPENDING, STANDBY)];
+        assert_eq!(
+            funding_pairs(&snapshot, &GoalBlockers::default()),
+            both,
+            "with nothing in flight both ordered pairs are priceable"
+        );
+
+        // Funding the SPENDING fed is in flight — from a THIRD federation, and at a different
+        // size, neither of which is part of the goal's identity.
+        let blocked =
+            GoalBlockers::from_intents(&[funding_in_flight(FederationId([0xC3; 32]), SPENDING)]);
+        assert_eq!(
+            funding_pairs(&snapshot, &blocked),
+            vec![(SPENDING, STANDBY)],
+            "only the pair funding the blocked destination is dropped; the reverse survives"
+        );
+
+        // The reverse direction is independent work with its own goal.
+        let reverse = GoalBlockers::from_intents(&[funding_in_flight(SPENDING, STANDBY)]);
+        assert_eq!(
+            funding_pairs(&snapshot, &reverse),
+            vec![(STANDBY, SPENDING)]
+        );
+
+        // A live evacuation owns its SOURCE balance. Both designated pairs touch that source here,
+        // so neither may spend quote I/O; an unrelated pair would remain independent.
+        let evacuating = GoalBlockers::from_intents(&[evacuation_in_flight(STANDBY, SPENDING)]);
+        assert!(funding_pairs(&snapshot, &evacuating).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_blocked_pair_spends_no_route_quote_calls() {
+        use fedimint_bip39::Mnemonic;
+        use fedimint_core::db::mem_impl::MemDatabase;
+        use fedimint_core::db::IRawDatabaseExt as _;
+
+        // No federation is open, so the first quote call for a pair FAILS — which is exactly what
+        // makes the budget an I/O seam counter here: a consumed call is a call that was made.
+        let mc = MultiClient::new(
+            MemDatabase::new().into_database(),
+            MemDatabase::new().into_database(),
+            Mnemonic::from_entropy(&[0_u8; 16]).expect("valid test mnemonic"),
+        )
+        .await;
+        let snapshot = underfunded_spending_snapshot();
+
+        let mut budget = RouteQuoteBudget::starting_at(crate::runtime::now_ms());
+        let mut priced = BTreeMap::new();
+        price_missing_pairs(
+            &mc,
+            None,
+            &snapshot,
+            &mut budget,
+            &mut priced,
+            &GoalBlockers::default(),
+        )
+        .await;
+        let spent_unblocked = MAX_ROUTE_CALLS - budget.remaining_calls;
+        assert!(
+            spent_unblocked > 0,
+            "the fundable pair reaches the gateway-quote seam when nothing blocks it"
+        );
+
+        let mut budget = RouteQuoteBudget::starting_at(crate::runtime::now_ms());
+        let mut priced = BTreeMap::new();
+        price_missing_pairs(
+            &mc,
+            None,
+            &snapshot,
+            &mut budget,
+            &mut priced,
+            &GoalBlockers::from_intents(&[funding_in_flight(STANDBY, SPENDING)]),
+        )
+        .await;
+        assert_eq!(
+            budget.remaining_calls, MAX_ROUTE_CALLS,
+            "a blocked funding destination spends no route quotes at all"
+        );
+        assert!(priced.is_empty());
+
+        let mut budget = RouteQuoteBudget::starting_at(crate::runtime::now_ms());
+        let mut priced = BTreeMap::new();
+        price_missing_pairs(
+            &mc,
+            None,
+            &snapshot,
+            &mut budget,
+            &mut priced,
+            &GoalBlockers::from_intents(&[evacuation_in_flight(STANDBY, SPENDING)]),
+        )
+        .await;
+        assert_eq!(
+            budget.remaining_calls, MAX_ROUTE_CALLS,
+            "funding pairs touching a live evacuation source spend no route quotes"
+        );
+        assert!(priced.is_empty());
+    }
 
     fn gateway(base: u64, ppm: u64) -> GatewayFee {
         GatewayFee {

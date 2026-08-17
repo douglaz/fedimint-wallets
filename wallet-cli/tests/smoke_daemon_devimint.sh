@@ -105,7 +105,7 @@ for bin in "$WALLET_CLI" "$WALLETD"; do
 done
 command -v fedimint-cli >/dev/null || { echo "FAIL: fedimint-cli not on PATH (run inside dev-fed --exec)" >&2; exit 1; }
 command -v jq >/dev/null || { echo "FAIL: jq not on PATH (it is in the fedimint nix devshell)" >&2; exit 1; }
-command -v curl >/dev/null || { echo "FAIL: curl not on PATH" >&2; exit 1; }
+command -v curl >/dev/null || { echo "FAIL: lock-pinned curl not on PATH (use run_exact_nix_develop)" >&2; exit 1; }
 
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
 RECEIVE_MSAT=500000   # our wallet receives 500 sat...

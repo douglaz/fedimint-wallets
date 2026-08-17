@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Barrier;
 use wallet_core::*;
@@ -114,6 +115,16 @@ fn move_record(intent: &Intent, phase: MovePhase) -> MoveRecord {
         } => (None, to, amount, fee_cap, false),
         _ => panic!("test record requires a move-shaped action"),
     };
+    let has_receive = phase != MovePhase::Created;
+    let has_send = send_required
+        && matches!(
+            phase,
+            MovePhase::Sending
+                | MovePhase::Settled
+                | MovePhase::Refunded
+                | MovePhase::Failed
+                | MovePhase::Stranded
+        );
     MoveRecord {
         key: intent.idempotency_key.clone(),
         from,
@@ -122,19 +133,20 @@ fn move_record(intent: &Intent, phase: MovePhase) -> MoveRecord {
         fee_cap,
         gateway: GatewayUrl("https://gateway.invalid".into()),
         send_required,
-        invoice: None,
-        recv_op: None,
-        send_op: None,
+        invoice: has_receive.then(|| Invoice("lnbc1movefixture".into())),
+        recv_op: has_receive.then_some(OperationId([0x51; 32])),
+        send_op: has_send.then_some(OperationId([0x52; 32])),
         phase,
         outcome: None,
-        preimage: None,
+        preimage: (send_required && matches!(phase, MovePhase::Settled | MovePhase::Stranded))
+            .then_some(Preimage([0x53; 32])),
         receive_fee_quoted: None,
         send_fee_quoted: None,
     }
 }
 
 #[test]
-fn reservation_projection_covers_every_phase6a_table_row() {
+fn strict_reservation_projection_covers_every_phase6a_table_row() {
     let from = FederationId([1; 32]);
     let to = FederationId([2; 32]);
     let move_action = Action::Move {
@@ -146,40 +158,15 @@ fn reservation_projection_covers_every_phase6a_table_row() {
     };
 
     for status in [IntentStatus::Pending, IntentStatus::Executing] {
-        for phase in [None, Some(MovePhase::Created), Some(MovePhase::Invoiced)] {
-            let intent = intent_for(move_action.clone(), status);
-            let record = phase.map(|phase| move_record(&intent, phase));
-            let reservations =
-                project_reservations(std::slice::from_ref(&intent), |_| record.clone());
-            assert_eq!(reservations.outbound(from), Msat(107));
-            assert_eq!(reservations.inbound(to), Msat(100));
-        }
-    }
-
-    let sending = intent_for(move_action.clone(), IntentStatus::Executing);
-    let sending_record = move_record(&sending, MovePhase::Sending);
-    let reservations = project_reservations(std::slice::from_ref(&sending), |_| {
-        Some(sending_record.clone())
-    });
-    assert_eq!(reservations.outbound(from), Msat(0));
-    assert_eq!(reservations.inbound(to), Msat(100));
-
-    for phase in [
-        MovePhase::Settled,
-        MovePhase::Refunded,
-        MovePhase::Failed,
-        MovePhase::Stranded,
-    ] {
-        let intent = intent_for(move_action.clone(), IntentStatus::Executing);
-        let record = move_record(&intent, phase);
-        let reservations =
-            project_reservations(std::slice::from_ref(&intent), |_| Some(record.clone()));
-        assert_eq!(reservations, Reservations::default());
+        let intent = intent_for(move_action.clone(), status);
+        let reservations = project_reservations(std::slice::from_ref(&intent));
+        assert_eq!(reservations.outbound(from), Msat(107));
+        assert_eq!(reservations.inbound(to), Msat(100));
     }
 
     for status in [IntentStatus::Done, IntentStatus::Failed] {
         let intent = intent_for(move_action.clone(), status);
-        let reservations = project_reservations(std::slice::from_ref(&intent), |_| None);
+        let reservations = project_reservations(std::slice::from_ref(&intent));
         assert_eq!(reservations, Reservations::default());
     }
 
@@ -191,7 +178,7 @@ fn reservation_projection_covers_every_phase6a_table_row() {
         },
         IntentStatus::Awaiting,
     );
-    let reservations = project_reservations(std::slice::from_ref(&inflow), |_| None);
+    let reservations = project_reservations(std::slice::from_ref(&inflow));
     assert_eq!(reservations.outbound(from), Msat(0));
     assert_eq!(reservations.inbound(to), Msat(55));
 
@@ -206,21 +193,9 @@ fn reservation_projection_covers_every_phase6a_table_row() {
         },
         IntentStatus::Pending,
     );
-    let reservations = project_reservations(std::slice::from_ref(&evacuate), |_| None);
-    assert_eq!(reservations.outbound(from), Msat(0));
+    let reservations = project_reservations(std::slice::from_ref(&evacuate));
+    assert_eq!(reservations.outbound(from), Msat(49));
     assert_eq!(reservations.inbound(to), Msat(40));
-
-    let mut downsized_evacuation = move_record(&evacuate, MovePhase::Created);
-    downsized_evacuation.amount = Msat(25);
-    let reservations = project_reservations(std::slice::from_ref(&evacuate), |_| {
-        Some(downsized_evacuation.clone())
-    });
-    assert_eq!(reservations.outbound(from), Msat(0));
-    assert_eq!(
-        reservations.inbound(to),
-        Msat(25),
-        "the durable executable amount replaces the intent's original evacuation ask"
-    );
 
     let receive = intent_for(
         Action::Receive {
@@ -232,9 +207,14 @@ fn reservation_projection_covers_every_phase6a_table_row() {
         },
         IntentStatus::Awaiting,
     );
-    let reservations = project_reservations(std::slice::from_ref(&receive), |_| None);
+    let reservations = project_reservations(std::slice::from_ref(&receive));
     assert_eq!(reservations.outbound(from), Msat(0));
     assert_eq!(reservations.inbound(to), Msat(70));
+    assert_eq!(
+        reservations.target_credit(to),
+        Msat(0),
+        "an external Receive consumes cap room but is not a wallet-delivered target credit"
+    );
 
     let join = intent_for(
         Action::Join {
@@ -245,13 +225,13 @@ fn reservation_projection_covers_every_phase6a_table_row() {
         IntentStatus::Executing,
     );
     assert_eq!(
-        project_reservations(std::slice::from_ref(&join), |_| None),
+        project_reservations(std::slice::from_ref(&join)),
         Reservations::default()
     );
 }
 
 #[test]
-fn raw_pay_reservation_ends_at_the_durable_send_artifact() {
+fn strict_raw_pay_reservation_ends_only_at_the_durable_intent_terminal() {
     let from = FederationId([1; 32]);
     let action = Action::Pay {
         from,
@@ -263,15 +243,403 @@ fn raw_pay_reservation_ends_at_the_durable_send_artifact() {
     };
     let pre_fund = intent_for(action.clone(), IntentStatus::Pending);
     assert_eq!(
-        project_reservations(std::slice::from_ref(&pre_fund), |_| None).outbound(from),
+        project_reservations(std::slice::from_ref(&pre_fund)).outbound(from),
         Msat(107)
     );
 
     let mut post_fund = pre_fund;
     post_fund.operation_id = Some(OperationId([3; 32]));
     assert_eq!(
-        project_reservations(std::slice::from_ref(&post_fund), |_| None).outbound(from),
-        Msat(0)
+        project_reservations(std::slice::from_ref(&post_fund)).outbound(from),
+        Msat(107)
+    );
+    assert_eq!(
+        project_allocator_reservations(std::slice::from_ref(&post_fund), &BTreeMap::new())
+            .outbound(from),
+        Msat(0),
+        "only the serialized allocator view absorbs an issued raw pay"
+    );
+}
+
+#[test]
+fn allocator_projection_tracks_move_and_evacuation_artifact_phases() {
+    let from = FederationId([1; 32]);
+    let to = FederationId([2; 32]);
+    let move_intent = intent_for(
+        Action::Move {
+            from,
+            to,
+            amount: Msat(100),
+            fee_cap: Msat(7),
+            gateway: None,
+        },
+        IntentStatus::Executing,
+    );
+    for (phase, outbound, inbound) in [
+        (MovePhase::Created, 107, 100),
+        (MovePhase::Invoiced, 107, 100),
+        (MovePhase::Sending, 0, 100),
+        (MovePhase::Settled, 0, 0),
+        (MovePhase::Refunded, 0, 0),
+        (MovePhase::Failed, 0, 0),
+        (MovePhase::Stranded, 0, 0),
+    ] {
+        let record = move_record(&move_intent, phase);
+        let reservations = project_allocator_reservations(
+            std::slice::from_ref(&move_intent),
+            &BTreeMap::from([(move_intent.idempotency_key.clone(), record)]),
+        );
+        assert_eq!(
+            reservations.outbound(from),
+            Msat(outbound),
+            "Move {phase:?} outbound"
+        );
+        assert_eq!(
+            reservations.inbound(to),
+            Msat(inbound),
+            "Move {phase:?} inbound"
+        );
+        assert_eq!(
+            reservations.target_credit(to),
+            Msat(inbound),
+            "Move {phase:?} target credit"
+        );
+    }
+
+    let components = EvacFeeCap {
+        base_msat: Msat(4),
+        bps: 500,
+    };
+    let evacuation = intent_for(
+        Action::Evacuate {
+            from,
+            to,
+            amount: Msat(100),
+            fee_cap: components.at(Msat(100)),
+            gateway: None,
+            fee_cap_components: Some(components),
+        },
+        IntentStatus::Executing,
+    );
+    for (phase, outbound, inbound) in [
+        (MovePhase::Created, 109, 100),
+        (MovePhase::Invoiced, 67, 60),
+        (MovePhase::Sending, 0, 60),
+        (MovePhase::Settled, 0, 0),
+        (MovePhase::Refunded, 0, 0),
+        (MovePhase::Failed, 0, 0),
+        (MovePhase::Stranded, 0, 0),
+    ] {
+        let mut record = move_record(&evacuation, phase);
+        record.amount = Msat(60);
+        record.fee_cap = components.at(record.amount);
+        let reservations = project_allocator_reservations(
+            std::slice::from_ref(&evacuation),
+            &BTreeMap::from([(evacuation.idempotency_key.clone(), record)]),
+        );
+        assert_eq!(
+            reservations.outbound(from),
+            Msat(outbound),
+            "Evacuate {phase:?} outbound"
+        );
+        assert_eq!(
+            reservations.inbound(to),
+            Msat(inbound),
+            "Evacuate {phase:?} inbound"
+        );
+        assert_eq!(
+            reservations.target_credit(to),
+            Msat(inbound),
+            "Evacuate {phase:?} target credit"
+        );
+    }
+
+    let mut incorrect_downsized_cap = move_record(&evacuation, MovePhase::Invoiced);
+    incorrect_downsized_cap.amount = Msat(60);
+    incorrect_downsized_cap.fee_cap = Msat(6);
+    assert_eq!(
+        project_allocator_reservations(
+            std::slice::from_ref(&evacuation),
+            &BTreeMap::from([(evacuation.idempotency_key.clone(), incorrect_downsized_cap,)]),
+        ),
+        project_reservations(std::slice::from_ref(&evacuation)),
+        "a downsized evacuation must retain the component-derived cap"
+    );
+
+    let legacy_evacuation = intent_for(
+        Action::Evacuate {
+            from,
+            to,
+            amount: Msat(100),
+            fee_cap: Msat(7),
+            gateway: None,
+            fee_cap_components: None,
+        },
+        IntentStatus::Executing,
+    );
+    let mut legacy_downsized = move_record(&legacy_evacuation, MovePhase::Invoiced);
+    legacy_downsized.amount = Msat(60);
+    assert_eq!(
+        project_allocator_reservations(
+            std::slice::from_ref(&legacy_evacuation),
+            &BTreeMap::from([(legacy_evacuation.idempotency_key.clone(), legacy_downsized,)]),
+        ),
+        Reservations {
+            per_fed_outbound: BTreeMap::from([(from, Msat(67))]),
+            per_fed_inbound: BTreeMap::from([(to, Msat(60))]),
+            per_fed_target_credit: BTreeMap::from([(to, Msat(60))]),
+        },
+        "a legacy evacuation may downsize while retaining its planned absolute cap"
+    );
+}
+
+#[test]
+fn allocator_projection_tracks_receive_only_artifact_phases() {
+    let to = FederationId([2; 32]);
+    let intent = intent_for(
+        Action::DirectInflow {
+            to,
+            amount: Msat(55),
+            fee_cap: Msat(3),
+        },
+        IntentStatus::Awaiting,
+    );
+    for (phase, inbound) in [
+        (MovePhase::Created, 55),
+        (MovePhase::Invoiced, 55),
+        (MovePhase::Settled, 0),
+        (MovePhase::Failed, 0),
+    ] {
+        let record = move_record(&intent, phase);
+        let reservations = project_allocator_reservations(
+            std::slice::from_ref(&intent),
+            &BTreeMap::from([(intent.idempotency_key.clone(), record)]),
+        );
+        assert_eq!(reservations.inbound(to), Msat(inbound), "{phase:?} inbound");
+        assert_eq!(
+            reservations.target_credit(to),
+            Msat(0),
+            "{phase:?} external DirectInflow is never target credit"
+        );
+    }
+
+    for phase in [MovePhase::Sending, MovePhase::Refunded, MovePhase::Stranded] {
+        let record = move_record(&intent, phase);
+        assert_eq!(
+            project_allocator_reservations(
+                std::slice::from_ref(&intent),
+                &BTreeMap::from([(intent.idempotency_key.clone(), record)]),
+            ),
+            project_reservations(std::slice::from_ref(&intent)),
+            "DirectInflow {phase:?} is impossible and must remain strict"
+        );
+    }
+
+    let strict = project_reservations(std::slice::from_ref(&intent));
+    let mut smaller_amount = move_record(&intent, MovePhase::Invoiced);
+    smaller_amount.amount = Msat(54);
+    assert_eq!(
+        project_allocator_reservations(
+            std::slice::from_ref(&intent),
+            &BTreeMap::from([(intent.idempotency_key.clone(), smaller_amount)]),
+        ),
+        strict,
+        "a DirectInflow record cannot reduce its exact-net amount"
+    );
+    let mut smaller_fee_cap = move_record(&intent, MovePhase::Settled);
+    smaller_fee_cap.fee_cap = Msat(2);
+    assert_eq!(
+        project_allocator_reservations(
+            std::slice::from_ref(&intent),
+            &BTreeMap::from([(intent.idempotency_key.clone(), smaller_fee_cap)]),
+        ),
+        strict,
+        "a DirectInflow record cannot reduce its exact-net fee cap"
+    );
+
+    for phase in [
+        MovePhase::Created,
+        MovePhase::Invoiced,
+        MovePhase::Sending,
+        MovePhase::Settled,
+        MovePhase::Refunded,
+        MovePhase::Failed,
+        MovePhase::Stranded,
+    ] {
+        let mut with_send_op = move_record(&intent, phase);
+        with_send_op.send_op = Some(OperationId([0x81; 32]));
+        assert_eq!(
+            project_allocator_reservations(
+                std::slice::from_ref(&intent),
+                &BTreeMap::from([(intent.idempotency_key.clone(), with_send_op)]),
+            ),
+            strict,
+            "DirectInflow {phase:?} with a sender operation is strict"
+        );
+
+        let mut with_preimage = move_record(&intent, phase);
+        with_preimage.preimage = Some(Preimage([0x82; 32]));
+        assert_eq!(
+            project_allocator_reservations(
+                std::slice::from_ref(&intent),
+                &BTreeMap::from([(intent.idempotency_key.clone(), with_preimage)]),
+            ),
+            strict,
+            "DirectInflow {phase:?} with a sender preimage is strict"
+        );
+
+        let mut with_send_fee = move_record(&intent, phase);
+        with_send_fee.send_fee_quoted = Some(Msat(1));
+        assert_eq!(
+            project_allocator_reservations(
+                std::slice::from_ref(&intent),
+                &BTreeMap::from([(intent.idempotency_key.clone(), with_send_fee)]),
+            ),
+            strict,
+            "DirectInflow {phase:?} with a sender fee quote is strict"
+        );
+    }
+}
+
+#[test]
+fn allocator_projection_falls_back_strictly_for_untrusted_records() {
+    let from = FederationId([1; 32]);
+    let to = FederationId([2; 32]);
+    let intent = intent_for(
+        Action::Move {
+            from,
+            to,
+            amount: Msat(100),
+            fee_cap: Msat(7),
+            gateway: None,
+        },
+        IntentStatus::Executing,
+    );
+    let strict = project_reservations(std::slice::from_ref(&intent));
+    assert_eq!(
+        project_allocator_reservations(std::slice::from_ref(&intent), &BTreeMap::new()),
+        strict,
+        "a missing record is strict"
+    );
+
+    let valid = move_record(&intent, MovePhase::Sending);
+    let mut smaller_amount = valid.clone();
+    smaller_amount.amount = Msat(99);
+    assert_eq!(
+        project_allocator_reservations(
+            std::slice::from_ref(&intent),
+            &BTreeMap::from([(intent.idempotency_key.clone(), smaller_amount)]),
+        ),
+        strict,
+        "a Sending Move record cannot reduce its exact-net amount"
+    );
+    let mut smaller_fee_cap = valid.clone();
+    smaller_fee_cap.fee_cap = Msat(6);
+    assert_eq!(
+        project_allocator_reservations(
+            std::slice::from_ref(&intent),
+            &BTreeMap::from([(intent.idempotency_key.clone(), smaller_fee_cap)]),
+        ),
+        strict,
+        "a Sending Move record cannot reduce its exact-net fee cap"
+    );
+
+    let mut malformed = Vec::new();
+    let mut wrong_key = valid.clone();
+    wrong_key.key = ikey("other");
+    malformed.push(wrong_key);
+    let mut wrong_from = valid.clone();
+    wrong_from.from = Some(FederationId([3; 32]));
+    malformed.push(wrong_from);
+    let mut wrong_to = valid.clone();
+    wrong_to.to = FederationId([4; 32]);
+    malformed.push(wrong_to);
+    let mut wrong_direction = valid.clone();
+    wrong_direction.send_required = false;
+    malformed.push(wrong_direction);
+    let mut missing_invoice = valid.clone();
+    missing_invoice.invoice = None;
+    malformed.push(missing_invoice);
+    let mut missing_receive_op = valid.clone();
+    missing_receive_op.recv_op = None;
+    malformed.push(missing_receive_op);
+    let mut missing_send_op = valid.clone();
+    missing_send_op.send_op = None;
+    malformed.push(missing_send_op);
+    let mut zero_amount = valid.clone();
+    zero_amount.amount = Msat(0);
+    malformed.push(zero_amount);
+    let mut oversized = valid.clone();
+    oversized.amount = Msat(101);
+    malformed.push(oversized);
+    let mut over_cap = valid;
+    over_cap.fee_cap = Msat(8);
+    malformed.push(over_cap);
+
+    for record in malformed {
+        assert_eq!(
+            project_allocator_reservations(
+                std::slice::from_ref(&intent),
+                &BTreeMap::from([(intent.idempotency_key.clone(), record)]),
+            ),
+            strict
+        );
+    }
+
+    let mut settled_without_preimage = move_record(&intent, MovePhase::Settled);
+    settled_without_preimage.preimage = None;
+    assert_eq!(
+        project_allocator_reservations(
+            std::slice::from_ref(&intent),
+            &BTreeMap::from([(intent.idempotency_key.clone(), settled_without_preimage,)]),
+        ),
+        strict,
+        "a terminal-looking send without settlement evidence is strict"
+    );
+
+    for phase in [MovePhase::Refunded, MovePhase::Failed] {
+        let mut impossible_preimage = move_record(&intent, phase);
+        impossible_preimage.preimage = Some(Preimage([0x54; 32]));
+        assert_eq!(
+            project_allocator_reservations(
+                std::slice::from_ref(&intent),
+                &BTreeMap::from([(intent.idempotency_key.clone(), impossible_preimage)]),
+            ),
+            strict,
+            "a send-required {phase:?} with a settlement preimage is strict"
+        );
+    }
+
+    let mut terminal = intent.clone();
+    terminal.status = IntentStatus::Done;
+    assert_eq!(
+        project_allocator_reservations(
+            std::slice::from_ref(&terminal),
+            &BTreeMap::from([(
+                terminal.idempotency_key.clone(),
+                move_record(&terminal, MovePhase::Sending),
+            )]),
+        ),
+        Reservations::default(),
+        "terminal Intent status wins over stale derived state"
+    );
+
+    let mut receive = intent_for(
+        Action::Receive {
+            to,
+            amount: Msat(70),
+            fee_cap: Msat(4),
+            nonce: "allocator-receive".to_owned(),
+            gateway: None,
+        },
+        IntentStatus::Awaiting,
+    );
+    receive.operation_id = Some(OperationId([0x44; 32]));
+    assert_eq!(
+        project_allocator_reservations(std::slice::from_ref(&receive), &BTreeMap::new())
+            .inbound(to),
+        Msat(70),
+        "raw Receive remains strict until its Intent terminalizes"
     );
 }
 
@@ -284,12 +652,76 @@ struct GetFailsJournal {
 enum ScanFailure {
     Pending,
     Awaiting,
-    MoveRecord,
 }
 
 struct ScanFailsJournal {
     inner: MemJournal,
     failure: ScanFailure,
+}
+
+/// Models an ambiguous new-intent write: the durable row is present, but the caller sees an error.
+/// Allocator batch admission must reserve the attempted action before considering a sibling.
+struct CommitThenErrorJournal {
+    inner: MemJournal,
+    fail_next_upsert: Mutex<bool>,
+}
+
+#[async_trait]
+impl Journal for CommitThenErrorJournal {
+    async fn upsert(&self, intent: &Intent) -> Result<(), ExecError> {
+        self.inner.upsert(intent).await?;
+        let mut fail_next = self
+            .fail_next_upsert
+            .lock()
+            .expect("commit-then-error mutex poisoned");
+        if std::mem::take(&mut *fail_next) {
+            Err(ExecError::Retryable(
+                "injected commit-then-error upsert".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn get(&self, key: &IdempotencyKey) -> Result<Option<Intent>, ExecError> {
+        self.inner.get(key).await
+    }
+
+    async fn set_status(
+        &self,
+        key: &IdempotencyKey,
+        expected_attempt: u32,
+        status: IntentStatus,
+        error: Option<&str>,
+    ) -> Result<(), ExecError> {
+        self.inner
+            .set_status(key, expected_attempt, status, error)
+            .await
+    }
+
+    async fn set_status_if(
+        &self,
+        key: &IdempotencyKey,
+        expected_attempt: u32,
+        expected: IntentStatus,
+        new: IntentStatus,
+    ) -> Result<bool, ExecError> {
+        self.inner
+            .set_status_if(key, expected_attempt, expected, new)
+            .await
+    }
+
+    async fn pending(&self) -> Result<Vec<Intent>, ExecError> {
+        self.inner.pending().await
+    }
+
+    async fn awaiting(&self) -> Result<Vec<Intent>, ExecError> {
+        self.inner.awaiting().await
+    }
+
+    async fn failed(&self) -> Vec<Intent> {
+        self.inner.failed().await
+    }
 }
 
 #[async_trait]
@@ -305,19 +737,25 @@ impl Journal for ScanFailsJournal {
     async fn set_status(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         status: IntentStatus,
         error: Option<&str>,
     ) -> Result<(), ExecError> {
-        self.inner.set_status(key, status, error).await
+        self.inner
+            .set_status(key, expected_attempt, status, error)
+            .await
     }
 
     async fn set_status_if(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         expected: IntentStatus,
         new: IntentStatus,
     ) -> Result<bool, ExecError> {
-        self.inner.set_status_if(key, expected, new).await
+        self.inner
+            .set_status_if(key, expected_attempt, expected, new)
+            .await
     }
 
     async fn pending(&self) -> Result<Vec<Intent>, ExecError> {
@@ -339,9 +777,6 @@ impl Journal for ScanFailsJournal {
     }
 
     async fn move_record(&self, key: &IdempotencyKey) -> Result<Option<MoveRecord>, ExecError> {
-        if matches!(self.failure, ScanFailure::MoveRecord) {
-            return Err(ExecError::Retryable("move record unavailable".into()));
-        }
         self.inner.move_record(key).await
     }
 }
@@ -366,20 +801,11 @@ async fn admission_fails_closed_when_any_reservation_scan_read_errors() {
     for (failure, expected) in [
         (ScanFailure::Pending, "pending scan unavailable"),
         (ScanFailure::Awaiting, "awaiting scan unavailable"),
-        (ScanFailure::MoveRecord, "move record unavailable"),
     ] {
         let journal = ScanFailsJournal {
             inner: MemJournal::new(),
             failure,
         };
-        if matches!(failure, ScanFailure::MoveRecord) {
-            let existing = move_decision("existing-move", 10);
-            journal
-                .inner
-                .upsert(&Intent::from_decision(&existing, Actor::User, 0))
-                .await
-                .expect("seed pending move");
-        }
         let decision = pay_decision("pay-a", FederationId([1; 32]), 10, 1);
         let balances = std::collections::BTreeMap::from([(FederationId([1; 32]), Msat(100))]);
         let error = decide_and_journal(&journal, &decision, Actor::User, 0, Some(&balances), None)
@@ -407,13 +833,23 @@ async fn cross_operation_reservations_gate_source_and_destination_admission() {
         Err(ExecError::Permanent(reason)) if reason.contains("insufficient balance after reservations")
     ));
 
+    let mut first_with_artifact = Intent::from_decision(&first, Actor::User, 0);
+    first_with_artifact.operation_id = Some(OperationId([8; 32]));
     journal
-        .set_operation_artifact(&first.idempotency_key, OperationId([8; 32]), None)
+        .upsert(&first_with_artifact)
         .await
-        .expect("funding artifact");
+        .expect("seed funding artifact state");
+    assert!(matches!(
+        decide_and_journal(&journal, &second, Actor::User, 0, Some(&balances), None).await,
+        Err(ExecError::Permanent(reason)) if reason.contains("insufficient balance after reservations")
+    ));
+    journal
+        .set_status(&first.idempotency_key, 0, IntentStatus::Done, None)
+        .await
+        .expect("actor-routed terminal status");
     decide_and_journal(&journal, &second, Actor::User, 0, Some(&balances), None)
         .await
-        .expect("post-fund pay no longer double counts the live balance debit");
+        .expect("terminal intent releases the reservation");
 
     let inflow = decision(
         "inflow-a",
@@ -475,6 +911,129 @@ async fn cross_operation_reservations_gate_source_and_destination_admission() {
     )
     .await
     .expect("evacuation admission must not pre-reserve amount plus fee on its source");
+}
+
+#[tokio::test]
+async fn allocator_apply_fails_closed_after_a_fresh_upsert_commits_then_errors() {
+    let from = FederationId([1; 32]);
+    let journal = CommitThenErrorJournal {
+        inner: MemJournal::new(),
+        fail_next_upsert: Mutex::new(true),
+    };
+    let first = move_decision("commit-then-error-first", 100);
+    let sibling = move_decision("commit-then-error-sibling", 50);
+    let balances = BTreeMap::from([(from, Msat(160))]);
+
+    let summary = apply_with_allocator_admission(
+        &journal,
+        &MockExecutor::new(),
+        &[first.clone(), sibling.clone()],
+        Actor::Agent {
+            occurrence: Occurrence(1),
+        },
+        1,
+        Some(&balances),
+        None,
+        Reservations::default(),
+    )
+    .await;
+
+    assert_eq!(summary.failed, 2, "{summary:#?}");
+    assert_eq!(summary.performed, 0, "{summary:#?}");
+    assert!(
+        journal
+            .get(&first.idempotency_key)
+            .await
+            .expect("read ambiguously committed first decision")
+            .is_some(),
+        "the injected first upsert must have committed before reporting its error"
+    );
+    assert_eq!(
+        journal
+            .get(&sibling.idempotency_key)
+            .await
+            .expect("read sibling after failed-closed admission"),
+        None,
+        "the sibling must not be admitted against the stale allocator snapshot"
+    );
+}
+
+#[tokio::test]
+async fn exclusive_allocator_apply_accepts_its_phase_aware_evacuation_plan() {
+    let from = FederationId([1; 32]);
+    let to = FederationId([2; 32]);
+    let inflow_decision = decision(
+        "settled-inflow",
+        Action::DirectInflow {
+            to,
+            amount: Msat(60),
+            fee_cap: Msat(1),
+        },
+        ReasonCode::UserInitiated,
+    );
+    let mut inflow = Intent::from_decision(&inflow_decision, Actor::User, 0);
+    inflow.status = IntentStatus::Awaiting;
+    let mut settled = move_record(&inflow, MovePhase::Settled);
+    settled.amount = Msat(60);
+    let allocator_reservations = project_allocator_reservations(
+        std::slice::from_ref(&inflow),
+        &BTreeMap::from([(inflow.idempotency_key.clone(), settled)]),
+    );
+    assert_eq!(allocator_reservations.inbound(to), Msat(0));
+
+    let evacuation = decision(
+        "planned-evacuation",
+        Action::Evacuate {
+            from,
+            to,
+            amount: Msat(1),
+            fee_cap: Msat(0),
+            gateway: None,
+            fee_cap_components: None,
+        },
+        ReasonCode::ShutdownNotice,
+    );
+    let balances = BTreeMap::from([(from, Msat(1)), (to, Msat(40))]);
+
+    let strict_journal = MemJournal::new();
+    strict_journal
+        .upsert(&inflow)
+        .await
+        .expect("seed nonterminal outer inflow");
+    let strict = apply_with_admission(
+        &strict_journal,
+        &MockExecutor::new(),
+        std::slice::from_ref(&evacuation),
+        Actor::Agent {
+            occurrence: Occurrence(1),
+        },
+        1,
+        Some(&balances),
+        Some(Msat(100)),
+    )
+    .await;
+    assert_eq!(strict.failed, 1, "generic admission remains strict");
+
+    let allocator_journal = MemJournal::new();
+    allocator_journal
+        .upsert(&inflow)
+        .await
+        .expect("seed nonterminal outer inflow");
+    let applied = apply_with_allocator_admission(
+        &allocator_journal,
+        &MockExecutor::new(),
+        std::slice::from_ref(&evacuation),
+        Actor::Agent {
+            occurrence: Occurrence(1),
+        },
+        1,
+        Some(&balances),
+        Some(Msat(100)),
+        allocator_reservations,
+    )
+    .await;
+    assert_eq!(applied.performed, 1);
+    assert_eq!(applied.failed, 0);
 }
 
 #[tokio::test]
@@ -827,6 +1386,7 @@ impl Journal for GetFailsJournal {
     async fn set_status(
         &self,
         _key: &IdempotencyKey,
+        _expected_attempt: u32,
         _status: IntentStatus,
         _error: Option<&str>,
     ) -> Result<(), ExecError> {
@@ -836,6 +1396,7 @@ impl Journal for GetFailsJournal {
     async fn set_status_if(
         &self,
         _key: &IdempotencyKey,
+        _expected_attempt: u32,
         _expected: IntentStatus,
         _new: IntentStatus,
     ) -> Result<bool, ExecError> {
@@ -874,20 +1435,26 @@ impl Journal for BarrierJournal {
     async fn set_status(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         status: IntentStatus,
         error: Option<&str>,
     ) -> Result<(), ExecError> {
-        self.inner.set_status(key, status, error).await
+        self.inner
+            .set_status(key, expected_attempt, status, error)
+            .await
     }
 
     async fn set_status_if(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         expected: IntentStatus,
         new: IntentStatus,
     ) -> Result<bool, ExecError> {
         self.barrier.wait().await;
-        self.inner.set_status_if(key, expected, new).await
+        self.inner
+            .set_status_if(key, expected_attempt, expected, new)
+            .await
     }
 
     async fn pending(&self) -> Result<Vec<Intent>, ExecError> {
@@ -921,19 +1488,25 @@ impl Journal for DelayedPendingJournal {
     async fn set_status(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         status: IntentStatus,
         error: Option<&str>,
     ) -> Result<(), ExecError> {
-        self.inner.set_status(key, status, error).await
+        self.inner
+            .set_status(key, expected_attempt, status, error)
+            .await
     }
 
     async fn set_status_if(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         expected: IntentStatus,
         new: IntentStatus,
     ) -> Result<bool, ExecError> {
-        self.inner.set_status_if(key, expected, new).await
+        self.inner
+            .set_status_if(key, expected_attempt, expected, new)
+            .await
     }
 
     async fn pending(&self) -> Result<Vec<Intent>, ExecError> {
@@ -1233,6 +1806,42 @@ async fn reconcile_redrives_executing_intent_after_crash() {
         journal.get(&ikey(key)).await.expect("get").unwrap().status,
         IntentStatus::Done
     );
+}
+
+#[tokio::test]
+async fn stale_executing_attempt_n_skips_without_performing_attempt_n_plus_one() {
+    let key = "move:executing-stale-attempt";
+    let mut stale = Intent::from_decision(&move_decision(key, 42), Actor::User, 0);
+    stale.status = IntentStatus::Executing;
+    let mut current = stale.clone();
+    current.attempt = 1;
+
+    let journal = MemJournal::new();
+    let executor = MockExecutor::new();
+    journal
+        .upsert(&current)
+        .await
+        .expect("seed current Executing N+1");
+    let mut summary = ExecutionSummary::default();
+
+    assert_eq!(
+        drive_intent_step(&journal, &executor, &stale, &mut summary)
+            .await
+            .expect("stale snapshot is skipped"),
+        None
+    );
+    assert!(
+        executor.performed_keys().is_empty(),
+        "N must not perform a side effect"
+    );
+    assert_eq!(summary.skipped, 1);
+    let preserved = journal
+        .get(&ikey(key))
+        .await
+        .expect("read current")
+        .expect("current exists");
+    assert_eq!(preserved.attempt, 1);
+    assert_eq!(preserved.status, IntentStatus::Executing);
 }
 
 #[tokio::test]
@@ -1578,7 +2187,12 @@ async fn set_status_if_cas() {
 
     assert_eq!(
         journal
-            .set_status_if(&key, IntentStatus::Pending, IntentStatus::Executing)
+            .set_status_if(
+                &key,
+                intent.attempt,
+                IntentStatus::Pending,
+                IntentStatus::Executing
+            )
             .await,
         Ok(true)
     );
@@ -1590,7 +2204,12 @@ async fn set_status_if_cas() {
     // Already Executing: a second claim against the stale `expected` (Pending) must not win.
     assert_eq!(
         journal
-            .set_status_if(&key, IntentStatus::Pending, IntentStatus::Executing)
+            .set_status_if(
+                &key,
+                intent.attempt,
+                IntentStatus::Pending,
+                IntentStatus::Executing
+            )
             .await,
         Ok(false)
     );
@@ -1603,7 +2222,12 @@ async fn set_status_if_cas() {
     let missing = ikey("no-such-key");
     assert_eq!(
         journal
-            .set_status_if(&missing, IntentStatus::Pending, IntentStatus::Executing)
+            .set_status_if(
+                &missing,
+                intent.attempt,
+                IntentStatus::Pending,
+                IntentStatus::Executing
+            )
             .await,
         Ok(false)
     );
@@ -1664,6 +2288,7 @@ impl Journal for RecordingJournal {
     async fn set_status(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         status: IntentStatus,
         error: Option<&str>,
     ) -> Result<(), ExecError> {
@@ -1671,16 +2296,21 @@ impl Journal for RecordingJournal {
             .lock()
             .expect("mutex poisoned")
             .push((status, error.map(str::to_owned)));
-        self.inner.set_status(key, status, error).await
+        self.inner
+            .set_status(key, expected_attempt, status, error)
+            .await
     }
 
     async fn set_status_if(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         expected: IntentStatus,
         new: IntentStatus,
     ) -> Result<bool, ExecError> {
-        self.inner.set_status_if(key, expected, new).await
+        self.inner
+            .set_status_if(key, expected_attempt, expected, new)
+            .await
     }
 
     async fn pending(&self) -> Result<Vec<Intent>, ExecError> {
@@ -1718,6 +2348,7 @@ impl Journal for TerminalWriteFailsJournal {
     async fn set_status(
         &self,
         _key: &IdempotencyKey,
+        _expected_attempt: u32,
         _status: IntentStatus,
         _error: Option<&str>,
     ) -> Result<(), ExecError> {
@@ -1727,10 +2358,13 @@ impl Journal for TerminalWriteFailsJournal {
     async fn set_status_if(
         &self,
         key: &IdempotencyKey,
+        expected_attempt: u32,
         expected: IntentStatus,
         new: IntentStatus,
     ) -> Result<bool, ExecError> {
-        self.inner.set_status_if(key, expected, new).await
+        self.inner
+            .set_status_if(key, expected_attempt, expected, new)
+            .await
     }
 
     async fn pending(&self) -> Result<Vec<Intent>, ExecError> {

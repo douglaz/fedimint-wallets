@@ -113,9 +113,10 @@ for f in "$WALLET_CLI" "$WALLETD"; do
     exit 1
   fi
 done
-for c in fedimint-cli jq curl; do
+for c in fedimint-cli jq; do
   command -v "$c" >/dev/null || { echo "FAIL: $c not on PATH" >&2; exit 1; }
 done
+command -v curl >/dev/null || { echo "FAIL: lock-pinned curl not on PATH (use run_exact_nix_develop)" >&2; exit 1; }
 
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
 PORT=19739

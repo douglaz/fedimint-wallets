@@ -6,10 +6,14 @@ mod scheduler;
 
 pub(crate) use actor::{active_probe_verdicts, plan_tick_round};
 
-use crate::journal::{FedimintJournal, ProbeRecord, ProbeSession};
+use crate::journal::{
+    FedimintJournal, LedgerRepairOracle, ProbeRecord, ProbeSession, RawIntentTerminalFence,
+    RawIntentTerminalSink,
+};
 use crate::probe::ProbeResult;
 use crate::runtime::Runtime;
 use crate::tick::TickPolicy;
+use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,8 +24,9 @@ use tokio::time::Instant;
 use wallet_api::{AwaitTarget, Policy, RefuseReason};
 use wallet_core::DiscoveryPolicy;
 use wallet_core::{
-    Actor, AllocatorDecision, ExecError, Executor, FederationId, IdempotencyKey, Intent,
-    IntentStatus, Invoice, Msat, OperationId, ProbeBudget, ProbePolicy, Reservations, WatchPolicy,
+    Action, Actor, AllocatorDecision, AllocatorGoal, ExecError, Executor, FederationId,
+    IdempotencyKey, Intent, IntentStatus, Invoice, MoveRecord, Msat, OperationId, ProbeBudget,
+    ProbePolicy, Reservations, WatchPolicy,
 };
 
 pub trait PolicyExt {
@@ -91,6 +96,110 @@ impl From<&Policy> for TickPolicy {
 pub const ACTOR_MAILBOX_CAPACITY: usize = 64;
 pub const EXTERNAL_DRIVER_CAP: usize = 32;
 
+/// Actor-minted, goal-scoped admission state for one planned tick.
+///
+/// The authority is intentionally private: callers can carry a token from
+/// `reconcile` (or obtain one from [`WalletClient::issue_tick_plan_token`]), but
+/// cannot fabricate one.  Counters retain admissions that have already become
+/// terminal, which is what closes the off-actor planning window without a
+/// terminal-history journal scan.
+#[derive(Clone, Debug)]
+pub struct GoalAdmissionSnapshot {
+    authority: Arc<()>,
+    counters: BTreeMap<AllocatorGoal, u64>,
+    blocked: wallet_core::GoalBlockers,
+    /// Membership changes alter the world the allocator planned against, even where
+    /// they do not conflict with one particular money-moving goal.
+    world_generation: u64,
+    membership_epoch: u64,
+}
+
+/// Actor-issued generation vector for a sequential fresh balance sample.
+/// It is opaque so a caller cannot relabel stale facts as fresh.
+#[derive(Clone, Debug)]
+pub struct BalanceFactsToken {
+    authority: Arc<()>,
+    generations: BTreeMap<FederationId, u64>,
+}
+
+/// A single-use, actor-issued guard for a short direct terminal journal mutation.
+/// It intentionally is not Clone: dropping it without `end_external_terminal_mutation`
+/// leaves balance-fact and tick authority fail-closed until restart.
+#[derive(Debug)]
+pub struct ExternalTerminalMutationLease {
+    authority: Arc<()>,
+    epoch: u64,
+    balance_federations: std::collections::BTreeSet<FederationId>,
+}
+
+/// Opaque authority for service discovery's rare direct membership mutation. It blocks only tick
+/// authority, never short raw-terminal leases or user money operations; a dropped lease therefore
+/// fails closed for scheduler work without globally disabling independently scoped balance facts.
+#[derive(Debug)]
+pub struct MembershipMutationLease {
+    authority: Arc<()>,
+    epoch: u64,
+}
+
+impl BalanceFactsToken {
+    fn is_issued_by(&self, authority: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.authority, authority)
+    }
+}
+
+/// Actor-issued authority for admitting fresh scheduled probe work under one exact policy.
+///
+/// Both identities are opaque. `authority` prevents a capability minted by another wallet actor
+/// from being accepted, while `version` is replaced rather than incremented on every successful
+/// `PutPolicy`, so a wrapped integer can never make an old policy current again.
+#[derive(Clone, Debug)]
+pub(crate) struct ProbePolicySnapshot {
+    authority: Arc<()>,
+    version: Arc<()>,
+    policy: Arc<Policy>,
+}
+
+impl ProbePolicySnapshot {
+    pub(crate) fn policy(&self) -> &Policy {
+        self.policy.as_ref()
+    }
+
+    fn is_current_for(&self, authority: &Arc<()>, version: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.authority, authority) && Arc::ptr_eq(&self.version, version)
+    }
+}
+
+impl PartialEq for GoalAdmissionSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.authority, &other.authority)
+            && self.counters == other.counters
+            && self.world_generation == other.world_generation
+            && self.membership_epoch == other.membership_epoch
+    }
+}
+
+impl Eq for GoalAdmissionSnapshot {}
+
+impl GoalAdmissionSnapshot {
+    fn is_issued_by(&self, authority: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.authority, authority)
+    }
+}
+
+/// A default value is deliberately foreign to every actor and therefore fails
+/// closed if a caller tries to use it as an eligibility token.
+impl Default for GoalAdmissionSnapshot {
+    fn default() -> Self {
+        Self {
+            authority: Arc::new(()),
+            counters: BTreeMap::new(),
+            blocked: wallet_core::GoalBlockers::default(),
+            world_generation: 0,
+            membership_epoch: 0,
+        }
+    }
+}
+
 pub fn coalesced_subscription_delay_ms(
     now_ms: u64,
     last_subscription_noop_ms: Option<u64>,
@@ -114,6 +223,47 @@ pub fn coalesced_subscription_delay_ms(
 }
 
 pub type ServiceResult<T> = Result<T, ServiceError>;
+
+struct ActorRawIntentTerminalSink<'a> {
+    client: &'a WalletClient,
+}
+
+#[async_trait]
+impl RawIntentTerminalSink for ActorRawIntentTerminalSink<'_> {
+    async fn set_raw_terminal(
+        &self,
+        key: &IdempotencyKey,
+        fence: &RawIntentTerminalFence,
+        status: IntentStatus,
+        error: Option<String>,
+    ) -> Result<bool, ExecError> {
+        self.client
+            .journal_transition(
+                key.clone(),
+                JournalTransition::SetRawTerminal {
+                    fence: fence.clone(),
+                    status,
+                    error,
+                },
+            )
+            .await
+            .map(|result| matches!(result, TransitionResult::Compared(true)))
+            .map_err(|error| ExecError::Retryable(format!("actor terminal transition: {error:?}")))
+    }
+}
+
+/// Run expensive repair I/O off actor while routing only reservation-releasing
+/// raw Pay/Receive terminal intent writes through the actor.
+pub async fn repair_ledger_with_actor(
+    journal: &FedimintJournal,
+    oracle: &dyn LedgerRepairOracle,
+    client: &WalletClient,
+) -> Result<crate::journal::RepairSummary, ExecError> {
+    let sink = ActorRawIntentTerminalSink { client };
+    journal
+        .repair_ledger_with_terminal_sink(oracle, &sink)
+        .await
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServiceError {
@@ -170,14 +320,24 @@ pub struct OpRequest {
 }
 
 #[derive(Clone, Debug)]
-pub struct ProbeCandidate {
-    pub federation: FederationId,
-    pub source: FederationId,
+pub(crate) struct ProbeCandidate {
+    pub(crate) federation: FederationId,
+    pub(crate) source: FederationId,
     /// Candidate balance sampled by the scheduler before entering the actor. It becomes
     /// the durable no-sweep baseline, so a missing/stale implicit default is never used.
-    pub baseline: Msat,
-    pub actor: Actor,
-    pub now_ms: u64,
+    pub(crate) baseline: Msat,
+    pub(crate) actor: Actor,
+    pub(crate) now_ms: u64,
+    /// Fresh work requires actor-minted policy authority. Retained work can only attach to the
+    /// exact durable session observed by the scheduler and can never fall through to fresh
+    /// admission if that session finishes or is replaced before this command is handled.
+    pub(crate) admission: ProbeAdmission,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ProbeAdmission {
+    Fresh(ProbePolicySnapshot),
+    ResumeOnly { expected_nonce: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,11 +348,11 @@ pub struct DecidedOp {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProbeDecision {
-    pub candidate: FederationId,
-    pub key: IdempotencyKey,
-    pub session: ProbeSession,
-    pub deduplicated: bool,
+pub(crate) struct ProbeDecision {
+    pub(crate) candidate: FederationId,
+    pub(crate) key: IdempotencyKey,
+    pub(crate) session: ProbeSession,
+    pub(crate) deduplicated: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -200,6 +360,33 @@ pub struct ReconcileReport {
     pub redriven: usize,
     pub awaiters_rehydrated: usize,
     pub executing_normalized: usize,
+    /// The logical allocator goals durable work still owns (br-p93), projected from the pending
+    /// scan BEFORE registry-ownership filtering — a goal a live driver owns is not re-driven
+    /// (`redriven` stays 0) but is very much in flight. The scheduler carries this into the
+    /// cycle's `ProbeFacts` so route pricing and planning suppress exactly these goals and
+    /// nothing else.
+    pub blocked: wallet_core::GoalBlockers,
+    /// Eligibility captured on the actor before this scheduler cycle senses or
+    /// plans.  A later durable Agent admission changes only the conflicting
+    /// old executable decision at commit.
+    pub admission_snapshot: GoalAdmissionSnapshot,
+}
+
+impl ReconcileReport {
+    /// Whether this pass changed nothing, for the scheduler's subscription-coalescing no-op
+    /// check. `blocked` is deliberately excluded: it is a standing projection of work journaled
+    /// earlier, not work this pass performed, so a permanently stuck goal must not make every
+    /// cycle look busy.
+    pub fn is_idle(&self) -> bool {
+        let Self {
+            redriven,
+            awaiters_rehydrated,
+            executing_normalized,
+            blocked: _,
+            admission_snapshot: _,
+        } = self;
+        *redriven == 0 && *awaiters_rehydrated == 0 && *executing_normalized == 0
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -212,17 +399,52 @@ pub struct ProbeFacts {
     /// Only the caller knows whether the cycle can commit. The actor mints one non-cloneable
     /// allowance when this is true and reuses it across every route-revision round.
     pub price_routes: bool,
+    /// The in-flight allocator goals this cycle's reconcile projected (br-p93). The actor copies
+    /// it onto the tick policy, so the same value suppresses route pricing for a blocked pair and
+    /// the decision that pair would have carried.
+    pub blocked: wallet_core::GoalBlockers,
+    /// The actor-issued eligibility watermark carried from reconcile through
+    /// off-actor planning. Missing or foreign tokens are refused by the actor.
+    pub admission_snapshot: GoalAdmissionSnapshot,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct TickRound {
-    pub decisions: Vec<AllocatorDecision>,
-    pub spending_fed: Option<FederationId>,
-    pub standby_fed: Option<FederationId>,
+    pub(crate) decisions: Vec<AllocatorDecision>,
+    pub(crate) occurrence: wallet_core::Occurrence,
+    pub(crate) spending_fed: Option<FederationId>,
     /// The policy generation the actor held when it planned this round. A commit is
     /// refused if a PutPolicy has bumped the generation since — the decisions were
     /// sized against caps/targets the operator has since changed.
-    pub planned_generation: u64,
+    pub(crate) planned_generation: u64,
+    /// Actor world generation captured with the admission authority.  Join/Recover
+    /// changes invalidate a complete off-actor plan, not merely decisions sharing a
+    /// particular allocator goal.
+    pub(crate) planned_world_generation: u64,
+    /// The same actor-issued eligibility watermark that guarded planning.
+    admission_snapshot: GoalAdmissionSnapshot,
+}
+
+#[cfg(test)]
+impl TickRound {
+    pub(crate) fn for_test(
+        decisions: Vec<AllocatorDecision>,
+        planned_generation: u64,
+        admission_snapshot: GoalAdmissionSnapshot,
+    ) -> Self {
+        let occurrence = decisions
+            .first()
+            .map(|decision| decision.occurrence)
+            .unwrap_or(wallet_core::Occurrence(0));
+        Self {
+            decisions,
+            occurrence,
+            spending_fed: None,
+            planned_generation,
+            planned_world_generation: admission_snapshot.world_generation,
+            admission_snapshot,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -264,38 +486,49 @@ pub enum Snapshot {
 }
 
 #[derive(Clone, Debug)]
-pub enum JournalTransition {
+pub(crate) enum JournalTransition {
     // Boxed: `Intent` is by far the largest variant (it carries a full `Action`), and boxing
     // keeps `JournalTransition` — which is cloned and moved through the actor loop — small.
-    Upsert(Box<Intent>),
+    Upsert {
+        expected_attempt: u32,
+        intent: Box<Intent>,
+    },
     CompareAndSet {
+        expected_attempt: u32,
         expected: IntentStatus,
         new: IntentStatus,
     },
     SetStatus {
+        expected_attempt: u32,
         status: IntentStatus,
         error: Option<String>,
     },
-    OperationArtifact {
-        operation_id: OperationId,
-        invoice: Option<Invoice>,
+    SetRawTerminal {
+        fence: RawIntentTerminalFence,
+        status: IntentStatus,
+        error: Option<String>,
     },
     /// The registered wrapper has returned from its step-2 drive, so its process-local
     /// perform guard is gone and the actor may safely hand ownership to a successor.
     DriverFinished {
         generation: u64,
+        expected_attempt: u32,
+        /// An awaiter lost a transient subscription/observation call.  It has already backed off
+        /// outside the actor; after removing this generation the actor may reattach only if the
+        /// same durable attempt is still Awaiting.
+        retry_awaiter: bool,
     },
     /// Re-read durable state after an existing step-2 executor wrote a derived artifact.
     Refresh,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TransitionResult {
+pub(crate) enum TransitionResult {
     Applied,
     Compared(bool),
 }
 
-pub enum Command {
+pub(crate) enum Command {
     DecideOp {
         req: OpRequest,
         reply: oneshot::Sender<ServiceResult<DecidedOp>>,
@@ -308,6 +541,19 @@ pub enum Command {
         key: IdempotencyKey,
         transition: JournalTransition,
         reply: oneshot::Sender<ServiceResult<TransitionResult>>,
+    },
+    SetOperationArtifact {
+        key: IdempotencyKey,
+        expected_attempt: u32,
+        operation_id: OperationId,
+        invoice: Option<Invoice>,
+        reply: oneshot::Sender<ServiceResult<bool>>,
+    },
+    PutMove {
+        key: IdempotencyKey,
+        expected_attempt: u32,
+        record: Box<MoveRecord>,
+        reply: oneshot::Sender<ServiceResult<bool>>,
     },
     Snapshot {
         scope: SnapshotScope,
@@ -322,16 +568,63 @@ pub enum Command {
     ReconcileDecide {
         reply: oneshot::Sender<ServiceResult<ReconcileReport>>,
     },
+    /// Rehydrate durable work without issuing scheduler tick authority.  Public recovery
+    /// endpoints use this so a live Join/Recover can resume even while it fences ticks.
+    ReconcileDurable {
+        reply: oneshot::Sender<ServiceResult<ReconcileReport>>,
+    },
+    /// Internal, durable-only reconciliation used to recover registry ownership after
+    /// a `DriverFinished` post-removal read fault.  Unlike scheduler reconciliation it
+    /// intentionally does not mint a tick token, so a tick-ineligible wallet can still
+    /// re-own its live work.
+    RecoverDriverOwnership {
+        reply: oneshot::Sender<ServiceResult<u64>>,
+    },
+    /// The detached ownership-recovery task has reconciled generation `generation`.
+    /// The reply says whether no newer read fault arrived before this actor turn.
+    FinishDriverOwnershipRecovery {
+        generation: u64,
+        reply: oneshot::Sender<ServiceResult<bool>>,
+    },
+    IssueTickPlanToken {
+        reply: oneshot::Sender<ServiceResult<GoalAdmissionSnapshot>>,
+    },
+    IssueBalanceFactsToken {
+        reply: oneshot::Sender<ServiceResult<BalanceFactsToken>>,
+    },
+    IssueProbePolicySnapshot {
+        reply: oneshot::Sender<ServiceResult<ProbePolicySnapshot>>,
+    },
     DecideTickRound {
         facts: ProbeFacts,
         reply: oneshot::Sender<ServiceResult<TickRound>>,
     },
     CommitTick {
-        decisions: Vec<AllocatorDecision>,
-        balances: Option<BTreeMap<FederationId, Msat>>,
+        round: TickRound,
+        balances: BTreeMap<FederationId, Msat>,
+        balance_facts: BalanceFactsToken,
         tick_key: Option<IdempotencyKey>,
-        planned_generation: u64,
         reply: oneshot::Sender<ServiceResult<CommitTickReport>>,
+    },
+    #[cfg(test)]
+    FailAfterFreshAdmissionForTest {
+        key: IdempotencyKey,
+        reply: oneshot::Sender<ServiceResult<()>>,
+    },
+    BeginExternalTerminalMutation {
+        action: Action,
+        reply: oneshot::Sender<ServiceResult<ExternalTerminalMutationLease>>,
+    },
+    EndExternalTerminalMutation {
+        lease: ExternalTerminalMutationLease,
+        reply: oneshot::Sender<ServiceResult<()>>,
+    },
+    BeginMembershipMutation {
+        reply: oneshot::Sender<ServiceResult<MembershipMutationLease>>,
+    },
+    EndMembershipMutation {
+        lease: MembershipMutationLease,
+        reply: oneshot::Sender<ServiceResult<()>>,
     },
     Shutdown {
         reply: oneshot::Sender<ServiceResult<ShutdownToken>>,
@@ -414,12 +707,20 @@ impl WalletClient {
         self.request(|reply| Command::DecideOp { req, reply }).await
     }
 
-    pub async fn decide_probe(&self, candidate: ProbeCandidate) -> ServiceResult<ProbeDecision> {
+    pub(crate) async fn decide_probe(
+        &self,
+        candidate: ProbeCandidate,
+    ) -> ServiceResult<ProbeDecision> {
         self.request(|reply| Command::DecideProbe { candidate, reply })
             .await
     }
 
-    pub async fn journal_transition(
+    pub(crate) async fn probe_policy_snapshot(&self) -> ServiceResult<ProbePolicySnapshot> {
+        self.request(|reply| Command::IssueProbePolicySnapshot { reply })
+            .await
+    }
+
+    pub(crate) async fn journal_transition(
         &self,
         key: IdempotencyKey,
         transition: JournalTransition,
@@ -427,6 +728,42 @@ impl WalletClient {
         self.request(|reply| Command::JournalTransition {
             key,
             transition,
+            reply,
+        })
+        .await
+    }
+
+    /// Fence one raw operation-artifact write on the actor turn. Private to service executors:
+    /// public admission has no way to release reservations through this seam.
+    pub(crate) async fn set_operation_artifact_if_attempt(
+        &self,
+        key: IdempotencyKey,
+        expected_attempt: u32,
+        operation_id: OperationId,
+        invoice: Option<&Invoice>,
+    ) -> ServiceResult<bool> {
+        self.request(|reply| Command::SetOperationArtifact {
+            key,
+            expected_attempt,
+            operation_id,
+            invoice: invoice.cloned(),
+            reply,
+        })
+        .await
+    }
+
+    /// Fence one derived MoveRecord write on the actor turn. This is a one-shot DB command, not a
+    /// lease: no driver can hold the actor gate across network I/O.
+    pub(crate) async fn put_move_if_attempt(
+        &self,
+        key: IdempotencyKey,
+        expected_attempt: u32,
+        record: MoveRecord,
+    ) -> ServiceResult<bool> {
+        self.request(|reply| Command::PutMove {
+            key,
+            expected_attempt,
+            record: Box::new(record),
             reply,
         })
         .await
@@ -457,34 +794,167 @@ impl WalletClient {
             .await
     }
 
+    /// Rehydrate all durable work without issuing tick-planning authority.
+    ///
+    /// This is for user-triggered recovery such as public and standalone reconcile or
+    /// standalone await.  Scheduler cycles must use [`Self::reconcile`], which mints the
+    /// authority required to plan a tick and therefore refuses while membership work is live.
+    pub async fn reconcile_durable(&self) -> ServiceResult<ReconcileReport> {
+        self.request(|reply| Command::ReconcileDurable { reply })
+            .await
+    }
+
+    async fn recover_driver_ownership(&self) -> ServiceResult<u64> {
+        self.request(|reply| Command::RecoverDriverOwnership { reply })
+            .await
+    }
+
+    async fn finish_driver_ownership_recovery(&self, generation: u64) -> ServiceResult<bool> {
+        self.request(|reply| Command::FinishDriverOwnershipRecovery { generation, reply })
+            .await
+    }
+
     pub async fn decide_tick_round(&self, facts: ProbeFacts) -> ServiceResult<TickRound> {
         self.request(|reply| Command::DecideTickRound { facts, reply })
             .await
     }
 
+    /// Mint a token for a direct caller that is not using scheduler reconcile.
+    /// Scheduler cycles instead carry the token in [`ReconcileReport`], which
+    /// is captured before they probe balances.
+    pub async fn issue_tick_plan_token(&self) -> ServiceResult<GoalAdmissionSnapshot> {
+        self.request(|reply| Command::IssueTickPlanToken { reply })
+            .await
+    }
+
+    /// One-shot test seam for the generic post-journal-admission error path.
+    #[cfg(test)]
+    async fn fail_after_fresh_admission_for_test(&self, key: IdempotencyKey) {
+        self.request(|reply| Command::FailAfterFreshAdmissionForTest { key, reply })
+            .await
+            .expect("configure fresh-admission failure");
+    }
+
+    /// Capture the actor generation immediately before sampling fresh balances.
+    pub async fn issue_balance_facts_token(&self) -> ServiceResult<BalanceFactsToken> {
+        self.request(|reply| Command::IssueBalanceFactsToken { reply })
+            .await
+    }
+
+    pub(crate) async fn begin_external_terminal_mutation(
+        &self,
+        action: Action,
+    ) -> ServiceResult<ExternalTerminalMutationLease> {
+        self.request(|reply| Command::BeginExternalTerminalMutation { action, reply })
+            .await
+    }
+
+    pub(crate) async fn end_external_terminal_mutation(
+        &self,
+        lease: ExternalTerminalMutationLease,
+    ) -> ServiceResult<()> {
+        self.request(|reply| Command::EndExternalTerminalMutation { lease, reply })
+            .await
+    }
+
+    pub(crate) async fn begin_membership_mutation(&self) -> ServiceResult<MembershipMutationLease> {
+        self.request(|reply| Command::BeginMembershipMutation { reply })
+            .await
+    }
+
+    pub(crate) async fn end_membership_mutation(
+        &self,
+        lease: MembershipMutationLease,
+    ) -> ServiceResult<()> {
+        self.request(|reply| Command::EndMembershipMutation { lease, reply })
+            .await
+    }
+
     pub async fn commit_tick(
         &self,
-        decisions: Vec<AllocatorDecision>,
-        planned_generation: u64,
+        round: TickRound,
+        balances: BTreeMap<FederationId, Msat>,
+        balance_facts: BalanceFactsToken,
     ) -> ServiceResult<CommitTickReport> {
-        self.commit_tick_with_facts(decisions, None, None, planned_generation)
+        self.commit_tick_with_facts(round, balances, balance_facts, None)
             .await
     }
 
     async fn commit_tick_with_facts(
         &self,
+        round: TickRound,
+        balances: BTreeMap<FederationId, Msat>,
+        balance_facts: BalanceFactsToken,
+        tick_key: Option<IdempotencyKey>,
+    ) -> ServiceResult<CommitTickReport> {
+        self.request(|reply| Command::CommitTick {
+            round,
+            balances,
+            balance_facts,
+            tick_key,
+            reply,
+        })
+        .await
+    }
+
+    /// Test-only compatibility seam for fixtures that deliberately construct a
+    /// malformed or stale round. Production callers cannot supply these parts
+    /// separately.
+    #[cfg(test)]
+    async fn commit_tick_legacy(
+        &self,
+        decisions: Vec<AllocatorDecision>,
+        planned_generation: u64,
+        admission_snapshot: GoalAdmissionSnapshot,
+    ) -> ServiceResult<CommitTickReport> {
+        // Legacy malformed-round fixtures predate the production requirement
+        // that callers supply a fresh balance sample.  Give those tests a
+        // deliberately simple, internally generated sample; production callers
+        // cannot reach this cfg(test)-only seam. Tests of balance rejection use
+        // `commit_tick_with_facts_legacy` with explicit facts instead.
+        let mut balances = BTreeMap::new();
+        for decision in &decisions {
+            match &decision.action {
+                wallet_core::Action::Move { from, to, .. } => {
+                    balances.entry(*to).or_insert(Msat(0));
+                    // These compatibility fixtures are not balance-boundary
+                    // tests. Give the source ample room even when unrelated
+                    // pending operations already reserve value from it.
+                    let source = balances.entry(*from).or_insert(Msat(0));
+                    source.0 = u64::MAX;
+                }
+                wallet_core::Action::Evacuate {
+                    from, to, amount, ..
+                } => {
+                    balances.entry(*to).or_insert(Msat(0));
+                    balances.entry(*from).or_insert(*amount);
+                }
+                _ => {}
+            }
+        }
+        self.commit_tick(
+            TickRound::for_test(decisions, planned_generation, admission_snapshot),
+            balances,
+            self.issue_balance_facts_token().await?,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn commit_tick_with_facts_legacy(
+        &self,
         decisions: Vec<AllocatorDecision>,
         balances: Option<BTreeMap<FederationId, Msat>>,
         tick_key: Option<IdempotencyKey>,
         planned_generation: u64,
+        admission_snapshot: GoalAdmissionSnapshot,
     ) -> ServiceResult<CommitTickReport> {
-        self.request(|reply| Command::CommitTick {
-            decisions,
-            balances,
+        self.commit_tick_with_facts(
+            TickRound::for_test(decisions, planned_generation, admission_snapshot),
+            balances.unwrap_or_default(),
+            self.issue_balance_facts_token().await?,
             tick_key,
-            planned_generation,
-            reply,
-        })
+        )
         .await
     }
 

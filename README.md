@@ -53,10 +53,17 @@ live and devimint-validated:
   rather than hanging forever) are covered by unit tests, NOT by a live gate: faithfully
   injecting a module-recovery failure needs a fault hook in the fedimint fork, so the live
   failure gate is deferred (`docs/recovery-failure-gate-analysis.md`).
-- **Route economics: complete.** Before each committable tick the allocator prices the
-  designated funding pair through the cheapest gateway serving both ends and floors
-  moves at that route's economic break-even, so it stops churning uneconomic
-  sub-viable moves every tick.
+- **Route economics: complete.** Before each committable tick, unless live allocator work
+  conflict-blocks the designated funding pair, the allocator attempts to price it. Absent an
+  explicit gateway override, it starts from the destination federation's vetted list; an
+  override is the sole candidate. It validates each candidate's `routing_info` at both ends and
+  chooses the cheapest validated candidate. A pair priced `Routable` floors moves at that route's
+  economic break-even, never below the protocol `min_move` floor;
+  `Unroutable`/`UneconomicAtAnySize` blocks funding. An absent candidate
+  list, bounded-scan miss, quote error, or indeterminate floor can instead leave the pair
+  unpriced, which permissively falls back to the protocol `min_move` floor. Requiring
+  destination-list candidates to appear on the **source** federation's vetted list remains
+  follow-up work (`br-s0e`).
 
 Recovery of ECASH from the seed is done; the remaining durability work — encryption of
 the seed at rest (decided in [ADR-0026](./docs/adr/0026-seed-at-rest-encryption-headless.md),
@@ -80,11 +87,12 @@ frontend (Phase 6b) and release hardening (Phase 8) are next. See
 - [wallet-cli](./wallet-cli/) - the first-class frontend, a thin client of `walletd`
   by default (`--standalone` for a direct-DB one-shot). Joins federations,
   balance/listing, receive/pay/direct-inflow, cross-federation moves, evacuations
-  through `tick`, active probes, seed recovery (`recover` / `restore-mnemonic`),
+  through `tick`, active probes, seed recovery (`recover`),
   reconciliation, and ledger inspection (`history` / `show`).
 - [wallet-daemon](./wallet-daemon/) - `walletd`, the 24/7 daemon: an axum local API
   (127.0.0.1 + bearer token) over a single Runtime-owning actor, with the watch
-  scheduler, per-operation IO driver tasks, and the settlement-stall self-heal watchdog.
+  scheduler, per-operation IO driver tasks, the `restore-mnemonic` recovery command, and the
+  settlement-stall self-heal watchdog.
 - [wallet-web](./wallet-web/) - the localhost browser sidecar (ADR-0028): a client of
   `walletd` over HTTP, exactly like `wallet-cli`, that renders HTML instead of terminal
   output. Currently the crate skeleton, `wallet-web init` provisioning, and a fail-closed
@@ -121,11 +129,18 @@ the two fee caps are deliberately different shapes:
   positive surplus is never refused for being smaller than a flat cap.
 
 A `--max-fee-bps-of-move` of `0` (every funding move would get a zero cap and fail) or above
-`10000` is rejected by policy validation. Before each committable tick, the allocator prices the
-designated funding pair through the cheapest gateway serving both federations. Small moves wait
-until their shortfall clears that route's economic floor; a cap below every serving route's
-proportional fee blocks that pair and records an `uneconomic_route` refusal in
-`wallet-cli history`. The perform-time cap remains the final money backstop if quotes change.
+`10000` is rejected by policy validation. Before each committable tick, if live allocator work has
+not conflict-blocked the designated funding pair, the allocator attempts to price it. Absent an
+explicit gateway override, candidates come from the destination federation's vetted list; an
+override is the sole candidate. Pricing validates `routing_info` at both ends and picks the
+cheapest validated candidate, but source-side vetted-list membership is not yet enforced
+(`br-s0e`). A pair priced `Routable` waits until its shortfall clears that route's economic
+floor or the protocol `min_move` floor, whichever is greater. `Unroutable` blocks the move;
+`UneconomicAtAnySize` also records an
+`uneconomic_route` refusal in `wallet-cli history`. An absent candidate list, bounded-scan miss,
+quote error, or indeterminate floor can instead leave the pair unpriced, in which case allocation
+permissively falls back to the protocol `min_move` floor. The perform-time cap remains the final
+money backstop if quotes change.
 
 See [docs/real-sats-pilot-runbook.md](./docs/real-sats-pilot-runbook.md) for suggested
 pilot values.
