@@ -15,9 +15,10 @@ Phase 7 seed encryption, the two-gateway evacuation fallback, Android, or the
 rest of the repository backlog. Those remain next-step recommendations, not
 silent scope expansion.
 
-**Phase:** HARDEN · **Bead:** `br-p93`
-· **Branch:** `fix/br-p93-conflict-scoped-tick-gates`
-· **Pending:** reviewed PR landing
+**Phase:** HARDEN · **Bead:** `br-n8o`
+· **Branch:** `chore/close-br-p93`
+· **Pending:** land the merged `br-p93` closeout, then implement the serialized
+  pre-artifact evacuation replacement
 **Gate:** `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
 · current final-fixes tree: EXIT=0, 953 passed / 0 failed (2026-08-17);
   complete gate log: `/tmp/pr36-final-coderabbit-cleanup-full-gate.log`
@@ -41,6 +42,10 @@ silent scope expansion.
 
 ## Done
 
+- Merged the conflict-scoped scheduler/standalone gate as PR #36
+  (`75802dfa898fcde45b8cf0102c30a7b1fc9fe281`), after the final 953-test
+  workspace gate, exact-pin two-federation live tick, and GitHub devshell/package
+  jobs all exited 0. `br-p93` is closed; `br-n8o` is claimed as the next P1.
 - Read the current project, canonical docs/ADRs, code architecture, current
   backlog and recent delivery evidence.
 - Two independent strategy reviews completed. Both found the re-canary unsafe
