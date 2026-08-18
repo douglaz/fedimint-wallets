@@ -94,6 +94,21 @@ secondarily by probes detecting degradation. The Allocator's core resilience
 action.
 _Avoid_: "sweep" (reserve for consolidating many inputs), "withdraw"
 
+**Structural evacuation refusal evidence**:
+Fresh typed sizing samples durably attached to a retryable, **pre-artifact** agent evacuation.
+They are evidence that the refusal appears structural, not proof that a route is unavailable:
+an empty bounded probe remains `Retryable`. The evidence identifies the delivered-net sample
+against which an evacuation-cap edit is evaluated.
+
+**Evacuation supersession**:
+The narrow atomic replacement of that marked evacuation after a component-wise monotone
+effective cap increase at its measured sample. It retires the old operation as `Failed`,
+creates a linked `Pending` child at a **fresh occurrence** and distinct key, and writes durable
+forward/reverse audit links (`superseded_by` / `supersedes`). It is actor-owned; standalone
+requires an explicitly advanced `--occurrence`. This preserves the old evidence and audit
+identity, does not turn evidence into route-unavailability proof, and is not a general retry
+or policy-edit escape hatch.
+
 **Sized ask**:
 The amount the sizing search committed to for a move — the largest candidate that fit the
 cap and the source's spendable balance. It is an INTENTION: the amount the executor will

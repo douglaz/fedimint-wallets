@@ -132,6 +132,23 @@ pub struct RawReceiveOutcome {
     pub status: IntentStatus,
 }
 
+/// The two callers have deliberately different dry-run authority contracts.  Keep this private:
+/// frontend selection belongs at the Runtime boundary, not in a caller-controlled policy field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusMode {
+    /// The exclusive direct-DB CLI diagnoses a stale replacement, but must not advertise its child.
+    StandaloneDiagnostic,
+    /// The daemon scheduler owns occurrence allocation, so a stale replacement is an authority error.
+    DaemonStrict,
+}
+
+fn stale_standalone_replacement_status_warning(error: &str) -> String {
+    format!(
+        "{error}; returning scored/designation diagnostics with no would-run decisions; \
+         retry standalone tick/status with a strictly newer --occurrence"
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct JoinIntentOutcome {
     pub key: IdempotencyKey,
@@ -360,9 +377,19 @@ pub(crate) struct TickPlan {
     /// Work conflict projection withheld before route preflight. Only the pinned-input check reads
     /// it, separately from `decisions`, because it is not executable endpoint evidence.
     pub(crate) suppressed: Vec<AllocatorDecision>,
+    /// Ordinary work deferred solely by replacement one-child exclusivity. Audit-only: it never
+    /// becomes an apply candidate or a conflict-suppression voucher.
+    pub(crate) replacement_deferred: Vec<AllocatorDecision>,
     /// Durable rebalance endpoints observed while planning. `status` reports against this planning
     /// view; `tick` re-scans and uses a fresh value after its final conflict retention.
     pub(crate) blockers: GoalBlockers,
+    /// A marker-bearing evacuation may be atomically exchanged for this fresh child.  It is kept
+    /// outside `decisions` because the parent remains the durable reservation until the exchange;
+    /// callers must not apply the child before that atomic hand-off.
+    pub(crate) replacement: Option<crate::service::EvacuationReplacementPlan>,
+    /// Exact marked parent to clear after a qualifying shadow yielded no child.  It is committed
+    /// without starting a driver, leaving ordinary retry to the next normal tick.
+    pub(crate) marker_disposition: Option<crate::service::EvacuationMarkerDisposition>,
 }
 
 /// Why a detached service awaiter stopped before terminalizing its durable intent.
@@ -438,6 +465,9 @@ impl AwaitFailure {
     fn from_exec(error: ExecError) -> Self {
         match error {
             ExecError::Retryable(message) => Self::Retryable(message),
+            ExecError::StructuralEvacuationRefusal(evidence) => {
+                Self::Retryable(evidence.diagnostic)
+            }
             ExecError::Permanent(message) => Self::Permanent(message),
             ExecError::Unsupported => Self::Permanent("await operation is unsupported".to_owned()),
         }
@@ -532,11 +562,25 @@ pub struct Runtime {
     /// A preplanned round paired with `test_executor`; production always calls `plan_tick` normally.
     #[cfg(test)]
     test_tick_plan: std::sync::Mutex<Option<TickPlan>>,
+    /// Select the supplied mock executor for a production-scheduler test fixture.  This is
+    /// separate from the plan itself so a test can install the exact parent/child plan after it
+    /// has seeded the durable marker but before it starts the scheduler cycle.
+    #[cfg(test)]
+    test_scheduler_fixture_enabled: std::sync::atomic::AtomicBool,
+    /// Deterministic clock values for the standalone replacement's one atomic timestamp.  Kept
+    /// narrower than `now_ms()` because only this exact identity boundary needs the seam.
+    #[cfg(test)]
+    test_replacement_exchange_times: std::sync::Mutex<std::collections::VecDeque<u64>>,
     /// Test-only sampled probe view for exercising the production scheduler's post-plan paths.
     /// It is separate from `test_tick_plan`: the scheduler samples both before planning and again
     /// when a stale designation must be re-derived.
     #[cfg(test)]
     test_probe_all: std::sync::Mutex<Option<Vec<(FederationId, ProbeResult)>>>,
+    /// Narrow planner seam: raw-probe unit tests have no live gateway clients,
+    /// so they can isolate allocation/replacement propagation from concrete
+    /// route I/O without prebuilding a `TickPlan`.
+    #[cfg(test)]
+    test_skip_route_preflight: std::sync::atomic::AtomicBool,
     /// Deterministic detached-awaiter outcomes for service-driver classification tests.
     #[cfg(test)]
     test_await_outcomes: std::sync::Mutex<std::collections::VecDeque<TestAwaitOutcome>>,
@@ -583,7 +627,15 @@ impl Runtime {
             #[cfg(test)]
             test_tick_plan: std::sync::Mutex::new(None),
             #[cfg(test)]
+            test_scheduler_fixture_enabled: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            test_replacement_exchange_times: std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            ),
+            #[cfg(test)]
             test_probe_all: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_skip_route_preflight: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             test_await_outcomes: std::sync::Mutex::new(std::collections::VecDeque::new()),
             #[cfg(test)]
@@ -615,11 +667,69 @@ impl Runtime {
     }
 
     #[cfg(test)]
+    fn set_tick_test_executor(&mut self, executor: Arc<wallet_core::MockExecutor>) {
+        self.test_executor = Some(executor);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_replacement_exchange_times_for_test(
+        &self,
+        times: impl IntoIterator<Item = u64>,
+    ) {
+        *self
+            .test_replacement_exchange_times
+            .lock()
+            .expect("replacement exchange clock mutex poisoned") = times.into_iter().collect();
+    }
+
+    fn replacement_exchange_now(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(now) = self
+            .test_replacement_exchange_times
+            .lock()
+            .expect("replacement exchange clock mutex poisoned")
+            .pop_front()
+        {
+            return now;
+        }
+        now_ms()
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_scheduler_probe_fixture(&self, probes: Vec<(FederationId, ProbeResult)>) {
         *self
             .test_probe_all
             .lock()
             .expect("scheduler probe fixture mutex poisoned") = Some(probes);
+    }
+
+    /// Install the actor-side scheduler planning fixture after the runtime is shared with the
+    /// service. Unlike [`Self::set_tick_test_fixture`], scheduler planning does not use the
+    /// standalone executor seam, so this only needs interior access to the prebuilt plan.
+    #[cfg(test)]
+    pub(crate) fn set_scheduler_tick_test_fixture(&self, plan: TickPlan) {
+        *self
+            .test_tick_plan
+            .lock()
+            .expect("tick test-plan mutex poisoned") = Some(plan);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_scheduler_tick_fixture_for_test(&self) {
+        self.test_scheduler_fixture_enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scheduler_tick_fixture_enabled_for_test(&self) -> bool {
+        self.test_scheduler_fixture_enabled
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn skip_route_preflight_for_test(&self) {
+        self.test_skip_route_preflight
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -1808,7 +1918,7 @@ impl Runtime {
                         "watch: ticking with the in-flight allocator goals suppressed"
                     );
                 }
-                match self.tick(&cycle_tick_policy).await {
+                match self.tick_for_daemon_scheduler(&cycle_tick_policy).await {
                     Ok(report) => WatchTickOutcome::Ran(report),
                     Err(e) => {
                         tracing::warn!(error = ?e, "watch: tick failed; continuing cycle");
@@ -1820,7 +1930,7 @@ impl Runtime {
         let spending = match &tick {
             WatchTickOutcome::Ran(report) => report.spending_fed,
             WatchTickOutcome::SkippedReconcileFailed | WatchTickOutcome::Failed(_) => self
-                .status(&cycle_tick_policy)
+                .status_for_daemon_scheduler(&cycle_tick_policy)
                 .await
                 .map(|status| status.spending_fed)
                 .unwrap_or(cycle_tick_policy.spending_fed),
@@ -3413,6 +3523,44 @@ impl Runtime {
     /// LDK gateway; §4), exactly as `do_move` does. The probe route gate validates that same
     /// pinned gateway when present, so decisions match the route the executor will use.
     pub async fn tick(&self, policy: &TickPolicy) -> anyhow::Result<TickReport> {
+        // A standalone MAX occurrence has no possible strictly newer daemon
+        // successor. Refuse before touching the watch checkpoint, tick ledger, or
+        // an intent so its CLI error is actionable and leaves no poisoned state.
+        crate::journal::ensure_occurrence_has_successor(policy.occurrence.0).map_err(exec_err)?;
+        self.tick_after_occurrence_authority(policy).await
+    }
+
+    /// Execute work for an occurrence allocated by the daemon scheduler.
+    ///
+    /// `advance_watch_occurrence` may allocate `u64::MAX` exactly once from a
+    /// `u64::MAX - 1` checkpoint. That final scheduler occurrence is valid work;
+    /// only a following scheduler cycle is exhausted. Standalone `tick` remains
+    /// stricter because it persists an occurrence floor that needs a successor.
+    async fn tick_for_daemon_scheduler(&self, policy: &TickPolicy) -> anyhow::Result<TickReport> {
+        self.tick_after_occurrence_authority(policy).await
+    }
+
+    /// Execute after the caller has applied its occurrence-authority boundary.
+    ///
+    /// Both standalone and daemon-scheduler callers use the same planning,
+    /// replacement, and execution behavior. Their sole distinction is whether
+    /// this occurrence must itself have a successor.
+    async fn tick_after_occurrence_authority(
+        &self,
+        policy: &TickPolicy,
+    ) -> anyhow::Result<TickReport> {
+        // A standalone `--occurrence` is also an allocator-generation boundary. Persist its floor
+        // under the journal transaction before planning so a subsequently restarted daemon advances
+        // beyond it rather than proposing a replacement child at or below its marked parent.
+        //
+        // The daemon has already atomically allocated and persisted this occurrence. Re-observing
+        // its final `u64::MAX` value would incorrectly apply the standalone successor requirement.
+        if policy.occurrence.0 != u64::MAX {
+            self.journal
+                .observe_watch_occurrence(policy.occurrence.0)
+                .await
+                .map_err(exec_err)?;
+        }
         // §10.4: open a `Started` tick row BEFORE probing (a per-attempt `tick:` key, §10.1), so
         // a crash mid-tick leaves a durable row that reconcile repairs after 1h. Ledger recording
         // is auxiliary to the money op, so a storage fault here is logged, never fatal.
@@ -3432,10 +3580,24 @@ impl Runtime {
         let mut plan = match self.plan_tick(policy).await {
             Ok(plan) => plan,
             Err(e) => {
+                // A corrupt strict reservation view makes fresh admission and replacement
+                // unknowable.  Do not run a bespoke executor bypass: the exact marked parent
+                // remains durable and parked until storage is repaired.
                 self.record_tick_failed(&tick_key, &e.to_string()).await;
                 return Err(e);
             }
         };
+        // A valid planner yields exactly one authoritative marker outcome. This guard comes before
+        // any marker clear, replacement exchange, child admission, deferred audit, or executor
+        // action. The tick itself is already an auditable `Started` row, so terminalize that row
+        // rather than leaving an impossible plan in-flight; both parents remain exact repair
+        // evidence for a later valid round.
+        if plan.replacement.is_some() && plan.marker_disposition.is_some() {
+            let error =
+                "tick: replacement and marker-clear disposition cannot share a standalone round";
+            self.record_tick_failed(&tick_key, error).await;
+            anyhow::bail!("{error}");
+        }
         // The final conflict check before anything is journaled (br-p93). `plan_tick` derived the
         // same conflict model from durable state before route pricing, so this normally removes
         // nothing; re-scan here so work admitted while planning was doing network I/O still blocks
@@ -3496,14 +3658,20 @@ impl Runtime {
         // Both bail paths land a `Failed` tick row WITH the diagnostic before returning (§10.4).
         // The check receives admitted and suppressed work separately. The fresh scan above moves a
         // race-lost decision into `suppressed` before this authoritative pin check.
-        let problems = Self::pinned_input_problems(policy, &plan, &blocked);
+        let pin_blockers = plan
+            .replacement
+            .as_ref()
+            .map(|replacement| blocked.excluding_key(&replacement.old_key))
+            .unwrap_or_else(|| blocked.clone());
+        let problems = Self::pinned_input_problems(policy, &plan, &pin_blockers);
         if !problems.is_empty() {
             let error = format!("tick: {}", problems.join("; "));
             self.record_tick_failed(&tick_key, &error).await;
             anyhow::bail!("{error}");
         }
+        let admitted_decisions = planned_tick_decisions(&plan);
         if let Err(e) = self
-            .ensure_fresh_tick_decisions(&plan.decisions, policy.occurrence)
+            .ensure_fresh_tick_decisions(&admitted_decisions, policy.occurrence)
             .await
         {
             self.record_tick_failed(&tick_key, &e.to_string()).await;
@@ -3515,7 +3683,99 @@ impl Runtime {
             .iter()
             .map(|fed| (fed.id, fed.balance.spendable))
             .collect::<BTreeMap<_, _>>();
-        let to_apply = decisions_to_apply(&plan.decisions);
+        for deferred in plan
+            .replacement_deferred
+            .iter()
+            .filter(|decision| decision.action.is_executable())
+        {
+            if let Err(error) = self
+                .journal
+                .record_tick_dropped_refusal(
+                    deferred,
+                    policy.occurrence,
+                    now_ms(),
+                    "deferred: replacement-exclusive one-child round",
+                    false,
+                )
+                .await
+            {
+                tracing::warn!(
+                    key = %deferred.idempotency_key.0,
+                    ?error,
+                    "tick: recording replacement-exclusive deferred audit failed"
+                );
+            }
+        }
+        if let Err(error) = self
+            .journal
+            .record_refusals_with_note(
+                &plan.replacement_deferred,
+                policy.occurrence,
+                now_ms(),
+                Some("deferred: replacement-exclusive one-child round"),
+            )
+            .await
+        {
+            tracing::warn!(
+                error = ?error,
+                "tick: recording replacement-exclusive deferred advisory audit failed"
+            );
+        }
+        let marker_clear_error = if let Some(disposition) = plan.marker_disposition.as_ref() {
+            match self
+                .journal
+                .clear_marked_evacuation_if_pending(&disposition.parent)
+                .await
+            {
+                Ok(true) => {
+                    // No immediate driver/policy wake: this cycle merely returns the old
+                    // evacuation to ordinary Pending retry for a subsequent normal tick.
+                    None
+                }
+                Ok(false) => {
+                    tracing::warn!(
+                        key = %disposition.parent.idempotency_key.0,
+                        "tick: marker-clear disposition no longer owned its exact Pending evacuation"
+                    );
+                    None
+                }
+                Err(error) => Some(error),
+            }
+        } else {
+            None
+        };
+        if let Some(error) = marker_clear_error {
+            if plan.decisions.is_empty() {
+                self.record_tick_failed(&tick_key, &format!("{error:?}"))
+                    .await;
+                return Err(exec_err(error));
+            }
+            // This exact marker remains durable/planner-owned, but a clear fault must not suppress
+            // independently replanned ordinary work. The actor follows the same split.
+            tracing::warn!(
+                ?error,
+                "tick: retaining marker after clear fault while continuing independent decisions"
+            );
+        }
+        let (to_apply, reservations) = match plan.replacement.as_ref() {
+            Some(replacement) => match self
+                .replace_marked_evacuation_standalone(replacement, policy, &balances, &blocked)
+                .await
+            {
+                Ok(reservations) => (
+                    decisions_to_apply(std::slice::from_ref(&replacement.fresh)),
+                    reservations,
+                ),
+                Err(error) => {
+                    self.record_tick_failed(&tick_key, &error.to_string()).await;
+                    return Err(error);
+                }
+            },
+            None => (
+                decisions_to_apply(&plan.decisions),
+                plan.snapshot.reservations.clone(),
+            ),
+        };
         #[cfg(test)]
         let summary = match &self.test_executor {
             Some(executor) => {
@@ -3525,7 +3785,7 @@ impl Runtime {
                     actor,
                     &balances,
                     policy,
-                    plan.snapshot.reservations.clone(),
+                    reservations.clone(),
                 )
                 .await
             }
@@ -3536,7 +3796,7 @@ impl Runtime {
                     actor,
                     &balances,
                     policy,
-                    plan.snapshot.reservations.clone(),
+                    reservations,
                 )
                 .await
             }
@@ -3549,7 +3809,7 @@ impl Runtime {
                 actor,
                 &balances,
                 policy,
-                plan.snapshot.reservations.clone(),
+                reservations,
             )
             .await;
 
@@ -3563,7 +3823,7 @@ impl Runtime {
             tracing::warn!(error = ?e, "tick: recording refusal rows failed");
         }
         let counts = Some((
-            plan.decisions.len() as u32,
+            admitted_decisions.len() as u32,
             summary.performed as u32,
             summary.failed as u32,
         ));
@@ -3582,7 +3842,7 @@ impl Runtime {
             tracing::warn!(error = ?e, "tick: recording the terminal tick row failed");
         }
         Ok(TickReport {
-            decisions: plan.decisions,
+            decisions: admitted_decisions,
             summary,
             spending_fed: plan.snapshot.spending_fed,
             standby_fed: plan.snapshot.standby_fed,
@@ -3606,21 +3866,85 @@ impl Runtime {
     /// `FederationStatus`), the designation `build_snapshot` chose, and the decisions that WOULD
     /// run. No money moves — this is `wallet-cli status`.
     ///
-    /// Unlike [`Runtime::tick`], `status` does NOT bail on an unsensed / unusable pin: its whole
-    /// job is to SHOW the operator why a tick would fail, so hard-failing before assembling the
-    /// scored view would blank out exactly the diagnostic they ran it for. It surfaces each such
-    /// pin problem as a `warn!` (to stderr) and still returns the full scored view + would-run
-    /// decisions. The route check reflects the pinned gateway when one was supplied, same as `tick`.
+    /// Unlike [`Runtime::tick`], `status` does NOT bail on an unsensed / unusable pin, nor on a
+    /// terminal-replaying occurrence: its whole job is to SHOW the operator why a tick would
+    /// fail, so hard-failing before assembling the scored view would blank out exactly the
+    /// diagnostic they ran it for. It surfaces each such problem as a `warn!` (to stderr) and
+    /// still returns the full scored view + would-run decisions. The route check reflects the
+    /// pinned gateway when one was supplied, same as `tick`.
+    ///
+    /// The exhausted standalone occurrence is a deliberate hard error: it has no successor. A stale
+    /// marked replacement is different. Standalone returns the scored/designation diagnostic, but
+    /// omits every would-run decision rather than advertising an impossible child (or ordinary work
+    /// deferred by that child's one-child round). The daemon's scheduler authority remains strict.
+    /// Both paths stay read-only: status writes neither an exchange nor a child.
     pub async fn status(&self, policy: &TickPolicy) -> anyhow::Result<StatusReport> {
+        // Status must not advertise an exhausted standalone generation as
+        // would-run work: `tick` rejects it before any durable write because
+        // no strictly newer successor can exist. This check is read-only.
+        crate::journal::ensure_occurrence_has_successor(policy.occurrence.0).map_err(exec_err)?;
+        self.status_after_occurrence_authority(policy, StatusMode::StandaloneDiagnostic)
+            .await
+    }
+
+    /// Dry-run the next daemon-scheduler occurrence.
+    ///
+    /// The daemon can allocate `Occurrence(u64::MAX)` exactly once as the final
+    /// child of a `u64::MAX - 1` watch floor. It must describe that valid final
+    /// work with the same dry-run behavior as [`Runtime::status`], rather than
+    /// applying the standalone successor requirement. Marked replacement
+    /// children remain strictly newer than their Agent parent.
+    pub async fn status_for_daemon_scheduler(
+        &self,
+        policy: &TickPolicy,
+    ) -> anyhow::Result<StatusReport> {
+        self.status_after_occurrence_authority(policy, StatusMode::DaemonStrict)
+            .await
+    }
+
+    /// Build a dry-run after the caller has applied its occurrence-authority boundary.
+    async fn status_after_occurrence_authority(
+        &self,
+        policy: &TickPolicy,
+        mode: StatusMode,
+    ) -> anyhow::Result<StatusReport> {
         let scorer_policy = ScorerPolicy::default();
         let plan = self.plan_tick(policy).await?;
+        let mut status_decisions = planned_tick_decisions(&plan);
+        // A stale structural replacement cannot be committed. The direct standalone command is an
+        // operator diagnostic, so retain the full scored/designation report but show no would-run
+        // work at all: its child is impossible and its ordinary siblings were deferred by the same
+        // one-child round. Daemon status instead remains an allocation-authority fence.
+        if let Some(replacement) = plan.replacement.as_ref() {
+            if let Actor::Agent {
+                occurrence: old_occurrence,
+            } = replacement.parent.actor
+            {
+                if replacement.fresh.occurrence <= old_occurrence
+                    || replacement.fresh.idempotency_key == replacement.old_key
+                {
+                    let error = crate::service::replacement_occurrence_error(
+                        old_occurrence,
+                        replacement.fresh.occurrence,
+                    );
+                    match mode {
+                        StatusMode::StandaloneDiagnostic => {
+                            let warning = stale_standalone_replacement_status_warning(&error);
+                            tracing::warn!("status: {warning}");
+                            status_decisions.clear();
+                        }
+                        StatusMode::DaemonStrict => anyhow::bail!(error),
+                    }
+                }
+            }
+        }
         // Surface (do NOT bail on) any pinned-input problem the equivalent `tick` would fail on, so
         // the operator sees BOTH the warning and the full scored view that explains it.
         for problem in Self::pinned_input_problems(policy, &plan, &plan.blockers) {
             tracing::warn!("status: {problem}");
         }
         match self
-            .terminal_replayed_executable_decisions(&plan.decisions)
+            .terminal_replayed_executable_decisions(&status_decisions)
             .await
         {
             Ok(replays) if !replays.is_empty() => tracing::warn!(
@@ -3674,22 +3998,26 @@ impl Runtime {
             scored,
             spending_fed: plan.snapshot.spending_fed,
             standby_fed: plan.snapshot.standby_fed,
-            decisions: plan.decisions,
+            decisions: status_decisions,
         })
     }
 
-    /// Return the pin diagnostics for this planned round. Conflict-suppressed decisions still
-    /// count: their logical rebalance was evaluated, even though durable work already owns it.
+    /// Return the pin diagnostics for this planned round. The replacement child and ordinary work
+    /// deferred solely by its one-child exclusivity were both route-planned, so both participate in
+    /// validation. Conflict-suppressed work remains separate because it has only the narrower
+    /// holder-associated voucher semantics.
     fn pinned_input_problems(
         policy: &TickPolicy,
         plan: &TickPlan,
         blockers: &GoalBlockers,
     ) -> Vec<String> {
+        let mut validation_decisions = planned_tick_decisions(plan);
+        validation_decisions.extend(plan.replacement_deferred.clone());
         crate::tick::pinned_input_problems(
             policy,
             &plan.snapshot,
             &plan.probes,
-            &plan.decisions,
+            &validation_decisions,
             &plan.suppressed,
             blockers,
         )
@@ -3741,11 +4069,14 @@ impl Runtime {
         Ok(TickPlan {
             raw_probes,
             suppressed: round.suppressed,
+            replacement_deferred: round.replacement_deferred,
             probes: round.probes,
             active_probes: round.active_probes,
             snapshot: round.snapshot,
             decisions: round.decisions,
-            blockers: policy.blocked,
+            blockers: round.blocked,
+            replacement: round.replacement,
+            marker_disposition: round.marker_disposition,
         })
     }
 
@@ -3773,6 +4104,287 @@ impl Runtime {
             reservations,
         )
         .await
+    }
+
+    /// The exclusive standalone counterpart of the actor's replacement commit.  A standalone
+    /// `tick` owns the database for its whole documented invocation, so it has no actor-generation
+    /// token to check; it still repeats every durable/fresh admission check before exchanging the
+    /// parent and only then hands the already-created child to the ordinary executor path. Every
+    /// replacement-path error retains the exact Pending marker: only the successful (or exactly
+    /// confirmed committed) exchange may consume it. The planner's separate no-child disposition is
+    /// the sole non-exchange marker-clear path.
+    async fn replace_marked_evacuation_standalone(
+        &self,
+        replacement: &crate::service::EvacuationReplacementPlan,
+        policy: &TickPolicy,
+        balances: &BTreeMap<FederationId, Msat>,
+        blockers: &GoalBlockers,
+    ) -> anyhow::Result<Reservations> {
+        let current_cap = wallet_core::EvacFeeCap {
+            base_msat: policy.evac_fee_base_msat,
+            bps: policy.evac_fee_bps,
+        };
+        let Action::Evacuate {
+            from,
+            to,
+            amount,
+            fee_cap,
+            fee_cap_components: Some(components),
+            ..
+        } = &replacement.fresh.action
+        else {
+            anyhow::bail!("standalone replacement child is not a component-capped evacuation");
+        };
+        if *components != current_cap || current_cap.at(*amount) != *fee_cap {
+            anyhow::bail!(
+                "standalone replacement child no longer exactly matches the current evacuation fee cap"
+            );
+        }
+        if !balances.contains_key(from) || !balances.contains_key(to) {
+            anyhow::bail!(
+                "standalone replacement requires fresh balances for both endpoints {} -> {}",
+                from.to_hex(),
+                to.to_hex()
+            );
+        }
+        let old_read = self.journal.get(&replacement.old_key).await;
+        let old = match old_read {
+            Err(error) => {
+                // No exchange was entered. Retain the exact structural marker as durable repair
+                // evidence; clearing a marker on an unreadable parent would turn a storage fault
+                // into permission to replan ordinary work.
+                anyhow::bail!(
+                    "standalone replacement could not read parent before exchange: {error:?}"
+                )
+            }
+            Ok(Some(old)) => old,
+            Ok(None) => anyhow::bail!("standalone replacement parent disappeared before exchange"),
+        };
+        if let Actor::Agent {
+            occurrence: old_occurrence,
+        } = old.actor
+        {
+            if replacement.fresh.occurrence <= old_occurrence
+                || replacement.fresh.idempotency_key == replacement.old_key
+            {
+                // This is an operator-correctable stale occurrence, not a failed exchange.
+                // Keep the typed marker so a rerun with a greater occurrence can replace the
+                // same parent directly; clearing it would discard its structural evidence.
+                anyhow::bail!(crate::service::replacement_occurrence_error(
+                    old_occurrence,
+                    replacement.fresh.occurrence,
+                ));
+            }
+        }
+        if old != replacement.parent
+            || old.attempt != replacement.old_attempt
+            || old.status != IntentStatus::Pending
+            || old.evacuation_refusal.as_ref() != Some(&replacement.evidence)
+            || !matches!(old.actor, Actor::Agent { .. })
+            || !matches!(&old.action, Action::Evacuate { from: old_from, .. } if old_from == from)
+        {
+            anyhow::bail!("standalone replacement parent is no longer exclusively pending");
+        }
+        if !wallet_core::evacuation_cap_qualifies_replacement(&replacement.evidence, current_cap) {
+            anyhow::bail!("standalone replacement fee-cap evidence no longer qualifies");
+        }
+        let fresh_blockers = match self.allocator_goal_blockers().await {
+            Ok(blockers) => blockers.excluding_key(&replacement.old_key),
+            Err(error) => {
+                // A projection read fault is not an authoritative no-child disposition.
+                anyhow::bail!(
+                    "standalone replacement could not project blockers before exchange: {error}"
+                )
+            }
+        };
+        if fresh_blockers.blocks_decision(
+            &replacement.fresh,
+            Actor::Agent {
+                occurrence: replacement.fresh.occurrence,
+            },
+        ) || blockers
+            .excluding_key(&replacement.old_key)
+            .blocks_decision(
+                &replacement.fresh,
+                Actor::Agent {
+                    occurrence: replacement.fresh.occurrence,
+                },
+            )
+        {
+            anyhow::bail!(
+                "standalone replacement child conflicts with allocator work already in flight"
+            );
+        }
+        let reservations = match crate::service::project_allocator_reservations_excluding(
+            self.journal.as_ref(),
+            &replacement.old_key,
+        )
+        .await
+        {
+            Ok(reservations) => reservations,
+            Err(error) => {
+                // Keep the marker. We have not entered the exchange and cannot prove the
+                // reservation projection that would make consuming it safe.
+                anyhow::bail!(
+                    "standalone replacement could not project reservations before exchange: {error:?}"
+                )
+            }
+        };
+        // The child identity and the atomic sidecar must have one timestamp.  In particular a
+        // post-commit retryable error is confirmed against this exact child; sampling again for
+        // the exchange would make a perfectly committed exchange look ambiguous at a clock tick.
+        let exchange_now = self.replacement_exchange_now();
+        let child = Intent::from_decision(
+            &replacement.fresh,
+            Actor::Agent {
+                occurrence: replacement.fresh.occurrence,
+            },
+            exchange_now,
+        );
+        if let Err(error) = wallet_core::admit_intent(
+            &child,
+            Some(balances),
+            Some(policy.per_fed_cap),
+            &reservations,
+        ) {
+            return Err(exec_err(error));
+        }
+        let exchanged = self
+            .journal
+            .replace_marked_evacuation(
+                &replacement.old_key,
+                replacement.old_attempt,
+                &replacement.evidence,
+                &replacement.fresh,
+                exchange_now,
+                &replacement.parent,
+            )
+            .await;
+        let mut refusal = None;
+        let committed = match exchanged {
+            Ok(true) => true,
+            Ok(false) => {
+                anyhow::bail!("standalone replacement parent was no longer exclusively pending");
+            }
+            Err(error) => {
+                let confirmed = self
+                    .confirm_standalone_replacement_exchange(
+                        replacement,
+                        &replacement.parent,
+                        &child,
+                    )
+                    .await
+                    .map_err(exec_err)
+                    .map_err(|confirmation| {
+                        anyhow::anyhow!(
+                            "standalone replacement exchange outcome is ambiguous after error \
+                              {error:?}; exact confirmation failed: {confirmation}"
+                        )
+                    })?;
+                refusal = Some(error);
+                confirmed
+            }
+        };
+        if !committed {
+            // The bail below reports only that nothing was written. The exchange's own error is
+            // the money-path signal — `replace_marked_evacuation` rejects incoherent parent move
+            // artifacts and a second live agent evacuation on the source through this same `Err`
+            // channel, and both leave every reread row untouched, so they confirm as uncommitted
+            // here. Its third corruption guard, a dirty child namespace, does NOT reach this
+            // branch: `replacement_child_namespace` still reports `Contaminated`, so exact
+            // confirmation fails and the caller reports an ambiguous outcome instead. Surface the
+            // two that do land here (stderr at the CLI's default `warn`) rather than drop them.
+            if let Some(error) = refusal {
+                tracing::warn!(
+                    ?error,
+                    key = %replacement.old_key.0,
+                    "standalone replacement exchange refused and confirmed uncommitted"
+                );
+            }
+            anyhow::bail!("standalone replacement exchange was definitely uncommitted");
+        }
+        Ok(reservations)
+    }
+
+    /// Confirm a retryable exchange error against the exact sidecar, retired parent, and child
+    /// state.  A mismatched or incomplete reread is deliberately an error: retrying could retire a
+    /// parent without knowing whether the child was created.
+    async fn confirm_standalone_replacement_exchange(
+        &self,
+        replacement: &crate::service::EvacuationReplacementPlan,
+        old_before: &Intent,
+        expected_child: &Intent,
+    ) -> Result<bool, ExecError> {
+        // A post-commit database error can be accompanied by one transient read fault. Retry only
+        // that transport class, a small bounded number of times; structural/mixed snapshots remain
+        // immediately ambiguous and therefore fail closed.
+        for attempt in 0..3 {
+            match self
+                .confirm_standalone_replacement_exchange_once(
+                    replacement,
+                    old_before,
+                    expected_child,
+                )
+                .await
+            {
+                Ok(outcome) => return Ok(outcome),
+                Err(ExecError::Retryable(error)) if attempt < 2 => {
+                    tracing::warn!(
+                        attempt,
+                        %error,
+                        "standalone replacement confirmation read retrying"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("bounded confirmation loop returns on its final attempt")
+    }
+
+    /// One exact confirmation snapshot attempt. Callers own the bounded Retryable retry policy.
+    async fn confirm_standalone_replacement_exchange_once(
+        &self,
+        replacement: &crate::service::EvacuationReplacementPlan,
+        old_before: &Intent,
+        expected_child: &Intent,
+    ) -> Result<bool, ExecError> {
+        let relation = self
+            .journal
+            .evacuation_canonical_successor(&replacement.old_key)
+            .await?;
+        let old = self.journal.get(&replacement.old_key).await?;
+        let child = self.journal.get(&replacement.fresh.idempotency_key).await?;
+        let namespace = self
+            .journal
+            .replacement_child_namespace(&replacement.fresh.idempotency_key)
+            .await?;
+        match (relation, old, child, namespace) {
+            (Some(relation), Some(old), Some(child), _)
+                if relation.old_key == replacement.old_key
+                    && relation.old_attempt == replacement.old_attempt
+                    && relation.new_key == replacement.fresh.idempotency_key
+                    && relation.new_attempt == 0
+                    && relation.occurrence == replacement.fresh.occurrence
+                    && relation.refusal == replacement.evidence
+                    && old.status == IntentStatus::Failed
+                    && old.attempt == replacement.old_attempt
+                    && old.evacuation_refusal.as_ref() == Some(&replacement.evidence)
+                    && child == *expected_child =>
+            {
+                Ok(true)
+            }
+            (
+                None,
+                Some(old),
+                None,
+                crate::journal::ReplacementChildNamespace::Pristine,
+            ) if old == *old_before => Ok(false),
+            _ => Err(ExecError::Permanent(
+                "standalone replacement exchange reread was incomplete or did not exactly match either outcome"
+                    .to_owned(),
+            )),
+        }
     }
 
     /// The standalone path's conflict projection, from the same durable `pending()` scan the
@@ -3944,6 +4556,13 @@ impl Runtime {
         &self,
         decisions: &[AllocatorDecision],
     ) -> Option<MoveRouteProblem> {
+        #[cfg(test)]
+        if self
+            .test_skip_route_preflight
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return None;
+        }
         let decisions = decisions_to_apply(decisions);
         for decision in &decisions {
             let problem = match &decision.action {
@@ -4125,7 +4744,7 @@ impl Runtime {
             .then_some(())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "move record attempt was superseded before finalization; leaving current attempt unchanged"
+                    "move record no longer accepts cache finalization (attempt mismatch, terminal intent, or structural evacuation marker); leaving current state unchanged"
                 )
             })
     }
@@ -5053,6 +5672,16 @@ fn source_route_problem(
 /// of Phase 3.A that is every executable action (`Move`/`Evacuate`/`DirectInflow`); `Evacuate` is
 /// no longer excluded, so a same-occurrence re-tick of a now-terminal evacuate fails loudly like a
 /// Move instead of silently reporting success.
+/// The one executable child of a replacement is deliberately absent from the ordinary round
+/// decisions until its atomic parent exchange.  Planning/status/freshness all use this projection
+/// so it is treated as the admitted work without ever letting ordinary `apply` create it early.
+fn planned_tick_decisions(plan: &TickPlan) -> Vec<AllocatorDecision> {
+    plan.replacement
+        .as_ref()
+        .map(|replacement| vec![replacement.fresh.clone()])
+        .unwrap_or_else(|| plan.decisions.clone())
+}
+
 fn tick_applies_decision(decision: &AllocatorDecision) -> bool {
     decision.action.is_executable()
 }
@@ -5128,6 +5757,7 @@ mod tests {
     use crate::journal::FederationInfo;
     use fedimint_bip39::Mnemonic;
     use fedimint_core::db::mem_impl::MemDatabase;
+    use fedimint_core::db::IDatabaseTransactionOpsCore as _;
     use fedimint_core::db::IRawDatabaseExt as _;
     use wallet_core::{FederationId, Intent, Journal, Msat, Occurrence, ProbeBudget};
 
@@ -5135,6 +5765,18 @@ mod tests {
     const FED_B: FederationId = FederationId([0xBB; 32]);
     const FED_C: FederationId = FederationId([0xCC; 32]);
     const FED_D: FederationId = FederationId([0xDD; 32]);
+
+    #[test]
+    fn stale_standalone_status_warning_is_actionable() {
+        let error = crate::service::replacement_occurrence_error(Occurrence(8), Occurrence(8));
+        assert_eq!(
+            stale_standalone_replacement_status_warning(&error),
+            "structurally refused standalone evacuation requires --occurrence advanced beyond old \
+             Agent occurrence (old=8, new=8); daemon scheduling advances occurrences automatically; \
+             returning scored/designation diagnostics with no would-run decisions; retry standalone \
+             tick/status with a strictly newer --occurrence"
+        );
+    }
 
     #[test]
     fn probe_gated_set_is_joined_members_minus_user_approved() {
@@ -5174,6 +5816,46 @@ mod tests {
         let mc = Arc::new(MultiClient::new(db, journal_db.clone(), mnemonic).await);
         let journal = Arc::new(FedimintJournal::new(journal_db));
         (Runtime::new(mc, journal.clone(), None, None, None), journal)
+    }
+
+    #[tokio::test]
+    async fn standalone_tick_reports_the_same_tick_watch_floor_retry() {
+        let (runtime, journal) = runtime_fixture().await;
+        for n in 0..(256 * 16 + 1) {
+            journal
+                .record_started(
+                    &IdempotencyKey(format!("join:standalone-watch-floor-{n}")),
+                    OperationKind::Join { fed: FED_A },
+                    Actor::User,
+                    ReasonCode::UserInitiated,
+                    n as u64,
+                    None,
+                )
+                .await
+                .expect("append valid User suffix without touching WatchState");
+        }
+
+        let error = runtime
+            .tick(&TickPolicy {
+                occurrence: Occurrence(1),
+                ..TickPolicy::default()
+            })
+            .await
+            .expect_err("one standalone tick must stop at its bounded WatchState drain budget");
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic
+                .starts_with("Permanent(\"journal: watch-state floor reconciliation is incomplete"),
+            "the stable typed diagnostic prefix must survive Runtime::tick: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("standalone: re-run the same tick until it converges"),
+            "standalone callers need an actionable retry, not a daemon-only instruction: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("daemon: retry GET /v1/watch/status"),
+            "the shared diagnostic must remain mode-neutral: {diagnostic}"
+        );
     }
 
     #[tokio::test]
@@ -5326,6 +6008,7 @@ mod tests {
             created_at_ms: 0,
             operation_id: None,
             invoice: None,
+            evacuation_refusal: None,
         }
     }
 
@@ -5387,6 +6070,1445 @@ mod tests {
             occurrence: Occurrence(0),
             idempotency_key: IdempotencyKey(key.to_string()),
         }
+    }
+
+    fn standalone_replacement_plan(
+        parent: Intent,
+        evidence: wallet_core::EvacuationRefusalEvidence,
+        fresh: AllocatorDecision,
+    ) -> TickPlan {
+        TickPlan {
+            raw_probes: vec![],
+            probes: vec![],
+            active_probes: BTreeMap::new(),
+            snapshot: AllocatorSnapshot {
+                federations: vec![
+                    wallet_core::FederationStatus {
+                        id: FED_A,
+                        balance: wallet_core::FedBalance {
+                            spendable: Msat(500_000),
+                            in_flight: Msat(0),
+                            claimable: Msat(0),
+                            reserved_fee: Msat(0),
+                        },
+                        probed_ok: true,
+                        reputation: 0,
+                        shutdown_notice: true,
+                        healthy: true,
+                        eligible_to_fund: true,
+                    },
+                    wallet_core::FederationStatus {
+                        id: FED_B,
+                        balance: wallet_core::FedBalance {
+                            spendable: Msat(0),
+                            in_flight: Msat(0),
+                            claimable: Msat(0),
+                            reserved_fee: Msat(0),
+                        },
+                        probed_ok: true,
+                        reputation: 0,
+                        shutdown_notice: false,
+                        healthy: true,
+                        eligible_to_fund: true,
+                    },
+                ],
+                spending_fed: Some(FED_A),
+                standby_fed: Some(FED_B),
+                per_fed_cap: Msat(1_000_000),
+                target_spending_balance: Msat(0),
+                standby_target: Msat(0),
+                max_fee: Msat(1_000),
+                max_fee_bps_of_move: 100,
+                evac_fee_base_msat: Msat(20_000),
+                evac_fee_bps: 0,
+                min_move: Msat(1),
+                route_economics_by_pair: BTreeMap::new(),
+                reservations: Reservations::default(),
+                now: 1,
+            },
+            decisions: vec![],
+            suppressed: vec![],
+            replacement_deferred: vec![],
+            blockers: GoalBlockers::default(),
+            replacement: Some(crate::service::EvacuationReplacementPlan {
+                old_key: parent.idempotency_key.clone(),
+                old_attempt: parent.attempt,
+                parent,
+                evidence,
+                fresh,
+            }),
+            marker_disposition: None,
+        }
+    }
+
+    fn marked_evacuation_evidence() -> wallet_core::EvacuationRefusalEvidence {
+        let old_cap = wallet_core::EvacFeeCap {
+            base_msat: Msat(10_000),
+            bps: 0,
+        };
+        wallet_core::EvacuationRefusalEvidence {
+            cap_components: old_cap,
+            requested_net: Msat(100_000),
+            source_spendable: Msat(500_000),
+            low: wallet_core::EvacuationQuoteSample {
+                delivered_net: Msat(10_000),
+                total_fee: Msat(15_000),
+                fee_cap: old_cap.at(Msat(10_000)),
+            },
+            high: wallet_core::EvacuationQuoteSample {
+                delivered_net: Msat(100_000),
+                total_fee: Msat(25_000),
+                fee_cap: old_cap.at(Msat(100_000)),
+            },
+            diagnostic: "measured, not proven".to_owned(),
+            measured_at_ms: 1,
+        }
+    }
+
+    async fn seed_standalone_replacement(
+        journal: &FedimintJournal,
+        parent_name: &str,
+    ) -> (
+        Intent,
+        wallet_core::EvacuationRefusalEvidence,
+        AllocatorDecision,
+        TickPolicy,
+    ) {
+        let evidence = marked_evacuation_evidence();
+        let new_cap = wallet_core::EvacFeeCap {
+            base_msat: Msat(20_000),
+            bps: 0,
+        };
+        let mut fresh = tick_evacuate_decision(&format!("evac:{parent_name}-child"), FED_A, FED_B);
+        fresh.occurrence = Occurrence(9);
+        let Action::Evacuate {
+            fee_cap,
+            fee_cap_components,
+            ..
+        } = &mut fresh.action
+        else {
+            unreachable!("evacuation fixture")
+        };
+        *fee_cap = new_cap.at(Msat(100_000));
+        *fee_cap_components = Some(new_cap);
+        let mut parent = Intent::from_decision(
+            &tick_evacuate_decision(&format!("evac:{parent_name}-parent"), FED_A, FED_B),
+            Actor::Agent {
+                occurrence: Occurrence(8),
+            },
+            1,
+        );
+        let Action::Evacuate {
+            fee_cap,
+            fee_cap_components,
+            ..
+        } = &mut parent.action
+        else {
+            unreachable!("evacuation fixture")
+        };
+        *fee_cap = evidence.cap_components.at(Msat(100_000));
+        *fee_cap_components = Some(evidence.cap_components);
+        parent.max_fee = Some(*fee_cap);
+        parent.evacuation_refusal = Some(evidence.clone());
+        journal
+            .upsert(&parent)
+            .await
+            .expect("seed marked standalone parent");
+        (
+            parent,
+            evidence,
+            fresh,
+            TickPolicy {
+                per_fed_cap: Msat(1_000_000),
+                evac_fee_base_msat: new_cap.base_msat,
+                evac_fee_bps: new_cap.bps,
+                ..TickPolicy::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn standalone_tick_rejects_dual_marker_outcomes_before_marker_or_child_mutation() {
+        let (mut runtime, journal) = runtime_fixture().await;
+        let (replacement_parent, evidence, replacement_child, policy) =
+            seed_standalone_replacement(journal.as_ref(), "dual-shape-replacement").await;
+        let disposition_evidence = marked_evacuation_evidence();
+        let mut disposition_parent = Intent::from_decision(
+            &tick_evacuate_decision("evac:dual-shape-disposition-parent", FED_C, FED_D),
+            Actor::Agent {
+                occurrence: Occurrence(7),
+            },
+            1,
+        );
+        let Action::Evacuate {
+            fee_cap,
+            fee_cap_components,
+            ..
+        } = &mut disposition_parent.action
+        else {
+            unreachable!("evacuation fixture")
+        };
+        *fee_cap = disposition_evidence.cap_components.at(Msat(100_000));
+        *fee_cap_components = Some(disposition_evidence.cap_components);
+        disposition_parent.max_fee = Some(*fee_cap);
+        disposition_parent.evacuation_refusal = Some(disposition_evidence);
+        journal
+            .upsert(&disposition_parent)
+            .await
+            .expect("seed independent no-child marker");
+        let disposition_child =
+            tick_evacuate_decision("evac:dual-shape-disposition-child", FED_C, FED_D);
+        let mut plan = standalone_replacement_plan(
+            replacement_parent.clone(),
+            evidence,
+            replacement_child.clone(),
+        );
+        plan.marker_disposition = Some(crate::service::EvacuationMarkerDisposition {
+            parent: disposition_parent.clone(),
+        });
+        let executor = Arc::new(wallet_core::MockExecutor::new());
+        runtime.set_tick_test_fixture(executor.clone(), plan);
+
+        let error = runtime.tick(&policy).await.expect_err(
+            "two independent marker outcomes must terminalize the audit before marker writes",
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("replacement and marker-clear disposition cannot share"),
+            "{error:#}"
+        );
+        assert_eq!(
+            journal
+                .get(&replacement_parent.idempotency_key)
+                .await
+                .expect("read replacement parent"),
+            Some(replacement_parent.clone()),
+            "the replacement marker stays exact"
+        );
+        assert_eq!(
+            journal
+                .get(&disposition_parent.idempotency_key)
+                .await
+                .expect("read disposition parent"),
+            Some(disposition_parent.clone()),
+            "the no-child marker stays exact"
+        );
+        for child in [&replacement_child, &disposition_child] {
+            assert!(
+                journal
+                    .get(&child.idempotency_key)
+                    .await
+                    .expect("read forged child")
+                    .is_none(),
+                "the forged dual plan must not create either child"
+            );
+        }
+        for parent in [&replacement_parent, &disposition_parent] {
+            assert!(
+                journal
+                    .evacuation_supersession(&parent.idempotency_key)
+                    .await
+                    .expect("read forged replacement sidecar")
+                    .is_none(),
+                "the forged dual plan must not create either sidecar"
+            );
+        }
+        assert!(
+            journal
+                .history(usize::MAX, None)
+                .await
+                .expect("read forged dual-plan history")
+                .iter()
+                .any(|row| {
+                    matches!(row.kind, OperationKind::Tick { .. })
+                        && row.status == OperationStatus::Failed
+                }),
+            "the guard terminalizes its already-open tick audit row"
+        );
+        assert_eq!(
+            executor.performed_keys(),
+            Vec::<IdempotencyKey>::new(),
+            "the guard runs before executor admission"
+        );
+    }
+
+    async fn assert_retained_standalone_replacement_marker(
+        journal: &FedimintJournal,
+        parent: &Intent,
+        fresh: &AllocatorDecision,
+    ) {
+        assert_eq!(
+            journal
+                .get(&parent.idempotency_key)
+                .await
+                .expect("read retained replacement parent"),
+            Some(parent.clone()),
+            "pre-exchange errors retain the exact Pending marker"
+        );
+        assert_eq!(
+            journal
+                .get(&fresh.idempotency_key)
+                .await
+                .expect("read absent replacement child"),
+            None,
+            "pre-exchange errors do not create a child"
+        );
+        assert!(
+            journal
+                .evacuation_supersession(&parent.idempotency_key)
+                .await
+                .expect("read absent replacement sidecar")
+                .is_none(),
+            "pre-exchange errors do not create a replacement sidecar"
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_replacement_admission_and_fresh_blocker_errors_retain_marker() {
+        let (runtime, journal) = runtime_fixture().await;
+        let (parent, evidence, fresh, mut policy) =
+            seed_standalone_replacement(journal.as_ref(), "admission-retention").await;
+        policy.per_fed_cap = Msat(1);
+        let replacement = crate::service::EvacuationReplacementPlan {
+            old_key: parent.idempotency_key.clone(),
+            old_attempt: parent.attempt,
+            parent: parent.clone(),
+            evidence,
+            fresh: fresh.clone(),
+        };
+        let error = runtime
+            .replace_marked_evacuation_standalone(
+                &replacement,
+                &policy,
+                &BTreeMap::from([(FED_A, Msat(1)), (FED_B, Msat(0))]),
+                &GoalBlockers::default(),
+            )
+            .await
+            .expect_err("admission failure must not release a structural marker");
+        assert!(!error.to_string().is_empty(), "{error:#}");
+        assert_retained_standalone_replacement_marker(&journal, &parent, &fresh).await;
+
+        let (parent, evidence, fresh, policy) =
+            seed_standalone_replacement(journal.as_ref(), "fresh-blocker-retention").await;
+        let holder = Intent::from_decision(
+            &tick_evacuate_decision("evac:fresh-blocker-holder", FED_A, FED_B),
+            Actor::Agent {
+                occurrence: Occurrence(7),
+            },
+            1,
+        );
+        journal
+            .upsert(&holder)
+            .await
+            .expect("seed fresh durable blocker");
+        let replacement = crate::service::EvacuationReplacementPlan {
+            old_key: parent.idempotency_key.clone(),
+            old_attempt: parent.attempt,
+            parent: parent.clone(),
+            evidence,
+            fresh: fresh.clone(),
+        };
+        let error = runtime
+            .replace_marked_evacuation_standalone(
+                &replacement,
+                &policy,
+                &BTreeMap::from([(FED_A, Msat(500_000)), (FED_B, Msat(0))]),
+                &GoalBlockers::default(),
+            )
+            .await
+            .expect_err("a fresh durable blocker must not release a structural marker");
+        assert!(
+            error.to_string().contains("conflicts with allocator work"),
+            "{error:#}"
+        );
+        assert_retained_standalone_replacement_marker(&journal, &parent, &fresh).await;
+    }
+
+    /// Standalone planning remains fail-closed when the complete reservation view is corrupt: it
+    /// must not bypass the planner with a bespoke executor for a marked parent.
+    #[tokio::test]
+    async fn standalone_tick_corrupt_reservations_keeps_marked_parent_unchanged() {
+        let client_db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
+        let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
+        let mc = Arc::new(MultiClient::new(client_db, journal_db.clone(), mnemonic).await);
+        let journal = Arc::new(FedimintJournal::new(journal_db.clone()));
+        let mut runtime = Runtime::new(mc, journal.clone(), None, None, None);
+        let executor = Arc::new(wallet_core::MockExecutor::new());
+        runtime.set_tick_test_executor(executor.clone());
+
+        let parent_key = IdempotencyKey("evac:standalone-corrupt-fallback".to_owned());
+        let evidence = marked_evacuation_evidence();
+        let mut parent = Intent::from_decision(
+            &tick_evacuate_decision(&parent_key.0, FED_A, FED_B),
+            Actor::Agent {
+                occurrence: Occurrence(8),
+            },
+            1,
+        );
+        let Action::Evacuate {
+            fee_cap,
+            fee_cap_components,
+            ..
+        } = &mut parent.action
+        else {
+            unreachable!("evacuation fixture")
+        };
+        *fee_cap = evidence.cap_components.at(Msat(100_000));
+        *fee_cap_components = Some(evidence.cap_components);
+        parent.max_fee = Some(*fee_cap);
+        parent.evacuation_refusal = Some(evidence.clone());
+        journal.upsert(&parent).await.expect("seed marked parent");
+
+        let unmarked_key = IdempotencyKey("evac:standalone-corrupt-unmarked".to_owned());
+        let unmarked = Intent::from_decision(
+            &tick_evacuate_decision(&unmarked_key.0, FED_C, FED_B),
+            Actor::Agent {
+                occurrence: Occurrence(7),
+            },
+            1,
+        );
+        journal
+            .upsert(&unmarked)
+            .await
+            .expect("seed ordinary unmarked evacuation");
+
+        let poison_key = IdempotencyKey("move:standalone-corrupt-reservation".to_owned());
+        let app_db = journal_db.with_prefix(vec![0x00]);
+        let mut intent_key = vec![0x01];
+        intent_key.extend_from_slice(poison_key.0.as_bytes());
+        let mut pending_index_key = vec![0x04, 0x00];
+        pending_index_key.extend_from_slice(poison_key.0.as_bytes());
+        let mut dbtx = app_db.begin_transaction().await;
+        dbtx.raw_insert_bytes(&intent_key, b"not valid json")
+            .await
+            .expect("insert corrupt pending intent");
+        dbtx.raw_insert_bytes(&pending_index_key, &[])
+            .await
+            .expect("index corrupt pending intent");
+        dbtx.commit_tx_result()
+            .await
+            .expect("commit corrupt pending intent");
+
+        let error = runtime
+            .tick(&TickPolicy {
+                occurrence: Occurrence(9),
+                evac_fee_base_msat: Msat(20_000),
+                evac_fee_bps: 0,
+                ..TickPolicy::default()
+            })
+            .await
+            .expect_err("strict corrupt reservation view still aborts standalone planning");
+        assert!(error.to_string().contains("intent"), "{error}");
+        let tick_rows = journal
+            .history(usize::MAX, None)
+            .await
+            .expect("read standalone corrupt-reservation history")
+            .into_iter()
+            .filter(|row| {
+                matches!(
+                    row.kind,
+                    OperationKind::Tick {
+                        occurrence: Occurrence(9),
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tick_rows.len(),
+            1,
+            "real planning corruption must leave exactly one tick audit row: {tick_rows:#?}"
+        );
+        let tick = &tick_rows[0];
+        assert_eq!(tick.status, OperationStatus::Failed);
+        assert_eq!(tick.error.as_deref(), Some(error.to_string().as_str()));
+        assert_eq!(
+            tick.kind,
+            OperationKind::Tick {
+                occurrence: Occurrence(9),
+                decisions: 0,
+                performed: 0,
+                failed: 0,
+            },
+            "planning failed before any decision could be applied"
+        );
+        assert_eq!(
+            executor.performed_keys(),
+            Vec::<IdempotencyKey>::new(),
+            "corrupt strict reservations must not launch a marked-parent executor bypass"
+        );
+        let retained_parent = journal
+            .get(&parent_key)
+            .await
+            .expect("read marked parent")
+            .expect("marked parent remains durable");
+        assert_eq!(retained_parent, parent);
+        assert_eq!(
+            journal.get(&unmarked_key).await.expect("read unmarked row"),
+            Some(unmarked),
+            "reservation corruption is not a generic bypass for ordinary pending work"
+        );
+        assert!(
+            journal.reservation_intents().await.is_err(),
+            "the recovery attempt does not weaken strict planning admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_status_is_dry_and_tick_atomically_replaces_marked_evacuation() {
+        let (mut runtime, journal) = runtime_fixture().await;
+        let old_key = IdempotencyKey("evac:standalone-parent".to_owned());
+        let evidence = marked_evacuation_evidence();
+        let new_cap = wallet_core::EvacFeeCap {
+            base_msat: Msat(20_000),
+            bps: 0,
+        };
+        let mut fresh = tick_evacuate_decision("evac:standalone-child", FED_A, FED_B);
+        fresh.occurrence = Occurrence(9);
+        let Action::Evacuate {
+            fee_cap,
+            fee_cap_components,
+            ..
+        } = &mut fresh.action
+        else {
+            unreachable!("evacuation fixture")
+        };
+        *fee_cap = new_cap.at(Msat(100_000));
+        *fee_cap_components = Some(new_cap);
+        let mut parent = Intent::from_decision(
+            &tick_evacuate_decision(&old_key.0, FED_A, FED_B),
+            Actor::Agent {
+                occurrence: Occurrence(8),
+            },
+            1,
+        );
+        let Action::Evacuate {
+            fee_cap,
+            fee_cap_components,
+            ..
+        } = &mut parent.action
+        else {
+            unreachable!("evacuation fixture")
+        };
+        *fee_cap = evidence.cap_components.at(Msat(100_000));
+        *fee_cap_components = Some(evidence.cap_components);
+        parent.max_fee = Some(*fee_cap);
+        parent.evacuation_refusal = Some(evidence.clone());
+        journal.upsert(&parent).await.expect("seed marked parent");
+        let executor = Arc::new(wallet_core::MockExecutor::new());
+        let deferred_executable = tick_move_decision("move:standalone-deferred-c-b", FED_C, FED_B);
+        let deferred_advisory = AllocatorDecision {
+            action: Action::RefuseInflow {
+                fed: FED_B,
+                reason: ReasonCode::SpendingBelowTarget,
+                diagnostics: wallet_core::RefusalDiagnostics {
+                    source: Some(FED_C),
+                    want: Some(Msat(101)),
+                    available: Some(Msat(102)),
+                    source_spendable: Some(Msat(103)),
+                    max_fee: Some(Msat(104)),
+                    max_fee_bps: Some(105),
+                    cap_room: Some(Msat(106)),
+                    amount: Some(Msat(107)),
+                    conflict_suppressed: true,
+                    min_move: Some(Msat(108)),
+                },
+            },
+            reason: ReasonCode::SpendingBelowTarget,
+            occurrence: Occurrence(9),
+            idempotency_key: IdempotencyKey("refuse:standalone-deferred-c-b".to_owned()),
+        };
+        let replacement_plan = |child: AllocatorDecision| {
+            let mut plan = standalone_replacement_plan(parent.clone(), evidence.clone(), child);
+            plan.raw_probes = vec![
+                (FED_A, raw_probe_with_expiry(true, None, None)),
+                (FED_B, raw_probe_with_expiry(true, None, None)),
+            ];
+            plan.snapshot
+                .federations
+                .push(wallet_core::FederationStatus {
+                    id: FED_C,
+                    balance: wallet_core::FedBalance {
+                        spendable: Msat(100_000),
+                        in_flight: Msat(0),
+                        claimable: Msat(0),
+                        reserved_fee: Msat(0),
+                    },
+                    probed_ok: false,
+                    reputation: 0,
+                    shutdown_notice: false,
+                    healthy: true,
+                    eligible_to_fund: true,
+                });
+            let mut unavailable_c = raw_probe_with_expiry(false, None, None);
+            unavailable_c.gateway_available = false;
+            plan.probes = vec![(FED_C, unavailable_c)];
+            plan.replacement_deferred =
+                vec![deferred_executable.clone(), deferred_advisory.clone()];
+            plan
+        };
+        let policy = TickPolicy {
+            per_fed_cap: Msat(1_000_000),
+            evac_fee_base_msat: new_cap.base_msat,
+            evac_fee_bps: new_cap.bps,
+            spending_fed: Some(FED_C),
+            ..TickPolicy::default()
+        };
+        // The CLI default occurrence (zero) is not a successor. In particular, a hand-composed
+        // standalone plan must not use the parent's identity to turn a structural marker into an
+        // ordinary retry. This runs before the exchange, so the exact parent bytes and both
+        // sidecars remain unchanged.
+        let mut same_occurrence = fresh.clone();
+        same_occurrence.idempotency_key =
+            IdempotencyKey("evac:standalone-default-occurrence".into());
+        same_occurrence.occurrence = Occurrence(0);
+        runtime.set_tick_test_fixture(executor.clone(), replacement_plan(same_occurrence.clone()));
+        let stale_status = runtime
+            .status(&policy)
+            .await
+            .expect("standalone stale replacement status remains a scored diagnostic");
+        assert!(
+            stale_status.decisions.is_empty(),
+            "standalone status must not advertise an impossible child or deferred ordinary work: \
+             {stale_status:#?}"
+        );
+        assert_eq!(
+            stale_status.scored.len(),
+            2,
+            "the populated status probes remain visible"
+        );
+        assert_eq!(stale_status.spending_fed, Some(FED_A));
+        assert_eq!(stale_status.standby_fed, Some(FED_B));
+        assert_eq!(
+            journal.get(&old_key).await.expect("read dry stale parent"),
+            Some(parent.clone()),
+            "the diagnostic must not mutate the marker"
+        );
+        assert!(
+            journal
+                .get(&same_occurrence.idempotency_key)
+                .await
+                .expect("read dry stale child")
+                .is_none(),
+            "the diagnostic must not create a child"
+        );
+        assert!(
+            journal
+                .history(usize::MAX, None)
+                .await
+                .expect("read dry stale ledger")
+                .iter()
+                .all(|row| !matches!(row.kind, OperationKind::Tick { .. })),
+            "the diagnostic must not open a tick row"
+        );
+        let error = runtime
+            .tick(&policy)
+            .await
+            .expect_err("old=8/new=0 replacement must be refused before exchange");
+        assert!(
+            error
+                .to_string()
+                .contains("requires --occurrence advanced beyond old Agent occurrence"),
+            "{error}"
+        );
+        assert_eq!(
+            journal.get(&old_key).await.expect("read unchanged parent"),
+            Some(parent.clone()),
+            "old=8/new=0 is operator-correctable: retain the typed marker for a newer rerun"
+        );
+        assert!(
+            journal
+                .evacuation_supersession(&old_key)
+                .await
+                .expect("read absent forward sidecar")
+                .is_none(),
+            "old=8/new=0 must not write either replacement sidecar"
+        );
+        assert_eq!(executor.performed_keys(), Vec::<IdempotencyKey>::new());
+
+        // The stale occurrence is operator-correctable, not a failed exchange: N+1 directly
+        // reuses the unchanged typed marker and follows the production exchange/drive path.
+        runtime.set_tick_test_fixture(executor.clone(), replacement_plan(fresh.clone()));
+        // A post-commit Retryable forces exact confirmation.  This fixed timestamp is deliberately
+        // unlike the wall clock: replacing either use of `exchange_now` with a second clock sample
+        // makes the confirmation's expected child disagree with the atomic journal child.
+        runtime.set_replacement_exchange_times_for_test([424_242]);
+
+        let status = runtime.status(&policy).await.expect("dry status");
+        assert_eq!(status.decisions, vec![fresh.clone()]);
+        assert_eq!(
+            journal.get(&old_key).await.expect("read parent"),
+            Some(parent.clone()),
+            "status must not retire the parent"
+        );
+        assert_eq!(
+            journal
+                .get(&fresh.idempotency_key)
+                .await
+                .expect("read prospective child"),
+            None,
+            "status must not create the successor"
+        );
+
+        journal.fail_after_next_evacuation_replacement_with_confirmation_read_for_test();
+        // The first exact confirmation read faults after the exchange committed. The bounded
+        // Retryable-only confirmation loop must reread and recover the child rather than poison
+        // authority or reporting an ambiguous outcome.
+        let report = runtime
+            .tick(&policy)
+            .await
+            .expect("post-commit exchange exact-confirms after one Retryable read fault");
+        assert_eq!(report.decisions, vec![fresh.clone()]);
+        assert_eq!(
+            (
+                report.decisions.len(),
+                report.summary.performed,
+                report.summary.failed
+            ),
+            (1, 1, 0),
+            "the confirmed child is driven and the tick records {{1,1,0}}"
+        );
+        assert_eq!(
+            executor.performed_keys(),
+            vec![fresh.idempotency_key.clone()]
+        );
+        for deferred in [&deferred_executable, &deferred_advisory] {
+            assert_eq!(
+                journal
+                    .get(&deferred.idempotency_key)
+                    .await
+                    .expect("read deferred intent"),
+                None,
+                "a deferred decision must stay audit-only and never become a child intent"
+            );
+        }
+        let executable_row = journal
+            .operation(&crate::journal::OperationRef::Key(IdempotencyKey(format!(
+                "tick-drop:{}:{}",
+                policy.occurrence.0, deferred_executable.idempotency_key.0
+            ))))
+            .await
+            .expect("read executable deferred audit")
+            .expect("executable deferred audit row");
+        assert!(
+            executable_row
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("replacement-exclusive one-child round")),
+            "{executable_row:#?}"
+        );
+        let advisory_row = journal
+            .operation(&crate::journal::OperationRef::Key(
+                deferred_advisory.idempotency_key.clone(),
+            ))
+            .await
+            .expect("read advisory deferred audit")
+            .expect("advisory deferred audit row");
+        assert_eq!(
+            advisory_row.error.as_deref(),
+            Some("deferred: replacement-exclusive one-child round"),
+            "{advisory_row:#?}"
+        );
+        assert_eq!(
+            advisory_row.kind,
+            wallet_core::OperationKind::Refusal {
+                fed: FED_B,
+                diagnostics: match deferred_advisory.action {
+                    Action::RefuseInflow { diagnostics, .. } => diagnostics,
+                    _ => unreachable!("advisory fixture"),
+                },
+            },
+            "the standalone advisory's allocator diagnostics must be exact"
+        );
+        assert_eq!(
+            journal
+                .get(&old_key)
+                .await
+                .expect("read retired parent")
+                .expect("parent remains auditable")
+                .status,
+            IntentStatus::Failed
+        );
+        let child = journal
+            .get(&fresh.idempotency_key)
+            .await
+            .expect("read child")
+            .expect("atomic child");
+        assert_eq!(child.status, IntentStatus::Done);
+        assert_eq!(child.created_at_ms, 424_242);
+        assert_eq!(
+            journal
+                .evacuation_supersession(&old_key)
+                .await
+                .expect("read exact relation")
+                .expect("replacement relation")
+                .superseded_at_ms,
+            child.created_at_ms,
+            "child identity and atomic sidecar share the one exchange timestamp"
+        );
+        assert!(
+            journal
+                .history(usize::MAX, None)
+                .await
+                .expect("tick history")
+                .into_iter()
+                .any(|row| {
+                    matches!(
+                        row.kind,
+                        OperationKind::Tick {
+                            decisions: 1,
+                            performed: 1,
+                            failed: 0,
+                            ..
+                        }
+                    )
+                }),
+            "the exchange is one tick decision, not an uncounted side effect"
+        );
+    }
+
+    async fn assert_standalone_marker_disposition_clear_fault(post_commit: bool, no_work: bool) {
+        let (mut runtime, journal) = runtime_fixture().await;
+        let evidence = marked_evacuation_evidence();
+        let mut parent = Intent::from_decision(
+            &tick_evacuate_decision("evac:standalone-marker-clear", FED_A, FED_B),
+            Actor::Agent {
+                occurrence: Occurrence(8),
+            },
+            1,
+        );
+        let Action::Evacuate {
+            fee_cap,
+            fee_cap_components,
+            ..
+        } = &mut parent.action
+        else {
+            unreachable!("evacuation fixture")
+        };
+        *fee_cap = evidence.cap_components.at(Msat(100_000));
+        *fee_cap_components = Some(evidence.cap_components);
+        parent.max_fee = Some(*fee_cap);
+        parent.evacuation_refusal = Some(evidence.clone());
+        journal.upsert(&parent).await.expect("seed marked parent");
+
+        let fresh = tick_evacuate_decision("evac:unused-replacement", FED_A, FED_B);
+        let mut plan = standalone_replacement_plan(parent.clone(), evidence.clone(), fresh);
+        plan.replacement = None;
+        plan.marker_disposition = Some(crate::service::EvacuationMarkerDisposition {
+            parent: parent.clone(),
+        });
+        if !no_work {
+            let mut source = plan.snapshot.federations[0].clone();
+            source.id = FED_C;
+            source.balance.spendable = Msat(100_000);
+            source.shutdown_notice = false;
+            let mut destination = plan.snapshot.federations[1].clone();
+            destination.id = FED_D;
+            plan.snapshot.federations.extend([source, destination]);
+            plan.decisions = vec![tick_move_decision(
+                "move:standalone-marker-clear-independent",
+                FED_C,
+                FED_D,
+            )];
+            plan.decisions[0].occurrence = Occurrence(9);
+        }
+        runtime.set_tick_test_fixture(Arc::new(wallet_core::MockExecutor::new()), plan);
+        if post_commit {
+            journal.fail_after_next_marker_clear_for_test();
+        } else {
+            journal.fail_before_next_marker_clear_for_test();
+        }
+        let result = runtime
+            .tick(&TickPolicy {
+                occurrence: Occurrence(9),
+                ..TickPolicy::default()
+            })
+            .await;
+        if no_work {
+            assert!(
+                result.is_err(),
+                "a marker-only clear failure must remain loud"
+            );
+        } else {
+            let report =
+                result.expect("marker-local clear fault must not suppress independent work");
+            assert!(
+                report
+                    .decisions
+                    .iter()
+                    .any(|decision| decision.idempotency_key.0
+                        == "move:standalone-marker-clear-independent"),
+                "{report:#?}"
+            );
+        }
+        let parent_after = journal
+            .get(&parent.idempotency_key)
+            .await
+            .expect("read marker parent")
+            .expect("marker parent remains");
+        assert_eq!(
+            parent_after.evacuation_refusal,
+            if post_commit { None } else { Some(evidence) },
+            "pre-commit faults retain the exact marker; a post-commit ambiguity confirms its clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_marker_disposition_clear_fault_continues_independent_work() {
+        assert_standalone_marker_disposition_clear_fault(false, false).await;
+        assert_standalone_marker_disposition_clear_fault(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn standalone_marker_disposition_clear_fault_without_work_terminalizes_tick() {
+        assert_standalone_marker_disposition_clear_fault(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn standalone_replacement_confirmation_ignores_a_middle_parents_predecessor() {
+        let (runtime, journal) = runtime_fixture().await;
+        let cap_a = wallet_core::EvacFeeCap {
+            base_msat: Msat(10_000),
+            bps: 0,
+        };
+        let cap_b = wallet_core::EvacFeeCap {
+            base_msat: Msat(20_000),
+            bps: 0,
+        };
+        let cap_c = wallet_core::EvacFeeCap {
+            base_msat: Msat(30_000),
+            bps: 0,
+        };
+        let a_key = IdempotencyKey("evac:standalone-chain-a".to_owned());
+        let mut a = Intent::from_decision(
+            &tick_evacuate_decision(&a_key.0, FED_A, FED_B),
+            Actor::Agent {
+                occurrence: Occurrence(8),
+            },
+            1,
+        );
+        let mut a_evidence = marked_evacuation_evidence();
+        a_evidence.cap_components = cap_a;
+        a_evidence.low.fee_cap = cap_a.at(a_evidence.low.delivered_net);
+        a_evidence.high.fee_cap = cap_a.at(a_evidence.high.delivered_net);
+        let Action::Evacuate {
+            fee_cap,
+            fee_cap_components,
+            ..
+        } = &mut a.action
+        else {
+            unreachable!("evacuation fixture")
+        };
+        *fee_cap = cap_a.at(Msat(100_000));
+        *fee_cap_components = Some(cap_a);
+        a.max_fee = Some(*fee_cap);
+        a.evacuation_refusal = Some(a_evidence.clone());
+        journal.upsert(&a).await.expect("seed marked A");
+
+        let mut b = tick_evacuate_decision("evac:standalone-chain-b", FED_A, FED_B);
+        b.occurrence = Occurrence(9);
+        let Action::Evacuate {
+            fee_cap,
+            fee_cap_components,
+            ..
+        } = &mut b.action
+        else {
+            unreachable!("evacuation fixture")
+        };
+        *fee_cap = cap_b.at(Msat(100_000));
+        *fee_cap_components = Some(cap_b);
+        journal
+            .replace_marked_evacuation(&a_key, a.attempt, &a_evidence, &b, 2, &a)
+            .await
+            .expect("commit A -> B");
+
+        let mut b_parent = journal
+            .get(&b.idempotency_key)
+            .await
+            .expect("read B")
+            .expect("B exists");
+        let mut b_evidence = a_evidence.clone();
+        b_evidence.cap_components = cap_b;
+        b_evidence.low.fee_cap = cap_b.at(b_evidence.low.delivered_net);
+        b_evidence.high.fee_cap = cap_b.at(b_evidence.high.delivered_net);
+        b_evidence.low.total_fee = Msat(b_evidence.low.fee_cap.0 + 1);
+        b_evidence.high.total_fee = Msat(b_evidence.high.fee_cap.0 + 2);
+        b_parent.evacuation_refusal = Some(b_evidence.clone());
+        journal.upsert(&b_parent).await.expect("mark B");
+
+        let mut c = tick_evacuate_decision("evac:standalone-chain-c", FED_A, FED_B);
+        c.occurrence = Occurrence(10);
+        let Action::Evacuate {
+            fee_cap,
+            fee_cap_components,
+            ..
+        } = &mut c.action
+        else {
+            unreachable!("evacuation fixture")
+        };
+        *fee_cap = cap_c.at(Msat(100_000));
+        *fee_cap_components = Some(cap_c);
+        let replacement = crate::service::EvacuationReplacementPlan {
+            old_key: b.idempotency_key.clone(),
+            old_attempt: b_parent.attempt,
+            parent: b_parent.clone(),
+            evidence: b_evidence.clone(),
+            fresh: c.clone(),
+        };
+        let policy = TickPolicy {
+            per_fed_cap: Msat(1_000_000),
+            evac_fee_base_msat: cap_c.base_msat,
+            evac_fee_bps: cap_c.bps,
+            ..TickPolicy::default()
+        };
+        let balances = BTreeMap::from([(FED_A, Msat(500_000)), (FED_B, Msat(0))]);
+
+        // B has a coherent A -> B predecessor, but the B -> C exchange faults before it writes.
+        // Exact confirmation must therefore return Uncommitted while retaining B's exact marker and
+        // leaving global durable facts without a C child. Replacing the strict lookup with the
+        // dual-key reader makes this confirmation ambiguous instead.
+        journal.fail_before_next_evacuation_replacement_for_test();
+        let error = runtime
+            .replace_marked_evacuation_standalone(
+                &replacement,
+                &policy,
+                &balances,
+                &GoalBlockers::default(),
+            )
+            .await
+            .expect_err("pre-commit B -> C fault is confirmed uncommitted");
+        assert!(
+            error.to_string().contains("definitely uncommitted"),
+            "{error:#}"
+        );
+        let b_after_fault = journal
+            .get(&b.idempotency_key)
+            .await
+            .expect("read B after uncommitted confirmation")
+            .expect("B remains");
+        assert_eq!(b_after_fault.status, IntentStatus::Pending);
+        assert_eq!(
+            b_after_fault.evacuation_refusal,
+            Some(b_evidence.clone()),
+            "uncommitted confirmation retains exactly B's Pending parent marker"
+        );
+        assert!(
+            journal
+                .get(&c.idempotency_key)
+                .await
+                .expect("read C after uncommitted confirmation")
+                .is_none(),
+            "confirmation neither writes nor clears a nonexistent attempted child"
+        );
+        assert_eq!(
+            journal
+                .evacuation_supersession(&b.idempotency_key)
+                .await
+                .expect("read B predecessor through dual-key API")
+                .expect("A -> B predecessor")
+                .old_key,
+            a_key,
+            "the predecessor remains durable audit history, not an outcome for B -> C"
+        );
+
+        // No manual re-mark/reconcile is needed: a higher occurrence retries the exact retained
+        // marker. The same strict reader must still confirm the actual B -> C successor.
+        runtime.set_replacement_exchange_times_for_test([424_243]);
+        journal.fail_after_next_evacuation_replacement_for_test();
+        runtime
+            .replace_marked_evacuation_standalone(
+                &replacement,
+                &policy,
+                &balances,
+                &GoalBlockers::default(),
+            )
+            .await
+            .expect("post-commit B -> C fault is confirmed committed");
+        assert_eq!(
+            journal
+                .evacuation_canonical_successor(&b.idempotency_key)
+                .await
+                .expect("read B canonical successor")
+                .expect("B -> C successor")
+                .new_key,
+            c.idempotency_key
+        );
+        assert_eq!(
+            journal
+                .get(&c.idempotency_key)
+                .await
+                .expect("read committed C")
+                .expect("C exists")
+                .created_at_ms,
+            424_243
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_replacement_validation_failure_preserves_the_marked_parent() {
+        let (mut runtime, journal) = runtime_fixture().await;
+        let old_key = IdempotencyKey("evac:standalone-corrupt-parent".to_owned());
+        let evidence = marked_evacuation_evidence();
+        let wrong_cap = wallet_core::EvacFeeCap {
+            base_msat: Msat(19_999),
+            bps: 0,
+        };
+        let mut fresh = tick_evacuate_decision("evac:standalone-corrupt-child", FED_A, FED_B);
+        let Action::Evacuate {
+            fee_cap,
+            fee_cap_components,
+            ..
+        } = &mut fresh.action
+        else {
+            unreachable!("evacuation fixture")
+        };
+        *fee_cap = wrong_cap.at(Msat(100_000));
+        *fee_cap_components = Some(wrong_cap);
+        let mut parent = Intent::from_decision(
+            &tick_evacuate_decision(&old_key.0, FED_A, FED_B),
+            Actor::Agent {
+                occurrence: Occurrence(8),
+            },
+            1,
+        );
+        let Action::Evacuate {
+            fee_cap,
+            fee_cap_components,
+            ..
+        } = &mut parent.action
+        else {
+            unreachable!("evacuation fixture")
+        };
+        *fee_cap = evidence.cap_components.at(Msat(100_000));
+        *fee_cap_components = Some(evidence.cap_components);
+        parent.max_fee = Some(*fee_cap);
+        parent.evacuation_refusal = Some(evidence.clone());
+        journal.upsert(&parent).await.expect("seed marked parent");
+        runtime.set_tick_test_fixture(
+            Arc::new(wallet_core::MockExecutor::new()),
+            standalone_replacement_plan(parent.clone(), evidence, fresh.clone()),
+        );
+
+        let error = runtime
+            .tick(&TickPolicy {
+                per_fed_cap: Msat(1_000_000),
+                evac_fee_base_msat: Msat(20_000),
+                evac_fee_bps: 0,
+                ..TickPolicy::default()
+            })
+            .await
+            .expect_err("mismatched child cap must fail before the exchange");
+        assert!(
+            error.to_string().contains("no longer exactly matches"),
+            "{error}"
+        );
+        assert_eq!(
+            journal.get(&old_key).await.expect("read parent"),
+            Some(parent),
+            "a failed validation retains the exact Pending parent marker"
+        );
+        assert_eq!(
+            journal
+                .get(&fresh.idempotency_key)
+                .await
+                .expect("read child"),
+            None,
+            "a failed validation must not create a child"
+        );
+    }
+
+    /// The standalone path must discover a marked evacuation through the real
+    /// raw-probe planner, not by accepting a test-built `TickPlan`.  This pins
+    /// the `round.replacement -> TickPlan.replacement` propagation that tick
+    /// later exchanges and drives.
+    #[tokio::test]
+    async fn standalone_probe_planner_carries_the_exact_structural_replacement() {
+        let (runtime, journal) = runtime_fixture().await;
+        runtime.skip_route_preflight_for_test();
+        let old_occurrence = Occurrence(41);
+        let child_occurrence = Occurrence(42);
+        let old_key = IdempotencyKey(format!(
+            "evac:{}:{}:{}",
+            FED_A.to_hex(),
+            FED_B.to_hex(),
+            old_occurrence.0
+        ));
+        let old_cap = wallet_core::EvacFeeCap {
+            base_msat: Msat(10_000),
+            bps: 0,
+        };
+        let new_cap = wallet_core::EvacFeeCap {
+            base_msat: Msat(30_000),
+            bps: 0,
+        };
+        let evidence = marked_evacuation_evidence();
+        let mut parent_decision = tick_evacuate_decision(&old_key.0, FED_A, FED_B);
+        parent_decision.occurrence = old_occurrence;
+        let Action::Evacuate {
+            amount,
+            fee_cap,
+            fee_cap_components,
+            ..
+        } = &mut parent_decision.action
+        else {
+            unreachable!("evacuation fixture")
+        };
+        *amount = Msat(300_000);
+        *fee_cap = old_cap.at(*amount);
+        *fee_cap_components = Some(old_cap);
+        let mut parent = Intent::from_decision(
+            &parent_decision,
+            Actor::Agent {
+                occurrence: old_occurrence,
+            },
+            1,
+        );
+        parent.max_fee = Some(old_cap.at(Msat(300_000)));
+        parent.evacuation_refusal = Some(evidence.clone());
+        journal
+            .upsert(&parent)
+            .await
+            .expect("seed structural marker");
+        journal
+            .put_federation(&FED_B, &federation_info())
+            .await
+            .expect("the replacement destination is joined");
+        let probe_gate_policy = ProbePolicy {
+            min_successes: 1,
+            min_span_ms: 0,
+            ttl_ms: 60 * 60 * 1000,
+            ..ProbePolicy::default()
+        };
+        seed_passed_probe(journal.as_ref(), FED_B, FED_A, &probe_gate_policy).await;
+
+        let policy = TickPolicy {
+            per_fed_cap: Msat(1_000_000),
+            target_spending_balance: Msat(0),
+            standby_target: Msat(0),
+            evac_fee_base_msat: new_cap.base_msat,
+            evac_fee_bps: new_cap.bps,
+            spending_fed: Some(FED_A),
+            standby_fed: Some(FED_B),
+            occurrence: child_occurrence,
+            probe_gate_policy,
+            ..TickPolicy::default()
+        };
+        let mut dying_a = raw_probe_with_expiry(true, None, None);
+        dying_a.spendable_msat = 300_000;
+        let mut healthy_b = raw_probe_with_expiry(false, None, None);
+        healthy_b.spendable_msat = 0;
+
+        let plan = runtime
+            .plan_tick_from_probes(&policy, vec![(FED_A, dying_a), (FED_B, healthy_b)])
+            .await
+            .expect("real standalone probe planner discovers a qualifying marker");
+        assert!(plan.decisions.is_empty(), "{plan:#?}");
+        let replacement = plan
+            .replacement
+            .expect("round replacement survives into the standalone TickPlan");
+        assert_eq!(replacement.old_key, old_key);
+        assert_eq!(replacement.old_attempt, 0);
+        assert_eq!(replacement.evidence, evidence);
+        assert_eq!(
+            replacement.fresh.idempotency_key,
+            IdempotencyKey(format!(
+                "evac:{}:{}:{}",
+                FED_A.to_hex(),
+                FED_B.to_hex(),
+                child_occurrence.0
+            ))
+        );
+        assert_eq!(replacement.fresh.occurrence, child_occurrence);
+        assert!(matches!(
+            replacement.fresh.action,
+            Action::Evacuate {
+                from: FED_A,
+                to: FED_B,
+                amount: Msat(300_000),
+                fee_cap,
+                fee_cap_components: Some(cap),
+                ..
+            } if cap == new_cap && fee_cap == new_cap.at(Msat(300_000))
+        ));
+    }
+
+    #[tokio::test]
+    async fn absent_pinned_input_refuses_standalone_replacement_before_the_exchange() {
+        let (mut runtime, journal) = runtime_fixture().await;
+        let old_key = IdempotencyKey("evac:standalone-pinned-parent".to_owned());
+        let evidence = marked_evacuation_evidence();
+        let new_cap = wallet_core::EvacFeeCap {
+            base_msat: Msat(20_000),
+            bps: 0,
+        };
+        let mut fresh = tick_evacuate_decision("evac:standalone-pinned-child", FED_A, FED_B);
+        let Action::Evacuate {
+            fee_cap,
+            fee_cap_components,
+            ..
+        } = &mut fresh.action
+        else {
+            unreachable!("evacuation fixture")
+        };
+        *fee_cap = new_cap.at(Msat(100_000));
+        *fee_cap_components = Some(new_cap);
+        let mut parent = Intent::from_decision(
+            &tick_evacuate_decision(&old_key.0, FED_A, FED_B),
+            Actor::Agent {
+                occurrence: Occurrence(8),
+            },
+            1,
+        );
+        let Action::Evacuate {
+            fee_cap,
+            fee_cap_components,
+            ..
+        } = &mut parent.action
+        else {
+            unreachable!("evacuation fixture")
+        };
+        *fee_cap = evidence.cap_components.at(Msat(100_000));
+        *fee_cap_components = Some(evidence.cap_components);
+        parent.max_fee = Some(*fee_cap);
+        parent.evacuation_refusal = Some(evidence.clone());
+        journal.upsert(&parent).await.expect("seed marked parent");
+        runtime.set_tick_test_fixture(
+            Arc::new(wallet_core::MockExecutor::new()),
+            standalone_replacement_plan(parent.clone(), evidence, fresh.clone()),
+        );
+
+        let error = runtime
+            .tick(&TickPolicy {
+                per_fed_cap: Msat(1_000_000),
+                evac_fee_base_msat: new_cap.base_msat,
+                evac_fee_bps: new_cap.bps,
+                standby_fed: Some(FED_C),
+                ..TickPolicy::default()
+            })
+            .await
+            .expect_err("an absent configured pin must stop the exchange");
+        assert!(
+            error.to_string().contains("failed to probe"),
+            "pin failure, not a replacement side effect: {error}"
+        );
+        assert_eq!(
+            journal.get(&old_key).await.expect("read parent"),
+            Some(parent),
+            "pin validation happens before the atomic parent retirement"
+        );
+        assert_eq!(
+            journal
+                .get(&fresh.idempotency_key)
+                .await
+                .expect("read child"),
+            None,
+            "pin validation must not create the child"
+        );
+    }
+
+    #[test]
+    fn replacement_child_is_admitted_evidence_for_pinned_input_validation() {
+        let evidence = marked_evacuation_evidence();
+        let fresh = tick_evacuate_decision("evac:pin-evidence-child", FED_A, FED_B);
+        let mut plan = standalone_replacement_plan(
+            Intent::from_decision(
+                &tick_evacuate_decision("evac:pin-evidence-parent", FED_A, FED_B),
+                Actor::Agent {
+                    occurrence: Occurrence(0),
+                },
+                0,
+            ),
+            evidence,
+            fresh,
+        );
+        let mut unusable_source = raw_probe_with_expiry(true, None, None);
+        unusable_source.gateway_available = false;
+        plan.probes = vec![(FED_A, unusable_source)];
+        let policy = TickPolicy {
+            spending_fed: Some(FED_A),
+            ..TickPolicy::default()
+        };
+        assert!(
+            Runtime::pinned_input_problems(&policy, &plan, &plan.blockers).is_empty(),
+            "the planned replacement evacuation is admitted endpoint evidence for its pinned source"
+        );
+    }
+
+    #[test]
+    fn replacement_deferred_are_validation_evidence_without_becoming_suppression_vouchers() {
+        let evidence = marked_evacuation_evidence();
+        let fresh = tick_evacuate_decision("evac:pin-evidence-child", FED_A, FED_B);
+        let mut plan = standalone_replacement_plan(
+            Intent::from_decision(
+                &tick_evacuate_decision("evac:pin-evidence-parent", FED_A, FED_B),
+                Actor::Agent {
+                    occurrence: Occurrence(0),
+                },
+                0,
+            ),
+            evidence,
+            fresh,
+        );
+        plan.snapshot
+            .federations
+            .push(wallet_core::FederationStatus {
+                id: FED_C,
+                balance: wallet_core::FedBalance {
+                    spendable: Msat(100_000),
+                    in_flight: Msat(0),
+                    claimable: Msat(0),
+                    reserved_fee: Msat(0),
+                },
+                probed_ok: false,
+                reputation: 0,
+                shutdown_notice: false,
+                healthy: true,
+                eligible_to_fund: true,
+            });
+        let mut unusable_c = raw_probe_with_expiry(false, None, None);
+        unusable_c.gateway_available = false;
+        plan.probes = vec![(FED_C, unusable_c)];
+        let policy = TickPolicy {
+            spending_fed: Some(FED_C),
+            ..TickPolicy::default()
+        };
+        let executable = tick_move_decision("move:deferred-c-b", FED_C, FED_B);
+        let advisory = AllocatorDecision {
+            action: Action::RefuseInflow {
+                fed: FED_B,
+                reason: ReasonCode::SpendingBelowTarget,
+                diagnostics: wallet_core::RefusalDiagnostics {
+                    source: Some(FED_C),
+                    ..Default::default()
+                },
+            },
+            reason: ReasonCode::SpendingBelowTarget,
+            occurrence: Occurrence(0),
+            idempotency_key: IdempotencyKey("refuse:deferred-c-b".to_owned()),
+        };
+        plan.replacement_deferred = vec![executable, advisory.clone()];
+        assert!(
+            Runtime::pinned_input_problems(&policy, &plan, &plan.blockers).is_empty(),
+            "the third configured pin's deferred executable was planned and route-preflighted; \
+             replacement exclusivity must not turn that into a false pin refusal"
+        );
+
+        // Deferred work is validation evidence, not conflict suppression. An advisory only vouches
+        // when its source still matches the durable holder; a re-sourced holder must stay loud.
+        plan.replacement_deferred = vec![advisory];
+        let re_sourced_holder = tick_move_decision("move:held-a-b", FED_A, FED_B);
+        plan.blockers.hold_decision(
+            &re_sourced_holder,
+            Actor::Agent {
+                occurrence: Occurrence(0),
+            },
+        );
+        assert!(
+            !Runtime::pinned_input_problems(&policy, &plan, &plan.blockers).is_empty(),
+            "an unrelated deferred advisory must not produce a false pass for the third pin"
+        );
     }
 
     fn federation_info() -> FederationInfo {
@@ -5551,6 +7673,7 @@ mod tests {
                 created_at_ms: now_ms(),
                 operation_id: None,
                 invoice: None,
+                evacuation_refusal: None,
             })
             .await
             .expect("seed leg-in intent");
@@ -5642,7 +7765,11 @@ mod tests {
             .upsert(&direct_inflow_intent(
                 key.clone(),
                 FED_A,
-                IntentStatus::Done,
+                // The move-record fence deliberately rejects creation under a
+                // terminal intent.  Model the real ordering: persist the
+                // settled record while the receive is Awaiting, then make the
+                // matching terminal transition.
+                IntentStatus::Awaiting,
             ))
             .await
             .expect("upsert intent");
@@ -5654,6 +7781,10 @@ mod tests {
             )
             .await
             .expect("put move");
+        journal
+            .set_status(&key, 0, IntentStatus::Done, None)
+            .await
+            .expect("terminalize intent");
 
         let err = runtime
             .await_move(&key, Some(FED_B))
@@ -5674,7 +7805,9 @@ mod tests {
             .upsert(&direct_inflow_intent(
                 key.clone(),
                 FED_A,
-                IntentStatus::Failed,
+                // As above, a real failure writes its record before the
+                // expected-attempt terminalization.
+                IntentStatus::Awaiting,
             ))
             .await
             .expect("upsert intent");
@@ -5691,6 +7824,15 @@ mod tests {
             )
             .await
             .expect("put move");
+        journal
+            .set_status(
+                &key,
+                0,
+                IntentStatus::Failed,
+                Some("receive invoice expired before payment"),
+            )
+            .await
+            .expect("terminalize intent");
 
         assert_eq!(
             runtime.await_move(&key, None).await.expect("failed retry"),
@@ -5818,6 +7960,257 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standalone_tick_occurrence_advances_the_next_daemon_watch_cycle() {
+        let (runtime, journal) = runtime_fixture().await;
+        journal
+            .put_watch_state(&WatchState {
+                occurrence: 5,
+                ..WatchState::default()
+            })
+            .await
+            .expect("seed older daemon checkpoint");
+        runtime
+            .tick(&TickPolicy {
+                occurrence: Occurrence(41),
+                ..TickPolicy::default()
+            })
+            .await
+            .expect("standalone no-op tick");
+
+        assert_eq!(
+            journal
+                .observe_watch_occurrence(4)
+                .await
+                .expect("a lower standalone occurrence cannot rewind the checkpoint")
+                .occurrence,
+            41
+        );
+        assert_eq!(
+            journal
+                .advance_watch_occurrence()
+                .await
+                .expect("daemon next occurrence")
+                .occurrence,
+            42,
+            "a restarted daemon must never reuse a standalone occurrence below its marked parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_tick_refuses_max_before_writing_watch_state_or_tick() {
+        let (runtime, journal) = runtime_fixture().await;
+        let checkpoint = WatchState {
+            occurrence: 41,
+            last_discover_ms: 42,
+            agent_floor_reconciled: true,
+            agent_floor_scan_initialized: true,
+            ..WatchState::default()
+        };
+        journal
+            .put_watch_state(&checkpoint)
+            .await
+            .expect("seed checkpoint");
+
+        let error = runtime
+            .tick(&TickPolicy {
+                occurrence: Occurrence(u64::MAX),
+                ..TickPolicy::default()
+            })
+            .await
+            .expect_err("a standalone MAX tick has no possible successor");
+        assert!(
+            error
+                .to_string()
+                .contains("occurrence exhausted at u64::MAX"),
+            "{error}"
+        );
+        assert_eq!(
+            journal.get_watch_state().await.expect("read checkpoint"),
+            checkpoint,
+            "runtime must reject before observing the standalone occurrence"
+        );
+        assert!(
+            journal
+                .history(usize::MAX, None)
+                .await
+                .expect("read ledger")
+                .is_empty(),
+            "runtime must reject before opening a tick ledger row"
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_status_refuses_max_without_writing_watch_state_or_tick() {
+        let (runtime, journal) = runtime_fixture().await;
+        let checkpoint = WatchState {
+            occurrence: 51,
+            last_discover_ms: 52,
+            agent_floor_reconciled: true,
+            agent_floor_scan_initialized: true,
+            ..WatchState::default()
+        };
+        journal
+            .put_watch_state(&checkpoint)
+            .await
+            .expect("seed checkpoint");
+
+        let error = runtime
+            .status(&TickPolicy {
+                occurrence: Occurrence(u64::MAX),
+                ..TickPolicy::default()
+            })
+            .await
+            .expect_err("status must reject the same exhausted occurrence as tick");
+        assert!(
+            error
+                .to_string()
+                .contains("occurrence exhausted at u64::MAX"),
+            "{error}"
+        );
+        assert_eq!(
+            journal.get_watch_state().await.expect("read checkpoint"),
+            checkpoint,
+            "status must reject before any watch-floor write"
+        );
+        assert!(
+            journal
+                .history(usize::MAX, None)
+                .await
+                .expect("read ledger")
+                .is_empty(),
+            "status must reject without opening a tick ledger row"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_scheduler_status_and_final_tick_accept_max_once() {
+        let (mut runtime, journal) = runtime_fixture().await;
+        let checkpoint = WatchState {
+            occurrence: u64::MAX - 1,
+            agent_floor_reconciled: true,
+            agent_floor_scan_initialized: true,
+            ..WatchState::default()
+        };
+        journal
+            .put_watch_state(&checkpoint)
+            .await
+            .expect("seed final scheduler floor");
+        let policy = TickPolicy {
+            occurrence: Occurrence(u64::MAX),
+            ..TickPolicy::default()
+        };
+        let mut normal = tick_move_decision("move:final-scheduler-work", FED_A, FED_B);
+        normal.occurrence = Occurrence(u64::MAX);
+        let evidence = marked_evacuation_evidence();
+        let parent = Intent::from_decision(
+            &tick_evacuate_decision("evac:final-scheduler-parent", FED_A, FED_B),
+            Actor::Agent {
+                occurrence: Occurrence(u64::MAX - 1),
+            },
+            1,
+        );
+        let mut normal_plan =
+            standalone_replacement_plan(parent.clone(), evidence.clone(), normal.clone());
+        normal_plan.replacement = None;
+        normal_plan.decisions = vec![normal.clone()];
+        let executor = Arc::new(wallet_core::MockExecutor::new());
+        runtime.set_tick_test_fixture(executor.clone(), normal_plan.clone());
+
+        let status = runtime
+            .status_for_daemon_scheduler(&policy)
+            .await
+            .expect("the final daemon-scheduler occurrence is valid dry-run work");
+        assert_eq!(status.decisions, vec![normal.clone()]);
+        assert_eq!(
+            journal
+                .get_watch_state()
+                .await
+                .expect("read dry-run checkpoint"),
+            checkpoint,
+            "the daemon status dry-run must not allocate or write"
+        );
+        assert!(
+            runtime.status(&policy).await.is_err(),
+            "the standalone status contract still rejects MAX"
+        );
+
+        let mut marked_child =
+            tick_evacuate_decision("evac:final-scheduler-replacement", FED_A, FED_B);
+        marked_child.occurrence = Occurrence(u64::MAX);
+        runtime.set_tick_test_fixture(
+            executor.clone(),
+            standalone_replacement_plan(parent.clone(), evidence.clone(), marked_child.clone()),
+        );
+        let marked_status = runtime
+            .status_for_daemon_scheduler(&policy)
+            .await
+            .expect("a MAX child remains strictly newer than its MAX-1 marked parent");
+        assert_eq!(marked_status.decisions, vec![marked_child.clone()]);
+
+        let mut stale_child = marked_child.clone();
+        stale_child.occurrence = Occurrence(u64::MAX - 1);
+        runtime.set_tick_test_fixture(
+            executor.clone(),
+            standalone_replacement_plan(parent, evidence, stale_child),
+        );
+        let stale_error = runtime
+            .status_for_daemon_scheduler(&policy)
+            .await
+            .expect_err("daemon status retains strict marked-replacement authority");
+        assert!(
+            stale_error
+                .to_string()
+                .contains("requires --occurrence advanced beyond old Agent occurrence"),
+            "{stale_error}"
+        );
+
+        runtime.set_tick_test_fixture(executor.clone(), normal_plan);
+        let report = runtime
+            .watch_once(
+                &TickPolicy::default(),
+                &WatchPolicy::default(),
+                &[],
+                &DiscoveryPolicy::default(),
+                false,
+            )
+            .await
+            .expect("the scheduler executes its one final allocated occurrence");
+        assert_eq!(report.occurrence, Occurrence(u64::MAX));
+        let WatchTickOutcome::Ran(tick) = report.tick else {
+            panic!("final scheduler work must run: {:?}", report.tick);
+        };
+        assert_eq!(tick.decisions, vec![normal.clone()]);
+        assert_eq!(
+            executor.performed_keys(),
+            vec![normal.idempotency_key.clone()]
+        );
+        assert_eq!(
+            journal
+                .get_watch_state()
+                .await
+                .expect("read final checkpoint")
+                .occurrence,
+            u64::MAX
+        );
+        let error = runtime
+            .watch_once(
+                &TickPolicy::default(),
+                &WatchPolicy::default(),
+                &[],
+                &DiscoveryPolicy::default(),
+                false,
+            )
+            .await
+            .expect_err("a scheduler cycle after its final occurrence is exhausted");
+        assert!(
+            error
+                .to_string()
+                .contains("watch scheduler occurrence exhausted"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn watch_once_records_tick_error_but_still_runs_due_discovery() {
         let (runtime, _journal) = runtime_fixture().await;
         let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
@@ -5895,7 +8288,10 @@ mod tests {
                 },
                 decisions: vec![],
                 suppressed: vec![],
+                replacement_deferred: vec![],
                 blockers: stale_blockers,
+                replacement: None,
+                marker_disposition: None,
             },
         );
 
@@ -6025,7 +8421,10 @@ mod tests {
                 snapshot,
                 decisions: vec![reissued_decision.clone(), independent_decision.clone()],
                 suppressed: vec![],
+                replacement_deferred: vec![],
                 blockers: GoalBlockers::default(),
+                replacement: None,
+                marker_disposition: None,
             },
         );
         let sources: Vec<Box<dyn CandidateSource>> = Vec::new();

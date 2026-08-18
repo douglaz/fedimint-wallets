@@ -153,6 +153,36 @@ follow-up if that residual is judged unacceptable, not part of this decision.
 [ADR-0030](./0030-automated-routing-is-never-pinned.md). An earlier draft of the implementing bead
 specified a four-case pin-precedence table for evacuation — that table is deleted, not answered.
 
+## Amendment (2026-08-18): structural-evidence evacuation supersession
+
+A bounded sizing probe that finds no fitting amount remains **`Retryable`**. Its emptiness is
+not proof that the route is unavailable, and this amendment neither records it as route
+unavailability nor weakens that retry rule. When the executor has fresh, typed structural
+samples, however, it durably records `EvacuationRefusalEvidence` on that pre-artifact
+retryable evacuation. That is operator/audit **evidence, not proof**.
+
+The narrow recovery is a component-wise monotone effective increase in the evacuation policy
+cap at the evidence's measured delivered-net sample. It permits only an **agent** evacuation
+whose refusal occurred before any artifact: the serialized actor atomically retires the old
+operation as `Failed`, creates a fresh `Pending` child with a distinct key and advanced
+occurrence, and writes forward and reverse supersession sidecars. Thus the old audit identity
+and its evidence remain preserved and linked; no row is rewritten. A `Pending -> Executing`
+claim consumes the marker, so it cannot later authorize replacement.
+
+Replacement planning is one-child exclusive: the child is the only decision admitted in that
+round. Executable ordinary decisions are retained separately from conflict suppression for
+pinned-input validation and a `tick-drop:`-keyed audit row with the explicit
+`replacement-exclusive` reason; they are never admitted, folded into reservations, or reported as
+accepted. Deferred `RefuseInflow` advisories instead retain their `refuse:` identity and
+diagnostics with the same replacement-exclusive error note.
+
+No child means no terminalization. A terminal parent, an artifact-bearing parent, an
+ambiguous authority/result, an equal/decreased/crossed cap edit, or a non-qualifying sample
+does not release the old intent. The standalone exclusive-DB path performs the same exchange
+but accepts it only when the supplied occurrence is advanced beyond the marked agent
+occurrence; the daemon advances occurrence through its scheduler. This is an evacuation
+exception, not a general policy-edit retry mechanism.
+
 ## Why
 
 > Line references in this section cite the tree at `ed0d679`, where this ADR was recorded — the

@@ -684,11 +684,17 @@ wallet-cli show <correlation-key | seq> [--json]
   The two fee columns are deliberately SEPARATE and the send column is NAMED quoted: the
   receive fee is exact ON `Succeeded` ROWS ONLY (elsewhere it is a quote too — §2.3/§7),
   the send fee is a pay-time estimate until the SDK exposes the final contract cost — one
-  collapsed "fees" number would present a quote as exact. Filters apply
-  before `--limit`. `--json`: one serde_json `OperationRecord` per line (JSONL), no tab
-  table.
+   collapsed "fees" number would present a quote as exact. Filters apply
+   before `--limit`. Standalone `--json` emits one flattened
+   `OperationRecordAuditView` per line (JSONL), not a raw `OperationRecord`: every persisted
+   record field remains top-level and optional `supersedes` / `superseded_by` links are projected
+   from immutable sidecars. The persisted `OperationRecord` schema itself remains unchanged.
 - `show` prints the full record multi-line (both op ids, gateway, fee breakdown, timestamps,
-  error, linked intent status read live from the journal); `--json` = the raw record.
+  error, linked intent status read live from the journal); standalone `show --json` emits the same
+  flattened `OperationRecordAuditView`. Daemon `history`/`show` do not expose a raw
+  `OperationRecord`; they emit the public `OperationView`, including the same optional links.
+- Daemon `GET /v1/history` is a bounded public page: `limit` is capped at 500 and a full page
+  returns `next_before_seq`; clients follow that cursor with `before_seq` to continue newest-first.
 - Both are read-only and never touch the network (journal scans only) — they must work
   offline. Diagnostics to stderr as everywhere else (ADR-0023).
 

@@ -4,7 +4,9 @@ mod actor;
 mod driver;
 mod scheduler;
 
-pub(crate) use actor::{active_probe_verdicts, plan_tick_round};
+pub(crate) use actor::{
+    active_probe_verdicts, plan_tick_round, project_allocator_reservations_excluding,
+};
 
 use crate::journal::{
     FedimintJournal, LedgerRepairOracle, ProbeRecord, ProbeSession, RawIntentTerminalFence,
@@ -25,8 +27,8 @@ use wallet_api::{AwaitTarget, Policy, RefuseReason};
 use wallet_core::DiscoveryPolicy;
 use wallet_core::{
     Action, Actor, AllocatorDecision, AllocatorGoal, ExecError, Executor, FederationId,
-    IdempotencyKey, Intent, IntentStatus, Invoice, MoveRecord, Msat, OperationId, ProbeBudget,
-    ProbePolicy, Reservations, WatchPolicy,
+    IdempotencyKey, Intent, IntentStatus, Invoice, MoveRecord, Msat, Occurrence, OperationId,
+    ProbeBudget, ProbePolicy, Reservations, WatchPolicy,
 };
 
 pub trait PolicyExt {
@@ -411,6 +413,9 @@ pub struct ProbeFacts {
 #[derive(Debug)]
 pub struct TickRound {
     pub(crate) decisions: Vec<AllocatorDecision>,
+    /// Ordinary work withheld solely because this round owns one replacement exchange. It is
+    /// audit-only at commit; it must never be admitted, folded, or reported as accepted.
+    pub(crate) replacement_deferred: Vec<AllocatorDecision>,
     pub(crate) occurrence: wallet_core::Occurrence,
     pub(crate) spending_fed: Option<FederationId>,
     /// The policy generation the actor held when it planned this round. A commit is
@@ -423,6 +428,49 @@ pub struct TickRound {
     pub(crate) planned_world_generation: u64,
     /// The same actor-issued eligibility watermark that guarded planning.
     admission_snapshot: GoalAdmissionSnapshot,
+    /// A single marker-bearing evacuation which this otherwise-exclusive round
+    /// may atomically exchange for `fresh`.  This is crate-private so callers
+    /// cannot forge a journal replacement around the actor authority checks.
+    pub(crate) replacement: Option<EvacuationReplacementPlan>,
+    /// A qualifying structural marker whose exclusive shadow did not produce a child.  Committing
+    /// this exact disposition consumes only that marker; it intentionally does not wake a driver
+    /// or policy cycle, so ordinary retry resumes on the next normal cycle.
+    pub(crate) marker_disposition: Option<EvacuationMarkerDisposition>,
+}
+
+/// Exact durable parent identity plus the complete fresh allocator decision.
+/// The planner carries this opaque hand-off to the actor; it never reconstructs
+/// a parent from an idempotency-key string.
+#[derive(Clone, Debug)]
+pub(crate) struct EvacuationReplacementPlan {
+    /// Exact full parent snapshot used by both exchange and any proven-uncommitted disposition.
+    pub(crate) parent: Intent,
+    pub(crate) old_key: IdempotencyKey,
+    pub(crate) old_attempt: u32,
+    pub(crate) evidence: wallet_core::EvacuationRefusalEvidence,
+    pub(crate) fresh: AllocatorDecision,
+}
+
+/// Exact identity of the one-cycle escape hatch for a planner-owned structural marker.  This is
+/// deliberately separate from replacement: there is no child, no supersession sidecar, and no
+/// permission to clear a marker that changed while route/planner work was in flight.
+#[derive(Clone, Debug)]
+pub(crate) struct EvacuationMarkerDisposition {
+    /// Full immutable-and-live parent snapshot, not merely a key/attempt. The journal compares
+    /// this whole row before clearing so a stale planning hand-off cannot consume a changed marker.
+    pub(crate) parent: Intent,
+}
+
+/// A replacement is a new allocator recurrence, not a retry of its refused
+/// parent.  Keep the operator-facing wording shared by the actor and the
+/// standalone runtime: the latter gets its occurrence from `--occurrence`,
+/// while the daemon scheduler advances it itself.
+pub(crate) fn replacement_occurrence_error(old: Occurrence, fresh: Occurrence) -> String {
+    format!(
+        "structurally refused standalone evacuation requires --occurrence advanced beyond old \
+         Agent occurrence (old={}, new={}); daemon scheduling advances occurrences automatically",
+        old.0, fresh.0
+    )
 }
 
 #[cfg(test)]
@@ -438,11 +486,14 @@ impl TickRound {
             .unwrap_or(wallet_core::Occurrence(0));
         Self {
             decisions,
+            replacement_deferred: Vec::new(),
             occurrence,
             spending_fed: None,
             planned_generation,
             planned_world_generation: admission_snapshot.world_generation,
             admission_snapshot,
+            replacement: None,
+            marker_disposition: None,
         }
     }
 }
@@ -498,6 +549,10 @@ pub(crate) enum JournalTransition {
         expected: IntentStatus,
         new: IntentStatus,
     },
+    ResetRetryable {
+        expected_attempt: u32,
+        structural_refusal: Option<wallet_core::EvacuationRefusalEvidence>,
+    },
     SetStatus {
         expected_attempt: u32,
         status: IntentStatus,
@@ -528,6 +583,10 @@ pub(crate) enum TransitionResult {
     Compared(bool),
 }
 
+// TickRound deliberately carries the complete replacement decision across the
+// actor boundary. Boxing it would add an allocation to every tick command;
+// keep this internal transport enum explicit instead.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Command {
     DecideOp {
         req: OpRequest,
@@ -572,6 +631,21 @@ pub(crate) enum Command {
     /// endpoints use this so a live Join/Recover can resume even while it fences ticks.
     ReconcileDurable {
         reply: oneshot::Sender<ServiceResult<ReconcileReport>>,
+    },
+    /// Scheduler-only recovery when this cycle cannot mint planning authority. Unlike ordinary
+    /// durable recovery, this may claim a qualifying structural-marker parent so its old work is
+    /// not stranded until the membership/floor fence clears.
+    ReconcileRecoveryOnlyCycle {
+        reply: oneshot::Sender<ServiceResult<ReconcileReport>>,
+    },
+    /// Drop all in-memory parked snapshots after a cycle loses its chance to reach CommitTick.
+    /// Durable markers are deliberately untouched and a later ReconcileDecide recaptures them.
+    AbandonParkedEvacuationHandoff {
+        reply: oneshot::Sender<ServiceResult<()>>,
+    },
+    #[cfg(test)]
+    ParkedEvacuationHandoffStateForTest {
+        reply: oneshot::Sender<ServiceResult<(usize, bool)>>,
     },
     /// Internal, durable-only reconciliation used to recover registry ownership after
     /// a `DriverFinished` post-removal read fault.  Unlike scheduler reconciliation it
@@ -801,6 +875,26 @@ impl WalletClient {
     /// authority required to plan a tick and therefore refuses while membership work is live.
     pub async fn reconcile_durable(&self) -> ServiceResult<ReconcileReport> {
         self.request(|reply| Command::ReconcileDurable { reply })
+            .await
+    }
+
+    /// Re-drive durable work for a scheduler cycle which has already committed not to plan.
+    /// This is deliberately crate-private: public recovery preserves planner-owned markers.
+    pub(crate) async fn reconcile_recovery_only_cycle(&self) -> ServiceResult<ReconcileReport> {
+        self.request(|reply| Command::ReconcileRecoveryOnlyCycle { reply })
+            .await
+    }
+
+    pub(crate) async fn abandon_parked_evacuation_handoff(&self) -> ServiceResult<()> {
+        self.request(|reply| Command::AbandonParkedEvacuationHandoff { reply })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn parked_evacuation_handoff_state_for_test(
+        &self,
+    ) -> ServiceResult<(usize, bool)> {
+        self.request(|reply| Command::ParkedEvacuationHandoffStateForTest { reply })
             .await
     }
 

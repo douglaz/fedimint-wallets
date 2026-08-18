@@ -6,6 +6,7 @@ use crate::runtime::{ledger_nonce, now_ms, Runtime};
 use fedimint_core::runtime as fedimint_runtime;
 use lightning_invoice::Bolt11Invoice;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 #[cfg(test)]
@@ -19,6 +20,25 @@ const DEFAULT_OBSERVER_URL: &str = "https://observer.fedimint.org/api";
 /// How many receives must be stuck Awaiting past the stall deadline before we conclude the
 /// fedimint client's shared receive task has died (rather than a single slow/unpaid invoice).
 const SETTLEMENT_STALL_THRESHOLD: usize = 3;
+
+/// Preserve the typed journal failure across `run_cycle`'s anyhow boundary. We use this only for
+/// the immediate valid-watch-floor drain retry; every other cycle error follows normal backoff.
+#[derive(Debug)]
+struct WatchAdvanceCycleError(wallet_core::ExecError);
+
+impl fmt::Display for WatchAdvanceCycleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?}", self.0)
+    }
+}
+
+impl std::error::Error for WatchAdvanceCycleError {}
+
+fn is_immediate_watch_floor_drain_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<WatchAdvanceCycleError>()
+        .is_some_and(|error| crate::journal::is_watch_floor_reconciliation_required(&error.0))
+}
 
 /// The settlement-stall deadline (host-operational, env-overridable for the devimint gates).
 fn settlement_stall_deadline() -> Duration {
@@ -573,6 +593,30 @@ pub(super) async fn run(
             Ok(cycle) => cycle,
             Err(error) => {
                 tracing::warn!(?error, "watch scheduler: cycle failed");
+                // A valid restored ledger may need more than this turn's bounded allocation-drain
+                // budget. Do not turn each batch into the routine min/base watch sleep; every batch
+                // committed durable progress and yielding here preserves cancellation/fairness.
+                if is_immediate_watch_floor_drain_error(&error) {
+                    match abortable(
+                        runtime
+                            .service_journal()
+                            .watch_floor_immediate_retry_needed(),
+                        &mut abort,
+                    )
+                    .await
+                    {
+                        None => return,
+                        Some(Ok(true)) => {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        Some(Ok(false)) => {}
+                        Some(Err(retry_error)) => tracing::warn!(
+                            ?retry_error,
+                            "watch scheduler: could not inspect failed watch-floor drain"
+                        ),
+                    }
+                }
                 CycleResult {
                     deadlines: wallet_core::AdaptiveSleepDeadlines::default(),
                     noop: false,
@@ -691,21 +735,75 @@ pub(super) async fn run(
     }
 }
 
+/// A floor fault after ReconcileDecide has offered a parked marker leaves this cycle unable to
+/// plan. Drop only that in-memory offer; the durable marker remains and the next healthy cycle can
+/// recapture it rather than having its next reconciliation clear it as stale.
+async fn abandon_parked_handoff_after_watch_fault(client: &WalletClient) {
+    if let Err(error) = client.abandon_parked_evacuation_handoff().await {
+        tracing::warn!(
+            ?error,
+            "watch scheduler: could not abandon parked marker handoff after watch-floor fault"
+        );
+    }
+}
+
+/// A scheduler cycle that cannot allocate a fresh occurrence must still re-own old durable work.
+/// This is intentionally distinct from public durable reconciliation: it permits the actor to
+/// claim a planner-owned structural marker, while preserving the marker if admission authority is
+/// poisoned.
+async fn redrive_without_planner(client: &WalletClient, context: &'static str) {
+    if let Err(error) = client.reconcile_recovery_only_cycle().await {
+        tracing::warn!(
+            ?error,
+            %context,
+            "watch scheduler: recovery-only reconciliation failed"
+        );
+    }
+}
+
 async fn run_cycle(
     runtime: &Runtime,
     client: &WalletClient,
     sources: &[Box<dyn CandidateSource>],
 ) -> anyhow::Result<CycleResult> {
-    let mut reconcile = match client.reconcile().await {
-        Ok(report) => Some(report),
-        Err(error) => {
-            tracing::warn!(
-                ?error,
-                "watch scheduler: reconcile failed; continuing cycle"
-            );
-            None
+    // A restored valid User-ledger suffix may take more than one bounded drain batch. Do this
+    // before reconcile, repair, or federation opening: those actions can otherwise release a
+    // marked replacement parent before its allocator floor has converged. This is drain-only;
+    // occurrence allocation remains below the partial-view and reconcile boundaries.
+    let journal = runtime.service_journal();
+    let preflight_error = match journal.preflight_watch_floor_drain().await {
+        Ok(_) => None,
+        // Only a valid, zero-unreadable bounded suffix is allowed to short-circuit the cycle
+        // before recovery. It cannot release a parked marker because ReconcileDecide is untouched.
+        Err(error) if crate::journal::is_watch_floor_reconciliation_required(&error) => {
+            match journal.watch_floor_immediate_retry_needed().await {
+                Ok(true) => return Err(anyhow::Error::new(WatchAdvanceCycleError(error))),
+                Ok(false) => Some(error),
+                Err(inspect_error) => {
+                    tracing::warn!(
+                        ?error,
+                        ?inspect_error,
+                        "watch scheduler: could not inspect preflight floor; limiting cycle to durable recovery"
+                    );
+                    Some(error)
+                }
+            }
         }
+        // A tail/counter or storage failure does not permit a fresh allocation, but durable
+        // recovery must still re-drive admitted work without capturing or releasing parked markers.
+        Err(error) => Some(error),
     };
+    // Recovery always precedes membership opening. A known floor fault has already committed this
+    // cycle not to plan, so immediately re-drive even an old marker. Otherwise preserve planner
+    // ownership until the whole view reaches the CaptureForPlanner reconciliation below.
+    if preflight_error.is_some() {
+        redrive_without_planner(client, "preflight floor recovery").await;
+    } else if let Err(error) = client.reconcile_durable().await {
+        tracing::warn!(
+            ?error,
+            "watch scheduler: durable reconciliation failed; continuing cycle"
+        );
+    }
     // The O(ledger) op-log scan remains off actor; its raw Pay/Receive terminal
     // intent synchronization is routed back through the actor.
     if let Err(error) = super::repair_ledger_with_actor(
@@ -730,11 +828,29 @@ async fn run_cycle(
     // Crash-recovery (the reconcile + repair above) still runs: re-driving already-admitted
     // intents is not a fresh money decision over the world-view.
     let multi_client = runtime.service_multi_client();
-    let joined = runtime
+    let joined_report = runtime
         .service_journal()
-        .list_federations()
+        .list_federations_report()
         .await
         .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    if joined_report.skipped_rows > 0 {
+        // A poison registry row is not an absent federation. Its funds and membership may be part
+        // of the world the allocator would otherwise score, so the healthy subset is not a safe
+        // planning view. Do not retry opens from that subset; recovery-only is still allowed to
+        // redrive work that was admitted under an earlier durable authority (including a parked
+        // RecoveryOnly marker).
+        tracing::warn!(
+            skipped_rows = joined_report.skipped_rows,
+            "watch scheduler: corrupt federation registry rows make the membership view unknown; \
+             skipping fresh tick, probes, discovery, and federation opening until repaired"
+        );
+        redrive_without_planner(client, "corrupt federation registry recovery").await;
+        return Ok(CycleResult {
+            deadlines: wallet_core::AdaptiveSleepDeadlines::default(),
+            noop: false,
+        });
+    }
+    let joined = joined_report.federations;
     let open: BTreeSet<_> = multi_client.federations().into_iter().collect();
     let missing: Vec<_> = joined
         .iter()
@@ -749,6 +865,25 @@ async fn run_cycle(
         let _ = multi_client
             .open_all_with_membership_lease(&missing, client)
             .await;
+        if let Some(error) = preflight_error {
+            // Opening can publish membership, so rehydrate its durable work too. This cycle still
+            // cannot plan because its floor is provisional, so it must redrive rather than park.
+            redrive_without_planner(client, "preflight recovery after membership open").await;
+            if let Err(repair_error) = super::repair_ledger_with_actor(
+                runtime.service_journal().as_ref(),
+                runtime.service_multi_client().as_ref(),
+                client,
+            )
+            .await
+            {
+                tracing::warn!(
+                    ?repair_error,
+                    "watch scheduler: ledger repair after preflight recovery open failed"
+                );
+            }
+            after_recovery_before_watch_allocation_test_hook(runtime).await;
+            return Err(anyhow::Error::new(WatchAdvanceCycleError(error)));
+        }
         let open: BTreeSet<_> = multi_client.federations().into_iter().collect();
         let unopened: Vec<_> = joined
             .iter()
@@ -760,36 +895,61 @@ async fn run_cycle(
                 unopened = ?unopened.iter().map(|id| id.to_hex()).collect::<Vec<_>>(),
                 "watch scheduler: partial federation view; skipping the automated cycle (§15.8)"
             );
+            // The opening attempts are over and this cycle has committed not to plan. One
+            // recovery-only pass claims old planner markers rather than leaving an evacuation
+            // stranded behind an unavailable federation.
+            redrive_without_planner(client, "partial federation view after membership open").await;
             return Ok(CycleResult {
                 deadlines: wallet_core::AdaptiveSleepDeadlines::default(),
                 noop: false,
             });
         }
-        // Every successful final open publication advances membership_epoch and the allocator
-        // world generation.  The reconcile above necessarily predates it, so its tick token is
-        // invalid even though the view is now whole.  Mint a replacement before opening the tick
-        // audit row or planning: otherwise this healthy recovery records a false failed tick and
-        // waits for the normal scheduler interval before it can allocate again.
-        //
-        // A second reconcile can itself fail (for example while re-driving durable work).  Keep
-        // the established failed-reconcile behavior in that case: do no money work this cycle,
-        // but continue probes, discovery, and deadline collection below.
-        reconcile = match client.reconcile().await {
-            Ok(report) => Some(report),
-            Err(error) => {
-                tracing::warn!(
-                    ?error,
-                    "watch scheduler: reconcile after reopening federation(s) failed; continuing non-money cycle"
-                );
-                None
-            }
-        };
     }
-    let watch_state = runtime
-        .service_journal()
-        .advance_watch_occurrence()
-        .await
-        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    if let Some(error) = preflight_error {
+        after_recovery_before_watch_allocation_test_hook(runtime).await;
+        return Err(anyhow::Error::new(WatchAdvanceCycleError(error)));
+    }
+    // The world is whole and the floor is valid. Mint the one scheduler handoff immediately
+    // before occurrence allocation; a partial/recovery-only cycle never captures a parked marker.
+    let reconcile = match client.reconcile().await {
+        Ok(report) => Some(report),
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "watch scheduler: reconcile before fresh allocation failed; continuing non-money cycle"
+            );
+            None
+        }
+    };
+    after_reconcile_before_watch_advance_test_hook(runtime).await;
+    let watch_state = loop {
+        match journal.advance_watch_occurrence().await {
+            Ok(state) => break state,
+            Err(error) if crate::journal::is_watch_floor_reconciliation_required(&error) => {
+                // A suffix may have arrived after the cycle's initial preflight (for example
+                // while reconcile re-drives an append). Drain only the next fixed batch; do not
+                // return to the outer scheduler loop and repeat reconcile/repair/open work.
+                match journal.watch_floor_immediate_retry_needed().await {
+                    Ok(true) => {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    Ok(false) => {
+                        abandon_parked_handoff_after_watch_fault(client).await;
+                        return Err(anyhow::Error::new(WatchAdvanceCycleError(error)));
+                    }
+                    Err(retry_error) => {
+                        abandon_parked_handoff_after_watch_fault(client).await;
+                        return Err(anyhow::anyhow!("{retry_error:?}"));
+                    }
+                }
+            }
+            Err(error) => {
+                abandon_parked_handoff_after_watch_fault(client).await;
+                return Err(anyhow::Error::new(WatchAdvanceCycleError(error)));
+            }
+        }
+    };
     let occurrence = Occurrence(watch_state.occurrence);
     // ONE eligibility RULE for the whole cycle: the tick row and the commit below read this, and
     // `cycle_probe_facts` derives the route-quote allowance from the same `tick_may_commit` on the
@@ -812,6 +972,10 @@ async fn run_cycle(
     let mut decision_count = 0;
     let mut commit = super::CommitTickReport::default();
     let mut tick_failed = false;
+    // ReconcileDecide may park exact marked-evacuation snapshots. Once this scheduler cycle has
+    // chosen not to invoke CommitTick, those snapshots must be abandoned in memory so a healthy
+    // next cycle recaptures durable state rather than clearing an old offer.
+    let mut commit_tick_invoked = false;
     // The allocator result is never probe-admission authority. Every path below obtains one fresh
     // atomic policy snapshot and re-designates under that exact policy after planning/commit work.
     let _planned_spending = match &reconcile {
@@ -841,6 +1005,7 @@ async fn run_cycle(
                                     .into_iter()
                                     .map(|(id, probe)| (id, Msat(probe.spendable_msat)))
                                     .collect();
+                                commit_tick_invoked = true;
                                 match client
                                     .commit_tick_with_facts(
                                         round,
@@ -898,6 +1063,9 @@ async fn run_cycle(
             }
         }
     };
+    if !commit_tick_invoked {
+        abandon_parked_handoff_after_watch_fault(client).await;
+    }
 
     let (policy, balances, spending, fresh_snapshot) = match current_policy_and_spending(
         runtime, client, occurrence,
@@ -1043,6 +1211,90 @@ type AfterTickPlanTestHookKey = (usize, Occurrence);
 type AfterTickPlanTestHooks = BTreeMap<AfterTickPlanTestHookKey, AfterTickPlanTestHook>;
 #[cfg(test)]
 static AFTER_TICK_PLAN_TEST_HOOKS: OnceLock<Mutex<AfterTickPlanTestHooks>> = OnceLock::new();
+
+/// Test-only proof that a preflight fault did not skip durable recovery before fresh allocation is
+/// refused. The hook is after both reconcile and ledger repair, and before federation opening or
+/// occurrence allocation.
+#[cfg(test)]
+type AfterRecoveryBeforeWatchAllocationTestHooks = BTreeMap<usize, oneshot::Sender<()>>;
+#[cfg(test)]
+static AFTER_RECOVERY_BEFORE_WATCH_ALLOCATION_TEST_HOOKS: OnceLock<
+    Mutex<AfterRecoveryBeforeWatchAllocationTestHooks>,
+> = OnceLock::new();
+
+#[cfg(test)]
+type AfterReconcileBeforeWatchAdvanceTestHooks =
+    BTreeMap<usize, oneshot::Sender<oneshot::Sender<()>>>;
+#[cfg(test)]
+static AFTER_RECONCILE_BEFORE_WATCH_ADVANCE_TEST_HOOKS: OnceLock<
+    Mutex<AfterReconcileBeforeWatchAdvanceTestHooks>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn install_after_reconcile_before_watch_advance_test_hook(
+    runtime: &Runtime,
+) -> oneshot::Receiver<oneshot::Sender<()>> {
+    let (sent, receive) = oneshot::channel();
+    let previous = AFTER_RECONCILE_BEFORE_WATCH_ADVANCE_TEST_HOOKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("post-reconcile hook lock poisoned")
+        .insert(runtime as *const Runtime as usize, sent);
+    assert!(
+        previous.is_none(),
+        "a test installed two post-reconcile hooks for the same runtime"
+    );
+    receive
+}
+
+#[cfg(test)]
+async fn after_reconcile_before_watch_advance_test_hook(runtime: &Runtime) {
+    let hook = AFTER_RECONCILE_BEFORE_WATCH_ADVANCE_TEST_HOOKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("post-reconcile hook lock poisoned")
+        .remove(&(runtime as *const Runtime as usize));
+    if let Some(hook) = hook {
+        let (resume, wait_for_resume) = oneshot::channel();
+        let _ = hook.send(resume);
+        let _ = wait_for_resume.await;
+    }
+}
+
+#[cfg(not(test))]
+async fn after_reconcile_before_watch_advance_test_hook(_runtime: &Runtime) {}
+
+#[cfg(test)]
+fn install_after_recovery_before_watch_allocation_test_hook(
+    runtime: &Runtime,
+) -> oneshot::Receiver<()> {
+    let (sent, receive) = oneshot::channel();
+    let previous = AFTER_RECOVERY_BEFORE_WATCH_ALLOCATION_TEST_HOOKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("post-recovery hook lock poisoned")
+        .insert(runtime as *const Runtime as usize, sent);
+    assert!(
+        previous.is_none(),
+        "a test installed two post-recovery hooks for the same runtime"
+    );
+    receive
+}
+
+#[cfg(test)]
+async fn after_recovery_before_watch_allocation_test_hook(runtime: &Runtime) {
+    let hook = AFTER_RECOVERY_BEFORE_WATCH_ALLOCATION_TEST_HOOKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("post-recovery hook lock poisoned")
+        .remove(&(runtime as *const Runtime as usize));
+    if let Some(hook) = hook {
+        let _ = hook.send(());
+    }
+}
+
+#[cfg(not(test))]
+async fn after_recovery_before_watch_allocation_test_hook(_runtime: &Runtime) {}
 
 #[cfg(test)]
 type BeforeDueProbesTestHook = oneshot::Sender<(
@@ -1217,18 +1469,1027 @@ struct CycleResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::{FederationInfo, FedimintJournal};
+    use crate::journal::{FederationInfo, FedimintJournal, WatchState};
     use crate::multi_client::MultiClient;
     use crate::runtime::TickPlan;
     use fedimint_bip39::Mnemonic;
     use fedimint_core::db::mem_impl::MemDatabase;
+    use fedimint_core::db::IDatabaseTransactionOpsCore as _;
     use fedimint_core::db::IRawDatabaseExt as _;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use wallet_api::Policy;
     use wallet_core::{
         Action, Actor, AllocatorDecision, AllocatorSnapshot, DiscoverySource, FedBalance,
         FederationStatus, GoalBlockers, Journal, ReasonCode, SourceStatus,
     };
+
+    #[test]
+    fn immediate_watch_drain_retry_classifier_rejects_unrelated_failures() {
+        let floor = anyhow::Error::new(WatchAdvanceCycleError(
+            wallet_core::ExecError::Permanent(
+                "journal: watch-state floor reconciliation is incomplete (scan high-water 4096, 0 unreadable rows); daemon: retry GET /v1/watch/status until the bounded ledger backlog converges; standalone: re-run the same tick until it converges".to_owned(),
+            ),
+        ));
+        assert!(is_immediate_watch_floor_drain_error(&floor));
+
+        let tail = anyhow::Error::new(WatchAdvanceCycleError(wallet_core::ExecError::Permanent(
+            "journal: ledger tail/counter inconsistency: counter is corrupt".to_owned(),
+        )));
+        assert!(!is_immediate_watch_floor_drain_error(&tail));
+        let unrelated = anyhow::anyhow!("corrupt candidate registry");
+        assert!(!is_immediate_watch_floor_drain_error(&unrelated));
+    }
+
+    fn scheduler_replacement_plan(parent: wallet_core::Intent, occurrence: Occurrence) -> TickPlan {
+        let Action::Evacuate {
+            from,
+            to,
+            amount,
+            fee_cap_components: Some(_),
+            ..
+        } = &parent.action
+        else {
+            panic!("scheduler replacement fixture parent must retain its fee-cap components");
+        };
+        let (from, to, amount) = (*from, *to, *amount);
+        let old_key = parent.idempotency_key.clone();
+        let fresh_cap = wallet_core::EvacFeeCap {
+            base_msat: Msat(20_000),
+            bps: 0,
+        };
+        let fresh = AllocatorDecision {
+            action: Action::Evacuate {
+                from,
+                to,
+                amount,
+                fee_cap: fresh_cap.at(amount),
+                gateway: None,
+                fee_cap_components: Some(fresh_cap),
+            },
+            reason: ReasonCode::ShutdownNotice,
+            occurrence,
+            idempotency_key: IdempotencyKey(format!(
+                "evac:{}:{}:{}",
+                from.to_hex(),
+                to.to_hex(),
+                occurrence.0
+            )),
+        };
+        let evidence = parent
+            .evacuation_refusal
+            .clone()
+            .expect("scheduler replacement fixture parent carries evidence");
+        let source = FederationStatus {
+            id: from,
+            balance: FedBalance {
+                spendable: Msat(500_000),
+                in_flight: Msat(0),
+                claimable: Msat(0),
+                reserved_fee: Msat(0),
+            },
+            probed_ok: true,
+            reputation: 0,
+            shutdown_notice: true,
+            healthy: true,
+            eligible_to_fund: true,
+        };
+        let destination = FederationStatus {
+            id: to,
+            balance: FedBalance {
+                spendable: Msat(0),
+                in_flight: Msat(0),
+                claimable: Msat(0),
+                reserved_fee: Msat(0),
+            },
+            probed_ok: true,
+            reputation: 0,
+            shutdown_notice: false,
+            healthy: true,
+            eligible_to_fund: true,
+        };
+        TickPlan {
+            raw_probes: vec![],
+            probes: vec![],
+            active_probes: BTreeMap::new(),
+            snapshot: AllocatorSnapshot {
+                federations: vec![source, destination],
+                spending_fed: Some(from),
+                standby_fed: Some(to),
+                per_fed_cap: Msat(1_000_000),
+                target_spending_balance: Msat(0),
+                standby_target: Msat(0),
+                max_fee: Msat(1_000_000),
+                max_fee_bps_of_move: 100,
+                evac_fee_base_msat: fresh_cap.base_msat,
+                evac_fee_bps: fresh_cap.bps,
+                min_move: Msat(1),
+                route_economics_by_pair: BTreeMap::new(),
+                reservations: wallet_core::Reservations::default(),
+                now: 1,
+            },
+            decisions: vec![],
+            suppressed: vec![],
+            replacement_deferred: vec![],
+            blockers: GoalBlockers::default(),
+            replacement: Some(crate::service::EvacuationReplacementPlan {
+                parent,
+                old_key,
+                old_attempt: 0,
+                evidence,
+                fresh,
+            }),
+            marker_disposition: None,
+        }
+    }
+
+    fn scheduler_marked_parent(
+        label: &str,
+        from: wallet_core::FederationId,
+        to: wallet_core::FederationId,
+        occurrence: Occurrence,
+    ) -> wallet_core::Intent {
+        let cap = wallet_core::EvacFeeCap {
+            base_msat: Msat(10_000),
+            bps: 0,
+        };
+        wallet_core::Intent {
+            idempotency_key: IdempotencyKey(format!("evac:scheduler-queued-{label}")),
+            attempt: 0,
+            action: Action::Evacuate {
+                from,
+                to,
+                amount: Msat(100_000),
+                fee_cap: cap.at(Msat(100_000)),
+                gateway: None,
+                fee_cap_components: Some(cap),
+            },
+            max_fee: Some(cap.at(Msat(100_000))),
+            status: wallet_core::IntentStatus::Pending,
+            reason: ReasonCode::ShutdownNotice,
+            actor: Actor::Agent { occurrence },
+            created_at_ms: 1,
+            operation_id: None,
+            invoice: None,
+            evacuation_refusal: Some(wallet_core::EvacuationRefusalEvidence {
+                cap_components: cap,
+                requested_net: Msat(100_000),
+                source_spendable: Msat(500_000),
+                low: wallet_core::EvacuationQuoteSample {
+                    delivered_net: Msat(10_000),
+                    total_fee: Msat(15_000),
+                    fee_cap: cap.at(Msat(10_000)),
+                },
+                high: wallet_core::EvacuationQuoteSample {
+                    delivered_net: Msat(100_000),
+                    total_fee: Msat(25_000),
+                    fee_cap: cap.at(Msat(100_000)),
+                },
+                diagnostic: format!("scheduler queued marker {label}"),
+                measured_at_ms: 1,
+            }),
+        }
+    }
+
+    fn scheduler_replacement_probes(
+        parent: &wallet_core::Intent,
+    ) -> Vec<(wallet_core::FederationId, crate::probe::ProbeResult)> {
+        let Action::Evacuate { from, to, .. } = &parent.action else {
+            panic!("scheduler replacement fixture parent must evacuate");
+        };
+        let probe = |spendable_msat, shutdown_scheduled| crate::probe::ProbeResult {
+            guardian_count: 4,
+            threshold: 3,
+            is_mainnet: true,
+            module_kinds: vec!["mint".to_owned(), "wallet".to_owned(), "lnv2".to_owned()],
+            has_lnv2: true,
+            quorum_live: true,
+            latency_ms: 10,
+            gateway_available: true,
+            wallet_module_present: true,
+            expiry_timestamp_secs: None,
+            config_expiry_secs: None,
+            meta_module_expiry_secs: None,
+            status_scheduled_shutdown: shutdown_scheduled,
+            shutdown_scheduled,
+            spendable_msat,
+            in_flight_msat: 0,
+            claimable_msat: 0,
+        };
+        vec![(*from, probe(500_000, true)), (*to, probe(0, false))]
+    }
+
+    #[tokio::test]
+    async fn preflight_drains_before_reconcile_and_preserves_a_marked_parent_until_converged() {
+        let executor = Arc::new(KeyRecordingExecutor::default());
+        let (runtime, service) =
+            scheduler_runtime_fixture_with_executor(0xF1, executor.clone()).await;
+        let client = service.client();
+        let journal = runtime.service_journal();
+        let mut policy = client.get_policy().await.expect("read policy");
+        policy.evac_fee_base_msat = Msat(20_000);
+        policy.evac_fee_bps = 0;
+        client
+            .put_policy(policy)
+            .await
+            .expect("install the qualifying replacement cap");
+        let parent_key = IdempotencyKey("evac:preflight-marked-parent".to_owned());
+        let cap = wallet_core::EvacFeeCap {
+            base_msat: Msat(10_000),
+            bps: 0,
+        };
+        let evidence = wallet_core::EvacuationRefusalEvidence {
+            cap_components: cap,
+            requested_net: Msat(100_000),
+            source_spendable: Msat(500_000),
+            low: wallet_core::EvacuationQuoteSample {
+                delivered_net: Msat(10_000),
+                total_fee: Msat(15_000),
+                fee_cap: cap.at(Msat(10_000)),
+            },
+            high: wallet_core::EvacuationQuoteSample {
+                delivered_net: Msat(100_000),
+                total_fee: Msat(25_000),
+                fee_cap: cap.at(Msat(100_000)),
+            },
+            diagnostic: "scheduler preflight fixture".to_owned(),
+            measured_at_ms: 1,
+        };
+        let parent = wallet_core::Intent {
+            idempotency_key: parent_key.clone(),
+            attempt: 0,
+            action: Action::Evacuate {
+                from: wallet_core::FederationId([0xA1; 32]),
+                to: wallet_core::FederationId([0xB1; 32]),
+                amount: Msat(100_000),
+                fee_cap: cap.at(Msat(100_000)),
+                gateway: None,
+                fee_cap_components: Some(cap),
+            },
+            max_fee: Some(cap.at(Msat(100_000))),
+            status: wallet_core::IntentStatus::Pending,
+            reason: ReasonCode::ShutdownNotice,
+            actor: Actor::Agent {
+                occurrence: Occurrence(8),
+            },
+            created_at_ms: 1,
+            operation_id: None,
+            invoice: None,
+            evacuation_refusal: Some(evidence),
+        };
+        journal.upsert(&parent).await.expect("seed marked parent");
+        runtime.set_scheduler_tick_test_fixture(scheduler_replacement_plan(
+            parent.clone(),
+            Occurrence(9),
+        ));
+        runtime.set_scheduler_probe_fixture(scheduler_replacement_probes(&parent));
+        for n in 0..(256 * 16 + 1) {
+            journal
+                .record_started(
+                    &IdempotencyKey(format!("join:preflight-backlog-{n}")),
+                    wallet_core::OperationKind::Join {
+                        fed: wallet_core::FederationId([0xC1; 32]),
+                    },
+                    Actor::User,
+                    ReasonCode::UserInitiated,
+                    n as u64,
+                    None,
+                )
+                .await
+                .expect("append User suffix without rewriting WatchState");
+        }
+
+        let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+        journal.reset_pending_reads_for_test();
+        let first = match run_cycle(runtime.as_ref(), &client, &sources).await {
+            Ok(_) => panic!("the first preflight must stop at its fixed drain budget"),
+            Err(error) => error,
+        };
+        assert!(
+            is_immediate_watch_floor_drain_error(&first),
+            "only the typed bounded WatchState failure may request an immediate retry: {first:?}"
+        );
+        assert_eq!(
+            journal.pending_reads_for_test(),
+            0,
+            "the exhausted preflight must stop before either durable reconciliation or planning"
+        );
+        assert_eq!(
+            journal
+                .get(&parent_key)
+                .await
+                .expect("read marked parent after exhausted preflight"),
+            Some(parent.clone()),
+            "preflight must run before reconcile can release a qualifying marked parent"
+        );
+        assert!(
+            !executor
+                .performed
+                .lock()
+                .expect("recording executor lock poisoned")
+                .contains(&parent_key),
+            "a valid bounded backlog must not launch an old-marker driver"
+        );
+        assert!(
+            !journal
+                .history(usize::MAX, None)
+                .await
+                .expect("history before convergence")
+                .iter()
+                .any(|row| matches!(
+                    row.kind,
+                    wallet_core::OperationKind::Tick {
+                        occurrence: Occurrence(9),
+                        ..
+                    }
+                )),
+            "the exhausted preflight must not give the planner an early opportunity"
+        );
+
+        run_cycle(runtime.as_ref(), &client, &sources)
+            .await
+            .expect("the converged scheduler cycle commits its real replacement");
+        let child = IdempotencyKey(format!(
+            "evac:{}:{}:9",
+            wallet_core::FederationId([0xA1; 32]).to_hex(),
+            wallet_core::FederationId([0xB1; 32]).to_hex()
+        ));
+        let relation = journal
+            .evacuation_supersession(&parent_key)
+            .await
+            .expect("read committed replacement sidecar")
+            .expect("replacement writes a parent-to-child sidecar");
+        assert_eq!(relation.old_key, parent_key);
+        assert_eq!(relation.old_attempt, 0);
+        assert_eq!(relation.new_key, child);
+        assert_eq!(relation.occurrence, Occurrence(9));
+        assert!(
+            !executor
+                .performed
+                .lock()
+                .expect("recording executor lock poisoned")
+                .contains(&parent_key),
+            "the healthy whole-view CaptureForPlanner path must replace, never ordinarily drive, the old key"
+        );
+        let retired = journal
+            .get(&parent_key)
+            .await
+            .expect("read retired marked parent")
+            .expect("replacement retains an auditable parent");
+        assert_eq!(retired.status, wallet_core::IntentStatus::Failed);
+        assert_eq!(retired.attempt, 0);
+        assert_eq!(
+            retired.evacuation_refusal, parent.evacuation_refusal,
+            "the retired parent retains the exact refusal evidence linked to its child"
+        );
+        let parent_rows = journal
+            .history(usize::MAX, None)
+            .await
+            .expect("history after replacement")
+            .into_iter()
+            .filter(|row| row.correlation_key == parent_key)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parent_rows.len(),
+            1,
+            "the old parent has exactly its replacement terminal row, not an ordinary redrive: {parent_rows:#?}"
+        );
+        assert_eq!(parent_rows[0].status, OperationStatus::Failed);
+        assert!(
+            parent_rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains(&child.0)),
+            "the sole old-parent terminal must name its deterministic replacement child: {parent_rows:#?}"
+        );
+        let ticks = journal
+            .history(usize::MAX, None)
+            .await
+            .expect("history after convergence")
+            .into_iter()
+            .filter(|row| {
+                matches!(
+                    row.kind,
+                    wallet_core::OperationKind::Tick {
+                        occurrence: Occurrence(9),
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ticks.len(), 1, "the real cycle opens one Tick(9)");
+        assert_eq!(ticks[0].status, OperationStatus::Succeeded, "{ticks:#?}");
+        assert!(
+            !journal
+                .history(usize::MAX, None)
+                .await
+                .expect("history after convergence")
+                .iter()
+                .any(|row| matches!(
+                    row.kind,
+                    wallet_core::OperationKind::Tick {
+                        occurrence: Occurrence(10),
+                        ..
+                    }
+                )),
+            "the scheduler must not create a stale successor tick"
+        );
+        service.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn partial_joined_view_recovery_only_redrives_old_marker_without_a_tick() {
+        let (runtime, service) = scheduler_runtime_fixture(0xF5).await;
+        let client = service.client();
+        let journal = runtime.service_journal();
+        let mut policy = client.get_policy().await.expect("read policy");
+        policy.evac_fee_base_msat = Msat(20_000);
+        policy.evac_fee_bps = 0;
+        client
+            .put_policy(policy)
+            .await
+            .expect("install the qualifying replacement cap");
+        journal
+            .put_watch_state(&WatchState {
+                occurrence: 8,
+                agent_floor_reconciled: true,
+                agent_floor_scan_initialized: true,
+                ..WatchState::default()
+            })
+            .await
+            .expect("seed scheduler occurrence");
+        let parent_key = IdempotencyKey("evac:partial-view-marked-parent".to_owned());
+        let cap = wallet_core::EvacFeeCap {
+            base_msat: Msat(10_000),
+            bps: 0,
+        };
+        let evidence = wallet_core::EvacuationRefusalEvidence {
+            cap_components: cap,
+            requested_net: Msat(100_000),
+            source_spendable: Msat(500_000),
+            low: wallet_core::EvacuationQuoteSample {
+                delivered_net: Msat(10_000),
+                total_fee: Msat(15_000),
+                fee_cap: cap.at(Msat(10_000)),
+            },
+            high: wallet_core::EvacuationQuoteSample {
+                delivered_net: Msat(100_000),
+                total_fee: Msat(25_000),
+                fee_cap: cap.at(Msat(100_000)),
+            },
+            diagnostic: "partial-view scheduler fixture".to_owned(),
+            measured_at_ms: 1,
+        };
+        let parent = wallet_core::Intent {
+            idempotency_key: parent_key.clone(),
+            attempt: 0,
+            action: Action::Evacuate {
+                from: wallet_core::FederationId([0xA5; 32]),
+                to: wallet_core::FederationId([0xB5; 32]),
+                amount: Msat(100_000),
+                fee_cap: cap.at(Msat(100_000)),
+                gateway: None,
+                fee_cap_components: Some(cap),
+            },
+            max_fee: Some(cap.at(Msat(100_000))),
+            status: wallet_core::IntentStatus::Pending,
+            reason: ReasonCode::ShutdownNotice,
+            actor: Actor::Agent {
+                occurrence: Occurrence(8),
+            },
+            created_at_ms: 1,
+            operation_id: None,
+            invoice: None,
+            evacuation_refusal: Some(evidence),
+        };
+        journal.upsert(&parent).await.expect("seed marked parent");
+        let unopened = wallet_core::FederationId([0xC5; 32]);
+        let db_prefix = 0xC5;
+        journal
+            .put_federation(
+                &unopened,
+                &FederationInfo {
+                    // Before the retry fixture is installed this intentionally cannot be opened,
+                    // leaving the process with a partial joined/open world-view.
+                    invite: "partial-view-retry-open-fixture".to_owned(),
+                    db_prefix,
+                    joined_at: 0,
+                },
+            )
+            .await
+            .expect("register unopened federation");
+
+        let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+        run_cycle(runtime.as_ref(), &client, &sources)
+            .await
+            .expect("a partial world-view skips fresh scheduler work");
+        for _ in 0..100 {
+            let terminal = journal
+                .get(&parent_key)
+                .await
+                .expect("read recovery-only parent")
+                .is_some_and(|intent| intent.status == wallet_core::IntentStatus::Done);
+            if terminal && service.inflight_drivers() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let redriven = journal
+            .get(&parent_key)
+            .await
+            .expect("read recovery-only parent")
+            .expect("recovery-only keeps an auditable old parent");
+        assert_eq!(redriven.status, wallet_core::IntentStatus::Done);
+        assert_eq!(
+            redriven.evacuation_refusal, None,
+            "the recovery claim, not a direct marker clear, consumes old evidence"
+        );
+        assert!(
+            journal
+                .evacuation_supersession(&parent_key)
+                .await
+                .expect("read replacement sidecar")
+                .is_none(),
+            "a partial world-view may re-drive old work but cannot create a replacement child"
+        );
+        assert!(
+            !journal
+                .history(usize::MAX, None)
+                .await
+                .expect("history during partial cycle")
+                .iter()
+                .any(|row| matches!(row.kind, wallet_core::OperationKind::Tick { .. })),
+            "a partial world-view must not open a fresh Tick while it re-drives old work"
+        );
+        service.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn corrupt_federation_registry_redrives_old_marker_without_fresh_scheduler_work() {
+        let executor = Arc::new(KeyRecordingExecutor::default());
+        let (runtime, service, journal_db) =
+            scheduler_runtime_fixture_with_executor_and_journal_db(0xF6, executor.clone()).await;
+        let client = service.client();
+        let journal = runtime.service_journal();
+        let mut policy = client.get_policy().await.expect("read policy");
+        policy.evac_fee_base_msat = Msat(20_000);
+        policy.evac_fee_bps = 0;
+        client
+            .put_policy(policy)
+            .await
+            .expect("install the qualifying replacement cap");
+        journal
+            .put_watch_state(&WatchState {
+                occurrence: 8,
+                agent_floor_reconciled: true,
+                agent_floor_scan_initialized: true,
+                ..WatchState::default()
+            })
+            .await
+            .expect("seed scheduler occurrence");
+        let parent_key = IdempotencyKey("evac:corrupt-registry-marked-parent".to_owned());
+        let cap = wallet_core::EvacFeeCap {
+            base_msat: Msat(10_000),
+            bps: 0,
+        };
+        let parent = wallet_core::Intent {
+            idempotency_key: parent_key.clone(),
+            attempt: 0,
+            action: Action::Evacuate {
+                from: wallet_core::FederationId([0xA6; 32]),
+                to: wallet_core::FederationId([0xB6; 32]),
+                amount: Msat(100_000),
+                fee_cap: cap.at(Msat(100_000)),
+                gateway: None,
+                fee_cap_components: Some(cap),
+            },
+            max_fee: Some(cap.at(Msat(100_000))),
+            status: wallet_core::IntentStatus::Pending,
+            reason: ReasonCode::ShutdownNotice,
+            actor: Actor::Agent {
+                occurrence: Occurrence(8),
+            },
+            created_at_ms: 1,
+            operation_id: None,
+            invoice: None,
+            evacuation_refusal: Some(wallet_core::EvacuationRefusalEvidence {
+                cap_components: cap,
+                requested_net: Msat(100_000),
+                source_spendable: Msat(500_000),
+                low: wallet_core::EvacuationQuoteSample {
+                    delivered_net: Msat(10_000),
+                    total_fee: Msat(15_000),
+                    fee_cap: cap.at(Msat(10_000)),
+                },
+                high: wallet_core::EvacuationQuoteSample {
+                    delivered_net: Msat(100_000),
+                    total_fee: Msat(25_000),
+                    fee_cap: cap.at(Msat(100_000)),
+                },
+                diagnostic: "corrupt registry scheduler fixture".to_owned(),
+                measured_at_ms: 1,
+            }),
+        };
+        journal.upsert(&parent).await.expect("seed marked parent");
+        let healthy = wallet_core::FederationId([0xD6; 32]);
+        let healthy_db_prefix = 0xD6;
+        journal
+            .put_federation(
+                &healthy,
+                &FederationInfo {
+                    // This explicit open seam makes the healthy subset observable: removing or
+                    // moving the poison gate would publish it before discovery/probes can run.
+                    invite: "corrupt-registry-healthy-open-fixture".to_owned(),
+                    db_prefix: healthy_db_prefix,
+                    joined_at: 0,
+                },
+            )
+            .await
+            .expect("register healthy federation alongside poison row");
+        runtime
+            .service_multi_client()
+            .install_retry_open_fixture(healthy_db_prefix, healthy);
+        let app_db = journal_db.with_prefix(vec![0x00]);
+        let mut dbtx = app_db.begin_transaction().await;
+        let mut key = vec![0x03];
+        key.extend_from_slice(&[0xC6; 32]);
+        dbtx.raw_insert_bytes(&key, b"not valid json")
+            .await
+            .expect("insert corrupt federation registry row");
+        dbtx.commit_tx_result()
+            .await
+            .expect("commit corrupt federation registry row");
+
+        let discovery_calls = Arc::new(AtomicUsize::new(0));
+        let sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(CountingDiscoverySource {
+            calls: Arc::clone(&discovery_calls),
+        })];
+        let cycle = run_cycle(runtime.as_ref(), &client, &sources)
+            .await
+            .expect("corrupt registry limits the cycle to recovery");
+
+        assert_eq!(
+            cycle.deadlines,
+            wallet_core::AdaptiveSleepDeadlines::default(),
+            "an unknown world must retain conservative default deadlines"
+        );
+        assert!(
+            !cycle.noop,
+            "the warning recovery cycle is not a scheduler no-op"
+        );
+        assert!(
+            !runtime
+                .service_multi_client()
+                .federations()
+                .contains(&healthy),
+            "a corrupt registry must fence healthy-subset federation opening before probes"
+        );
+        assert_eq!(
+            discovery_calls.load(Ordering::SeqCst),
+            0,
+            "a corrupt registry must not collect fresh discovery candidates from the healthy subset"
+        );
+        for _ in 0..100 {
+            let terminal = journal
+                .get(&parent_key)
+                .await
+                .expect("read recovery-only parent")
+                .is_some_and(|intent| intent.status == wallet_core::IntentStatus::Done);
+            if terminal && service.inflight_drivers() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let redriven = journal
+            .get(&parent_key)
+            .await
+            .expect("read recovery-only parent")
+            .expect("recovery-only keeps an auditable old parent");
+        assert_eq!(redriven.status, wallet_core::IntentStatus::Done);
+        assert_eq!(
+            redriven.evacuation_refusal, None,
+            "the RecoveryOnly claim consumes the durable marker instead of planning a replacement"
+        );
+        assert!(
+            journal
+                .evacuation_supersession(&parent_key)
+                .await
+                .expect("read replacement sidecar")
+                .is_none(),
+            "an unknown registry cannot produce a fresh replacement decision"
+        );
+        assert!(
+            !journal
+                .history(usize::MAX, None)
+                .await
+                .expect("history during corrupt-registry cycle")
+                .iter()
+                .any(|row| {
+                    matches!(
+                        row.kind,
+                        wallet_core::OperationKind::Probe { .. }
+                            | wallet_core::OperationKind::Tick { .. }
+                    )
+                }),
+            "a corrupt registry must not allocate fresh probe or Tick work"
+        );
+        service.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn unreadable_preflight_recovery_claims_a_prior_parked_marker_without_a_tick() {
+        let (runtime, service) = empty_scheduler_fixture(0xF2).await;
+        let client = service.client();
+        let journal = runtime.service_journal();
+        // Cycle A's scheduler reconcile captures this qualifying marker as its parked handoff.
+        // Cycle B below installs an unreadable floor after that handoff. Its committed
+        // no-planning decision must discard the stale handoff and claim (not directly clear) this
+        // exact old parent.
+        let parent_key = IdempotencyKey("evac:unreadable-preflight-parked".to_owned());
+        let cap = wallet_core::EvacFeeCap {
+            base_msat: Msat(10_000),
+            bps: 0,
+        };
+        let evidence = wallet_core::EvacuationRefusalEvidence {
+            cap_components: cap,
+            requested_net: Msat(100_000),
+            source_spendable: Msat(500_000),
+            low: wallet_core::EvacuationQuoteSample {
+                delivered_net: Msat(10_000),
+                total_fee: Msat(15_000),
+                fee_cap: cap.at(Msat(10_000)),
+            },
+            high: wallet_core::EvacuationQuoteSample {
+                delivered_net: Msat(100_000),
+                total_fee: Msat(25_000),
+                fee_cap: cap.at(Msat(100_000)),
+            },
+            diagnostic: "parked before unreadable floor".to_owned(),
+            measured_at_ms: 1,
+        };
+        let parent = wallet_core::Intent {
+            idempotency_key: parent_key.clone(),
+            attempt: 0,
+            action: Action::Evacuate {
+                from: wallet_core::FederationId([0xA2; 32]),
+                to: wallet_core::FederationId([0xB2; 32]),
+                amount: Msat(100_000),
+                fee_cap: cap.at(Msat(100_000)),
+                gateway: None,
+                fee_cap_components: Some(cap),
+            },
+            max_fee: Some(cap.at(Msat(100_000))),
+            status: wallet_core::IntentStatus::Pending,
+            reason: ReasonCode::ShutdownNotice,
+            actor: Actor::Agent {
+                occurrence: Occurrence(8),
+            },
+            created_at_ms: 1,
+            operation_id: None,
+            invoice: None,
+            evacuation_refusal: Some(evidence),
+        };
+        journal
+            .upsert(&parent)
+            .await
+            .expect("seed qualifying marker");
+        client
+            .reconcile()
+            .await
+            .expect("cycle A parks the marker for its scheduler handoff");
+        journal
+            .put_watch_state(&WatchState {
+                occurrence: Occurrence(8).0,
+                agent_floor_reconciled: false,
+                agent_floor_scan_initialized: true,
+                agent_floor_unreadable_ledger_keys: vec![vec![0x05, 0, 0, 0, 0, 0, 0, 3, 0xe7]],
+                ..WatchState::default()
+            })
+            .await
+            .expect("seed an unreadable repair key");
+        let recovered = install_after_recovery_before_watch_allocation_test_hook(runtime.as_ref());
+        let cycle_runtime = Arc::clone(&runtime);
+        let cycle_client = client.clone();
+        let cycle = tokio::spawn(async move {
+            let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+            run_cycle(cycle_runtime.as_ref(), &cycle_client, &sources).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), recovered)
+            .await
+            .expect("unreadable preflight must still reach reconcile and repair")
+            .expect("recovery hook remains installed until reached");
+        let error = match cycle.await.expect("cycle task") {
+            Ok(_) => panic!("unreadable floor must still fence fresh occurrence allocation"),
+            Err(error) => error,
+        };
+        assert!(
+            is_immediate_watch_floor_drain_error(&error),
+            "the later allocation keeps the stable typed floor diagnostic: {error:?}"
+        );
+        let redriven = journal
+            .get(&parent_key)
+            .await
+            .expect("read parent after recovery-only cycle")
+            .expect("old parent remains durable after its failed runtime drive");
+        assert_eq!(redriven.status, wallet_core::IntentStatus::Pending);
+        assert_eq!(
+            redriven.evacuation_refusal, None,
+            "recovery-only must claim the prior handoff, atomically consuming old evidence instead of directly clearing it"
+        );
+        assert!(
+            !journal
+                .history(usize::MAX, None)
+                .await
+                .expect("history")
+                .iter()
+                .any(|row| matches!(row.kind, wallet_core::OperationKind::Tick { .. })),
+            "recovery may run, but an unreadable preflight cannot allocate a fresh tick"
+        );
+        service.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn tail_preflight_reaches_durable_recovery_but_refuses_fresh_allocation() {
+        let client_db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
+        let mnemonic =
+            Mnemonic::from_entropy(&[0xF3; 16]).expect("valid scheduler fixture mnemonic");
+        let multi_client =
+            Arc::new(MultiClient::new(client_db, journal_db.clone(), mnemonic).await);
+        let journal = Arc::new(FedimintJournal::new(journal_db.clone()));
+        let runtime = Arc::new(Runtime::new(
+            multi_client,
+            journal.clone(),
+            None,
+            None,
+            None,
+        ));
+        let service = super::super::WalletService::start_parts(
+            None,
+            journal.clone(),
+            Arc::new(runtime.service_executor(None)),
+            Policy::default(),
+            None,
+        )
+        .await
+        .expect("start actor-only scheduler fixture");
+        let client = service.client();
+        let app_db = journal_db.with_prefix(vec![0x00]);
+        let mut dbtx = app_db.begin_transaction().await;
+        dbtx.raw_insert_bytes(&[0x05, 0, 0, 0, 0, 0, 0, 0, 0], b"not valid json")
+            .await
+            .expect("insert malformed physical tail");
+        dbtx.raw_insert_bytes(&[0x07], &0_u64.to_be_bytes())
+            .await
+            .expect("counter disagrees with malformed tail successor");
+        dbtx.commit_tx_result()
+            .await
+            .expect("commit malformed tail fixture");
+        let recovered = install_after_recovery_before_watch_allocation_test_hook(runtime.as_ref());
+        let cycle_runtime = Arc::clone(&runtime);
+        let cycle_client = client.clone();
+        let cycle = tokio::spawn(async move {
+            let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+            run_cycle(cycle_runtime.as_ref(), &cycle_client, &sources).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), recovered)
+            .await
+            .expect("tail preflight must still reach reconcile and repair")
+            .expect("recovery hook remains installed until reached");
+        let error = match cycle.await.expect("cycle task") {
+            Ok(_) => panic!("tail mismatch must fence fresh occurrence allocation"),
+            Err(error) => error,
+        };
+        assert!(
+            !is_immediate_watch_floor_drain_error(&error),
+            "a tail fence is not a valid-backlog retry: {error:?}"
+        );
+        assert!(
+            !journal
+                .history(usize::MAX, None)
+                .await
+                .expect("history")
+                .iter()
+                .any(|row| matches!(row.kind, wallet_core::OperationKind::Tick { .. })),
+            "recovery may run, but a tail mismatch cannot allocate a fresh tick"
+        );
+        service.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn post_reconcile_floor_fault_abandons_handoff_and_preserves_marker_for_retry() {
+        let (runtime, service) = empty_scheduler_fixture(0xF4).await;
+        let client = service.client();
+        let journal = runtime.service_journal();
+        let key = IdempotencyKey("evac:post-reconcile-floor-fault".to_owned());
+        let cap = wallet_core::EvacFeeCap {
+            base_msat: Msat(10_000),
+            bps: 0,
+        };
+        let evidence = wallet_core::EvacuationRefusalEvidence {
+            cap_components: cap,
+            requested_net: Msat(100_000),
+            source_spendable: Msat(500_000),
+            low: wallet_core::EvacuationQuoteSample {
+                delivered_net: Msat(10_000),
+                total_fee: Msat(15_000),
+                fee_cap: cap.at(Msat(10_000)),
+            },
+            high: wallet_core::EvacuationQuoteSample {
+                delivered_net: Msat(100_000),
+                total_fee: Msat(25_000),
+                fee_cap: cap.at(Msat(100_000)),
+            },
+            diagnostic: "post-reconcile fault fixture".to_owned(),
+            measured_at_ms: 1,
+        };
+        let parent = wallet_core::Intent {
+            idempotency_key: key.clone(),
+            attempt: 0,
+            action: Action::Evacuate {
+                from: wallet_core::FederationId([0xA4; 32]),
+                to: wallet_core::FederationId([0xB4; 32]),
+                amount: Msat(100_000),
+                fee_cap: cap.at(Msat(100_000)),
+                gateway: None,
+                fee_cap_components: Some(cap),
+            },
+            max_fee: Some(cap.at(Msat(100_000))),
+            status: wallet_core::IntentStatus::Pending,
+            reason: ReasonCode::ShutdownNotice,
+            actor: Actor::Agent {
+                occurrence: Occurrence(8),
+            },
+            created_at_ms: 1,
+            operation_id: None,
+            invoice: None,
+            evacuation_refusal: Some(evidence),
+        };
+        journal.upsert(&parent).await.expect("seed marked parent");
+        let paused = install_after_reconcile_before_watch_advance_test_hook(runtime.as_ref());
+        let cycle_runtime = Arc::clone(&runtime);
+        let cycle_client = client.clone();
+        let cycle = tokio::spawn(async move {
+            let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+            run_cycle(cycle_runtime.as_ref(), &cycle_client, &sources).await
+        });
+        let resume = tokio::time::timeout(Duration::from_secs(5), paused)
+            .await
+            .expect("cycle reached ReconcileDecide before allocation")
+            .expect("post-reconcile hook installed");
+        journal
+            .put_watch_state(&WatchState {
+                occurrence: 8,
+                agent_floor_reconciled: false,
+                agent_floor_scan_initialized: true,
+                agent_floor_unreadable_ledger_keys: vec![vec![0x05, 0, 0, 0, 0, 0, 0, 3, 0xe7]],
+                ..WatchState::default()
+            })
+            .await
+            .expect("race an unreadable floor after handoff");
+        resume.send(()).expect("resume allocation");
+        let error = match cycle.await.expect("cycle task") {
+            Ok(_) => panic!("post-reconcile unreadable floor must fence allocation"),
+            Err(error) => error,
+        };
+        assert!(is_immediate_watch_floor_drain_error(&error), "{error:?}");
+        assert_eq!(
+            journal.get(&key).await.expect("read parent after fault"),
+            Some(parent.clone()),
+            "abandoning the handoff must not clear its durable marker"
+        );
+        journal
+            .put_watch_state(&WatchState {
+                occurrence: 8,
+                agent_floor_reconciled: true,
+                agent_floor_scan_initialized: true,
+                agent_floor_scan_high_water: 1,
+                ..WatchState::default()
+            })
+            .await
+            .expect("repair floor for next cycle");
+        let planned = install_after_reconcile_before_watch_advance_test_hook(runtime.as_ref());
+        let retry_runtime = Arc::clone(&runtime);
+        let retry_client = client.clone();
+        let retry = tokio::spawn(async move {
+            let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+            run_cycle(retry_runtime.as_ref(), &retry_client, &sources).await
+        });
+        let resume = tokio::time::timeout(Duration::from_secs(5), planned)
+            .await
+            .expect("repaired cycle recaptures marker into its planner handoff")
+            .expect("repaired hook");
+        assert_eq!(
+            journal.get(&key).await.expect("read marker at recapture"),
+            Some(parent),
+            "the recaptured marker survives until the cycle gets its planner opportunity"
+        );
+        resume.send(()).expect("finish repaired cycle");
+        retry
+            .await
+            .expect("retry task")
+            .expect("repaired cycle completes");
+        service.shutdown().await.expect("shutdown");
+    }
 
     struct DropFlag(Arc<AtomicBool>);
 
@@ -1299,6 +2560,180 @@ mod tests {
         (runtime, service)
     }
 
+    #[derive(Default)]
+    struct KeyRecordingExecutor {
+        performed: Mutex<Vec<IdempotencyKey>>,
+    }
+
+    struct CountingDiscoverySource {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl CandidateSource for CountingDiscoverySource {
+        fn source(&self) -> DiscoverySource {
+            DiscoverySource::Manual
+        }
+
+        async fn candidates(&self) -> crate::discovery::SourceResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            crate::discovery::SourceResult {
+                candidates: Vec::new(),
+                status: SourceStatus::Ok,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl wallet_core::Executor for KeyRecordingExecutor {
+        async fn perform(
+            &self,
+            intent: &wallet_core::Intent,
+        ) -> Result<wallet_core::PerformOutcome, wallet_core::ExecError> {
+            self.performed
+                .lock()
+                .expect("recording executor lock poisoned")
+                .push(intent.idempotency_key.clone());
+            Ok(wallet_core::PerformOutcome::Done)
+        }
+    }
+
+    async fn scheduler_runtime_fixture_with_executor(
+        entropy: u8,
+        executor: Arc<dyn wallet_core::Executor>,
+    ) -> (Arc<Runtime>, super::super::WalletService) {
+        let (runtime, service, _) =
+            scheduler_runtime_fixture_with_executor_and_journal_db(entropy, executor).await;
+        (runtime, service)
+    }
+
+    async fn scheduler_runtime_fixture_with_executor_and_journal_db(
+        entropy: u8,
+        executor: Arc<dyn wallet_core::Executor>,
+    ) -> (
+        Arc<Runtime>,
+        super::super::WalletService,
+        fedimint_core::db::Database,
+    ) {
+        let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
+        let mnemonic =
+            Mnemonic::from_entropy(&[entropy; 16]).expect("valid scheduler fixture mnemonic");
+        let multi_client = Arc::new(MultiClient::new(db, journal_db.clone(), mnemonic).await);
+        let journal = Arc::new(FedimintJournal::new(journal_db.clone()));
+        let runtime = Arc::new(Runtime::new(
+            multi_client,
+            journal.clone(),
+            None,
+            None,
+            None,
+        ));
+        runtime.enable_scheduler_tick_fixture_for_test();
+        let service = super::super::WalletService::start_parts_inner(
+            Some(Arc::clone(&runtime)),
+            None,
+            journal,
+            executor,
+            Policy::default(),
+            None,
+        )
+        .await
+        .expect("start runtime-backed scheduler fixture");
+        (runtime, service, journal_db)
+    }
+
+    async fn scheduler_runtime_fixture(entropy: u8) -> (Arc<Runtime>, super::super::WalletService) {
+        scheduler_runtime_fixture_with_executor(entropy, Arc::new(wallet_core::MockExecutor::new()))
+            .await
+    }
+
+    #[tokio::test]
+    async fn run_cycle_executes_the_final_max_occurrence_once_then_fails_closed() {
+        let (runtime, service) = empty_scheduler_fixture(0xD7).await;
+        let journal = runtime.service_journal();
+        journal
+            .put_watch_state(&WatchState {
+                occurrence: u64::MAX - 1,
+                agent_floor_reconciled: true,
+                agent_floor_scan_initialized: true,
+                ..WatchState::default()
+            })
+            .await
+            .expect("seed the final scheduler floor");
+        let client = service.client();
+        let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+
+        run_cycle(runtime.as_ref(), &client, &sources)
+            .await
+            .expect("the scheduler must run its one final allocated occurrence");
+
+        let ticks: Vec<_> = journal
+            .history(usize::MAX, None)
+            .await
+            .expect("read tick history")
+            .into_iter()
+            .filter(|row| {
+                matches!(
+                    row.kind,
+                    wallet_core::OperationKind::Tick {
+                        occurrence: Occurrence(u64::MAX),
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(ticks.len(), 1, "the final occurrence opens one tick row");
+        assert_eq!(ticks[0].status, OperationStatus::Succeeded);
+        assert!(matches!(
+            ticks[0].kind,
+            wallet_core::OperationKind::Tick {
+                occurrence: Occurrence(u64::MAX),
+                decisions: 0,
+                performed: 0,
+                failed: 0,
+            }
+        ));
+        assert_eq!(
+            journal
+                .get_watch_state()
+                .await
+                .expect("read consumed final floor")
+                .occurrence,
+            u64::MAX
+        );
+
+        let error = match run_cycle(runtime.as_ref(), &client, &sources).await {
+            Ok(_) => panic!("the cycle after MAX must fail checked occurrence exhaustion"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("watch scheduler occurrence exhausted"),
+            "{error:#}"
+        );
+        let final_ticks = journal
+            .history(usize::MAX, None)
+            .await
+            .expect("read final tick history")
+            .into_iter()
+            .filter(|row| {
+                matches!(
+                    row.kind,
+                    wallet_core::OperationKind::Tick {
+                        occurrence: Occurrence(u64::MAX),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            final_ticks, 1,
+            "a rejected post-MAX cycle must not duplicate final scheduler work"
+        );
+        service.shutdown().await.expect("shutdown");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn abort_arm_cancels_a_stuck_cycle_promptly() {
         let (abort, mut abort_rx) = oneshot::channel();
@@ -1309,6 +2744,55 @@ mod tests {
         abort.send(()).expect("scheduler is listening");
         tokio::task::yield_now().await;
         assert_eq!(task.await.expect("join"), None);
+    }
+
+    #[tokio::test]
+    async fn abort_cancels_the_post_cycle_watch_floor_retry_inspection() {
+        let (runtime, service) = empty_scheduler_fixture(0xF6).await;
+        let journal = runtime.service_journal();
+        for n in 0..(256 * 16 + 1) {
+            journal
+                .record_started(
+                    &IdempotencyKey(format!("join:abortable-watch-floor-backlog-{n}")),
+                    wallet_core::OperationKind::Join {
+                        fed: wallet_core::FederationId([0xF6; 32]),
+                    },
+                    Actor::User,
+                    ReasonCode::UserInitiated,
+                    n as u64,
+                    None,
+                )
+                .await
+                .expect("append valid backlog row");
+        }
+        // `run_cycle` makes the first checkpoint read while classifying its bounded-preflight
+        // error. Pause the second raw read, which is the outer scheduler's post-cycle inspection.
+        let paused = journal.pause_watch_floor_immediate_retry_read_after_for_test(1);
+        let (policy_wake_tx, policy_wake) = watch::channel(0_u64);
+        let (abort_tx, abort_rx) = oneshot::channel();
+        let scheduler_runtime = Arc::clone(&runtime);
+        let scheduler_client = service.client();
+        let task = tokio::spawn(async move {
+            let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+            run(
+                scheduler_runtime,
+                scheduler_client,
+                sources,
+                policy_wake,
+                abort_rx,
+            )
+            .await;
+        });
+        paused.wait_until_started().await;
+        abort_tx
+            .send(())
+            .expect("the paused scheduler still owns its abort receiver");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("outer scheduler abort must cancel the paused raw inspection")
+            .expect("scheduler task joins");
+        drop(policy_wake_tx);
+        service.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]
@@ -1389,6 +2873,7 @@ mod tests {
             created_at_ms: 0,
             operation_id: None,
             invoice: None,
+            evacuation_refusal: None,
         };
         let owned = ReconcileReport {
             blocked: wallet_core::GoalBlockers::from_intents(std::slice::from_ref(&held)),
@@ -1424,6 +2909,7 @@ mod tests {
             created_at_ms: 0,
             operation_id: None,
             invoice: None,
+            evacuation_refusal: None,
         };
         // A successful pass that re-drove work: the cycle still prices and still commits, and it
         // plans against exactly the goals that pass left in flight.
@@ -1674,28 +3160,69 @@ mod tests {
 
     #[tokio::test]
     async fn post_plan_balance_token_failure_still_runs_discovery_and_deadline_collection() {
-        let db = MemDatabase::new().into_database();
-        let journal_db = MemDatabase::new().into_database();
-        let mnemonic = Mnemonic::from_entropy(&[1_u8; 16]).expect("valid test mnemonic");
-        let multi_client = Arc::new(MultiClient::new(db, journal_db.clone(), mnemonic).await);
-        let journal = Arc::new(FedimintJournal::new(journal_db));
-        let runtime = Arc::new(Runtime::new(
-            multi_client,
-            journal.clone(),
-            None,
-            None,
-            None,
-        ));
-        let service = super::super::WalletService::start_parts(
-            None,
-            journal.clone(),
-            Arc::new(runtime.service_executor(None)),
-            Policy::default(),
-            None,
-        )
-        .await
-        .expect("start actor-only service");
+        let (runtime, service) = scheduler_runtime_fixture(0xB9).await;
+        let journal = runtime.service_journal();
         let client = service.client();
+        let parent_key = IdempotencyKey("evac:post-plan-token-failure-parent".to_owned());
+        let old_cap = wallet_core::EvacFeeCap {
+            base_msat: Msat(10_000),
+            bps: 0,
+        };
+        let evidence = wallet_core::EvacuationRefusalEvidence {
+            cap_components: old_cap,
+            requested_net: Msat(100_000),
+            source_spendable: Msat(500_000),
+            low: wallet_core::EvacuationQuoteSample {
+                delivered_net: Msat(10_000),
+                total_fee: Msat(15_000),
+                fee_cap: old_cap.at(Msat(10_000)),
+            },
+            high: wallet_core::EvacuationQuoteSample {
+                delivered_net: Msat(100_000),
+                total_fee: Msat(25_000),
+                fee_cap: old_cap.at(Msat(100_000)),
+            },
+            diagnostic: "post-plan balance-token failure fixture".to_owned(),
+            measured_at_ms: 1,
+        };
+        let parent = wallet_core::Intent {
+            idempotency_key: parent_key.clone(),
+            attempt: 0,
+            action: Action::Evacuate {
+                from: wallet_core::FederationId([0xB9; 32]),
+                to: wallet_core::FederationId([0xBA; 32]),
+                amount: Msat(100_000),
+                fee_cap: old_cap.at(Msat(100_000)),
+                gateway: None,
+                fee_cap_components: Some(old_cap),
+            },
+            max_fee: Some(old_cap.at(Msat(100_000))),
+            status: wallet_core::IntentStatus::Pending,
+            reason: ReasonCode::ShutdownNotice,
+            actor: Actor::Agent {
+                occurrence: Occurrence(0),
+            },
+            created_at_ms: 1,
+            operation_id: None,
+            invoice: None,
+            evacuation_refusal: Some(evidence.clone()),
+        };
+        journal
+            .upsert(&parent)
+            .await
+            .expect("seed qualifying marker");
+        let mut policy = client.get_policy().await.expect("read policy");
+        policy.evac_fee_base_msat = Msat(20_000);
+        policy.evac_fee_bps = 0;
+        client
+            .put_policy(policy)
+            .await
+            .expect("install qualifying replacement cap");
+        runtime.set_scheduler_tick_test_fixture(scheduler_replacement_plan(
+            parent.clone(),
+            Occurrence(1),
+        ));
+        runtime.set_scheduler_probe_fixture(scheduler_replacement_probes(&parent));
 
         let planned_rx = install_after_tick_plan_test_hook(runtime.as_ref(), Occurrence(1));
         let cycle_runtime = runtime.clone();
@@ -1748,6 +3275,204 @@ mod tests {
                     })
             }),
             "post-plan balance-token failure was not terminalized: {history:#?}"
+        );
+        let healthy = client
+            .reconcile()
+            .await
+            .expect("the next public scheduler reconciliation recaptures the marker");
+        assert_eq!(
+            healthy.redriven, 0,
+            "an abandoned pre-CommitTick handoff must stay planner-owned: {healthy:#?}"
+        );
+        assert_eq!(
+            journal
+                .get(&parent_key)
+                .await
+                .expect("read parent after healthy reconciliation"),
+            Some(parent),
+            "balance-token failure must not clear the replacement marker"
+        );
+        service.shutdown().await.expect("shutdown");
+    }
+
+    /// Once CommitTick has been invoked, its actor-owned marker outcome is authoritative. The
+    /// scheduler must not subsequently abandon the parked queue: an unselected parent remains
+    /// available for the actor's bounded next-cycle handoff.
+    #[tokio::test]
+    async fn invoked_commit_preserves_unselected_parked_marker_for_the_next_plan() {
+        let (runtime, service) = scheduler_runtime_fixture(0xBC).await;
+        let journal = runtime.service_journal();
+        let client = service.client();
+        let first = scheduler_marked_parent(
+            "first",
+            wallet_core::FederationId([0xC1; 32]),
+            wallet_core::FederationId([0xC2; 32]),
+            Occurrence(0),
+        );
+        let second = scheduler_marked_parent(
+            "second",
+            wallet_core::FederationId([0xC3; 32]),
+            wallet_core::FederationId([0xC4; 32]),
+            Occurrence(0),
+        );
+        journal.upsert(&first).await.expect("seed first marker");
+        journal.upsert(&second).await.expect("seed second marker");
+        let mut policy = client.get_policy().await.expect("read policy");
+        policy.evac_fee_base_msat = Msat(20_000);
+        policy.evac_fee_bps = 0;
+        client
+            .put_policy(policy)
+            .await
+            .expect("install qualifying replacement cap");
+        runtime.set_scheduler_tick_test_fixture(scheduler_replacement_plan(
+            first.clone(),
+            Occurrence(1),
+        ));
+        runtime.set_scheduler_probe_fixture(scheduler_replacement_probes(&first));
+        let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+        run_cycle(runtime.as_ref(), &client, &sources)
+            .await
+            .expect("the first replacement reaches CommitTick");
+        assert_eq!(
+            client
+                .parked_evacuation_handoff_state_for_test()
+                .await
+                .expect("inspect queue after invoked commit"),
+            (2, true),
+            "CommitTick invocation must leave actor-owned parked outcomes intact"
+        );
+        let next = client
+            .reconcile()
+            .await
+            .expect("next cycle releases only the completed first handoff");
+        assert_eq!(
+            client
+                .parked_evacuation_handoff_state_for_test()
+                .await
+                .expect("inspect next offered marker"),
+            (1, true),
+            "the unselected parent remains the next bounded handoff"
+        );
+        runtime.set_scheduler_tick_test_fixture(scheduler_replacement_plan(
+            second.clone(),
+            Occurrence(2),
+        ));
+        let next_round = client
+            .decide_tick_round(ProbeFacts {
+                probes: scheduler_replacement_probes(&second),
+                occurrence: Occurrence(2),
+                now_ms: 2,
+                price_routes: false,
+                blocked: next.blocked,
+                admission_snapshot: next.admission_snapshot,
+            })
+            .await
+            .expect("next cycle plans the queued second marker");
+        assert_eq!(
+            next_round
+                .replacement
+                .as_ref()
+                .map(|replacement| &replacement.parent),
+            Some(&second),
+            "the next plan must select the unselected parent, not abandon its queue"
+        );
+        service.shutdown().await.expect("shutdown");
+    }
+
+    /// CommitTick may return an actor error after it has accepted the scheduler's handoff.  That
+    /// invocation still owns the parked queue: its failed replacement consumes only its exact
+    /// parent, and the scheduler must not abandon the remaining parent before the next reconcile.
+    #[tokio::test]
+    async fn errored_invoked_commit_preserves_the_remaining_parked_marker_for_the_next_plan() {
+        let (runtime, service) = scheduler_runtime_fixture(0xBD).await;
+        let journal = runtime.service_journal();
+        let client = service.client();
+        let first = scheduler_marked_parent(
+            "errored-first",
+            wallet_core::FederationId([0xD1; 32]),
+            wallet_core::FederationId([0xD2; 32]),
+            Occurrence(0),
+        );
+        let second = scheduler_marked_parent(
+            "errored-second",
+            wallet_core::FederationId([0xD3; 32]),
+            wallet_core::FederationId([0xD4; 32]),
+            Occurrence(0),
+        );
+        journal.upsert(&first).await.expect("seed first marker");
+        journal.upsert(&second).await.expect("seed second marker");
+        let mut policy = client.get_policy().await.expect("read policy");
+        policy.evac_fee_base_msat = Msat(20_000);
+        policy.evac_fee_bps = 0;
+        client
+            .put_policy(policy)
+            .await
+            .expect("install qualifying replacement cap");
+        runtime.set_scheduler_tick_test_fixture(scheduler_replacement_plan(
+            first.clone(),
+            Occurrence(1),
+        ));
+        runtime.set_scheduler_probe_fixture(scheduler_replacement_probes(&first));
+        let planned = install_after_tick_plan_test_hook(runtime.as_ref(), Occurrence(1));
+        let cycle_runtime = Arc::clone(&runtime);
+        let cycle_client = client.clone();
+        let cycle = tokio::spawn(async move {
+            let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+            run_cycle(cycle_runtime.as_ref(), &cycle_client, &sources).await
+        });
+        let resume = planned
+            .await
+            .expect("scheduler reached the post-plan pre-CommitTick seam");
+        // The next parent read is CommitTick's pre-exchange exact-parent revalidation. It makes
+        // the invoked actor return an error without changing either durable marker.
+        journal.fail_one_intent_read_after_successes_for_test(0);
+        resume.send(()).expect("resume scheduler into CommitTick");
+        cycle
+            .await
+            .expect("scheduler task")
+            .expect("an invoked CommitTick error does not abort the scheduler cycle");
+        assert_eq!(
+            client
+                .parked_evacuation_handoff_state_for_test()
+                .await
+                .expect("inspect queue after the invoked actor error"),
+            (1, false),
+            "the failed first commit consumes only its own parked offer"
+        );
+        assert_eq!(
+            journal
+                .get(&first.idempotency_key)
+                .await
+                .expect("read failed first parent"),
+            Some(first.clone()),
+            "the failing pre-exchange read must leave the first marker durable"
+        );
+        let next = client
+            .reconcile()
+            .await
+            .expect("the next reconciliation preserves the remaining parked parent");
+        runtime.set_scheduler_tick_test_fixture(scheduler_replacement_plan(
+            second.clone(),
+            Occurrence(2),
+        ));
+        let next_round = client
+            .decide_tick_round(ProbeFacts {
+                probes: scheduler_replacement_probes(&second),
+                occurrence: Occurrence(2),
+                now_ms: 2,
+                price_routes: false,
+                blocked: next.blocked,
+                admission_snapshot: next.admission_snapshot,
+            })
+            .await
+            .expect("the next cycle plans the remaining parked marker");
+        assert_eq!(
+            next_round
+                .replacement
+                .as_ref()
+                .map(|replacement| &replacement.parent),
+            Some(&second),
+            "the scheduler must not abandon the actor queue after CommitTick was invoked"
         );
         service.shutdown().await.expect("shutdown");
     }
@@ -1837,7 +3562,10 @@ mod tests {
                 },
                 decisions: vec![independent.clone()],
                 suppressed: vec![],
+                replacement_deferred: vec![],
                 blockers: GoalBlockers::default(),
+                replacement: None,
+                marker_disposition: None,
             },
         );
         runtime.set_scheduler_probe_fixture(sampled_probes);
@@ -1986,7 +3714,10 @@ mod tests {
                 },
                 decisions: vec![],
                 suppressed: vec![],
+                replacement_deferred: vec![],
                 blockers: GoalBlockers::default(),
+                replacement: None,
+                marker_disposition: None,
             },
         );
         runtime.set_scheduler_probe_fixture(sampled_probes);
