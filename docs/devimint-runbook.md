@@ -954,3 +954,26 @@ in the session scratchpad (`tv3.sh`, `lnv2swap.sh`).
   `wallet-cli/tests/smoke_*_devimint.sh` are the working references.
 - Crash-resume test: kill the client/process mid-operation, reopen the client, assert the
   operation completes (the executor self-resumes) and balances are exactly-once.
+
+## 7. Inspecting a structural evacuation marker
+
+Use `wallet-cli show <operation-key> --json` (or daemon `GET /v1/operations/<key>`) and require
+`"evacuation_refusal_active": true` before treating `evacuation_refusal` as a live replacement
+marker. A superseded Failed parent deliberately retains its historical `evacuation_refusal`
+evidence and reports `"evacuation_refusal_active": false`. The field is omitted when `show` cannot
+read an exact linked intent (including malformed/degraded rows), and history omits it because it
+does not perform intent reads. Only the literal value `true` is authority to replace it.
+
+## 8. Recovering a bounded WatchState floor reconciliation
+
+An incomplete WatchState floor is an allocation fence, not a reason to delete ledger rows. On a
+daemon, retry `GET /v1/watch/status` until its bounded valid backlog converges. For a standalone
+`wallet-cli --standalone ... tick`, re-run the same tick (with the same occurrence) until it
+converges. If the diagnostic reports unreadable ledger rows, stop the daemon, preserve the store,
+restore those rows from a trusted backup, then use the applicable retry above. User-ledger appends
+intentionally do not rewrite the WatchState hot row; the next drain or Agent admission accounts
+for their suffix. A watch response with `agent_floor_reconciled=false` and
+`unreadable_ledger_rows=0` is a bounded valid backlog; a positive unreadable count requires exact
+row repair. If standalone `tick` or dry-run `status` instead reports a corrupt federation registry,
+repair that registry from a consistent backup before retrying—those world-complete commands do not
+open or plan only the healthy subset.

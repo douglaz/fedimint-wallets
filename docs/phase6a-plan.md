@@ -373,12 +373,29 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
     daemon needs an absolute home, not the CLI-era CWD-relative `./.wallet-cli-data`);
     the CLI client finds the daemon via `~/.config/walletd/` (URL + token path).
   - **Policy activation semantics (broad review):** decisions read the CURRENT policy at
-    decide time; an in-flight driver keeps its ADMITTED parameters (fee caps etc. are
-    journaled in its intent — immutable per operation). `PUT /v1/policy` wakes the
-    scheduler so cadences/budgets/deadlines recompute immediately. `walletd init` inserts
-    defaults ONLY if no Policy row exists (re-running init for token rotation never
-    resets policy). `Runtime`'s currently-immutable per-fed-cap/timeout constructor
-    fields become per-decide policy reads as part of the restructure.
+     decide time; admitted intents and their parameters remain immutable in general. The narrow
+     `br-n8o` exception is a pre-artifact agent evacuation carrying durable typed structural
+     refusal evidence: a component-wise monotone effective evacuation-cap increase at its
+     measured delivered-net sample may atomically replace it with a linked, fresh
+     occurrence/key. The old operation is `Failed`, the child is `Pending`, and durable
+     forward/reverse sidecars preserve the audit chain; an empty bounded probe remains
+     `Retryable` evidence-not-proof, never route unavailability. `PUT /v1/policy` wakes the
+     scheduler and bumps policy generation, so any round planned under the old policy is
+     discarded and a fresh plan/current generation decides the replacement. A claimed
+     `Pending -> Executing` consumes the marker. Actor `CommitTick` owns this exchange;
+      off-actor planning/reconcile cannot forge it. A replacement round admits exactly its one
+      child; deferred ordinary decisions and suppressions stay visible to pinned-input validation.
+      Executable deferred decisions are written as explicit `tick-drop:`-keyed audit facts with the
+      replacement-exclusive note, while deferred `RefuseInflow` advisories retain their `refuse:`
+      identity and diagnostics with that same replacement-exclusive error note.
+      The exclusive-DB standalone `tick` is the
+     only parallel mutation seam and requires `--occurrence` advanced beyond the marked agent
+      occurrence. Its standalone dry `status` counterpart warns on a stale/default occurrence and
+     returns the scored/designation diagnostic with no would-run decisions; it never exchanges the
+     parent or writes a child. Daemon status remains strict because it owns occurrence allocation.
+     `walletd init` inserts defaults ONLY if no Policy row exists (re-running init
+     for token rotation never resets policy). `Runtime`'s currently-immutable per-fed-cap/
+     timeout constructor fields become per-decide policy reads as part of the restructure.
   - **Shipped policy defaults (owner-set):** `per_fed_cap` **1,500,000 sats** ·
     `spending_target` **500,000 sats** · `standby_target` **150,000 sats** · `max_fee`/move
     200 sats · probe amount 20 sats · probe budget 10 attempts / 500 sats per week ·
@@ -388,9 +405,9 @@ cadence/budget, discovery rotation. Differences from 5.2's in-process loop:
 | Verb | Endpoint | Semantics |
 |---|---|---|
 | balance / list-feds | `GET /v1/balance` · `/v1/federations` | actor snapshot |
-| history / show | `GET /v1/history` · `/v1/operations/{key}` | detached ledger read |
-| status (dry-run) | `GET /v1/status` | detached (probes network); inputs via snapshot |
-| watch observability | `GET /v1/watch/status` · `/v1/health` | health = actor queue depth, registry size, scheduler liveness |
+| history / show | `GET /v1/history` · `/v1/operations/{key}` | detached ledger read; `OperationView.supersedes` / `.superseded_by` expose durable evacuation-replacement audit links. `show` additionally projects a live `evacuation_refusal` marker when present; bounded history omits it to avoid N+1 intent reads. History is newest-first, caps each public page at 500, and returns `next_before_seq`; pass it as `before_seq` for the next page |
+| status (dry-run) | `GET /v1/status` | detached, live network probes and no money admission. Requires the daemon's live `Runtime` **and** `MultiClient`, with **every** journal-joined federation open; otherwise `503` rather than previewing a partial world. Its registry scan also counts poison rows: any skipped malformed federation row returns actionable `503` **before** watch-state access or probes, because the healthy subset is not a complete world. Stop the daemon, preserve the data directory, and repair the registry row; do not re-join or delete it. Reads `get_watch_state` only after that gate, which must report a reconciled Agent floor; that bounded migration read may advance one valid batch before returning `503` and directing the operator to `/v1/watch/status`. The prospective occurrence is checked: floor `MAX-1` previews the one legal `MAX` cycle, while floor `MAX` returns `503` because no successor exists |
+| watch observability | `GET /v1/watch/status` · `/v1/health` | `/v1/watch/status` reads and persists one bounded WatchState-floor migration batch. `agent_floor_reconciled=false, unreadable_ledger_rows=0` means valid canonical scan backlog; a positive unreadable count is exact-row repair work and remains allocation-fenced. `/v1/health` reports actor queue depth, registry size, scheduler liveness |
 | pay / move | `POST /v1/pay` · `/v1/move` | `202` + **operation key** ≤250 ms; driver async ("operation" is the public term — CONTEXT.md; "intent" stays internal) |
 | receive / direct-inflow | `POST /v1/receive` · `/v1/direct-inflow` | blocks for the invoice mint under a hard deadline (bounded seconds → timeout error); BOLT11 is the response; settlement async |
 | await | `GET /v1/operations/{key}?wait=true` | pending-map long-poll; mandatory deadline; drained-with-error on shutdown |
@@ -479,6 +496,14 @@ verb is DELETED** — the daemon IS the watch: redundant in client mode, a daemo
 in standalone mode (the 5.2c smoke is superseded by the 6a daemon gates, which re-validate
 the ported scheduler in its new home). Clear errors: daemon-not-running (with the two
 options), 401 (bad token), lock-held.
+
+Standalone `tick` and dry-run `status` also require a complete federation registry before
+they open any federation, probe, plan, or access WatchState. Their bootstrap uses the
+poison-tolerant registry report but refuses if it skipped even one malformed row; it never
+plans from the healthy subset. Preserve and copy the data directory, repair the exact
+registry row from a consistent backup, and retry. Do not delete the row or use `join` as a
+substitute. Other explicit user/admin standalone verbs retain their existing tolerant-row
+behavior unless they require a world-complete planning view.
 
 ## 6a.8 Lifecycle + observability
 

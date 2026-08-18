@@ -47,7 +47,8 @@
 //! federation's evacuation into A — `A` is only
 //! a legal evacuation destination once its probe reports it healthy again, and stranding a second
 //! dying federation to spare one extra hop would be the same trade, made the wrong way round.
-//! Cancelling or superseding the stale funding intent remains `br-n8o`, not this projection.
+//! A marked pre-artifact evacuation may now be atomically superseded only through `br-n8o`'s
+//! policy-qualified exchange; this projection still does not cancel work itself.
 //!
 //! That deferral has a residual worth stating rather than discovering: [`crate::allocator::decide`]
 //! funds only the two DESIGNATED federations (`usable_source(standby)` / `usable_source(spending)`),
@@ -55,8 +56,9 @@
 //! and no allocator top-up is emitted at all. It lasts exactly as long as that intent does — a
 //! cycle or two in the ordinary case — and it withholds only agent funding: user payments, probes,
 //! and every other federation's evacuation keep running. An evacuation that retries forever
-//! therefore parks rebalancing until something terminalizes it, which is `br-n8o`. Releasing the
-//! edge once the held move has SENT would not buy that case out either: the structural refusal
+//! therefore parks rebalancing until it terminalizes or the narrowly qualified `br-n8o` exchange
+//! replaces its pre-artifact refusal. Releasing the edge once the held move has SENT would not buy
+//! that case out either: the structural refusal
 //! that produces a forever-retrying evacuation is raised while the executor sizes it (the
 //! `EvacuationSizing::Refused` arm), before any invoice or send, so the source spend such a
 //! release would key on has not happened.
@@ -211,6 +213,18 @@ pub struct GoalBlockers {
 }
 
 impl GoalBlockers {
+    /// Return the same durable projection with one exact intent holder removed.
+    ///
+    /// Supersession uses this only while atomically exchanging that exact pending
+    /// evacuation for its child.  Removing by key (rather than by goal or endpoint)
+    /// is important: a second holder for the source remains a conflict.
+    pub fn excluding_key(&self, key: &IdempotencyKey) -> Self {
+        let mut out = self.clone();
+        out.holders.retain(|(_, holder)| holder != key);
+        out.holder_sources.retain(|(_, holder, _)| holder != key);
+        out
+    }
+
     /// Add every holder and its observational source metadata from another
     /// projection.
     ///
@@ -501,7 +515,8 @@ mod tests {
         // reason), so the only ordering this covers is "B was topped up while healthy, then
         // started dying" — and withholding the drain there would strand B's WHOLE balance behind
         // a move that may never terminalize, to avoid one in-flight chunk landing late. See the
-        // module docs; superseding the stale funding intent is br-n8o.
+        // module docs; the narrow br-n8o exchange supersedes only a marked pre-artifact
+        // evacuation, not this funding intent.
         assert!(!held.blocks_decision(
             &decision(
                 "evac:b",

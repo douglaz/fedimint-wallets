@@ -57,9 +57,10 @@ pub use executor::FedimintExecutor;
 pub use fee::{gross_up, predicted_net, total_within_cap, GatewayFee, GrossUp};
 pub use journal::{
     prune_probe_attempts, raw_operation_row_matches, CandidateListReport, CandidateRecord,
-    CandidateState, FederationInfo, FederationListReport, FedimintJournal, LedgerRepairOracle,
-    OperationRef, ProbeRecord, ProbeSession, RawOpObservation, RawOperationRole, RawTerminal,
-    RepairSummary, StructuralOutcome, WatchState, JOIN_NOOP_REOPEN_NOTE, PROBE_HISTORY_CAP,
+    CandidateState, EvacuationSupersessionNeighbors, EvacuationSupersessionRecord, FederationInfo,
+    FederationListReport, FedimintJournal, LedgerRepairOracle, OperationRef, ProbeRecord,
+    ProbeSession, RawOpObservation, RawOperationRole, RawTerminal, RepairSummary,
+    StructuralOutcome, WatchState, JOIN_NOOP_REOPEN_NOTE, PROBE_HISTORY_CAP,
 };
 pub use move_protocol::{
     assemble_move_record, next_step, Leg, MoveMeta, MoveParams, MovePhase, MovePlan, MoveRecord,
