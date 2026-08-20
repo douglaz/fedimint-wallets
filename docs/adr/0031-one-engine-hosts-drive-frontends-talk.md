@@ -41,10 +41,25 @@ attempt/sequence/status fenced and neither admits a fresh intent. Consequences o
   writer of agent intents" is a convention today, not a compiler-checked fact —
    `wallet-core`'s `apply_with_allocator_admission` and
    `decide_and_journal_with_allocator_reservations` are public, so another in-process caller can
-   bypass the seam. Sealing that surface (visibility narrowing or an admission token only the
-   guarded paths can construct) is follow-up work that rides br-n8o: atomic supersession must open
-   the journal boundary anyway, and building an atomic scan-and-insert twice — once here, once
-   there — was rejected as the wrong sequencing, not as a wrong goal.
+   bypass the seam. Generic public admission sealing (visibility narrowing or an admission token
+   only guarded paths can construct) remains separate follow-up
+   `br-seal-agent-admission-yfr`; it is not deferred on evacuation supersession.
+
+`br-n8o` now gives the actor a narrower, completed journal-boundary duty: `CommitTick` owns the
+serialized exchange of one policy-qualified, pre-artifact structural-refusal evacuation for a
+fresh occurrence/key. The exclusive-DB standalone `Runtime::tick` seam performs that same
+atomic journal exchange. It writes the durable canonical `EvacuationSupersessionRecord` plus
+its reverse sidecar, preserves the retired parent's audit identity, and rejects ambiguity or a
+generation/occurrence that is not current; marker claim is consumed on `Pending -> Executing`.
+Replacement-path validation, admission, fresh-blocker, CAS-false, and confirmed-uncommitted errors
+retain the exact Pending parent marker: only a successful (or exactly confirmed committed) exchange
+may consume it. The separate, authoritative planner no-child disposition still clears its exact
+marker when no replacement was selected. Standalone `Runtime::status` is a dry diagnostic: for a
+stale structural replacement it warns and returns the scored/designation report with no would-run
+decisions, rather than advertising an impossible child or deferred ordinary work. It writes neither
+the exchange nor a child. Daemon scheduler status remains strict and rejects the same stale
+replacement because it owns occurrence allocation.
+Those duties do not make the public generic admission surface self-sealing.
 
 ## 2. All three resident frontends sit on that one actor; Android embeds it in-process
 
@@ -95,14 +110,15 @@ disagreeing". Code that must be kept equivalent by discipline is one implementat
 late had a concrete failure mode: Phase 6b's path of least resistance would have been either
 porting the resident loop into a foreground service (Doze-fragile, battery-hostile) or
 reviving `watch_once` as the mobile scheduler (two admission implementations, forever, with
-every future invariant — br-n8o supersession included — landing twice).
+every future invariant — including the actor-owned exchange and the isolated standalone
+equivalent — landing twice).
 
 ## Alternatives rejected
 
 - **The journal defends itself (universal atomic goal admission at insertion), now.** Stronger
-  in the abstract, but it builds br-n8o's atomic journal-boundary machinery early and then
-  rebuilds it when supersession lands. The contract is accepted; the sequencing is: br-n8o's
-  boundary work carries it.
+  in the abstract, but broader than the completed br-n8o replacement exchange. Generic public
+  admission sealing remains `br-seal-agent-admission-yfr`; the sidecar-linked, authority- and
+  generation-fenced evacuation exchange is not a universal insertion guard.
 - **Android on `Runtime::watch_once`.** Permanent two-implementation drift; rejected above.
 - **Resident loop in an Android foreground service.** Fights the platform's process model
   instead of using it; the durable-intent + reconcile design already makes externally-driven
