@@ -114,7 +114,6 @@ type PreparedTickRound = (
     TickPolicy,
     u64,
     u64,
-    Option<Intent>,
 );
 
 struct ActorState {
@@ -159,26 +158,11 @@ struct ActorState {
     ownership_recovery_generation: u64,
     policy_wake: tokio::sync::watch::Sender<u64>,
     tick_batches: Vec<TickBatch>,
-    /// Full rows captured for ordered, one-child scheduler handoff. Only `ReconcileDecide`
-    /// advances this queue; durable ownership recovery must not race an off-actor planner by
-    /// clearing it.
-    parked_evacuation_markers: Vec<Intent>,
-    /// The exact parked parent offered to the current scheduler cycle. A later reconciliation
-    /// may release only this row: the remaining queue was never handed to that cycle's planner.
-    parked_evacuation_handoff: Option<Intent>,
-    /// A deliberate planner clear, or a recovery-only claim which atomically consumes this exact
-    /// structural marker, makes the next retry's renewed marker a continuation of the current
-    /// scheduler decision, not new policy information. Suppress that one wake only after the
-    /// clear/claim is armed; DriverFinished cleans up abandoned attempts.
-    marker_clear_wake_suppression: BTreeSet<(IdempotencyKey, u32)>,
     /// Per-logical-goal admission counters.  Unlike the pending scan, these
     /// deliberately retain a terminal admission long enough for an older
     /// off-actor plan to see that it was superseded.
     goal_admissions: BTreeMap<AllocatorGoal, u64>,
-    /// A durable-admission ambiguity is not an arithmetic overflow.  Retain
-    /// its diagnostic so all later plan/commit refusals describe the actual
-    /// fail-closed condition.
-    goal_admissions_poisoned: Option<String>,
+    goal_admissions_poisoned: bool,
     tick_token_authority: Arc<()>,
     balance_generations: BTreeMap<FederationId, u64>,
     balance_generations_poisoned: bool,
@@ -189,16 +173,6 @@ struct ActorState {
     balance_facts_authority: Arc<()>,
     #[cfg(test)]
     fail_after_fresh_admission: Option<IdempotencyKey>,
-}
-
-/// What a reconciliation pass may do with a current qualifying structural marker. This is actor
-/// policy rather than a public boolean because preserving, handing work to a planner, and
-/// recovery-only re-driving have materially different money-path authority.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReconciliationMarkerPolicy {
-    PreservePlannerOwned,
-    CaptureForPlanner,
-    RedriveWithoutPlanner,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -214,18 +188,7 @@ pub(super) async fn run(
     registry: driver::Registry,
     policy_wake: tokio::sync::watch::Sender<u64>,
 ) {
-    #[cfg(test)]
-    let scheduler_fixture_executor = runtime
-        .as_deref()
-        .is_some_and(Runtime::scheduler_tick_fixture_enabled_for_test);
-    let executor = runtime.as_ref().map_or(executor.clone(), |runtime| {
-        #[cfg(test)]
-        if scheduler_fixture_executor {
-            executor.clone()
-        } else {
-            Arc::new(runtime.service_executor(Some(policy.per_fed_cap)))
-        }
-        #[cfg(not(test))]
+    let executor = runtime.as_ref().map_or(executor, |runtime| {
         Arc::new(runtime.service_executor(Some(policy.per_fed_cap)))
     });
     let budget_journal = journal.clone();
@@ -263,11 +226,8 @@ pub(super) async fn run(
         ownership_recovery_generation: 0,
         policy_wake,
         tick_batches: Vec::new(),
-        parked_evacuation_markers: Vec::new(),
-        parked_evacuation_handoff: None,
-        marker_clear_wake_suppression: BTreeSet::new(),
         goal_admissions: BTreeMap::new(),
-        goal_admissions_poisoned: None,
+        goal_admissions_poisoned: false,
         tick_token_authority: Arc::new(()),
         balance_generations: BTreeMap::new(),
         balance_generations_poisoned: false,
@@ -446,78 +406,9 @@ pub(crate) struct PlannedTickRound {
     /// intent already owns. Kept separately from admitted work because it did not complete route
     /// preflight and can only supply the narrow source-associated pin voucher.
     pub(crate) suppressed: Vec<AllocatorDecision>,
-    /// Ordinary planned work deferred by an exclusive replacement. It is deliberately distinct
-    /// from conflict suppression: deferred work must not vouch for an in-flight holder.
-    pub(crate) replacement_deferred: Vec<AllocatorDecision>,
     pub(crate) probes: Vec<(FederationId, crate::probe::ProbeResult)>,
     pub(crate) active_probes: BTreeMap<FederationId, ActiveProbeVerdict>,
     pub(crate) snapshot: AllocatorSnapshot,
-    /// The exact blocker projection used for pinned-input validation. A
-    /// replacement shadow excludes only its retiring parent.
-    pub(crate) blocked: GoalBlockers,
-    pub(crate) replacement: Option<super::EvacuationReplacementPlan>,
-    pub(crate) marker_disposition: Option<super::EvacuationMarkerDisposition>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReplacementExchangeOutcome {
-    Committed,
-    Uncommitted,
-}
-
-/// Whether a failed marked-evacuation replacement is known not to have crossed
-/// the journal exchange boundary.  This is deliberately a typed contract:
-/// marker cleanup must not infer the boundary from an error message.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReplacementFailureDisposition {
-    DefiniteUncommitted,
-    /// The journal autocommit closure rejected the exchange before commit. The
-    /// marker remains durable repair evidence even though no child was written.
-    DefiniteUncommittedRetainMarker,
-    PostExchangeAmbiguous,
-}
-
-/// Internal failure result for the actor-owned half of a marked evacuation
-/// replacement.  The caller owns tick terminalization and the exact-parent
-/// marker CAS, so it needs the exchange-boundary proof alongside the public
-/// error it must return or report.
-#[derive(Debug)]
-struct ReplacementCommitError {
-    error: ServiceError,
-    disposition: ReplacementFailureDisposition,
-}
-
-impl ReplacementCommitError {
-    fn definite_uncommitted(error: ServiceError) -> Self {
-        Self {
-            error,
-            disposition: ReplacementFailureDisposition::DefiniteUncommitted,
-        }
-    }
-
-    fn post_exchange_ambiguous(error: ServiceError) -> Self {
-        Self {
-            error,
-            disposition: ReplacementFailureDisposition::PostExchangeAmbiguous,
-        }
-    }
-
-    fn definite_uncommitted_retain_marker(error: ServiceError) -> Self {
-        Self {
-            error,
-            disposition: ReplacementFailureDisposition::DefiniteUncommittedRetainMarker,
-        }
-    }
-}
-
-/// Route observations are cycle-scoped, not shadow-plan-scoped.  In
-/// particular, when a qualifying marker no longer yields a same-source child,
-/// normal fallback inherits the shadow's spent quote budget, successful
-/// prices, and failed concrete-preflight facts.
-struct RoutePlanningState {
-    budget: Option<crate::route_econ::RouteQuoteBudget>,
-    priced: BTreeMap<(FederationId, FederationId), RouteEconomics>,
-    invalidated: BTreeSet<(FederationId, FederationId)>,
 }
 
 pub(crate) async fn plan_tick_round(
@@ -526,108 +417,7 @@ pub(crate) async fn plan_tick_round(
     probes: Vec<(FederationId, crate::probe::ProbeResult)>,
     policy: &TickPolicy,
     sensed_at_ms: u64,
-    route_budget: Option<crate::route_econ::RouteQuoteBudget>,
-) -> Result<PlannedTickRound, ExecError> {
-    plan_tick_round_for_marker(
-        journal,
-        runtime,
-        probes,
-        policy,
-        sensed_at_ms,
-        route_budget,
-        None,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn plan_tick_round_for_marker(
-    journal: &FedimintJournal,
-    runtime: Option<&Runtime>,
-    probes: Vec<(FederationId, crate::probe::ProbeResult)>,
-    policy: &TickPolicy,
-    sensed_at_ms: u64,
-    route_budget: Option<crate::route_econ::RouteQuoteBudget>,
-    preferred_replacement_parent: Option<&Intent>,
-) -> Result<PlannedTickRound, ExecError> {
-    // A shadow round is exclusive only while it can actually produce the
-    // successor it reserved capacity for.  Do not turn a disappeared
-    // same-source evacuation into an idle cycle: the old marker remains live,
-    // but independently eligible work still deserves the ordinary plan.
-    let mut probes = probes;
-    let mut route_state = RoutePlanningState {
-        budget: route_budget,
-        priced: BTreeMap::new(),
-        invalidated: BTreeSet::new(),
-    };
-    let shadow = plan_tick_round_inner(
-        journal,
-        runtime,
-        probes.as_mut_slice(),
-        policy,
-        sensed_at_ms,
-        &mut route_state,
-        true,
-        preferred_replacement_parent,
-    )
-    .await?;
-    if shadow.marker_disposition.is_some() && shadow.replacement.is_none() {
-        let mut ordinary = plan_tick_round_inner(
-            journal,
-            runtime,
-            probes.as_mut_slice(),
-            policy,
-            sensed_at_ms,
-            &mut route_state,
-            false,
-            None,
-        )
-        .await?;
-        // The exclusive shadow did not yield the only admissible child.  Preserve its exact
-        // one-cycle marker disposition while ordinary work gets this cycle's normal plan.
-        ordinary.marker_disposition = shadow.marker_disposition;
-        return Ok(ordinary);
-    }
-    Ok(shadow)
-}
-
-async fn qualifying_replacement_parent(
-    journal: &FedimintJournal,
-    policy: &TickPolicy,
-    preferred: Option<&Intent>,
-) -> Result<Option<Intent>, ExecError> {
-    let qualifies = |intent: &Intent| {
-        matches!(intent.actor, Actor::Agent { occurrence } if occurrence.0 < u64::MAX)
-            && matches!(intent.action, Action::Evacuate { .. })
-            && intent.evacuation_refusal.as_ref().is_some_and(|evidence| {
-                wallet_core::evacuation_cap_qualifies_replacement(
-                    evidence,
-                    wallet_core::EvacFeeCap {
-                        base_msat: policy.evac_fee_base_msat,
-                        bps: policy.evac_fee_bps,
-                    },
-                )
-            })
-    };
-    if let Some(preferred) = preferred {
-        return Ok(journal
-            .get(&preferred.idempotency_key)
-            .await?
-            .filter(|current| current == preferred && qualifies(current)));
-    }
-    Ok(journal.pending().await?.into_iter().find(qualifies))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn plan_tick_round_inner(
-    journal: &FedimintJournal,
-    runtime: Option<&Runtime>,
-    probes: &mut [(FederationId, crate::probe::ProbeResult)],
-    policy: &TickPolicy,
-    sensed_at_ms: u64,
-    route_state: &mut RoutePlanningState,
-    replacements_enabled: bool,
-    preferred_replacement_parent: Option<&Intent>,
+    mut route_budget: Option<crate::route_econ::RouteQuoteBudget>,
 ) -> Result<PlannedTickRound, ExecError> {
     let candidates = journal.list_candidates_report().await?;
     let joined = journal.list_federations().await?;
@@ -639,34 +429,9 @@ async fn plan_tick_round_inner(
             .map(|(id, record)| (*id, record.state)),
     );
     let reservations = project_allocator_reservations(journal).await?;
-    // A structural marker remains retryable unless the current cap grants a
-    // component-wise monotone, *effective* improvement at an observed net.
-    // Choose one parent in pending-index order and reserve this cycle solely
-    // for its shadow replacement.
-    let replacement_parent = if replacements_enabled {
-        #[cfg(test)]
-        journal.wait_before_replacement_scan_for_test().await;
-        qualifying_replacement_parent(journal, policy, preferred_replacement_parent).await?
-    } else {
-        None
-    };
-    let mut shadow_policy = policy.clone();
-    let mut shadow_reservations = reservations.clone();
-    if let Some(parent) = &replacement_parent {
-        shadow_policy.blocked = policy.blocked.excluding_key(&parent.idempotency_key);
-        shadow_reservations =
-            project_allocator_reservations_excluding(journal, &parent.idempotency_key).await?;
-    }
-    let active_policy = if replacement_parent.is_some() {
-        &shadow_policy
-    } else {
-        policy
-    };
-    let active_reservations = if replacement_parent.is_some() {
-        &shadow_reservations
-    } else {
-        &reservations
-    };
+    let mut probes = probes;
+    let mut priced = BTreeMap::<(FederationId, FederationId), RouteEconomics>::new();
+    let mut invalidated = BTreeSet::new();
     let mut evacuation_fallback: Option<(FederationId, PlannedTickRound)> = None;
     // The round whose refusal first named an unroutable designated pair. A re-designation that ends
     // up funding nothing reverts to it so that refusal (§Q5) is not lost.
@@ -677,14 +442,14 @@ async fn plan_tick_round_inner(
         let round = build_tick_round(
             journal,
             runtime,
-            probes,
-            active_policy,
+            &probes,
+            policy,
             sensed_at_ms,
             &auto_joined,
-            active_reservations,
-            route_state.budget.as_mut(),
-            &mut route_state.priced,
-            &route_state.invalidated,
+            &reservations,
+            route_budget.as_mut(),
+            &mut priced,
+            &invalidated,
         )
         .await?;
         if let Some((source, fallback)) = &evacuation_fallback {
@@ -692,16 +457,13 @@ async fn plan_tick_round_inner(
                 matches!(decision.action, Action::Evacuate { from, .. } if from == *source)
             });
             if !still_evacuating {
-                return Ok(finish_replacement_round(
-                    fallback.clone(),
-                    replacement_parent.as_ref(),
-                ));
+                return Ok(fallback.clone());
             }
         }
         // A discarded reconcile cycle supplies no budget. It pays for neither route economics nor
         // the pre-existing concrete route preflight.
-        let (Some(runtime), Some(budget)) = (runtime, route_state.budget.as_ref()) else {
-            return Ok(finish_replacement_round(round, replacement_parent.as_ref()));
+        let (Some(runtime), Some(budget)) = (runtime, route_budget.as_ref()) else {
+            return Ok(round);
         };
         let Some(problem) = budget
             .run_before_deadline(runtime.first_move_route_problem(&round.decisions))
@@ -711,7 +473,7 @@ async fn plan_tick_round_inner(
                 "tick: route-work deadline expired before concrete preflight completed; \
                  leaving final validation to perform"
             );
-            return Ok(finish_replacement_round(round, replacement_parent.as_ref()));
+            return Ok(round);
         };
         let Some(problem) = problem else {
             // No EMITTED move failed preflight — but `decide()` may have route-BLOCKED the designated
@@ -722,7 +484,7 @@ async fn plan_tick_round_inner(
             // Restore it: drop the blocked destination and re-drive so allocation re-designates onto
             // another eligible pairing, keeping the FIRST such round as the fallback.
             if let Some((_, to)) = first_route_blocked_designation(&round) {
-                if crate::runtime::mark_gateway_unavailable(probes, to) {
+                if crate::runtime::mark_gateway_unavailable(&mut probes, to) {
                     tracing::warn!(
                         to = %to.to_hex(),
                         "tick: the designated funding pair is unroutable this cycle; re-driving \
@@ -731,10 +493,7 @@ async fn plan_tick_round_inner(
                     route_blocked_fallback.get_or_insert_with(|| round.clone());
                     route_revisions += 1;
                     if route_revisions > probes.len() {
-                        return Ok(finish_replacement_round(
-                            route_blocked_fallback.take().unwrap_or(round),
-                            replacement_parent.as_ref(),
-                        ));
+                        return Ok(route_blocked_fallback.take().unwrap_or(round));
                     }
                     continue;
                 }
@@ -750,13 +509,10 @@ async fn plan_tick_round_inner(
                     .iter()
                     .any(|decision| matches!(decision.action, Action::Move { .. }));
                 if !funds_a_move {
-                    return Ok(finish_replacement_round(
-                        fallback,
-                        replacement_parent.as_ref(),
-                    ));
+                    return Ok(fallback);
                 }
             }
-            return Ok(finish_replacement_round(round, replacement_parent.as_ref()));
+            return Ok(round);
         };
         if problem.evacuation_source_route
             && round.decisions.iter().any(|decision| {
@@ -769,8 +525,9 @@ async fn plan_tick_round_inner(
         // A concrete preflight failure invalidates the exact pair's earlier `Routable` evidence.
         // Keep it in the accumulator only to prevent another quote pass; `build_tick_round`
         // excludes invalidated entries from every later snapshot.
-        route_state.invalidated.insert((problem.from, problem.to));
-        let changed = crate::runtime::mark_gateway_unavailable(probes, problem.mark_unavailable);
+        invalidated.insert((problem.from, problem.to));
+        let changed =
+            crate::runtime::mark_gateway_unavailable(&mut probes, problem.mark_unavailable);
         tracing::warn!(
             from = %problem.from.to_hex(),
             to = %problem.to.to_hex(),
@@ -783,67 +540,13 @@ async fn plan_tick_round_inner(
             "tick: planned send-required route failed gateway validation; revising the fundable set"
         );
         if !changed {
-            return Ok(finish_replacement_round(round, replacement_parent.as_ref()));
+            return Ok(round);
         }
         route_revisions += 1;
         if route_revisions > probes.len() {
-            return Ok(finish_replacement_round(round, replacement_parent.as_ref()));
+            return Ok(round);
         }
     }
-}
-
-/// Turn a shadow allocation into the only work in an exclusive replacement
-/// round. If allocation no longer yields a same-source evacuation, carry an exact one-cycle
-/// disposition which clears only the coherent Pending marker at commit.  The caller then returns
-/// to ordinary retry on its next normal cycle; no immediate policy wake is permitted.
-fn finish_replacement_round(
-    mut round: PlannedTickRound,
-    parent: Option<&Intent>,
-) -> PlannedTickRound {
-    let Some(parent) = parent else {
-        return round;
-    };
-    let source = match parent.action {
-        Action::Evacuate { from, .. } => from,
-        _ => return round,
-    };
-    let fresh = round
-        .decisions
-        .iter()
-        .find(|decision| matches!(decision.action, Action::Evacuate { from, .. } if from == source))
-        .cloned();
-    // Preserve all non-child planned work as suppressed facts.  The replacement is exclusive at
-    // commit (only `replacement.fresh` is admitted), but pinned-input validation must still see
-    // both the allocator's original suppressions and the ordinary work deferred by exclusivity.
-    // Otherwise a third holder can disappear from the validation projection merely because the
-    // marker selected a child. Keep these separate from conflict suppression: the latter has
-    // narrow holder-voucher semantics in pinned-input validation.
-    if let Some(fresh) = fresh.as_ref() {
-        round.replacement_deferred = round
-            .decisions
-            .iter()
-            .filter(|decision| *decision != fresh)
-            .cloned()
-            .collect();
-    }
-    round.decisions.clear();
-    let evidence = parent
-        .evacuation_refusal
-        .clone()
-        .expect("qualifying replacement parent carries evidence");
-    round.replacement = fresh.map(|fresh| super::EvacuationReplacementPlan {
-        parent: parent.clone(),
-        old_key: parent.idempotency_key.clone(),
-        old_attempt: parent.attempt,
-        evidence: evidence.clone(),
-        fresh,
-    });
-    if round.replacement.is_none() {
-        round.marker_disposition = Some(super::EvacuationMarkerDisposition {
-            parent: parent.clone(),
-        });
-    }
-    round
 }
 
 /// The off-actor half of a tick decision: the network-heavy route pricing + concrete route
@@ -859,7 +562,6 @@ async fn plan_tick_off_actor(
     policy: TickPolicy,
     planned_generation: u64,
     planned_world_generation: u64,
-    preferred_replacement_parent: Option<Intent>,
 ) -> ServiceResult<TickRound> {
     let route_budget = facts
         .price_routes
@@ -874,55 +576,43 @@ async fn plan_tick_off_actor(
             PlannedTickRound {
                 decisions: round.decisions,
                 suppressed: round.suppressed,
-                replacement_deferred: round.replacement_deferred,
                 probes: round.probes,
                 active_probes: round.active_probes,
                 snapshot: round.snapshot,
-                blocked: round.blockers,
-                replacement: round.replacement,
-                marker_disposition: round.marker_disposition,
             }
         } else {
-            plan_tick_round_for_marker(
+            plan_tick_round(
                 journal.as_ref(),
                 runtime.as_deref(),
                 facts.probes,
                 &policy,
                 facts.now_ms,
                 route_budget,
-                preferred_replacement_parent.as_ref(),
             )
             .await
             .map_err(storage)?
         }
         #[cfg(not(test))]
         {
-            plan_tick_round_for_marker(
+            plan_tick_round(
                 journal.as_ref(),
                 runtime.as_deref(),
                 facts.probes,
                 &policy,
                 facts.now_ms,
                 route_budget,
-                preferred_replacement_parent.as_ref(),
             )
             .await
             .map_err(storage)?
         }
     };
-    let mut validation_decisions = round
-        .replacement
-        .as_ref()
-        .map(|replacement| vec![replacement.fresh.clone()])
-        .unwrap_or_else(|| round.decisions.clone());
-    validation_decisions.extend(round.replacement_deferred.clone());
     let problems = pinned_input_problems(
         &policy,
         &round.snapshot,
         &round.probes,
-        &validation_decisions,
+        &round.decisions,
         &round.suppressed,
-        &round.blocked,
+        &policy.blocked,
     );
     if !problems.is_empty() {
         return Err(ServiceError::Storage(format!(
@@ -932,14 +622,11 @@ async fn plan_tick_off_actor(
     }
     Ok(TickRound {
         decisions: round.decisions,
-        replacement_deferred: round.replacement_deferred,
         occurrence: facts.occurrence,
         spending_fed: round.snapshot.spending_fed,
         planned_generation,
         planned_world_generation,
         admission_snapshot: facts.admission_snapshot,
-        replacement: round.replacement,
-        marker_disposition: round.marker_disposition,
     })
 }
 
@@ -1066,13 +753,9 @@ async fn build_tick_round(
     Ok(PlannedTickRound {
         decisions,
         suppressed,
-        replacement_deferred: Vec::new(),
         probes: probes.to_vec(),
         active_probes,
         snapshot,
-        blocked: policy.blocked.clone(),
-        replacement: None,
-        marker_disposition: None,
     })
 }
 
@@ -1126,21 +809,7 @@ async fn project_strict_reservations(journal: &FedimintJournal) -> Result<Reserv
 async fn project_allocator_reservations(
     journal: &FedimintJournal,
 ) -> Result<Reservations, ExecError> {
-    project_allocator_reservations_excluding(journal, &IdempotencyKey(String::new())).await
-}
-
-/// Artifact-aware allocator reservations with exactly one old intent omitted
-/// for the replacement shadow.  This is not a general release primitive.
-pub(crate) async fn project_allocator_reservations_excluding(
-    journal: &FedimintJournal,
-    excluded: &IdempotencyKey,
-) -> Result<Reservations, ExecError> {
-    let intents: Vec<_> = journal
-        .reservation_intents()
-        .await?
-        .into_iter()
-        .filter(|intent| intent.idempotency_key != *excluded)
-        .collect();
+    let intents = journal.reservation_intents().await?;
     let mut records = BTreeMap::new();
     for intent in &intents {
         if !matches!(
@@ -1161,9 +830,7 @@ pub(crate) async fn project_allocator_reservations_excluding(
                     "allocator reservation: corrupt derived record; retaining strict action reservation"
                 );
             }
-            Err(error @ ExecError::Retryable(_))
-            | Err(error @ ExecError::StructuralEvacuationRefusal(_))
-            | Err(error @ ExecError::Unsupported) => {
+            Err(error @ ExecError::Retryable(_)) | Err(error @ ExecError::Unsupported) => {
                 return Err(error);
             }
         }
@@ -1174,19 +841,6 @@ pub(crate) async fn project_allocator_reservations_excluding(
 }
 
 impl ActorState {
-    fn structural_marker_qualifies(
-        &self,
-        evidence: &wallet_core::EvacuationRefusalEvidence,
-    ) -> bool {
-        wallet_core::evacuation_cap_qualifies_replacement(
-            evidence,
-            wallet_core::EvacFeeCap {
-                base_msat: self.policy.evac_fee_base_msat,
-                bps: self.policy.evac_fee_bps,
-            },
-        )
-    }
-
     async fn handle(&mut self, command: Command, client: Option<&WalletClient>, intake: bool) {
         match command {
             Command::DecideOp { req, reply } => {
@@ -1233,31 +887,6 @@ impl ActorState {
                 };
                 let resolve_waiters = transition_may_resolve(&transition);
                 let terminal_membership_transition = transition_terminal_status(&transition);
-                // A marker is evidence, not a release primitive. Wake only when this actor's
-                // current policy grants it a monotone, effective cap increase. Equal, crossed,
-                // and decreased caps stay Pending for the normal reconciliation interval (a later
-                // PutPolicy wakes separately), avoiding marker-write wake storms. A deliberate
-                // marker clear suppresses exactly the next renewed marker, but merely *observing*
-                // that suppression must not consume it before the reset is durable.
-                let reset_suppression_key = match &transition {
-                    JournalTransition::ResetRetryable {
-                        expected_attempt, ..
-                    } => Some((key.clone(), *expected_attempt)),
-                    _ => None,
-                };
-                let suppress_marker_wake = reset_suppression_key
-                    .as_ref()
-                    .is_some_and(|key| self.marker_clear_wake_suppression.contains(key));
-                let structural_marker_qualifies = !suppress_marker_wake
-                    && match &transition {
-                        JournalTransition::ResetRetryable {
-                            structural_refusal: Some(evidence),
-                            ..
-                        } => self.structural_marker_qualifies(evidence),
-                        _ => false,
-                    };
-                let reset_retryable =
-                    matches!(&transition, JournalTransition::ResetRetryable { .. });
                 // `Applied` is the successful reply shape for both an intent write and
                 // process/probe bookkeeping.  Only the former invalidates balance facts:
                 // DriverFinished tears down a registry entry and Refresh re-reads a probe
@@ -1300,21 +929,7 @@ impl ActorState {
                             ));
                         }
                     }
-                    if structural_marker_qualifies {
-                        self.policy_wake.send_modify(|generation| {
-                            *generation = generation.wrapping_add(1);
-                        });
-                    }
-                    if reset_suppression_key.is_some() {
-                        // `ResetRetryable` reports Applied only after its Executing->Pending write
-                        // commits.  A pre-commit error must leave the one-shot entry available.
-                        if let Some(key) = reset_suppression_key.as_ref() {
-                            self.marker_clear_wake_suppression.remove(key);
-                        }
-                    }
                     if let Some((generation, expected_attempt, retry_awaiter)) = finished {
-                        self.marker_clear_wake_suppression
-                            .remove(&(key.clone(), expected_attempt));
                         if intake {
                             if let Some(client) = client {
                                 self.finish_driver(
@@ -1351,32 +966,6 @@ impl ActorState {
                             "intent transition {} returned an ambiguous durability error without an affected action",
                             key.0
                         ));
-                    }
-                    // A reset can commit then report an error. Re-read only the exact Pending
-                    // attempt before consuming a one-shot suppression; a pre-commit error or a
-                    // changed row retains it for this driver's later reset/finish.
-                    if reset_retryable {
-                        let durable_marker = self.journal.get(&key).await.map(|intent| {
-                            intent.as_ref().is_some_and(|intent| {
-                                intent.status == IntentStatus::Pending
-                                    && reset_suppression_key.as_ref().is_some_and(
-                                        |(_, expected_attempt)| intent.attempt == *expected_attempt,
-                                    )
-                                    && intent.evacuation_refusal.as_ref().is_some_and(|evidence| {
-                                        self.structural_marker_qualifies(evidence)
-                                    })
-                            })
-                        });
-                        let durable_marker = durable_marker.unwrap_or(false);
-                        if durable_marker && suppress_marker_wake {
-                            if let Some(key) = reset_suppression_key.as_ref() {
-                                self.marker_clear_wake_suppression.remove(key);
-                            }
-                        } else if durable_marker {
-                            self.policy_wake.send_modify(|generation| {
-                                *generation = generation.wrapping_add(1);
-                            });
-                        }
                     }
                 }
                 let _ = reply.send(result);
@@ -1482,61 +1071,19 @@ impl ActorState {
             Command::ReconcileDurable { reply } => {
                 let result = if intake {
                     match client {
-                        Some(client) => {
-                            self.reconcile_durable(
-                                client,
-                                ReconciliationMarkerPolicy::PreservePlannerOwned,
-                            )
-                            .await
-                        }
+                        Some(client) => self.reconcile_durable(client).await,
                         None => Err(ServiceError::ActorStopped),
                     }
                 } else {
                     Err(ServiceError::ShuttingDown)
                 };
                 let _ = reply.send(result);
-            }
-            Command::ReconcileRecoveryOnlyCycle { reply } => {
-                let result = if intake {
-                    match client {
-                        Some(client) => {
-                            self.reconcile_durable(
-                                client,
-                                ReconciliationMarkerPolicy::RedriveWithoutPlanner,
-                            )
-                            .await
-                        }
-                        None => Err(ServiceError::ActorStopped),
-                    }
-                } else {
-                    Err(ServiceError::ShuttingDown)
-                };
-                let _ = reply.send(result);
-            }
-            Command::AbandonParkedEvacuationHandoff { reply } => {
-                // A scheduler cycle ended before CommitTick. Never clear durable evidence here:
-                // discard every in-memory snapshot from that cycle, so the next healthy
-                // ReconcileDecide scans and recaptures the durable markers instead of treating
-                // an old parked snapshot as authority to clear one.
-                self.parked_evacuation_markers.clear();
-                self.parked_evacuation_handoff = None;
-                let _ = reply.send(Ok(()));
-            }
-            #[cfg(test)]
-            Command::ParkedEvacuationHandoffStateForTest { reply } => {
-                let _ = reply.send(Ok((
-                    self.parked_evacuation_markers.len(),
-                    self.parked_evacuation_handoff.is_some(),
-                )));
             }
             Command::RecoverDriverOwnership { reply } => {
                 let result = if intake {
                     match client {
                         Some(client) => self
-                            .reconcile_durable(
-                                client,
-                                ReconciliationMarkerPolicy::PreservePlannerOwned,
-                            )
+                            .reconcile_durable(client)
                             .await
                             .map(|_| self.ownership_recovery_generation),
                         None => Err(ServiceError::ActorStopped),
@@ -1568,7 +1115,6 @@ impl ActorState {
                             policy,
                             planned_generation,
                             planned_world_generation,
-                            preferred_replacement_parent,
                         )) => {
                             tokio::spawn(async move {
                                 let result = plan_tick_off_actor(
@@ -1578,7 +1124,6 @@ impl ActorState {
                                     policy,
                                     planned_generation,
                                     planned_world_generation,
-                                    preferred_replacement_parent,
                                 )
                                 .await;
                                 let _ = reply.send(result);
@@ -1672,10 +1217,6 @@ impl ActorState {
                                 self.policy = policy.clone();
                                 self.policy_generation = self.policy_generation.wrapping_add(1);
                                 self.probe_policy_version = Arc::new(());
-                                // A policy edit is itself new scheduler information.  Do not let
-                                // a clear from the prior policy generation suppress the marker
-                                // produced by a driver which was already executing across it.
-                                self.marker_clear_wake_suppression.clear();
                                 self.policy_wake.send_modify(|generation| {
                                     *generation = generation.wrapping_add(1);
                                 });
@@ -1687,96 +1228,6 @@ impl ActorState {
                 let _ = reply.send(result);
             }
         }
-    }
-
-    /// Forget the parked snapshot of exactly this parent without touching durable state.
-    ///
-    /// Only a commit outcome that deliberately KEEPS the durable marker for a later cycle needs
-    /// this. Outcomes that clear the marker leave a changed row behind, so the drain's
-    /// full-parent CAS already misses their stale snapshots.
-    fn consume_parked_evacuation_marker(&mut self, parent: &Intent) {
-        self.parked_evacuation_markers
-            .retain(|parked| parked != parent);
-        if self.parked_evacuation_handoff.as_ref() == Some(parent) {
-            self.parked_evacuation_handoff = None;
-        }
-    }
-
-    fn suppress_next_marker_wake(&mut self, parent: &Intent) {
-        self.marker_clear_wake_suppression
-            .insert((parent.idempotency_key.clone(), parent.attempt));
-    }
-
-    /// Clear an exact planner marker and suppress its next renewed wake only when a retryable write
-    /// error leaves the commit boundary ambiguous. An exact reread only decides whether a parked
-    /// snapshot is stale and must not be requeued. A permanent closure/validation error cannot have
-    /// committed, so it must not suppress a later qualifying wake.
-    async fn clear_marker_with_confirmation(
-        &mut self,
-        parent: &Intent,
-    ) -> Result<bool, (ServiceError, bool)> {
-        let mut expected_cleared = parent.clone();
-        expected_cleared.evacuation_refusal = None;
-        match self
-            .journal
-            .clear_marked_evacuation_if_pending(parent)
-            .await
-        {
-            Ok(cleared) => {
-                if cleared {
-                    self.suppress_next_marker_wake(parent);
-                } else if matches!(
-                    self.journal.get(&parent.idempotency_key).await,
-                    Ok(Some(current)) if current == expected_cleared
-                ) {
-                    // A prior ambiguous clear can leave this call observing a CAS miss. It is
-                    // still this actor's exact markerless parent, so its next renewed marker is
-                    // not new scheduler information.
-                    self.suppress_next_marker_wake(parent);
-                }
-                Ok(cleared)
-            }
-            Err(error) => {
-                // Only a retryable write error may have crossed an ambiguous commit boundary. A
-                // permanent closure/validation error is definitely uncommitted, so suppression
-                // there would incorrectly swallow new scheduler information after repair.
-                if matches!(error, ExecError::Retryable(_)) {
-                    self.suppress_next_marker_wake(parent);
-                }
-                let confirmed = matches!(
-                    self.journal.get(&parent.idempotency_key).await,
-                    Ok(Some(current)) if current == expected_cleared
-                );
-                Err((storage(error), confirmed))
-            }
-        }
-    }
-
-    /// Release only the exact row offered to the prior scheduler cycle. Unselected parked rows
-    /// remain queued for later one-child rounds. Do not call this from `ReconcileDurable`:
-    /// ownership recovery is allowed during an off-actor replacement plan.
-    async fn release_parked_evacuation_markers_at_reconcile(&mut self) -> ServiceResult<()> {
-        let Some(parent) = self.parked_evacuation_handoff.take() else {
-            return Ok(());
-        };
-        self.parked_evacuation_markers
-            .retain(|parked| parked != &parent);
-        match self.clear_marker_with_confirmation(&parent).await {
-            Ok(true) => {}
-            Ok(false) => {}
-            Err((error, confirmed)) => {
-                // An unreadable or mismatched reread says nothing about whether this full-parent
-                // CAS committed. Keep the exact snapshot, but rotate it behind independent queued
-                // parents so one corrupt row cannot permanently starve their replacement rounds.
-                // A byte-exact confirmed clear has already registered suppression and must not
-                // requeue its stale snapshot.
-                if !confirmed {
-                    self.parked_evacuation_markers.push(parent);
-                }
-                return Err(error);
-            }
-        }
-        Ok(())
     }
 
     /// The ms-scale, actor-serialized half of a tick decision: record the sensed balances and
@@ -1806,15 +1257,14 @@ impl ActorState {
             policy,
             self.policy_generation,
             self.world_generation,
-            self.parked_evacuation_handoff.clone(),
         ))
     }
 
     async fn issue_tick_plan_token(&self) -> ServiceResult<super::GoalAdmissionSnapshot> {
-        if let Some(diagnostic) = &self.goal_admissions_poisoned {
-            return Err(ServiceError::Storage(format!(
-                "tick admission authority is poisoned; refusing plans until restart: {diagnostic}"
-            )));
+        if self.goal_admissions_poisoned {
+            return Err(ServiceError::Storage(
+                "tick admission watermark overflowed; refusing plans until restart".to_owned(),
+            ));
         }
         if self.world_generation_poisoned
             || self.external_terminal_poisoned
@@ -1846,10 +1296,10 @@ impl ActorState {
         &self,
         snapshot: &super::GoalAdmissionSnapshot,
     ) -> ServiceResult<()> {
-        if let Some(diagnostic) = &self.goal_admissions_poisoned {
-            return Err(ServiceError::Storage(format!(
-                "tick admission authority is poisoned; refusing commit: {diagnostic}"
-            )));
+        if self.goal_admissions_poisoned {
+            return Err(ServiceError::Storage(
+                "tick admission watermark overflowed; refusing commit".to_owned(),
+            ));
         }
         if self.world_generation_poisoned {
             return Err(ServiceError::Storage(
@@ -1897,9 +1347,7 @@ impl ActorState {
         match counter.checked_add(1) {
             Some(next) => *counter = next,
             None => {
-                self.goal_admissions_poisoned = Some(
-                    "tick admission watermark overflowed; refusing work until restart".to_owned(),
-                );
+                self.goal_admissions_poisoned = true;
                 tracing::error!(
                     ?goal,
                     "agent admission watermark overflowed; future tick plans fail closed"
@@ -2124,9 +1572,7 @@ impl ActorState {
                 .await
                 .map_err(storage)
                 .map(|intent| intent.map(|intent| intent.action)),
-            JournalTransition::SetStatus { .. }
-            | JournalTransition::SetRawTerminal { .. }
-            | JournalTransition::ResetRetryable { .. } => self
+            JournalTransition::SetStatus { .. } | JournalTransition::SetRawTerminal { .. } => self
                 .journal
                 .get(key)
                 .await
@@ -2185,37 +1631,12 @@ impl ActorState {
     ) -> ServiceResult<CommitTickReport> {
         let super::TickRound {
             decisions,
-            replacement_deferred,
             occurrence,
             planned_generation,
             planned_world_generation,
             admission_snapshot,
-            replacement,
-            marker_disposition,
             ..
         } = round;
-        // A forged round must not pair two independently authoritative marker outcomes. Reject it
-        // before any authority check or durable marker action; each parent remains repair evidence
-        // for a later, valid round.
-        if replacement.is_some() && marker_disposition.is_some() {
-            self.abandon_tick_marker_snapshots(replacement.as_ref(), marker_disposition.as_ref());
-            let error = ServiceError::Storage(
-                "CommitTick: replacement and marker-clear disposition cannot share a round"
-                    .to_owned(),
-            );
-            if let Some(key) = existing_tick_key.as_ref() {
-                self.record_tick_failed(key, &error.to_string()).await;
-            }
-            return Err(error);
-        }
-        // A replacement shadow intentionally has no ordinary `decisions`:
-        // its one admissible action is carried separately.  Every early
-        // authority refusal must nevertheless audit that fresh child, not an
-        // empty shadow shell (and never its retired parent).
-        let audit_decisions = replacement
-            .as_ref()
-            .map(|replacement| vec![replacement.fresh.clone()])
-            .unwrap_or_else(|| decisions.clone());
         // Policy-generation guard (§6a P1): a PutPolicy may have landed while the daemon
         // was validating routes over the network between DecideTickRound and here. These
         // decisions were sized against caps/targets the operator has since changed, so we
@@ -2226,7 +1647,7 @@ impl ActorState {
                 "tick planned under policy generation {planned_generation}, current is {}",
                 self.policy_generation
             );
-            let refused = audit_decisions
+            let refused = decisions
                 .iter()
                 .map(|decision| TickRefusal {
                     key: decision.idempotency_key.clone(),
@@ -2234,17 +1655,16 @@ impl ActorState {
                     message: message.clone(),
                 })
                 .collect();
-            self.abandon_tick_marker_snapshots(replacement.as_ref(), marker_disposition.as_ref());
             // The daemon opens its scheduler tick row before awaiting route pricing.  A policy
             // edit may therefore supersede this plan after that row is Started; terminalize that
             // already-open row instead of returning early and leaking Started forever.
             if let Some(key) = existing_tick_key.as_ref() {
                 self.finish_tick_batch(TickBatch {
                     key: key.clone(),
-                    decisions: audit_decisions.len() as u32,
+                    decisions: decisions.len() as u32,
                     pending: BTreeSet::new(),
                     performed: 0,
-                    failed: audit_decisions.len() as u32,
+                    failed: decisions.len() as u32,
                     error: Some(message),
                 })
                 .await;
@@ -2259,7 +1679,7 @@ impl ActorState {
                 "tick planned under membership world generation {planned_world_generation}, current is {}",
                 self.world_generation
             );
-            let refused = audit_decisions
+            let refused = decisions
                 .iter()
                 .map(|decision| TickRefusal {
                     key: decision.idempotency_key.clone(),
@@ -2267,14 +1687,13 @@ impl ActorState {
                     message: message.clone(),
                 })
                 .collect();
-            self.abandon_tick_marker_snapshots(replacement.as_ref(), marker_disposition.as_ref());
             if let Some(key) = existing_tick_key.as_ref() {
                 self.finish_tick_batch(TickBatch {
                     key: key.clone(),
-                    decisions: audit_decisions.len() as u32,
+                    decisions: decisions.len() as u32,
                     pending: BTreeSet::new(),
                     performed: 0,
-                    failed: audit_decisions.len() as u32,
+                    failed: decisions.len() as u32,
                     error: Some(message),
                 })
                 .await;
@@ -2285,14 +1704,12 @@ impl ActorState {
             });
         }
         if let Err(error) = self.validate_tick_plan_token(&admission_snapshot) {
-            self.abandon_tick_marker_snapshots(replacement.as_ref(), marker_disposition.as_ref());
             if let Some(key) = existing_tick_key.as_ref() {
                 self.record_tick_failed(key, &error.to_string()).await;
             }
             return Err(error);
         }
         if let Err(error) = self.validate_balance_facts(&balance_facts) {
-            self.abandon_tick_marker_snapshots(replacement.as_ref(), marker_disposition.as_ref());
             if let Some(key) = existing_tick_key.as_ref() {
                 self.record_tick_failed(key, &error.to_string()).await;
             }
@@ -2302,13 +1719,12 @@ impl ActorState {
         // advance a generation. Shared-destination independent work must not
         // invalidate a later sibling merely because the first became durable.
         let balance_generations_at_commit = self.balance_generations.clone();
-        if audit_decisions
+        if decisions
             .iter()
             .any(|decision| decision.occurrence != occurrence)
         {
             let error =
                 ServiceError::Storage("CommitTick: decisions span multiple occurrences".to_owned());
-            self.abandon_tick_marker_snapshots(replacement.as_ref(), marker_disposition.as_ref());
             if let Some(key) = existing_tick_key.as_ref() {
                 self.record_tick_failed(key, &error.to_string()).await;
             }
@@ -2326,46 +1742,6 @@ impl ActorState {
         {
             tracing::warn!(?error, "CommitTick: recording the Started tick row failed");
         }
-        // A replacement may consume exactly one child. Keep the otherwise-planned decisions as
-        // durable audit facts, but never pass them to admission/reservation folding or report
-        // them as accepted work.
-        for deferred in replacement_deferred
-            .iter()
-            .filter(|decision| decision.action.is_executable())
-        {
-            if let Err(error) = self
-                .journal
-                .record_tick_dropped_refusal(
-                    deferred,
-                    occurrence,
-                    now,
-                    "deferred: replacement-exclusive one-child round",
-                    false,
-                )
-                .await
-            {
-                tracing::warn!(
-                    key = %deferred.idempotency_key.0,
-                    ?error,
-                    "CommitTick: recording replacement-exclusive deferred audit failed"
-                );
-            }
-        }
-        if let Err(error) = self
-            .journal
-            .record_refusals_with_note(
-                &replacement_deferred,
-                occurrence,
-                now,
-                Some("deferred: replacement-exclusive one-child round"),
-            )
-            .await
-        {
-            tracing::warn!(
-                ?error,
-                "CommitTick: recording replacement-exclusive deferred advisory audit failed"
-            );
-        }
         // br-p93, the final conflict check: re-derive the in-flight goals HERE rather than trust
         // the set the caller planned against, so a batch that bypassed planning — or one whose
         // plan raced work admitted since — still cannot re-issue an in-flight goal under a fresh
@@ -2382,10 +1758,6 @@ impl ActorState {
             Ok(pending) => GoalBlockers::from_intents(&pending),
             Err(error) => {
                 let error = storage(error);
-                self.abandon_tick_marker_snapshots(
-                    replacement.as_ref(),
-                    marker_disposition.as_ref(),
-                );
                 self.record_tick_failed(&tick_key, &error.to_string()).await;
                 return Err(error);
             }
@@ -2405,12 +1777,8 @@ impl ActorState {
                 // Keep this a soft, per-decision tick refusal (the existing
                 // CommitTick API contract) while refusing the complete batch.
                 let message = storage(error).to_string();
-                self.abandon_tick_marker_snapshots(
-                    replacement.as_ref(),
-                    marker_disposition.as_ref(),
-                );
                 report.refused.extend(
-                    decisions_to_apply(&audit_decisions)
+                    decisions_to_apply(&decisions)
                         .into_iter()
                         .filter(|decision| decision.action.is_executable())
                         .map(|decision| TickRefusal {
@@ -2421,7 +1789,7 @@ impl ActorState {
                 );
                 if let Err(error) = self
                     .journal
-                    .record_refusals(&audit_decisions, occurrence, now)
+                    .record_refusals(&decisions, occurrence, now)
                     .await
                 {
                     tracing::warn!(
@@ -2431,7 +1799,7 @@ impl ActorState {
                 }
                 self.finish_tick_batch(TickBatch {
                     key: tick_key,
-                    decisions: audit_decisions.len() as u32,
+                    decisions: decisions.len() as u32,
                     pending: BTreeSet::new(),
                     performed: 0,
                     failed: report.refused.len() as u32,
@@ -2441,209 +1809,6 @@ impl ActorState {
                 return Ok(report);
             }
         };
-        // A no-child disposition is authoritative only after every pre-admission authority and
-        // fail-closed journal projection above has succeeded. It alone may clear its exact marker.
-        if let Some(disposition) = marker_disposition.as_ref() {
-            match self
-                .clear_marker_with_confirmation(&disposition.parent)
-                .await
-            {
-                Ok(true) => {
-                    // Deliberately no policy wake and no driver admission. The next regular
-                    // scheduler cycle sees an ordinary unmarked Pending evacuation.
-                }
-                Ok(false) => tracing::warn!(
-                    key = %disposition.parent.idempotency_key.0,
-                    "CommitTick: marker-clear disposition no longer owned its exact Pending evacuation"
-                ),
-                Err((error, _)) => {
-                    // `plan_tick_round_for_marker` replans this fallback's ordinary decisions with
-                    // the original live blockers and reservation projection still present. A failed
-                    // best-effort disposition clear therefore cannot make those independently sized
-                    // decisions unsafe; retain the exact parent for the next reconcile and commit
-                    // them. Keep the no-work path loud so a scheduler-only disposition fault is not
-                    // silently reported as a successful tick.
-                    if decisions.is_empty() {
-                        self.record_tick_failed(&tick_key, &error.to_string()).await;
-                        return Err(error);
-                    }
-                    tracing::warn!(
-                        key = %disposition.parent.idempotency_key.0,
-                        ?error,
-                        "CommitTick: retaining marker after disposition-clear fault; committing independently replanned ordinary decisions"
-                    );
-                }
-            }
-        }
-        // Replacement is deliberately a one-child batch.  Nothing below may
-        // admit an ordinary sibling against the old parent's hypothetical
-        // released capacity.
-        if let Some(replacement) = replacement {
-            // This is an operator-correctable pre-exchange refusal. Classify it from the typed
-            // parent captured by planning rather than from an error string returned below: a later
-            // daemon cycle must retain the structural marker and choose an occurrence strictly
-            // beyond the old parent.
-            if let Actor::Agent {
-                occurrence: old_occurrence,
-            } = replacement.parent.actor
-            {
-                if replacement.fresh.occurrence <= old_occurrence
-                    || replacement.fresh.idempotency_key == replacement.old_key
-                {
-                    // Retaining the durable marker only reaches that later cycle if this refusal
-                    // also consumes the snapshot the parking reconciliation took of this exact
-                    // parent: the next `ReconcileDecide` drains that snapshot first, and its
-                    // full-parent CAS would match the untouched row and release the evidence.
-                    // Dropping it here writes nothing durable, so the same reconciliation
-                    // recaptures the marker for another replacement attempt.
-                    self.consume_parked_evacuation_marker(&replacement.parent);
-                    let message = super::replacement_occurrence_error(
-                        old_occurrence,
-                        replacement.fresh.occurrence,
-                    );
-                    let report = CommitTickReport {
-                        accepted: Vec::new(),
-                        refused: vec![TickRefusal {
-                            key: replacement.fresh.idempotency_key.clone(),
-                            reason: RefuseReason::Conflict,
-                            message: message.clone(),
-                        }],
-                    };
-                    self.finish_tick_batch(TickBatch {
-                        key: tick_key,
-                        decisions: 1,
-                        pending: BTreeSet::new(),
-                        performed: 0,
-                        failed: 1,
-                        error: Some(message),
-                    })
-                    .await;
-                    return Ok(report);
-                }
-            }
-            if self.admission_snapshot_conflicts(
-                &admission_snapshot,
-                &replacement.fresh,
-                Actor::Agent { occurrence },
-            ) {
-                let error = refused(
-                    RefuseReason::Conflict,
-                    "replacement goal was admitted after its eligibility snapshot".to_owned(),
-                );
-                // The child was never exchanged. Keep the structural evidence and discard only
-                // this exact parked offer so a later reconciliation can recapture it.
-                self.consume_parked_evacuation_marker(&replacement.parent);
-                self.record_tick_failed(&tick_key, &error.to_string()).await;
-                return Err(error);
-            }
-            let child = match self
-                .commit_evacuation_replacement(
-                    &replacement,
-                    occurrence,
-                    &balances,
-                    &balance_facts,
-                    &balance_generations_at_commit,
-                    &blocked,
-                    now,
-                    client,
-                )
-                .await
-            {
-                Ok(child) => child,
-                Err(ReplacementCommitError {
-                    error,
-                    disposition: ReplacementFailureDisposition::DefiniteUncommitted,
-                }) => {
-                    // The exchange is definitely uncommitted, but that is not authority to erase
-                    // the parent's structural repair evidence. Forget only the exact parked
-                    // snapshot so the next reconciliation recaptures the unchanged marker.
-                    self.consume_parked_evacuation_marker(&replacement.parent);
-                    match error {
-                        ServiceError::Refused { reason, message } => {
-                            let report = CommitTickReport {
-                                accepted: Vec::new(),
-                                refused: vec![TickRefusal {
-                                    key: replacement.fresh.idempotency_key,
-                                    reason,
-                                    message: message.clone(),
-                                }],
-                            };
-                            self.finish_tick_batch(TickBatch {
-                                key: tick_key,
-                                decisions: 1,
-                                pending: BTreeSet::new(),
-                                performed: 0,
-                                failed: 1,
-                                error: Some(message),
-                            })
-                            .await;
-                            return Ok(report);
-                        }
-                        error => {
-                            self.record_tick_failed(&tick_key, &error.to_string()).await;
-                            return Err(error);
-                        }
-                    }
-                }
-                Err(ReplacementCommitError {
-                    error,
-                    disposition: ReplacementFailureDisposition::PostExchangeAmbiguous,
-                }) => {
-                    // An exchange may have committed.  Its marker is durable
-                    // recovery evidence and must remain until exact
-                    // confirmation authorizes a cleanup. Forget the exact parked snapshot too:
-                    // the following ReconcileDecide would otherwise drain-clear this deliberately
-                    // retained full parent before it can be recaptured from durable state.
-                    self.consume_parked_evacuation_marker(&replacement.parent);
-                    self.record_tick_failed(&tick_key, &error.to_string()).await;
-                    return Err(error);
-                }
-                Err(ReplacementCommitError {
-                    error,
-                    disposition: ReplacementFailureDisposition::DefiniteUncommittedRetainMarker,
-                }) => {
-                    // The journal proved this exchange did not commit, but its
-                    // pre-commit validation found durable state that prevents
-                    // this child. Retain the marker for a later child rather
-                    // than treating that validation failure as authority to
-                    // release the parent. Consume only the exact parked
-                    // handoff: otherwise the next reconciliation would
-                    // drain-clear this deliberately retained full parent before
-                    // recapturing it.
-                    self.consume_parked_evacuation_marker(&replacement.parent);
-                    self.record_tick_failed(&tick_key, &error.to_string()).await;
-                    return Err(error);
-                }
-            };
-            let mut report = CommitTickReport::default();
-            if let Some(child) = child {
-                report.accepted.push(child);
-            } else {
-                // A confirmed-uncommitted CAS miss/no-child result retains the marker for a later
-                // occurrence. It is not ambiguous, so do not poison admission authority.
-                self.consume_parked_evacuation_marker(&replacement.parent);
-                report.refused.push(TickRefusal {
-                    key: replacement.fresh.idempotency_key,
-                    reason: RefuseReason::Conflict,
-                    message: "evacuation replacement parent was no longer exclusively pending"
-                        .to_owned(),
-                });
-            }
-            let batch = TickBatch {
-                key: tick_key,
-                decisions: 1,
-                pending: report.accepted.iter().cloned().collect(),
-                performed: 0,
-                failed: report.refused.len() as u32,
-                error: None,
-            };
-            if batch.pending.is_empty() {
-                self.finish_tick_batch(batch).await;
-            } else {
-                self.tick_batches.push(batch);
-            }
-            return Ok(report);
-        }
         for decision in decisions_to_apply(&decisions) {
             // Advisory allocator decisions are durable refusal facts, not executable work.
             // `record_refusals` below is their single ledger writer, matching the standalone
@@ -2955,348 +2120,6 @@ impl ActorState {
             self.tick_batches.push(batch);
         }
         result
-    }
-
-    /// An early CommitTick rejection has not validated either planner result. Abandon only the
-    /// matching in-memory offers so the next reconciliation recaptures both durable parents; the
-    /// explicit, validated no-child disposition below is the only disposition path allowed to
-    /// clear its marker.
-    fn abandon_tick_marker_snapshots(
-        &mut self,
-        replacement: Option<&super::EvacuationReplacementPlan>,
-        disposition: Option<&super::EvacuationMarkerDisposition>,
-    ) {
-        if let Some(replacement) = replacement {
-            self.consume_parked_evacuation_marker(&replacement.parent);
-        }
-        if let Some(disposition) = disposition {
-            self.consume_parked_evacuation_marker(&disposition.parent);
-        }
-    }
-
-    /// Actor-only half of the marked evacuation exchange.  The journal owns
-    /// atomicity; this owner rechecks every authority and fresh fact which was
-    /// unavailable to the off-actor shadow planner.
-    #[allow(clippy::too_many_arguments)]
-    async fn commit_evacuation_replacement(
-        &mut self,
-        replacement: &super::EvacuationReplacementPlan,
-        occurrence: Occurrence,
-        balances: &BTreeMap<FederationId, Msat>,
-        facts: &super::BalanceFactsToken,
-        generations_at_commit: &BTreeMap<FederationId, u64>,
-        blockers: &GoalBlockers,
-        now: u64,
-        client: &WalletClient,
-    ) -> Result<Option<IdempotencyKey>, ReplacementCommitError> {
-        if replacement.fresh.occurrence != occurrence {
-            return Err(ReplacementCommitError::definite_uncommitted(
-                ServiceError::Storage(
-                    "replacement child occurrence differs from its tick round".to_owned(),
-                ),
-            ));
-        }
-        let current_cap = wallet_core::EvacFeeCap {
-            base_msat: self.policy.evac_fee_base_msat,
-            bps: self.policy.evac_fee_bps,
-        };
-        let Action::Evacuate {
-            from,
-            to,
-            amount,
-            fee_cap,
-            fee_cap_components: Some(components),
-            ..
-        } = &replacement.fresh.action
-        else {
-            return Err(ReplacementCommitError::definite_uncommitted(
-                ServiceError::Storage(
-                    "replacement plan does not contain a component-capped evacuation".to_owned(),
-                ),
-            ));
-        };
-        if *components != current_cap || current_cap.at(*amount) != *fee_cap {
-            return Err(ReplacementCommitError::definite_uncommitted(refused(
-                RefuseReason::PolicySuperseded,
-                "replacement child no longer exactly matches the current evacuation fee cap"
-                    .to_owned(),
-            )));
-        }
-        // The exchange is an admission, not a best-effort repair.  Its
-        // source affordability and destination capacity are both facts from
-        // this exact sample; accepting with either endpoint absent would turn
-        // an unknown fact into a release of the marker's reservation.
-        if !balances.contains_key(from) || !balances.contains_key(to) {
-            return Err(ReplacementCommitError::definite_uncommitted(refused(
-                RefuseReason::Conflict,
-                format!(
-                    "replacement requires fresh balances for both endpoints {} -> {}",
-                    from.to_hex(),
-                    to.to_hex()
-                ),
-            )));
-        }
-        let old = self
-            .journal
-            .get(&replacement.old_key)
-            .await
-            // This is before the exchange boundary, but it is not an authoritative logical
-            // disposition. Retain the structural marker and terminalize the tick rather than
-            // clearing durable repair evidence because storage was unreadable.
-            .map_err(|error| ReplacementCommitError::post_exchange_ambiguous(storage(error)))?
-            .ok_or_else(|| {
-                ReplacementCommitError::definite_uncommitted(refused(
-                    RefuseReason::Conflict,
-                    "replacement parent disappeared before exchange".to_owned(),
-                ))
-            })?;
-        if let Actor::Agent {
-            occurrence: old_occurrence,
-        } = old.actor
-        {
-            if replacement.fresh.occurrence <= old_occurrence
-                || replacement.fresh.idempotency_key == replacement.old_key
-            {
-                return Err(ReplacementCommitError::definite_uncommitted(refused(
-                    RefuseReason::Conflict,
-                    super::replacement_occurrence_error(
-                        old_occurrence,
-                        replacement.fresh.occurrence,
-                    ),
-                )));
-            }
-        }
-        if old != replacement.parent
-            || old.attempt != replacement.old_attempt
-            || old.status != IntentStatus::Pending
-            || old.evacuation_refusal.as_ref() != Some(&replacement.evidence)
-            || !matches!(old.actor, Actor::Agent { .. })
-            || !matches!(old.action, Action::Evacuate { from: old_from, .. } if old_from == *from)
-        {
-            return Ok(None);
-        }
-        if !wallet_core::evacuation_cap_qualifies_replacement(&replacement.evidence, current_cap) {
-            return Ok(None);
-        }
-        if Self::balance_facts_changed_for(generations_at_commit, facts, &old.action)
-            || Self::balance_facts_changed_for(
-                generations_at_commit,
-                facts,
-                &replacement.fresh.action,
-            )
-        {
-            return Err(ReplacementCommitError::definite_uncommitted(refused(
-                RefuseReason::Conflict,
-                "replacement endpoints changed after the fresh balance sample".to_owned(),
-            )));
-        }
-        let pending = self
-            .journal
-            .pending()
-            .await
-            .map_err(|error| ReplacementCommitError::post_exchange_ambiguous(storage(error)))?;
-        let shadow_blockers = GoalBlockers::from_intents(
-            pending
-                .iter()
-                .filter(|intent| intent.idempotency_key != replacement.old_key),
-        );
-        // The actor token's projection must also not gain a third holder while
-        // planning happened off actor.
-        let token_shadow = blockers.excluding_key(&replacement.old_key);
-        if shadow_blockers.blocks_decision(&replacement.fresh, Actor::Agent { occurrence })
-            || token_shadow.blocks_decision(&replacement.fresh, Actor::Agent { occurrence })
-        {
-            return Ok(None);
-        }
-        let shadow_reservations =
-            project_allocator_reservations_excluding(&self.journal, &replacement.old_key)
-                .await
-                .map_err(|error| ReplacementCommitError::post_exchange_ambiguous(storage(error)))?;
-        let child_intent =
-            Intent::from_decision(&replacement.fresh, Actor::Agent { occurrence }, now);
-        admit_intent(
-            &child_intent,
-            Some(balances),
-            Some(self.policy.per_fed_cap),
-            &shadow_reservations,
-        )
-        .map_err(|error| ReplacementCommitError::definite_uncommitted(refusal_from_exec(error)))?;
-        let exchanged = self
-            .journal
-            .replace_marked_evacuation(
-                &replacement.old_key,
-                replacement.old_attempt,
-                &replacement.evidence,
-                &replacement.fresh,
-                now,
-                &replacement.parent,
-            )
-            .await;
-        let committed = match exchanged {
-            Ok(exchanged) => exchanged,
-            // `replace_marked_evacuation` maps autocommit commit failures and
-            // every write seam to Retryable. A Permanent error here therefore
-            // came from its autocommit closure's validation before commit, so no
-            // exchange row can have been written. Keep the journal diagnostic,
-            // retain the marker for a later child key, and do not poison fresh
-            // goal or balance-facts authority.
-            Err(error @ ExecError::Permanent(_)) => {
-                return Err(ReplacementCommitError::definite_uncommitted_retain_marker(
-                    storage(error),
-                ));
-            }
-            // Every remaining failure is classified from one exact reread. In
-            // production this is Retryable: its commit acknowledgement may be
-            // lost, so only the complete durable outcomes below decide whether
-            // the marker may be released. The otherwise-unreachable remaining
-            // ExecError variants use the same fail-closed confirmation.
-            // Corruption/mixed rows stay ambiguous.
-            Err(error) => match self
-                .replacement_exchange_outcome(replacement, &replacement.parent, &child_intent)
-                .await
-            {
-                Ok(ReplacementExchangeOutcome::Committed) => true,
-                Ok(ReplacementExchangeOutcome::Uncommitted) => {
-                    // The caller turns this into a generic "no longer exclusively pending"
-                    // conflict. `replace_marked_evacuation` also rejects genuine corruption
-                    // through this same `Err` channel, and the two that leave EVERY reread row
-                    // untouched — incoherent parent move artifacts, and a second live agent
-                    // evacuation on the source — do confirm here. A dirty child namespace does
-                    // NOT: `replacement_child_namespace` still reports `Contaminated`, which
-                    // matches neither outcome and stays post-exchange ambiguous below. Keep the
-                    // money-path signal of the two that land here instead of dropping it.
-                    tracing::warn!(
-                        ?error,
-                        key = %replacement.old_key.0,
-                        "CommitTick: replacement exchange refused and confirmed uncommitted"
-                    );
-                    return Ok(None);
-                }
-                Err(confirmation_error) => {
-                    let diagnostic = format!(
-                        "replacement exchange outcome is ambiguous after error {error:?}; \
-                         exact confirmation failed: {confirmation_error:?}"
-                    );
-                    self.goal_admissions_poisoned
-                        .get_or_insert_with(|| diagnostic.clone());
-                    self.poison_balance_facts(diagnostic.clone());
-                    // The child may be durable, but this commit did not prove
-                    // it, so it starts no owner HERE.  What is fenced is
-                    // PLANNING: both authorities stay poisoned until restart,
-                    // so no fresh round is minted against ambiguous facts.
-                    // Durable ownership recovery deliberately still runs —
-                    // `reconcile_durable` rehydrates whichever side actually
-                    // committed — because ADR-0029 forbids stranding a dying
-                    // federation's balance behind an unproven audit read.
-                    return Err(ReplacementCommitError::post_exchange_ambiguous(
-                        ServiceError::Storage(diagnostic),
-                    ));
-                }
-            },
-        };
-        if !committed {
-            return Ok(None);
-        }
-        self.record_goal_admission(&replacement.fresh, Actor::Agent { occurrence });
-        let mut endpoints = balance_federations(&old.action);
-        endpoints.extend(balance_federations(&child_intent.action));
-        for endpoint in endpoints {
-            self.bump_balance_generation(endpoint);
-        }
-        self.resolve_key(&replacement.old_key).await;
-        #[cfg(test)]
-        if self
-            .journal
-            .take_stop_after_evacuation_replacement_before_child_driver_for_test()
-        {
-            // Deliberately leave only the durable Pending child.  The recovery
-            // test tears this actor down immediately and proves a new service
-            // rehydrates exactly that one owner before driving it.
-            return Ok(Some(replacement.fresh.idempotency_key.clone()));
-        }
-        let external_admission = counts_against_external_cap_for_intent(&child_intent);
-        self.ensure_driver(child_intent, client, external_admission, None);
-        Ok(Some(replacement.fresh.idempotency_key.clone()))
-    }
-
-    /// Prove the outcome of a reported exchange failure.  A post-commit
-    /// transport/database error is not permission to retry: only the exact
-    /// sidecar + retired parent + deterministic child shape says which side of
-    /// the atomic boundary was reached.
-    async fn replacement_exchange_outcome(
-        &self,
-        replacement: &super::EvacuationReplacementPlan,
-        old_before: &Intent,
-        expected_child: &Intent,
-    ) -> Result<ReplacementExchangeOutcome, ExecError> {
-        // A commit acknowledgement may be lost together with a transient confirmation read. Give
-        // only Retryable storage errors a few fair retries; a structural/mixed result is not made
-        // safer by rereading it and remains an immediate fail-closed ambiguity.
-        for attempt in 0..3 {
-            match self
-                .replacement_exchange_outcome_once(replacement, old_before, expected_child)
-                .await
-            {
-                Ok(outcome) => return Ok(outcome),
-                Err(ExecError::Retryable(error)) if attempt < 2 => {
-                    tracing::warn!(
-                        attempt,
-                        %error,
-                        "replacement exchange confirmation read retrying"
-                    );
-                    tokio::task::yield_now().await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        unreachable!("bounded confirmation loop returns on its final attempt")
-    }
-
-    /// One exact confirmation snapshot attempt. The wrapper retries only transient read failures.
-    async fn replacement_exchange_outcome_once(
-        &self,
-        replacement: &super::EvacuationReplacementPlan,
-        old_before: &Intent,
-        expected_child: &Intent,
-    ) -> Result<ReplacementExchangeOutcome, ExecError> {
-        let relation = self
-            .journal
-            .evacuation_canonical_successor(&replacement.old_key)
-            .await?;
-        let old = self.journal.get(&replacement.old_key).await?;
-        let child = self.journal.get(&replacement.fresh.idempotency_key).await?;
-        let namespace = self
-            .journal
-            .replacement_child_namespace(&replacement.fresh.idempotency_key)
-            .await?;
-        match (relation, old, child, namespace) {
-            (Some(relation), Some(old), Some(child), _)
-                if relation.old_key == replacement.old_key
-                    && relation.old_attempt == replacement.old_attempt
-                    && relation.new_key == replacement.fresh.idempotency_key
-                    && relation.new_attempt == 0
-                    && relation.occurrence == replacement.fresh.occurrence
-                    && relation.refusal == replacement.evidence
-                    && old.status == IntentStatus::Failed
-                    && old.attempt == replacement.old_attempt
-                    && old.evacuation_refusal.as_ref() == Some(&replacement.evidence)
-                    && child == *expected_child =>
-            {
-                Ok(ReplacementExchangeOutcome::Committed)
-            }
-            (
-                None,
-                Some(old),
-                None,
-                crate::journal::ReplacementChildNamespace::Pristine,
-            ) if old == *old_before => {
-                Ok(ReplacementExchangeOutcome::Uncommitted)
-            }
-            _ => Err(ExecError::Permanent(
-                "replacement exchange reread was incomplete or did not exactly match either outcome"
-                    .to_owned(),
-            )),
-        }
     }
 
     /// A scheduler funding move must still fit the destination's *fresh*
@@ -3619,12 +2442,7 @@ impl ActorState {
                 // corrupt or externally concurrent.  Neither its allocator identity nor all of
                 // its balance effects are safe to infer from this failed fresh admission.  Refuse
                 // future authority narrowly instead of relabelling old tokens as current.
-                self.goal_admissions_poisoned.get_or_insert_with(|| {
-                    format!(
-                        "fresh Agent upsert ambiguity reread mismatched intent at key {}",
-                        key.0
-                    )
-                });
+                self.goal_admissions_poisoned = true;
                 self.balance_facts_poisoned.get_or_insert_with(|| {
                     format!(
                         "fresh Agent upsert ambiguity reread mismatched intent at key {}",
@@ -4221,15 +3039,6 @@ impl ActorState {
                 .await
                 .map(TransitionResult::Compared)
                 .map_err(storage),
-            JournalTransition::ResetRetryable {
-                expected_attempt,
-                structural_refusal,
-            } => self
-                .journal
-                .reset_retryable(key, expected_attempt, structural_refusal)
-                .await
-                .map(|_| TransitionResult::Applied)
-                .map_err(storage),
             JournalTransition::SetRawTerminal {
                 fence,
                 status,
@@ -4304,63 +3113,19 @@ impl ActorState {
     }
 
     async fn reconcile(&mut self, client: &WalletClient) -> ServiceResult<ReconcileReport> {
-        // Ambiguous exchange authority is deliberately sticky until restart/recovery. A parked
-        // full-parent snapshot is only a one-cycle planning handoff in a healthy actor; while
-        // poisoned it must neither be offered nor cleared, or a later reconciliation could erase
-        // the durable marker whose ambiguity caused the poison.
-        let planner_authority_poisoned = self.goal_admissions_poisoned.is_some();
-        if planner_authority_poisoned {
-            self.parked_evacuation_handoff = None;
-        } else if let Err(error) = self.release_parked_evacuation_markers_at_reconcile().await {
-            // The full-parent CAS remains fail-closed and the unprocessed snapshots remain
-            // parked. A marker-local release fault must not suppress the strict durable scan
-            // below: that scan rehydrates unrelated work and observes whichever side of an
-            // ambiguity actually committed before fresh scheduler authority is issued.
-            tracing::warn!(
-                ?error,
-                "ReconcileDecide: parked evacuation marker release failed; retaining its snapshots and continuing durable recovery"
-            );
-        }
-        // This is the only scan permitted to add parked markers. It captures the exact full
-        // parent only when this scheduler reconciliation itself skips that parent for the
-        // replacement planner; durable recovery must never rescan and overwrite the list.
-        let report = self
-            .reconcile_durable(client, ReconciliationMarkerPolicy::CaptureForPlanner)
-            .await;
-        // Offer one exact snapshot to this scheduler cycle. Selecting after the scan preserves
-        // pending-index order for new captures, while a failed clear has already rotated its row
-        // behind independent queued parents. Do this even when durable reconciliation fails so
-        // the captured prefix still receives its bounded next-cycle release.
-        if !planner_authority_poisoned {
-            self.parked_evacuation_handoff = self.parked_evacuation_markers.first().cloned();
-        }
-        let mut report = report?;
+        let mut report = self.reconcile_durable(client).await?;
         // Do not let tick ineligibility prevent crash recovery.  In particular a pending
         // Join/Recover must regain its driver (and unrelated intents must be rehydrated) before
         // this authoritative eligibility mint refuses the cycle.  A caller receiving this scoped
         // error must skip planning, while the spawned drivers continue to converge durable work.
-        report.admission_snapshot = match self.issue_tick_plan_token().await {
-            Ok(token) => token,
-            Err(error) => {
-                // This cycle cannot hand its captures to CommitTick. Drop every in-memory
-                // snapshot without a durable CAS, so the next healthy reconciliation recaptures
-                // the current marker instead of releasing this stale offer.
-                self.parked_evacuation_markers.clear();
-                self.parked_evacuation_handoff = None;
-                return Err(error);
-            }
-        };
+        report.admission_snapshot = self.issue_tick_plan_token().await?;
         Ok(report)
     }
 
     /// Rehydrate all durable live work without issuing scheduler authority.  Ownership
     /// recovery uses this narrower operation because a tick-ineligible result is not a
     /// storage failure and must not make its retry loop spin forever after rehydration.
-    async fn reconcile_durable(
-        &mut self,
-        client: &WalletClient,
-        marker_policy: ReconciliationMarkerPolicy,
-    ) -> ServiceResult<ReconcileReport> {
+    async fn reconcile_durable(&mut self, client: &WalletClient) -> ServiceResult<ReconcileReport> {
         let pending = self.journal.pending().await.map_err(storage)?;
         // br-p93: project the in-flight allocator goals from the RAW scan, before the registry
         // ownership filter below. An intent a live driver already owns is re-driven by nobody
@@ -4401,38 +3166,6 @@ impl ActorState {
             ..ReconcileReport::default()
         };
         for mut intent in pending {
-            // Only a qualifying current policy hands this marker to the
-            // replacement planner. Equal, crossed, decreased, unrelated and
-            // integer-effectively-equal edits deliberately re-drive the
-            // original Retryable attempt.
-            if self.marker_is_planner_owned(&intent) {
-                match marker_policy {
-                    ReconciliationMarkerPolicy::PreservePlannerOwned => continue,
-                    ReconciliationMarkerPolicy::CaptureForPlanner => {
-                        if self.goal_admissions_poisoned.is_none()
-                            && self.qualifying_pending_evacuation_marker(&intent)
-                            && !self.parked_evacuation_markers.contains(&intent)
-                        {
-                            self.parked_evacuation_markers.push(intent.clone());
-                        }
-                        continue;
-                    }
-                    ReconciliationMarkerPolicy::RedriveWithoutPlanner => {
-                        // An ambiguous fresh admission must preserve its exact evidence: ownership
-                        // can recover only after restart proves a new authority. Otherwise this
-                        // cycle has committed not to plan, so discard only its stale in-memory
-                        // handoff and let the normal Pending/Executing path re-own the old work.
-                        if self.goal_admissions_poisoned.is_some() {
-                            continue;
-                        }
-                        self.consume_parked_evacuation_marker(&intent);
-                        // Pending -> Executing atomically clears the durable evidence. Arm the
-                        // existing one-shot suppression before that claim, so a renewed structural
-                        // refusal does not wake a scheduler cycle which still cannot plan.
-                        self.suppress_next_marker_wake(&intent);
-                    }
-                }
-            }
             // A probe session is the durable owner of its legs. Once that session has
             // resolved (including evacuation preemption), an orphaned leg is stale and
             // must not be re-driven on a later recovery pass.
@@ -4568,16 +3301,6 @@ impl ActorState {
             let executor: Arc<dyn Executor> = self.runtime.as_ref().map_or_else(
                 || self.executor.clone(),
                 |runtime| {
-                    #[cfg(test)]
-                    if runtime.scheduler_tick_fixture_enabled_for_test() {
-                        Arc::new(wallet_core::MockExecutor::new())
-                    } else {
-                        Arc::new(runtime.service_executor_with_client(
-                            Some(self.policy.per_fed_cap),
-                            client.clone(),
-                        ))
-                    }
-                    #[cfg(not(test))]
                     Arc::new(runtime.service_executor_with_client(
                         Some(self.policy.per_fed_cap),
                         client.clone(),
@@ -4646,46 +3369,13 @@ impl ActorState {
             && matches!(&finished.kind, driver::DriverKind::Awaiter { .. })
             && same_attempt
             && intent.status == IntentStatus::Awaiting;
-        let planner_owned_marker = self.marker_is_planner_owned(&intent);
         if hand_off_awaiting
             || honor_requested_redrive
             || hand_off_newer_pending_attempt
             || retry_same_awaiter
         {
-            if planner_owned_marker {
-                return;
-            }
             self.ensure_driver(intent, client, external_admission, probe_session_nonce);
         }
-    }
-
-    fn marker_is_planner_owned(&self, intent: &Intent) -> bool {
-        matches!(intent.actor, Actor::Agent { occurrence } if occurrence.0 < u64::MAX)
-            && matches!(intent.action, Action::Evacuate { .. })
-            && intent.evacuation_refusal.as_ref().is_some_and(|evidence| {
-                wallet_core::evacuation_cap_qualifies_replacement(
-                    evidence,
-                    wallet_core::EvacFeeCap {
-                        base_msat: self.policy.evac_fee_base_msat,
-                        bps: self.policy.evac_fee_bps,
-                    },
-                )
-            })
-    }
-
-    /// A parked marker is a complete Pending parent, not a key or a fresh rescan result. The
-    /// exact parent is later passed to the journal's full-row CAS, so a changed row can never
-    /// release a newly qualifying evacuation.
-    fn qualifying_pending_evacuation_marker(&self, intent: &Intent) -> bool {
-        intent.status == IntentStatus::Pending
-            && matches!(intent.actor, Actor::Agent { occurrence } if occurrence.0 < u64::MAX)
-            && matches!(intent.action, Action::Evacuate { .. })
-            && intent.operation_id.is_none()
-            && intent.invoice.is_none()
-            && intent
-                .evacuation_refusal
-                .as_ref()
-                .is_some_and(|evidence| self.structural_marker_qualifies(evidence))
     }
 
     /// Recover ownership after a finished driver's post-removal intent refresh fails.  This task
@@ -5233,7 +3923,6 @@ fn transition_may_resolve(transition: &JournalTransition) -> bool {
         JournalTransition::Upsert { .. } => true,
         JournalTransition::SetStatus { .. }
         | JournalTransition::SetRawTerminal { .. }
-        | JournalTransition::ResetRetryable { .. }
         | JournalTransition::Refresh => true,
     }
 }
@@ -5252,9 +3941,7 @@ fn transition_terminal_status(transition: &JournalTransition) -> bool {
         JournalTransition::Upsert { intent, .. } => {
             matches!(intent.status, IntentStatus::Done | IntentStatus::Failed)
         }
-        JournalTransition::DriverFinished { .. }
-        | JournalTransition::ResetRetryable { .. }
-        | JournalTransition::Refresh => false,
+        JournalTransition::DriverFinished { .. } | JournalTransition::Refresh => false,
     }
 }
 
@@ -5278,14 +3965,12 @@ fn transition_is_intent_mutation(transition: &JournalTransition) -> bool {
             | JournalTransition::CompareAndSet { .. }
             | JournalTransition::SetStatus { .. }
             | JournalTransition::SetRawTerminal { .. }
-            | JournalTransition::ResetRetryable { .. }
     )
 }
 
 pub(super) fn storage(error: ExecError) -> ServiceError {
     let message = match error {
         ExecError::Retryable(message) | ExecError::Permanent(message) => message,
-        ExecError::StructuralEvacuationRefusal(evidence) => evidence.diagnostic,
         ExecError::Unsupported => "journal operation is unsupported".to_owned(),
     };
     ServiceError::Storage(message)
@@ -5316,7 +4001,6 @@ fn as_storage_refusal(error: ServiceError) -> ServiceError {
 pub(super) fn refusal_from_exec(error: ExecError) -> ServiceError {
     let message = match error {
         ExecError::Retryable(message) | ExecError::Permanent(message) => message,
-        ExecError::StructuralEvacuationRefusal(evidence) => evidence.diagnostic,
         ExecError::Unsupported => "operation is unsupported".to_owned(),
     };
     let reason = if message.contains("conflicts with the existing request") {
@@ -5402,13 +4086,9 @@ mod route_blocked_designation_tests {
         PlannedTickRound {
             decisions,
             suppressed: vec![],
-            replacement_deferred: vec![],
             probes: vec![],
             active_probes: BTreeMap::new(),
             snapshot,
-            blocked: GoalBlockers::default(),
-            replacement: None,
-            marker_disposition: None,
         }
     }
 

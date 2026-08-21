@@ -25,11 +25,9 @@ live and devimint-validated:
   `--evac-fee-base-msat` + `--evac-fee-bps`, default 200 sats + 3% — computed from the net
   the destination is actually credited, not the flat absolute `--max-fee`, which at real
   gateway prices could fall below the cost of draining a full balance and stall the drain.
-   One limit to know before an incident: admitted evacuations are immutable generally. The
-   narrow exception is a pre-artifact agent evacuation with durable typed structural-refusal
-   evidence: a component-wise monotone effective cap increase at its recorded sample atomically
-   creates a linked fresh occurrence. An empty bounded probe is still `Retryable` evidence, not
-   proof that a route is unavailable; ordinary policy edits do not release an evacuation.
+  One limit to know before an incident: those knobs bound evacuations DECIDED AFTERWARDS. A
+  pending evacuation carries the pair it was admitted with, so raising them does not release
+  one already retrying.
 - **Phase 4 hardening + ledger: complete.** Review P1s are closed, per-federation
   caps are enforced, terminal stranded moves are explicit, and the append-only
   operation ledger is exposed through `wallet-cli history` / `wallet-cli show`.
@@ -46,9 +44,6 @@ live and devimint-validated:
   pricing and all network IO run OFF the actor so a mid-flight (hours-long LN) payment
   never blocks another operation (ADR-0024); the responsiveness gate holds
   `POST /v1/pay` to its first external call in <250 ms.
-  Standalone `tick` and dry-run `status` refuse a corrupt joined-federation registry rather
-  than plan from its healthy subset; preserve the data directory and repair the exact row from
-  a consistent backup before retrying.
 - **Seed recovery: complete.** A wallet restores each federation's ecash balance from
   the 12-word seed **plus the joined federation IDs/invites** — the backup unit settled by
   [ADR-0025](./docs/adr/0025-recovery-fresh-partition-seed-is-the-backup-unit.md), not the
@@ -126,12 +121,8 @@ the two fee caps are deliberately different shapes:
   `0`-`10000` — `300` is 3%, not 300 msat, and entering a bps value as msat silently widens the
   cap by orders of magnitude. Zero bps is accepted and means a base-only cap, valid only
   alongside a non-zero base. It is computed from the net the destination is actually CREDITED,
-  not the amount asked for. An admitted evacuation normally keeps its cap pair. The narrow
-  exception is an Agent evacuation that is still pre-artifact and carries durable typed evidence
-  of a structural refusal: a component-wise monotone cap edit that is effectively larger at a
-  recorded delivered-net sample lets the daemon atomically retire it and admit a linked successor
-  under the new pair. Standalone recovery requires a tick occurrence newer than the marked
-  evacuation; ordinary, equal, decreased, or crossed cap edits do not release it.
+  not the amount asked for. Raising these affects evacuations decided afterwards; a pending one
+  keeps the pair it was admitted with.
 - `--max-fee-bps-of-move` - PROPORTIONAL fee cap for funding moves (top-up and standby), in
   basis points of the amount moved, `1`-`10000`; default `300` (3%). Funding sizing reserves
   it from the source, so `amount + amount * bps / 10000` always fits the source budget and a

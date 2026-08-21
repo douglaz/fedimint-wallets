@@ -138,7 +138,6 @@ fn leg_intent_with_fee_cap(
         created_at_ms: 0,
         operation_id: None,
         invoice: None,
-        evacuation_refusal: None,
     }
 }
 
@@ -341,7 +340,7 @@ async fn sized_but_unjournaled_out_resume_runs_the_no_sweep_guard_first() {
         .expect("seed session");
     seed_intent(&journal, &{
         let mut done = leg_intent(in_key(), SOURCE, CANDIDATE, AMOUNT);
-        done.status = IntentStatus::Executing;
+        done.status = IntentStatus::Done;
         done
     })
     .await;
@@ -363,10 +362,6 @@ async fn sized_but_unjournaled_out_resume_runs_the_no_sweep_guard_first() {
             .expect("seed settled in record"),
         "seed settled in record must own attempt 0"
     );
-    journal
-        .set_status(&in_key(), 0, IntentStatus::Done, None)
-        .await
-        .expect("terminalize settled leg IN");
 
     let err = runtime
         .active_probe(CANDIDATE, SOURCE, &ProbePolicy::default(), Actor::User)
@@ -395,7 +390,7 @@ async fn mid_out_resume_drives_the_journaled_leg_without_any_guard() {
         .expect("seed session");
     seed_intent(&journal, &{
         let mut done = leg_intent(in_key(), SOURCE, CANDIDATE, AMOUNT);
-        done.status = IntentStatus::Executing;
+        done.status = IntentStatus::Done;
         done
     })
     .await;
@@ -417,10 +412,6 @@ async fn mid_out_resume_drives_the_journaled_leg_without_any_guard() {
             .expect("seed settled in record"),
         "seed settled in record must own attempt 0"
     );
-    journal
-        .set_status(&in_key(), 0, IntentStatus::Done, None)
-        .await
-        .expect("terminalize settled leg IN");
     seed_intent(&journal, &out_leg_intent(OUT_NET)).await;
 
     let err = runtime
@@ -452,10 +443,10 @@ async fn recovered_attempt_is_stamped_at_probe_start_not_recovery_time() {
         .await
         .expect("seed a session that started an hour ago");
     let mut done_in = leg_intent(in_key(), SOURCE, CANDIDATE, AMOUNT);
-    done_in.status = IntentStatus::Executing;
+    done_in.status = IntentStatus::Done;
     seed_intent(&journal, &done_in).await;
     let mut done_out = out_leg_intent(OUT_NET);
-    done_out.status = IntentStatus::Executing;
+    done_out.status = IntentStatus::Done;
     seed_intent(&journal, &done_out).await;
     assert!(
         journal
@@ -486,14 +477,6 @@ async fn recovered_attempt_is_stamped_at_probe_start_not_recovery_time() {
             .expect("seed settled out record"),
         "seed settled out record must own attempt 0"
     );
-    journal
-        .set_status(&in_key(), 0, IntentStatus::Done, None)
-        .await
-        .expect("terminalize settled leg IN");
-    journal
-        .set_status(&out_key(OUT_NET), 0, IntentStatus::Done, None)
-        .await
-        .expect("terminalize settled leg OUT");
 
     let report = runtime
         .active_probe(CANDIDATE, SOURCE, &ProbePolicy::default(), Actor::User)
@@ -521,10 +504,10 @@ async fn crash_window_repair_records_the_attempt_and_clears_the_session() {
         .await
         .expect("seed session");
     let mut done_in = leg_intent(in_key(), SOURCE, CANDIDATE, AMOUNT);
-    done_in.status = IntentStatus::Executing;
+    done_in.status = IntentStatus::Done;
     seed_intent(&journal, &done_in).await;
     let mut done_out = out_leg_intent(OUT_NET);
-    done_out.status = IntentStatus::Executing;
+    done_out.status = IntentStatus::Done;
     seed_intent(&journal, &done_out).await;
     assert!(
         journal
@@ -555,14 +538,6 @@ async fn crash_window_repair_records_the_attempt_and_clears_the_session() {
             .expect("seed settled out record"),
         "seed settled out record must own attempt 0"
     );
-    journal
-        .set_status(&in_key(), 0, IntentStatus::Done, None)
-        .await
-        .expect("terminalize settled leg IN");
-    journal
-        .set_status(&out_key(OUT_NET), 0, IntentStatus::Done, None)
-        .await
-        .expect("terminalize settled leg OUT");
 
     let report = runtime
         .active_probe(CANDIDATE, SOURCE, &ProbePolicy::default(), Actor::User)
@@ -609,7 +584,7 @@ async fn candidate_refused_pay_on_leg_out_writes_a_demoting_attempt() {
         .await
         .expect("seed session");
     let mut done = leg_intent(in_key(), SOURCE, CANDIDATE, AMOUNT);
-    done.status = IntentStatus::Executing;
+    done.status = IntentStatus::Done;
     seed_intent(&journal, &done).await;
     assert!(
         journal
@@ -629,14 +604,10 @@ async fn candidate_refused_pay_on_leg_out_writes_a_demoting_attempt() {
             .expect("seed settled in record"),
         "seed settled in record must own attempt 0"
     );
-    journal
-        .set_status(&in_key(), 0, IntentStatus::Done, None)
-        .await
-        .expect("terminalize settled leg IN");
     // Leg OUT terminally failed at settlement: C's send reached a terminal Failed state
     // — the classified candidate-refused pay, the redeemability core.
     let mut failed = out_leg_intent(OUT_NET);
-    failed.status = IntentStatus::Executing;
+    failed.status = IntentStatus::Failed;
     seed_intent(&journal, &failed).await;
     assert!(
         journal
@@ -655,15 +626,6 @@ async fn candidate_refused_pay_on_leg_out_writes_a_demoting_attempt() {
             .expect("seed failed out record"),
         "seed failed out record must own attempt 0"
     );
-    journal
-        .set_status(
-            &out_key(OUT_NET),
-            0,
-            IntentStatus::Failed,
-            Some("lnv2 send deterministically rejected the invoice: FederationNotSupported"),
-        )
-        .await
-        .expect("terminalize failed leg OUT");
 
     let report = runtime
         .active_probe(CANDIDATE, SOURCE, &ProbePolicy::default(), Actor::User)
@@ -792,7 +754,7 @@ async fn stranded_leg_and_source_and_local_faults_write_umbrella_only_outcomes()
             .await
             .expect("seed session");
         let mut failed = leg_intent(in_key(), SOURCE, CANDIDATE, AMOUNT);
-        failed.status = IntentStatus::Executing;
+        failed.status = IntentStatus::Failed;
         seed_intent(&journal, &failed).await;
         assert!(
             journal
@@ -816,19 +778,6 @@ async fn stranded_leg_and_source_and_local_faults_write_umbrella_only_outcomes()
                 .expect("seed stranded record"),
             "seed stranded record must own attempt 0"
         );
-        journal
-            .set_status(
-                &in_key(),
-                0,
-                IntentStatus::Failed,
-                Some(
-                    "send settled but receive was not credited: receive invoice expired; \
-                     not proven lost, not proven recoverable — preserve the data directory and \
-                     follow the stranded-move entry in docs/real-sats-pilot-runbook.md",
-                ),
-            )
-            .await
-            .expect("terminalize stranded leg IN");
         let report = runtime
             .active_probe(CANDIDATE, SOURCE, &ProbePolicy::default(), Actor::User)
             .await
@@ -893,7 +842,7 @@ async fn stranded_leg_and_source_and_local_faults_write_umbrella_only_outcomes()
             .await
             .expect("seed session");
         let mut done = leg_intent(in_key(), SOURCE, CANDIDATE, AMOUNT);
-        done.status = IntentStatus::Executing;
+        done.status = IntentStatus::Done;
         seed_intent(&journal, &done).await;
         assert!(
             journal
@@ -913,10 +862,6 @@ async fn stranded_leg_and_source_and_local_faults_write_umbrella_only_outcomes()
                 .expect("seed settled in record"),
             "seed settled in record must own attempt 0"
         );
-        journal
-            .set_status(&in_key(), 0, IntentStatus::Done, None)
-            .await
-            .expect("terminalize settled leg IN");
         seed_intent(&journal, &out_leg_intent(OUT_NET)).await;
         journal
             .set_status(

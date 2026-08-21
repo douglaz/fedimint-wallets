@@ -589,25 +589,6 @@ fn print_operation_view(view: &OperationView) {
     println!("amount_msat: {}", opt_msat(view.amount));
     println!("receive_fee_msat: {}", opt_msat(view.receive_fee));
     println!("send_fee_quoted_msat: {}", opt_msat(view.send_fee_quoted));
-    println!("supersedes: {}", view.supersedes.as_deref().unwrap_or("-"));
-    println!(
-        "superseded_by: {}",
-        view.superseded_by.as_deref().unwrap_or("-")
-    );
-    println!(
-        "evacuation_refusal: {}",
-        view.evacuation_refusal.as_ref().map_or_else(
-            || "-".to_owned(),
-            |evidence| {
-                serde_json::to_string(evidence).unwrap_or_else(|_| "<unserializable>".to_owned())
-            }
-        )
-    );
-    println!(
-        "evacuation_refusal_active: {}",
-        view.evacuation_refusal_active
-            .map_or_else(|| "-".to_owned(), |active| active.to_string())
-    );
     if let Some(diagnostics) = &view.refusal {
         crate::print_refusal_diagnostics(diagnostics);
     }

@@ -263,9 +263,9 @@ fn forced_shutdown(_id: &FederationId) -> bool {
 /// out from [`forced_shutdown`] so the match logic is unit-tested WITHOUT process-global env
 /// (the same split as `executor::crash_point_matches`). The value is a comma-separated list of
 /// federation hex ids; surrounding whitespace is ignored and the compare is case-insensitive.
-/// The predicate is compiled for debug builds and tests, including `cargo test --release`, but
-/// not into a non-test release binary where the force seam is absent.
-#[cfg(any(debug_assertions, test))]
+/// In a `--release` non-test build the seam above is elided and this predicate is unused; it
+/// stays defined (and tested) rather than gated so `cargo test --release` still compiles it.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 fn forced_shutdown_matches(configured: Option<&str>, id: &FederationId) -> bool {
     let Some(list) = configured else {
         return false;

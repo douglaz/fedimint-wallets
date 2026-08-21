@@ -22,7 +22,7 @@ use wallet_api::{
     RecoverRequest, RefuseReason, WatchStatusView,
 };
 use wallet_core::{
-    Action, Actor, AllocatorDecision, FederationId, IdempotencyKey, IntentStatus, Msat, Occurrence,
+    Action, Actor, AllocatorDecision, FederationId, IdempotencyKey, Msat, Occurrence,
     OperationKind, OperationRecord, OperationStatus, ReasonCode,
 };
 use wallet_fedimint::{
@@ -90,14 +90,6 @@ async fn federation_views(state: &AppState) -> Result<Vec<FederationView>, HttpE
 
 // ---- history / show -------------------------------------------------------------------------
 
-/// Bounded so a public history request cannot turn one audit projection into an unbounded
-/// snapshot/read allocation.  Link sidecars for the whole page are read in one journal snapshot.
-pub(crate) const HISTORY_PAGE_LIMIT_MAX: usize = 500;
-
-fn capped_history_limit(requested: Option<usize>) -> usize {
-    requested.unwrap_or(50).min(HISTORY_PAGE_LIMIT_MAX)
-}
-
 #[derive(Debug, Default, Deserialize)]
 pub struct HistoryQuery {
     limit: Option<usize>,
@@ -109,7 +101,7 @@ pub async fn history(
     query: Result<Query<HistoryQuery>, QueryRejection>,
 ) -> Result<impl IntoResponse, HttpError> {
     let Query(query) = query?;
-    let limit = capped_history_limit(query.limit);
+    let limit = query.limit.unwrap_or(50);
     let rows = state
         .journal
         .history(limit, query.before_seq)
@@ -119,23 +111,10 @@ pub async fn history(
     let next_before_seq = (rows.len() == limit && limit > 0)
         .then(|| rows.last().map(|row| row.seq))
         .flatten();
-    let links = state
-        .journal
-        .evacuation_supersession_neighbors_for_display_keys(
-            &rows
-                .iter()
-                .map(|row| row.correlation_key.clone())
-                .collect::<Vec<_>>(),
-        )
-        .await
-        .map_err(storage)?;
-    let mut operations = Vec::with_capacity(rows.len());
-    for row in &rows {
-        operations.push(operation_view_with_supersession_neighbors(
-            operation_view_masked(row, &state.mc),
-            display_supersession_neighbors_for_key(&links, &row.correlation_key),
-        ));
-    }
+    let operations = rows
+        .iter()
+        .map(|row| operation_view_masked(row, &state.mc))
+        .collect();
     Ok(Json(HistoryResponse {
         operations,
         next_before_seq,
@@ -182,31 +161,7 @@ pub async fn show_operation(
         .await
         .map_err(storage)?
     {
-        Some(record) => {
-            // Unlike history, `show` has one requested key, so fetch the exact intent to surface
-            // a live structural evacuation marker without an N+1 history read.  A malformed
-            // intent row degrades to absent (with a `warn!`) like a malformed sidecar, so one
-            // corrupt marker cannot 500 the ledger row an operator is reading mid-incident.
-            let intent = state
-                .journal
-                .intent_for_display(&key)
-                .await
-                .map_err(storage)?;
-            let links = state
-                .journal
-                .evacuation_supersession_neighbors_for_display_keys(std::slice::from_ref(
-                    &record.correlation_key,
-                ))
-                .await
-                .map_err(storage)?;
-            Ok(Json(operation_view_with_supersession_neighbors(
-                operation_view_with_evacuation_refusal(
-                    operation_view_masked(&record, &state.mc),
-                    intent.as_ref(),
-                ),
-                display_supersession_neighbors_for_key(&links, &record.correlation_key),
-            )))
-        }
+        Some(record) => Ok(Json(operation_view_masked(&record, &state.mc))),
         None => Err(HttpError::not_found(format!(
             "no operation found for key {}",
             key.0
@@ -243,38 +198,6 @@ pub async fn status(State(state): State<AppState>) -> Result<impl IntoResponse, 
             "status dry-run requires a live runtime (covered by the daemon gate)",
         ));
     };
-    let Some(mc) = state.mc.as_ref() else {
-        return Err(HttpError::unavailable(
-            "status dry-run requires the live federation membership view; retry after walletd opens every joined federation",
-        ));
-    };
-    let joined_report = state
-        .journal
-        .list_federations_report()
-        .await
-        .map_err(storage)?;
-    if joined_report.skipped_rows > 0 {
-        return Err(HttpError::unavailable(format!(
-            "status dry-run refuses an incomplete federation registry: {} corrupt row(s) were skipped. \
-             Stop walletd, preserve the wallet data directory, and repair the corrupt federation \
-             registry row(s) before retrying; no scheduler planning was performed",
-            joined_report.skipped_rows
-        )));
-    }
-    let joined = joined_report.federations;
-    let open = mc.federations();
-    let unopened: Vec<_> = joined
-        .iter()
-        .filter(|(id, _)| !open.contains(id))
-        .map(|(id, _)| id.to_hex())
-        .collect();
-    if !unopened.is_empty() {
-        return Err(HttpError::unavailable(format!(
-            "status dry-run requires every joined federation to be open; unopened: {}. \
-             Retry after walletd opens them",
-            unopened.join(", ")
-        )));
-    }
     let policy = state.client.get_policy().await?;
     let mut tick_policy = TickPolicy::from(&policy);
     // The dry-run describes what the NEXT scheduler tick would do. That tick advances the
@@ -282,21 +205,10 @@ pub async fn status(State(state): State<AppState>) -> Result<impl IntoResponse, 
     // verdicts against the live clock — `From<&Policy>` leaves both at 0, which would emit
     // occurrence-0 keys (possibly already terminal) and mis-score every TTL-gated probe.
     let watch = state.journal.get_watch_state().await.map_err(storage)?;
-    if !watch.agent_floor_reconciled {
-        return Err(HttpError::unavailable(
-            "status dry-run cannot preview a provisional watch occurrence; inspect /v1/watch/status \
-             and retry after its bounded reconciliation completes or unreadable rows are repaired",
-        ));
-    }
-    tick_policy.occurrence = Occurrence(watch.occurrence.checked_add(1).ok_or_else(|| {
-        HttpError::unavailable(
-            "watch scheduler occurrence exhausted at u64::MAX; restore a checkpoint below u64::MAX \
-             before scheduling another cycle",
-        )
-    })?);
+    tick_policy.occurrence = Occurrence(watch.occurrence.saturating_add(1));
     tick_policy.now = now_ms();
     let report = runtime
-        .status_for_daemon_scheduler(&tick_policy)
+        .status(&tick_policy)
         .await
         .map_err(|error| HttpError::unavailable(format!("status probe failed: {error}")))?;
     Ok(Json(StatusResponse {
@@ -331,8 +243,6 @@ pub async fn watch_status(State(state): State<AppState>) -> Result<impl IntoResp
         last_discover_ms: watch.last_discover_ms,
         discover_cursor: watch.discover_cursor,
         discover_backlog: watch.discover_backlog,
-        agent_floor_reconciled: watch.agent_floor_reconciled,
-        unreadable_ledger_rows: watch.agent_floor_unreadable_ledger_keys.len(),
     }))
 }
 
@@ -917,8 +827,6 @@ fn operation_view(record: &OperationRecord) -> OperationView {
         reason: reason_tag(record.reason).to_owned(),
         operation_key: record.correlation_key.0.clone(),
         error: record.error.clone(),
-        superseded_by: None,
-        supersedes: None,
         // Only a refusal that actually recorded diagnostics carries a `refusal` object; the
         // default/figure-less refusal (plain over-cap, no-destination evacuation, ordinary
         // tick-drop) maps to `None` so the wire omits the field entirely rather than emitting
@@ -930,8 +838,6 @@ fn operation_view(record: &OperationRecord) -> OperationView {
             }
             _ => None,
         },
-        evacuation_refusal: None,
-        evacuation_refusal_active: None,
     }
 }
 
@@ -956,44 +862,6 @@ fn operation_view_masked(record: &OperationRecord, mc: &Option<Arc<MultiClient>>
         }
     }
     view
-}
-
-/// `show` is intentionally the only operation projection that reads the matching intent. This
-/// exposes an exact tri-state structural-marker projection without turning bounded history into an
-/// N+1 intent scan.
-fn operation_view_with_evacuation_refusal(
-    mut view: OperationView,
-    intent: Option<&wallet_core::Intent>,
-) -> OperationView {
-    view.evacuation_refusal = intent.and_then(|intent| intent.evacuation_refusal.clone());
-    view.evacuation_refusal_active = intent.map(|intent| {
-        intent.evacuation_refusal.is_some()
-            && intent.status == IntentStatus::Pending
-            && matches!(intent.actor, Actor::Agent { .. })
-            && matches!(intent.action, Action::Evacuate { .. })
-    });
-    view
-}
-
-/// Apply already-validated sidecar neighbors to the wire view.  Kept separate from the journal
-/// bulk read so the daemon mapping can be tested without an HTTP server or a storage fixture.
-fn operation_view_with_supersession_neighbors(
-    mut view: OperationView,
-    links: wallet_fedimint::EvacuationSupersessionNeighbors,
-) -> OperationView {
-    view.supersedes = links.predecessor.map(|link| link.old_key.0);
-    view.superseded_by = links.successor.map(|link| link.new_key.0);
-    view
-}
-
-/// Presentation sidecars must never hide a ledger row. The journal normally inserts an empty
-/// neighbor entry for every requested key, but a missing entry is equivalent to no display links.
-/// Strict replacement and confirmation paths deliberately use their strict journal readers instead.
-fn display_supersession_neighbors_for_key(
-    links: &BTreeMap<IdempotencyKey, wallet_fedimint::EvacuationSupersessionNeighbors>,
-    key: &IdempotencyKey,
-) -> wallet_fedimint::EvacuationSupersessionNeighbors {
-    links.get(key).cloned().unwrap_or_default()
 }
 
 fn operation_status_dto(status: OperationStatus) -> OperationStatusDto {
@@ -1084,11 +952,7 @@ pub const AWAIT_LONGPOLL_DEADLINE: Duration = Duration::from_secs(60);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wallet_core::{
-        EvacFeeCap, EvacuationQuoteSample, EvacuationRefusalEvidence, FeeBreakdown,
-        RefusalDiagnostics,
-    };
-    use wallet_fedimint::{EvacuationSupersessionNeighbors, EvacuationSupersessionRecord};
+    use wallet_core::{FeeBreakdown, RefusalDiagnostics};
 
     fn refusal_record(diagnostics: RefusalDiagnostics) -> OperationRecord {
         OperationRecord {
@@ -1111,69 +975,6 @@ mod tests {
         }
     }
 
-    fn supersession(old: &str, new: &str) -> EvacuationSupersessionRecord {
-        let cap = EvacFeeCap {
-            base_msat: Msat(10),
-            bps: 100,
-        };
-        EvacuationSupersessionRecord {
-            old_key: IdempotencyKey(old.into()),
-            old_attempt: 0,
-            new_key: IdempotencyKey(new.into()),
-            new_attempt: 0,
-            old_occurrence: Occurrence(1),
-            occurrence: Occurrence(2),
-            source: FederationId([1; 32]),
-            old_cap_components: Some(cap),
-            new_cap_components: Some(cap),
-            refusal: EvacuationRefusalEvidence {
-                cap_components: cap,
-                requested_net: Msat(100),
-                source_spendable: Msat(100),
-                low: EvacuationQuoteSample {
-                    delivered_net: Msat(10),
-                    total_fee: Msat(20),
-                    fee_cap: cap.at(Msat(10)),
-                },
-                high: EvacuationQuoteSample {
-                    delivered_net: Msat(100),
-                    total_fee: Msat(30),
-                    fee_cap: cap.at(Msat(100)),
-                },
-                diagnostic: "test relation".into(),
-                measured_at_ms: 1,
-            },
-            superseded_at_ms: 1,
-        }
-    }
-
-    fn marked_evacuation_intent(status: IntentStatus) -> wallet_core::Intent {
-        let evidence = supersession("evac:old", "evac:new").refusal;
-        let cap = evidence.cap_components;
-        wallet_core::Intent {
-            idempotency_key: IdempotencyKey("evac:marked".into()),
-            attempt: 0,
-            action: Action::Evacuate {
-                from: FederationId([1; 32]),
-                to: FederationId([2; 32]),
-                amount: Msat(100),
-                fee_cap: cap.at(Msat(100)),
-                gateway: None,
-                fee_cap_components: Some(cap),
-            },
-            max_fee: Some(cap.at(Msat(100))),
-            status,
-            reason: ReasonCode::ShutdownNotice,
-            actor: Actor::Agent {
-                occurrence: Occurrence(1),
-            },
-            created_at_ms: 1,
-            operation_id: None,
-            invoice: None,
-            evacuation_refusal: Some(evidence),
-        }
-    }
-
     #[test]
     fn operation_view_carries_populated_refusal_and_omits_figure_less() {
         // A default/figure-less refusal maps to no wire object (so `skip_serializing_if` omits
@@ -1181,17 +982,6 @@ mod tests {
         // the always-equal `PartialEq` means a DTO round-trip alone would not catch it.
         let empty = operation_view(&refusal_record(RefusalDiagnostics::default()));
         assert!(empty.refusal.is_none());
-        assert!(
-            empty.evacuation_refusal_active.is_none(),
-            "history/base mapping has no intent N+1"
-        );
-        assert!(
-            serde_json::to_value(&empty)
-                .expect("serialize history/base view")
-                .get("evacuation_refusal_active")
-                .is_none(),
-            "history omits live marker authority because it performs no intent lookup"
-        );
 
         let populated = operation_view(&refusal_record(RefusalDiagnostics {
             want: Some(Msat(50_000)),
@@ -1212,88 +1002,5 @@ mod tests {
                 .expect("conflict suppression is observational data")
                 .conflict_suppressed
         );
-    }
-
-    #[test]
-    fn show_marker_projection_distinguishes_active_historical_and_absent_evidence() {
-        let record = refusal_record(RefusalDiagnostics::default());
-        let active = marked_evacuation_intent(IntentStatus::Pending);
-        let active_view =
-            operation_view_with_evacuation_refusal(operation_view(&record), Some(&active));
-        assert_eq!(active_view.evacuation_refusal_active, Some(true));
-        assert_eq!(
-            serde_json::to_value(&active_view).expect("serialize active daemon view")
-                ["evacuation_refusal_active"],
-            true
-        );
-        assert!(
-            active_view.evacuation_refusal.is_some(),
-            "active marker includes its exact evidence"
-        );
-
-        let failed = marked_evacuation_intent(IntentStatus::Failed);
-        let failed_view =
-            operation_view_with_evacuation_refusal(operation_view(&record), Some(&failed));
-        assert_eq!(
-            failed_view.evacuation_refusal_active,
-            Some(false),
-            "a superseded Failed parent retains evidence without becoming live"
-        );
-        assert!(
-            failed_view.evacuation_refusal.is_some(),
-            "historical evidence remains visible"
-        );
-        assert_eq!(
-            serde_json::to_value(&failed_view).expect("serialize failed daemon view")
-                ["evacuation_refusal_active"],
-            false,
-            "a readable exact historical intent explicitly projects inactive"
-        );
-
-        let absent_view = operation_view_with_evacuation_refusal(operation_view(&record), None);
-        assert_eq!(absent_view.evacuation_refusal_active, None);
-        assert!(absent_view.evacuation_refusal.is_none());
-        assert!(serde_json::to_value(&absent_view)
-            .expect("serialize absent daemon view")
-            .get("evacuation_refusal_active")
-            .is_none());
-    }
-
-    #[test]
-    fn operation_view_keeps_predecessor_and_successor_for_chain_middle() {
-        let middle = OperationRecord {
-            correlation_key: IdempotencyKey("evac:b".into()),
-            ..refusal_record(RefusalDiagnostics::default())
-        };
-        let view = operation_view_with_supersession_neighbors(
-            operation_view(&middle),
-            EvacuationSupersessionNeighbors {
-                predecessor: Some(supersession("evac:a", "evac:b")),
-                successor: Some(supersession("evac:b", "evac:c")),
-            },
-        );
-        assert_eq!(view.supersedes.as_deref(), Some("evac:a"));
-        assert_eq!(view.superseded_by.as_deref(), Some("evac:c"));
-    }
-
-    #[test]
-    fn missing_bulk_supersession_key_degrades_to_empty_display_links() {
-        let record = refusal_record(RefusalDiagnostics::default());
-        let links = BTreeMap::new();
-
-        let view = operation_view_with_supersession_neighbors(
-            operation_view(&record),
-            display_supersession_neighbors_for_key(&links, &record.correlation_key),
-        );
-
-        assert_eq!(view.supersedes, None);
-        assert_eq!(view.superseded_by, None);
-    }
-
-    #[test]
-    fn history_page_limit_is_capped_before_the_journal_read() {
-        assert_eq!(capped_history_limit(None), 50);
-        assert_eq!(capped_history_limit(Some(12)), 12);
-        assert_eq!(capped_history_limit(Some(HISTORY_PAGE_LIMIT_MAX + 1)), 500);
     }
 }

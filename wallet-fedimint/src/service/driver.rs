@@ -255,25 +255,6 @@ impl Journal for ActorJournal {
         }
     }
 
-    async fn reset_retryable(
-        &self,
-        key: &IdempotencyKey,
-        expected_attempt: u32,
-        structural_refusal: Option<wallet_core::EvacuationRefusalEvidence>,
-    ) -> Result<(), ExecError> {
-        self.client
-            .journal_transition(
-                key.clone(),
-                JournalTransition::ResetRetryable {
-                    expected_attempt,
-                    structural_refusal,
-                },
-            )
-            .await
-            .map(|_| ())
-            .map_err(service_exec_error)
-    }
-
     async fn pending(&self) -> Result<Vec<Intent>, ExecError> {
         self.durable.pending().await
     }

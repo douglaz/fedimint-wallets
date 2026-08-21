@@ -103,7 +103,6 @@ fn move_intent(k: &str, status: IntentStatus) -> Intent {
         created_at_ms: BASE,
         operation_id: None,
         invoice: None,
-        evacuation_refusal: None,
     }
 }
 
@@ -156,7 +155,6 @@ fn evacuation_intent(k: &str, status: IntentStatus) -> Intent {
         created_at_ms: BASE,
         operation_id: None,
         invoice: None,
-        evacuation_refusal: None,
     }
 }
 
@@ -423,7 +421,6 @@ fn repairable_pay_intent(key: IdempotencyKey, status: IntentStatus, attempt: u32
         created_at_ms: BASE,
         operation_id: Some(op(7)),
         invoice: None,
-        evacuation_refusal: None,
     }
 }
 
@@ -547,7 +544,6 @@ async fn raw_finalizer_completes_intent_and_ledger_from_one_observation() {
         created_at_ms: BASE,
         operation_id: Some(operation_id),
         invoice: None,
-        evacuation_refusal: None,
     };
     journal.upsert(&intent).await.expect("seed raw pay intent");
     let mut oracle = MockOracle::default();
@@ -1839,7 +1835,6 @@ async fn raw_negative_repair_keeps_the_intent_retriable_and_the_ledger_defeasibl
         created_at_ms: BASE,
         operation_id: None,
         invoice: None,
-        evacuation_refusal: None,
     })
     .await
     .expect("seed raw intent and ledger row");
@@ -2643,7 +2638,6 @@ async fn repair_awaiting_with_op_id_terminalizes_from_the_op_log() {
         created_at_ms: BASE,
         operation_id: Some(op(7)),
         invoice: Some(Invoice("lnbc1repairfixture".into())),
-        evacuation_refusal: None,
     })
     .await
     .expect("seed matching raw receive intent");
@@ -2949,7 +2943,6 @@ async fn late_join_outcome_supersedes_repaired_join_superseded_failure() {
         created_at_ms: BASE,
         operation_id: None,
         invoice: None,
-        evacuation_refusal: None,
     };
     let old = join_intent(old_key.clone(), IntentStatus::Executing);
     let current = join_intent(current_key.clone(), IntentStatus::Executing);
@@ -3017,7 +3010,6 @@ async fn noop_join_outcome_supersedes_repaired_join_success() {
         created_at_ms: BASE,
         operation_id: None,
         invoice: None,
-        evacuation_refusal: None,
     };
     j.upsert(&intent).await.expect("seed executing join");
     // This real repair path concludes that the live attempt created the registry entry, but its

@@ -8,10 +8,7 @@
 //! `/v1/federations` with live client balances. Here we prove the HTTP contract itself: 401,
 //! the 202 contract, the invoice-mint deadline, and policy get/put.
 
-use crate::{
-    handlers::HISTORY_PAGE_LIMIT_MAX,
-    server::{router, AppState},
-};
+use crate::server::{router, AppState};
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use serde_json::{json, Value};
@@ -20,12 +17,12 @@ use std::time::Duration;
 use tower::ServiceExt as _;
 use wallet_api::Policy;
 use wallet_core::{
-    Action, Actor, AllocatorDecision, ExecError, Executor, FederationId, IdempotencyKey, Intent,
-    IntentStatus, Journal, Msat, Occurrence, PerformOutcome, ReasonCode,
+    Action, Actor, AllocatorDecision, ExecError, Executor, FederationId, Intent, IntentStatus,
+    Journal, Msat, Occurrence, PerformOutcome, ReasonCode,
 };
 use wallet_fedimint::{
     move_key, raw_receive_key, CandidateRecord, CandidateState, FederationInfo, FedimintJournal,
-    Invoice, MultiClient, Runtime, StructuralOutcome, WalletService,
+    Invoice, MultiClient, StructuralOutcome, WalletService,
 };
 
 const TOKEN: &str = "test-bearer-token";
@@ -56,7 +53,9 @@ fn fixture_policy() -> Policy {
 }
 
 async fn fixture() -> (AppState, WalletService, Arc<FedimintJournal>) {
-    let (state, service, journal) = empty_fixture().await;
+    use fedimint_core::db::mem_impl::MemDatabase;
+    use fedimint_core::db::IRawDatabaseExt as _;
+    let journal = Arc::new(FedimintJournal::new(MemDatabase::new().into_database()));
     journal
         .put_federation(
             &fed(2),
@@ -68,24 +67,6 @@ async fn fixture() -> (AppState, WalletService, Arc<FedimintJournal>) {
         )
         .await
         .expect("seed joined federation");
-    (state, service, journal)
-}
-
-async fn empty_fixture() -> (AppState, WalletService, Arc<FedimintJournal>) {
-    let (state, service, journal, _) = empty_fixture_with_db().await;
-    (state, service, journal)
-}
-
-async fn empty_fixture_with_db() -> (
-    AppState,
-    WalletService,
-    Arc<FedimintJournal>,
-    fedimint_core::db::Database,
-) {
-    use fedimint_core::db::mem_impl::MemDatabase;
-    use fedimint_core::db::IRawDatabaseExt as _;
-    let db = MemDatabase::new().into_database();
-    let journal = Arc::new(FedimintJournal::new(db.clone()));
     let service =
         WalletService::start_detached(journal.clone(), Arc::new(PendingExecutor), fixture_policy())
             .await
@@ -101,67 +82,7 @@ async fn empty_fixture_with_db() -> (
         invoice_deadline: Duration::from_millis(120),
         await_deadline: Duration::from_millis(120),
     };
-    (state, service, journal, db)
-}
-
-/// A real malformed federation value under a well-formed registry key. This uses the same raw
-/// poison boundary as a damaged on-disk journal rather than a mock report, so the status handler
-/// must refuse before it reaches its live dry-run.
-async fn fixture_with_corrupt_federation_registry_row() -> (
-    AppState,
-    WalletService,
-    Arc<FedimintJournal>,
-    fedimint_core::db::Database,
-) {
-    use fedimint_core::db::mem_impl::MemDatabase;
-    use fedimint_core::db::{IDatabaseTransactionOpsCore as _, IRawDatabaseExt as _};
-
-    let db = MemDatabase::new().into_database();
-    let journal = Arc::new(FedimintJournal::new(db.clone()));
-    let service =
-        WalletService::start_detached(journal.clone(), Arc::new(PendingExecutor), fixture_policy())
-            .await
-            .expect("start detached fixture service");
-    let app_db = db.with_prefix(vec![0x00]);
-    let mut dbtx = app_db.begin_transaction().await;
-    let mut key = vec![0x03];
-    key.extend_from_slice(&[0xC3; 32]);
-    dbtx.raw_insert_bytes(&key, b"not valid json")
-        .await
-        .expect("insert corrupt federation registry row");
-    dbtx.commit_tx_result()
-        .await
-        .expect("commit corrupt federation registry row");
-    let state = AppState {
-        client: service.client(),
-        journal: journal.clone(),
-        mc: None,
-        runtime: None,
-        scheduler_alive: service.scheduler_liveness(),
-        token: Arc::from(TOKEN),
-        invoice_deadline: Duration::from_millis(120),
-        await_deadline: Duration::from_millis(120),
-    };
-    (state, service, journal, db)
-}
-
-async fn attach_empty_runtime(state: &mut AppState, journal: &Arc<FedimintJournal>) {
-    use fedimint_bip39::Mnemonic;
-    use fedimint_core::db::mem_impl::MemDatabase;
-    use fedimint_core::db::IRawDatabaseExt as _;
-
-    let client_db = MemDatabase::new().into_database();
-    let client_journal_db = MemDatabase::new().into_database();
-    let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
-    let mc = Arc::new(MultiClient::new(client_db, client_journal_db, mnemonic).await);
-    state.runtime = Some(Arc::new(Runtime::new(
-        mc.clone(),
-        journal.clone(),
-        None,
-        None,
-        None,
-    )));
-    state.mc = Some(mc);
+    (state, service, journal)
 }
 
 /// Like [`fixture`], but with a REAL (empty) `MultiClient` attached. fed(2) stays JOINED in the
@@ -185,264 +106,8 @@ async fn fixture_with_unopened_dest() -> (AppState, WalletService, Arc<FedimintJ
     );
     // No `open_all` — the open set is empty, so every joined fed reads as joined-but-not-open.
     assert!(mc.federations().is_empty());
-    state.runtime = Some(Arc::new(Runtime::new(
-        mc.clone(),
-        journal.clone(),
-        None,
-        None,
-        None,
-    )));
     state.mc = Some(mc);
     (state, service, journal)
-}
-
-#[tokio::test]
-async fn daemon_status_describes_the_final_scheduler_occurrence() {
-    let (mut state, service, journal) = empty_fixture().await;
-    attach_empty_runtime(&mut state, &journal).await;
-    let checkpoint = journal
-        .observe_watch_occurrence(u64::MAX - 1)
-        .await
-        .expect("seed final scheduler floor");
-
-    let (status, body) = send(&state, request("GET", "/v1/status", Some(TOKEN), None)).await;
-
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "the daemon previews its one valid final scheduler occurrence: {body}"
-    );
-    assert_eq!(body["decisions"], json!([]));
-    assert_eq!(
-        journal.get_watch_state().await.expect("read checkpoint"),
-        checkpoint,
-        "the dry-run remains read-only"
-    );
-    service.shutdown().await.expect("shutdown fixture service");
-}
-
-#[tokio::test]
-async fn daemon_status_refuses_a_consumed_final_scheduler_occurrence_without_writing() {
-    let (mut state, service, journal) = empty_fixture().await;
-    attach_empty_runtime(&mut state, &journal).await;
-    journal
-        .observe_watch_occurrence(u64::MAX - 1)
-        .await
-        .expect("seed final scheduler floor");
-    let consumed = journal
-        .advance_watch_occurrence()
-        .await
-        .expect("allocate the one final scheduler occurrence");
-    assert_eq!(consumed.occurrence, u64::MAX);
-
-    let (status, body) = send(&state, request("GET", "/v1/status", Some(TOKEN), None)).await;
-
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(
-        body["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("watch scheduler occurrence exhausted")),
-        "{body}"
-    );
-    assert_eq!(
-        journal
-            .get_watch_state()
-            .await
-            .expect("read final checkpoint"),
-        consumed,
-        "the exhausted preview must not rewrite the consumed final checkpoint"
-    );
-    assert!(
-        journal
-            .history(usize::MAX, None)
-            .await
-            .expect("read history")
-            .iter()
-            .all(|row| !matches!(row.kind, wallet_core::OperationKind::Tick { .. })),
-        "the rejected dry-run must not open a tick row"
-    );
-    service.shutdown().await.expect("shutdown fixture service");
-}
-
-async fn assert_daemon_status_refuses_provisional_watch_floor(occurrence: Option<u64>) {
-    let (mut state, service, journal) = empty_fixture().await;
-    attach_empty_runtime(&mut state, &journal).await;
-    if let Some(occurrence) = occurrence {
-        assert_eq!(
-            journal
-                .observe_watch_occurrence(occurrence)
-                .await
-                .expect("seed reconciled positive occurrence")
-                .occurrence,
-            occurrence
-        );
-    }
-    // The handler's one permitted `get_watch_state` migration pass processes only 256 rows. A
-    // 257-row User suffix therefore leaves the floor unreconciled, without adding an Agent
-    // occurrence or any scheduler tick.
-    for n in 0..257 {
-        journal
-            .record_started(
-                &IdempotencyKey(format!("join:status-provisional-{occurrence:?}-{n}")),
-                wallet_core::OperationKind::Join { fed: fed(9) },
-                Actor::User,
-                ReasonCode::UserInitiated,
-                n,
-                None,
-            )
-            .await
-            .expect("append User-only ledger suffix");
-    }
-
-    let (status, body) = send(&state, request("GET", "/v1/status", Some(TOKEN), None)).await;
-
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(
-        body["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("provisional watch occurrence")),
-        "{body}"
-    );
-    assert!(
-        journal
-            .history(usize::MAX, None)
-            .await
-            .expect("read history")
-            .iter()
-            .all(|row| !matches!(row.kind, wallet_core::OperationKind::Tick { .. })),
-        "the provisional dry-run must not plan or journal a scheduler tick"
-    );
-    service.shutdown().await.expect("shutdown fixture service");
-}
-
-#[tokio::test]
-async fn daemon_status_refuses_an_unreconciled_zero_watch_floor() {
-    assert_daemon_status_refuses_provisional_watch_floor(None).await;
-}
-
-#[tokio::test]
-async fn daemon_status_refuses_an_unreconciled_positive_watch_floor() {
-    assert_daemon_status_refuses_provisional_watch_floor(Some(7)).await;
-}
-
-#[tokio::test]
-async fn daemon_status_refuses_a_joined_but_unopened_federation_without_writing() {
-    let (state, service, journal) = fixture_with_unopened_dest().await;
-    let checkpoint = journal
-        .get_watch_state()
-        .await
-        .expect("initialize checkpoint");
-
-    let (status, body) = send(&state, request("GET", "/v1/status", Some(TOKEN), None)).await;
-
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(
-        body["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("every joined federation to be open")),
-        "{body}"
-    );
-    assert_eq!(
-        journal.get_watch_state().await.expect("read checkpoint"),
-        checkpoint,
-        "the partial membership view must be refused before any scheduler planning"
-    );
-    assert!(
-        journal
-            .history(usize::MAX, None)
-            .await
-            .expect("read history")
-            .is_empty(),
-        "the partial membership view must not create scheduler work"
-    );
-    service.shutdown().await.expect("shutdown fixture service");
-}
-
-#[tokio::test]
-async fn daemon_status_refuses_corrupt_federation_registry_before_dry_run() {
-    use fedimint_core::db::IDatabaseTransactionOpsCore as _;
-
-    let (mut state, service, journal, db) = fixture_with_corrupt_federation_registry_row().await;
-    attach_empty_runtime(&mut state, &journal).await;
-    let app_db = db.with_prefix(vec![0x00]);
-    let mut dbtx = app_db.begin_transaction_nc().await;
-    let watch_before = dbtx
-        .raw_get_bytes(&[0x0a])
-        .await
-        .expect("read raw absent watch checkpoint");
-    assert!(
-        watch_before.is_none(),
-        "the corrupt-registry fence must begin before absent WatchState migration"
-    );
-    drop(dbtx);
-
-    let (status, body) = send(&state, request("GET", "/v1/status", Some(TOKEN), None)).await;
-
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(
-        body["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("incomplete federation registry")),
-        "{body}"
-    );
-    assert!(
-        body["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("repair the corrupt federation registry")),
-        "{body}"
-    );
-    let mut dbtx = app_db.begin_transaction_nc().await;
-    let watch_after = dbtx
-        .raw_get_bytes(&[0x0a])
-        .await
-        .expect("read raw watch checkpoint after refused status");
-    assert_eq!(
-        watch_after, watch_before,
-        "a skipped registry row must return 503 before it can migrate an absent WatchState"
-    );
-    assert!(
-        journal
-            .history(usize::MAX, None)
-            .await
-            .expect("read history")
-            .iter()
-            .all(|row| {
-                !matches!(
-                    row.kind,
-                    wallet_core::OperationKind::Probe { .. }
-                        | wallet_core::OperationKind::Tick { .. }
-                )
-            }),
-        "a corrupt registry must not create probe or Tick work"
-    );
-    service.shutdown().await.expect("shutdown fixture service");
-}
-
-#[tokio::test]
-async fn daemon_status_requires_a_live_membership_view_without_writing() {
-    let (mut state, service, journal) = empty_fixture().await;
-    attach_empty_runtime(&mut state, &journal).await;
-    state.mc = None;
-    let checkpoint = journal
-        .get_watch_state()
-        .await
-        .expect("initialize checkpoint");
-
-    let (status, body) = send(&state, request("GET", "/v1/status", Some(TOKEN), None)).await;
-
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(
-        body["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("live federation membership view")),
-        "{body}"
-    );
-    assert_eq!(
-        journal.get_watch_state().await.expect("read checkpoint"),
-        checkpoint,
-        "a missing membership view must be refused before scheduler planning"
-    );
-    service.shutdown().await.expect("shutdown fixture service");
 }
 
 fn request(method: &str, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
@@ -1053,190 +718,6 @@ async fn history_and_watch_status_read_detached() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["occurrence"], 0);
     assert_eq!(body["discover_backlog"], false);
-    assert_eq!(body["agent_floor_reconciled"], true);
-    assert_eq!(body["unreadable_ledger_rows"], 0);
-    service.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test]
-async fn history_cursor_uses_the_effective_capped_limit_without_losing_rows() {
-    const REQUEST_OVERAGE: usize = 7;
-
-    let (state, service, journal) = empty_fixture().await;
-    let row_count = HISTORY_PAGE_LIMIT_MAX + 1;
-    // Typed Tick rows exercise the real ledger and history projection without starting money work.
-    for seq in 0..row_count {
-        journal
-            .record_tick_started(
-                &IdempotencyKey(format!("tick:history-pagination:{seq}")),
-                Occurrence(seq as u64),
-                seq as u64,
-            )
-            .await
-            .expect("seed history tick row");
-    }
-
-    let requested_limit = HISTORY_PAGE_LIMIT_MAX + REQUEST_OVERAGE;
-    let (status, first_page) = send(
-        &state,
-        request(
-            "GET",
-            &format!("/v1/history?limit={requested_limit}"),
-            Some(TOKEN),
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let first_seqs = first_page["operations"]
-        .as_array()
-        .expect("history operations array")
-        .iter()
-        .map(|operation| operation["seq"].as_u64().expect("history operation seq"))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        first_seqs,
-        (1..row_count)
-            .rev()
-            .map(|seq| seq as u64)
-            .collect::<Vec<_>>(),
-        "the over-limit request must return exactly the capped newest-first page"
-    );
-    let cursor = first_page["next_before_seq"]
-        .as_u64()
-        .expect("a full effective page has a cursor");
-    assert_eq!(
-        Some(cursor),
-        first_seqs.last().copied(),
-        "the cursor must be the last row of the effective capped page"
-    );
-
-    let (status, second_page) = send(
-        &state,
-        request(
-            "GET",
-            &format!("/v1/history?limit={requested_limit}&before_seq={cursor}"),
-            Some(TOKEN),
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let remaining_seqs = second_page["operations"]
-        .as_array()
-        .expect("history operations array")
-        .iter()
-        .map(|operation| operation["seq"].as_u64().expect("history operation seq"))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        remaining_seqs,
-        (0..cursor).rev().collect::<Vec<_>>(),
-        "following the cursor must return every older row in newest-first order"
-    );
-    assert_eq!(second_page["next_before_seq"], Value::Null);
-
-    let all_seqs = first_seqs
-        .into_iter()
-        .chain(remaining_seqs)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        all_seqs,
-        (0..row_count)
-            .rev()
-            .map(|seq| seq as u64)
-            .collect::<Vec<_>>(),
-        "the two pages must have no gap, duplicate, or ordering loss"
-    );
-    service.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test]
-async fn watch_status_reports_a_bounded_valid_ledger_backlog_in_its_json_view() {
-    let (state, service, journal) = empty_fixture().await;
-    // `get_watch_state` scans at most 256 canonical rows per access. A 257-row valid User suffix
-    // therefore exercises the production handler's bounded migration mapping, not a DTO literal.
-    for seq in 0..257 {
-        journal
-            .record_started(
-                &IdempotencyKey(format!("watch-status-valid-backlog-{seq}")),
-                wallet_core::OperationKind::Join { fed: fed(9) },
-                Actor::User,
-                ReasonCode::UserInitiated,
-                seq,
-                None,
-            )
-            .await
-            .expect("append valid canonical User row");
-    }
-
-    let (status, body) = send(
-        &state,
-        request("GET", "/v1/watch/status", Some(TOKEN), None),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body,
-        json!({
-            "occurrence": 0,
-            "last_discover_ms": 0,
-            "discover_cursor": null,
-            "discover_backlog": false,
-            "agent_floor_reconciled": false,
-            "unreadable_ledger_rows": 0,
-        }),
-        "a valid suffix beyond one bounded chunk is progress, not repair work"
-    );
-    service.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test]
-async fn watch_status_reports_an_unreadable_canonical_row_in_its_json_view() {
-    use fedimint_core::db::IDatabaseTransactionOpsCore as _;
-
-    let (state, service, journal, db) = empty_fixture_with_db().await;
-    journal
-        .record_started(
-            &IdempotencyKey("watch-status-unreadable-row".to_owned()),
-            wallet_core::OperationKind::Join { fed: fed(9) },
-            Actor::User,
-            ReasonCode::UserInitiated,
-            0,
-            None,
-        )
-        .await
-        .expect("append canonical row to corrupt");
-    let app_db = db.with_prefix(vec![0x00]);
-    let mut dbtx = app_db.begin_transaction().await;
-    let mut key = vec![0x05];
-    key.extend_from_slice(&0_u64.to_be_bytes());
-    dbtx.raw_insert_bytes(&key, b"not valid json")
-        .await
-        .expect("make canonical ledger row unreadable");
-    dbtx.commit_tx_result()
-        .await
-        .expect("commit unreadable canonical row");
-
-    let (status, body) = send(
-        &state,
-        request("GET", "/v1/watch/status", Some(TOKEN), None),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body,
-        json!({
-            "occurrence": 0,
-            "last_discover_ms": 0,
-            "discover_cursor": null,
-            "discover_backlog": false,
-            "agent_floor_reconciled": false,
-            "unreadable_ledger_rows": 1,
-        }),
-        "a corrupt canonical row is durable repair work, not merely bounded scan backlog"
-    );
     service.shutdown().await.expect("shutdown");
 }
 

@@ -18,7 +18,6 @@ use wallet_core::{
     ExecutionSummary, Executor, FederationId, IdempotencyKey, Intent, IntentStatus, Journal,
     MockExecutor, Msat, Occurrence, OperationKind, OperationStatus, PerformOutcome, ReasonCode,
 };
-
 use wallet_fedimint::{
     CandidateRecord, CandidateState, FederationInfo, FedimintJournal, GatewayUrl, Invoice,
     MovePhase, MoveRecord, OperationId, OperationRef, Preimage, StructuralOutcome, WatchState,
@@ -55,19 +54,7 @@ fn intent(key: &str, status: IntentStatus) -> Intent {
         created_at_ms: 0,
         operation_id: None,
         invoice: None,
-        evacuation_refusal: None,
     }
-}
-
-#[test]
-fn legacy_intent_json_defaults_structural_refusal_marker() {
-    let current = intent("legacy-marker", IntentStatus::Pending);
-    let mut old = serde_json::to_value(current).expect("serialize current intent");
-    old.as_object_mut()
-        .expect("intent object")
-        .remove("evacuation_refusal");
-    let decoded: Intent = serde_json::from_value(old).expect("decode legacy intent");
-    assert_eq!(decoded.evacuation_refusal, None);
 }
 
 fn move_record(key: &str) -> MoveRecord {
@@ -120,17 +107,6 @@ fn encoded_test_row<T: serde::Serialize>(value: &T) -> Vec<u8> {
         data: value,
     })
     .expect("encode test row")
-}
-
-fn decode_test_row<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
-    #[derive(serde::Deserialize)]
-    struct TestStoredRow<T> {
-        version: u8,
-        data: T,
-    }
-    let row: TestStoredRow<T> = serde_json::from_slice(bytes).expect("decode test stored row");
-    assert_eq!(row.version, 1);
-    row.data
 }
 
 fn invite() -> InviteCode {
@@ -277,11 +253,7 @@ async fn watch_state_roundtrip_and_default_seed() {
             .get_watch_state()
             .await
             .expect("default watch state"),
-        WatchState {
-            agent_floor_reconciled: true,
-            agent_floor_scan_initialized: true,
-            ..WatchState::default()
-        }
+        WatchState::default()
     );
 
     let updated = journal
@@ -302,9 +274,6 @@ async fn watch_state_roundtrip_and_default_seed() {
             discover_cursor: Some(fed(0x42)),
             discover_backlog: true,
             discover_rotation: vec![fed(0x41), fed(0x42), fed(0x43)],
-            agent_floor_reconciled: true,
-            agent_floor_scan_initialized: true,
-            ..WatchState::default()
         }
     );
     assert_eq!(
@@ -350,20 +319,17 @@ async fn watch_state_occurrence_advance_is_monotonic_and_preserves_discovery_fie
 }
 
 #[tokio::test]
-async fn ledger_tail_counter_mismatch_fences_fresh_user_and_agent_admissions() {
+async fn watch_state_absent_row_seeds_occurrence_from_tick_history() {
     let db = MemDatabase::new().into_database();
     let journal = FedimintJournal::new(db.clone());
     journal
-        .record_started(
-            &IdempotencyKey("join:seed".to_owned()),
-            OperationKind::Join { fed: fed(7) },
-            Actor::User,
-            ReasonCode::UserInitiated,
+        .record_tick_started(
+            &IdempotencyKey("tick:7:test".to_owned()),
+            Occurrence(7),
             1_000,
-            None,
         )
         .await
-        .expect("seed user row");
+        .expect("seed tick row");
     let app_db = db.with_prefix(vec![0x00]);
     let mut dbtx = app_db.begin_transaction().await;
     dbtx.raw_insert_bytes(&tagged_key(0x05, &999_u64.to_be_bytes()), b"not valid json")
@@ -373,400 +339,18 @@ async fn ledger_tail_counter_mismatch_fences_fresh_user_and_agent_admissions() {
         .await
         .expect("commit corrupt ledger row");
 
-    let user_error = journal
-        .record_started(
-            &IdempotencyKey("join:fenced".to_owned()),
-            OperationKind::Join { fed: fed(8) },
-            Actor::User,
-            ReasonCode::UserInitiated,
-            1_001,
-            None,
-        )
-        .await
-        .expect_err("a tail/counter mismatch fences fresh User admission");
-    assert!(
-        format!("{user_error:?}").contains("ledger tail/counter inconsistency"),
-        "User admission must report the generic allocation fence: {user_error:?}"
-    );
-
-    let agent_error = journal
-        .record_tick_started(
-            &IdempotencyKey("tick:7:fenced".to_owned()),
-            Occurrence(7),
-            1_002,
-        )
-        .await
-        .expect_err("a tail/counter mismatch fences fresh Agent admission");
-    assert!(
-        format!("{agent_error:?}").contains("ledger tail/counter inconsistency"),
-        "Agent admission must report the generic allocation fence: {agent_error:?}"
-    );
-}
-
-#[tokio::test]
-async fn restored_reconciled_watch_state_with_stale_high_water_rescans_before_allocation() {
-    let db = MemDatabase::new().into_database();
-    let journal = FedimintJournal::new(db.clone());
-    journal
-        .record_started(
-            &IdempotencyKey("join:before-watch-backup".to_owned()),
-            OperationKind::Join { fed: fed(1) },
-            Actor::User,
-            ReasonCode::UserInitiated,
-            1_000,
-            None,
-        )
-        .await
-        .expect("seed user row before watch backup");
-    let stale = journal
-        .get_watch_state()
-        .await
-        .expect("persist reconciled state before later Agent row");
-    assert_eq!(stale.agent_floor_scan_high_water, 1);
-    assert!(stale.agent_floor_reconciled);
-
-    journal
-        .record_tick_started(
-            &IdempotencyKey("tick:7:after-watch-backup".to_owned()),
-            Occurrence(7),
-            1_001,
-        )
-        .await
-        .expect("append Agent row after watch backup");
-    let app_db = db.with_prefix(vec![0x00]);
-    let mut dbtx = app_db.begin_transaction().await;
-    dbtx.raw_insert_bytes(&[0x0a], &encoded_test_row(&stale))
-        .await
-        .expect("restore stale reconciled watch state");
-    dbtx.commit_tx_result()
-        .await
-        .expect("commit restored stale watch state");
-
-    let advanced = journal
-        .advance_watch_occurrence()
-        .await
-        .expect("reconcile stale high-water before allocating");
-    assert_eq!(
-        advanced.occurrence, 8,
-        "the bounded rescan must see the Agent occurrence appended after the restored state"
-    );
-    assert_eq!(advanced.agent_floor_scan_high_water, 2);
-    assert!(advanced.agent_floor_reconciled);
-}
-
-#[tokio::test]
-async fn restored_partial_watch_state_ahead_of_ledger_restarts_bounded_reconciliation() {
-    let db = MemDatabase::new().into_database();
-    let journal = FedimintJournal::new(db.clone());
-    journal
-        .record_tick_started(
-            &IdempotencyKey("tick:7:older-ledger".to_owned()),
-            Occurrence(7),
-            1_000,
-        )
-        .await
-        .expect("seed older valid Agent row");
-
-    // Model a WatchState from a newer snapshot restored over this older ledger. Its remembered
-    // repair key belongs to the incompatible snapshot and must not make the old ledger unrecoverable.
-    let newer_partial = WatchState {
-        occurrence: 42,
-        agent_floor_reconciled: false,
-        agent_floor_scan_initialized: true,
-        agent_floor_scan_high_water: 3,
-        agent_floor_unreadable_ledger_keys: vec![tagged_key(0x05, &2_u64.to_be_bytes())],
-        ..WatchState::default()
-    };
-    let app_db = db.with_prefix(vec![0x00]);
-    let mut dbtx = app_db.begin_transaction().await;
-    dbtx.raw_insert_bytes(&[0x0a], &encoded_test_row(&newer_partial))
-        .await
-        .expect("restore newer partial watch state");
-    dbtx.commit_tx_result()
-        .await
-        .expect("commit newer partial watch state");
-
-    let advanced = journal
-        .advance_watch_occurrence()
-        .await
-        .expect("restart bounded reconciliation against the restored older ledger");
-    assert_eq!(
-        advanced.occurrence, 43,
-        "a restored partial state may not lower its Agent floor or reuse its occurrence"
-    );
-    assert_eq!(advanced.agent_floor_scan_high_water, 1);
-    assert!(advanced.agent_floor_unreadable_ledger_keys.is_empty());
-    assert!(advanced.agent_floor_reconciled);
-}
-
-#[tokio::test]
-async fn reconciled_watch_state_absorbs_a_healthy_appended_user_before_agent_admission() {
-    let journal = mem_journal();
-    let initial = journal
-        .get_watch_state()
-        .await
-        .expect("seed reconciled empty watch state");
-    assert!(initial.agent_floor_reconciled);
-    assert_eq!(initial.agent_floor_scan_high_water, 0);
-
-    journal
-        .record_started(
-            &IdempotencyKey("join:between-agent-admissions".to_owned()),
-            OperationKind::Join { fed: fed(2) },
-            Actor::User,
-            ReasonCode::UserInitiated,
-            1_000,
-            None,
-        )
-        .await
-        .expect("append healthy User row");
-    journal
-        .record_tick_started(
-            &IdempotencyKey("tick:9:after-user".to_owned()),
-            Occurrence(9),
-            1_001,
-        )
-        .await
-        .expect("reconcile the User append before Agent admission");
-
-    let state = journal
-        .get_watch_state()
-        .await
-        .expect("read reconciled state after Agent admission");
-    assert_eq!(state.occurrence, 9);
-    assert_eq!(state.agent_floor_scan_high_water, 2);
-    assert!(state.agent_floor_reconciled);
-}
-
-#[tokio::test]
-async fn user_appends_leave_the_raw_watch_state_unchanged_until_advance_drains_the_suffix() {
-    let db = MemDatabase::new().into_database();
-    let journal = FedimintJournal::new(db.clone());
-    let initial = journal
-        .get_watch_state()
-        .await
-        .expect("seed reconciled empty watch state");
-
-    for n in 0..(256 * 2 + 17) {
-        journal
-            .record_started(
-                &IdempotencyKey(format!("join:healthy-user-append-{n}")),
-                OperationKind::Join { fed: fed(2) },
-                Actor::User,
-                ReasonCode::UserInitiated,
-                1_000 + n as u64,
-                None,
-            )
-            .await
-            .expect("User append does not need the WatchState hot row");
-    }
-
-    let app_db = db.with_prefix(vec![0x00]);
-    let mut dbtx = app_db.begin_transaction().await;
-    let bytes = dbtx
-        .raw_get_bytes(&[0x0a])
-        .await
-        .expect("read raw checkpoint")
-        .expect("WatchState remains present");
-    let persisted: WatchState = decode_test_row(&bytes);
-    assert_eq!(
-        persisted, initial,
-        "a User append must not read or rewrite WatchState's reconciled frontier"
-    );
-
-    let advanced = journal
-        .advance_watch_occurrence()
-        .await
-        .expect("advance drains the previously untracked valid User suffix");
-    assert!(advanced.agent_floor_reconciled);
-    assert_eq!(
-        advanced.occurrence, 1,
-        "User rows have no occurrence authority; only allocation increments the floor"
-    );
-    assert_eq!(advanced.agent_floor_scan_high_water, 256 * 2 + 17);
-}
-
-#[tokio::test]
-async fn partial_watch_state_does_not_jump_over_a_user_append() {
-    let db = MemDatabase::new().into_database();
-    let journal = FedimintJournal::new(db.clone());
-    let partial = WatchState {
-        agent_floor_reconciled: false,
-        agent_floor_scan_initialized: true,
-        agent_floor_scan_high_water: 0,
-        ..WatchState::default()
-    };
-    let app_db = db.with_prefix(vec![0x00]);
-    let mut dbtx = app_db.begin_transaction().await;
-    dbtx.raw_insert_bytes(&[0x0a], &encoded_test_row(&partial))
-        .await
-        .expect("seed partial checkpoint");
-    dbtx.commit_tx_result()
-        .await
-        .expect("commit partial checkpoint");
-
-    journal
-        .record_started(
-            &IdempotencyKey("join:after-partial-frontier".to_owned()),
-            OperationKind::Join { fed: fed(2) },
-            Actor::User,
-            ReasonCode::UserInitiated,
-            1_000,
-            None,
-        )
-        .await
-        .expect("User append is valid while migration is partial");
-
-    let app_db = db.with_prefix(vec![0x00]);
-    let mut dbtx = app_db.begin_transaction().await;
-    let bytes = dbtx
-        .raw_get_bytes(&[0x0a])
-        .await
-        .expect("read checkpoint")
-        .expect("checkpoint remains present");
-    let persisted: WatchState = decode_test_row(&bytes);
-    assert!(!persisted.agent_floor_reconciled);
-    assert_eq!(
-        persisted.agent_floor_scan_high_water, 0,
-        "an append must not jump a partial migration frontier"
-    );
-}
-
-#[tokio::test]
-async fn occurrence_allocation_immediately_drains_a_valid_multi_chunk_legacy_backlog() {
-    let journal = mem_journal();
-    for n in 0..(256 * 3 + 1) {
-        journal
-            .record_started(
-                &IdempotencyKey(format!("join:legacy-user-{n}")),
-                OperationKind::Join { fed: fed(2) },
-                Actor::User,
-                ReasonCode::UserInitiated,
-                n as u64,
-                None,
-            )
-            .await
-            .expect("append legacy User history before a WatchState exists");
-    }
-
-    let advanced = journal
-        .advance_watch_occurrence()
-        .await
-        .expect("allocation drains valid backlog without an outer scheduler interval");
-    assert_eq!(advanced.occurrence, 1);
-    assert!(advanced.agent_floor_reconciled);
-    assert_eq!(advanced.agent_floor_scan_high_water, 256 * 3 + 1);
-}
-
-#[tokio::test]
-async fn occurrence_allocation_stops_at_its_exact_drain_budget_then_next_batch_converges() {
-    let journal = mem_journal();
-    let rows = 256 * 16 + 1;
-    for n in 0..rows {
-        journal
-            .record_started(
-                &IdempotencyKey(format!("join:over-immediate-drain-budget-{n}")),
-                OperationKind::Join { fed: fed(2) },
-                Actor::User,
-                ReasonCode::UserInitiated,
-                n as u64,
-                None,
-            )
-            .await
-            .expect("append legacy User history before WatchState exists");
-    }
-
     let first = journal
         .advance_watch_occurrence()
         .await
-        .expect_err("one allocation invocation must not exceed its sixteen chunk budget");
-    assert!(
-        format!("{first:?}").contains("scan high-water 4096"),
-        "the error names actionable durable progress rather than sleeping a normal cadence: {first:?}"
-    );
-    assert!(
-        journal
-            .watch_floor_immediate_retry_needed()
-            .await
-            .expect("scheduler inspects the persisted checkpoint without scanning another chunk"),
-        "the scheduler must immediately retry this valid remaining row, not sleep normally"
-    );
-    assert_eq!(
-        journal
-            .advance_watch_occurrence()
-            .await
-            .expect("next scheduler batch allocates after durable convergence")
-            .occurrence,
-        1
-    );
-    assert!(
-        journal
-            .watch_floor_immediate_retry_needed()
-            .await
-            .expect("pure checkpoint read after a concurrent finishing scan"),
-        "the typed failed cycle must retry immediately even if another reader finished the backlog"
-    );
-}
+        .expect("advance seeded from tick history");
 
-#[tokio::test]
-async fn concurrent_watch_advances_are_serialized_by_autocommit() {
-    let journal = Arc::new(mem_journal());
-    journal
-        .get_watch_state()
-        .await
-        .expect("seed checkpoint before concurrent advances");
-    let (left, right) = tokio::join!(
-        journal.advance_watch_occurrence(),
-        journal.advance_watch_occurrence()
-    );
-    assert_eq!(left.expect("left advance").occurrence, 1);
-    assert_eq!(right.expect("right advance").occurrence, 2);
+    assert_eq!(first.occurrence, 8);
     assert_eq!(
         journal
             .get_watch_state()
             .await
-            .expect("read final checkpoint")
-            .occurrence,
-        2
-    );
-}
-
-#[tokio::test]
-async fn fully_reconciled_watch_state_does_not_rescan_corrupted_accounted_row() {
-    let db = MemDatabase::new().into_database();
-    let journal = FedimintJournal::new(db.clone());
-    journal
-        .record_tick_started(
-            &IdempotencyKey("tick:11:accounted".to_owned()),
-            Occurrence(11),
-            1_000,
-        )
-        .await
-        .expect("seed Agent row and reconciled state");
-    let reconciled = journal
-        .get_watch_state()
-        .await
-        .expect("read fully reconciled state");
-    assert!(reconciled.agent_floor_reconciled);
-    assert_eq!(reconciled.occurrence, 11);
-    assert_eq!(reconciled.agent_floor_scan_high_water, 1);
-
-    let app_db = db.with_prefix(vec![0x00]);
-    let mut dbtx = app_db.begin_transaction().await;
-    dbtx.raw_insert_bytes(&tagged_key(0x05, &0_u64.to_be_bytes()), b"not valid json")
-        .await
-        .expect("corrupt already-accounted canonical row");
-    dbtx.commit_tx_result()
-        .await
-        .expect("commit accounted-row corruption");
-
-    assert_eq!(
-        journal
-            .get_watch_state()
-            .await
-            .expect("sticky reconciled state does not rescan old canonical rows"),
-        reconciled,
-        "a later corruption in the already-accounted range must not regress the durable floor"
+            .expect("persisted watch state"),
+        first
     );
 }
 
@@ -823,10 +407,6 @@ async fn watch_state_discovery_update_preserves_advanced_occurrence() {
             discover_cursor: Some(fed(0x20)),
             discover_backlog: true,
             discover_rotation: vec![fed(0x20), fed(0x30)],
-            agent_floor_reconciled: true,
-            agent_floor_scan_initialized: true,
-            agent_floor_scan_high_water: 1,
-            ..WatchState::default()
         }
     );
     assert_eq!(
@@ -1363,7 +943,6 @@ async fn recovery_registration_terminalizes_the_intent_atomically() {
         created_at_ms: fixed_clock(),
         operation_id: None,
         invoice: None,
-        evacuation_refusal: None,
     };
     let info = FederationInfo {
         invite: "fed1recover".to_string(),
@@ -1433,7 +1012,6 @@ fn recover_intent(key: &IdempotencyKey, id: FederationId, invite_str: &str) -> I
         created_at_ms: fixed_clock(),
         operation_id: None,
         invoice: None,
-        evacuation_refusal: None,
     }
 }
 

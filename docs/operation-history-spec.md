@@ -144,21 +144,6 @@ Rules (load-bearing):
    (impl spec §7): a terminal row written by reconcile REPAIR (`repaired: true` — an
    absence-of-evidence conclusion) may be superseded exactly once by an AUTHORITATIVE
    evidence-carrying write; repair writes never supersede anything terminal.
-   **Evacuation supersession is different:** for the narrow pre-artifact, structurally marked
-   agent case, the parent and a fresh child are distinct operation rows. One atomic journal
-   transaction marks the parent `Failed`, inserts the child `Pending` at an advanced occurrence
-   and distinct key, and writes durable forward/reverse sidecars. It does not mutate either
-    row's identity or erase the parent's evidence. `show` projects a live `evacuation_refusal`
-    marker for its exact key; history intentionally omits that projection rather than doing an
-    intent lookup per row. Standalone `status` is dry: a stale/default occurrence warns and returns
-    the scored/designation diagnostic with no would-run decisions, while a strictly newer occurrence
-    may display a prospective replacement. It writes neither parent nor child; daemon status remains
-    strict because it owns occurrence allocation. A replacement round admits only its child;
-    executable deferred ordinary decisions remain pinned-input validation facts and produce
-    explicit `tick-drop:`-keyed audit rows with the replacement-exclusive note; deferred
-    `RefuseInflow` advisories retain their `refuse:` identity and diagnostics with that same
-    replacement-exclusive error note.
-    Conflict-suppressed decisions retain their separate holder-voucher semantics.
 3. **`seq` orders, clocks display.** The counter increments in the row's own dbtx. Wall-clock
    comes from a `now_ms()` injected clock (testable); a bad clock degrades display, never order.
 4. **Failures and refusals are first-class rows.** A `Failed` op, a `Refusal`, an expired
@@ -211,16 +196,7 @@ Rules (load-bearing):
   (A `--since <ts>` filter was considered and dropped for v1 — seq + `--limit` suffice; the
   impl spec §11 owns the exact CLI shape.)
 - `wallet-cli show <key|seq>` — the full record: both legs' op-ids, gateway, fee breakdown,
-  error, timestamps, linked intent status, and any `supersedes` / `superseded_by` sidecar
-  links. Standalone `show --json` and JSON history emit a flattened
-  `OperationRecordAuditView`, not a raw `OperationRecord`: the persisted fields remain top-level
-  and the two optional links are projected from sidecars without changing the durable record
-  shape. Daemon `history`/`show` instead expose the public `OperationView`, with those same
-  optional link fields. `show`'s `evacuation_refusal_active` is tri-state: `true` only for an
-  exact readable Pending Agent Evacuate marker, `false` for an exact readable inactive intent, and
-  omitted when no exact intent is available; history also omits it because it does not read intents.
-- Public daemon history is paged newest-first: `GET /v1/history` caps `limit` at 500 and returns
-  `next_before_seq` for a full page; pass that value as `before_seq` to retrieve the next page.
+  error, timestamps, and the linked intent status.
 - Plain-text default, `--json` for scripts (ADR-0023).
 
 ## 6. Tests / gate

@@ -1,7 +1,7 @@
 use crate::ledger::Actor;
 use crate::types::{
-    Action, AllocatorDecision, EvacFeeCap, FederationId, IdempotencyKey, MoveRecord, Msat,
-    OperationId, ReasonCode, Reservations,
+    Action, AllocatorDecision, FederationId, IdempotencyKey, MoveRecord, Msat, OperationId,
+    ReasonCode, Reservations,
 };
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,11 +59,6 @@ pub struct Intent {
     pub operation_id: Option<OperationId>,
     /// The invoice minted by a raw `Receive`, persisted before it is surfaced.
     pub invoice: Option<crate::Invoice>,
-    /// Evidence from the current attempt's measured structural evacuation refusal.  This is an
-    /// attempt-scoped planning handoff, not a terminal result: claiming the pending work clears it.
-    /// Old persisted intent rows predate it, so they intentionally decode as `None`.
-    #[serde(default)]
-    pub evacuation_refusal: Option<EvacuationRefusalEvidence>,
 }
 
 impl Intent {
@@ -81,7 +76,6 @@ impl Intent {
             created_at_ms: now_ms,
             operation_id: None,
             invoice: None,
-            evacuation_refusal: None,
         }
     }
 
@@ -102,100 +96,6 @@ impl Intent {
             self.attempt
         ))
     }
-}
-
-/// One diagnosis-time quote used by a structural evacuation refusal.  Amounts are delivered nets,
-/// never invoice asks: the evacuation cap is defined over delivered net.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct EvacuationQuoteSample {
-    pub delivered_net: Msat,
-    pub total_fee: Msat,
-    pub fee_cap: Msat,
-}
-
-/// Durable evidence that a fresh evacuation was refused by the existing two-point structural
-/// diagnostic.  It is evidence rather than proof: quote curves are non-monotone and these are two
-/// independently measured dry-runs.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct EvacuationRefusalEvidence {
-    pub cap_components: EvacFeeCap,
-    pub requested_net: Msat,
-    pub source_spendable: Msat,
-    pub low: EvacuationQuoteSample,
-    pub high: EvacuationQuoteSample,
-    pub diagnostic: String,
-    pub measured_at_ms: u64,
-}
-
-/// Whether a new evacuation cap may supersede a marker made with `evidence`.
-///
-/// A component must never go backwards, and at least one of the actually
-/// measured delivered-net samples must gain effective integer cap room.  Keep
-/// this beside the evidence type: the journal and planner must make precisely
-/// the same adjudication, including integer-rounding/effectively-equal cases.
-pub fn evacuation_cap_qualifies_replacement(
-    evidence: &EvacuationRefusalEvidence,
-    new_cap: EvacFeeCap,
-) -> bool {
-    let old = evidence.cap_components;
-    new_cap.base_msat >= old.base_msat
-        && new_cap.bps >= old.bps
-        && [evidence.low.delivered_net, evidence.high.delivered_net]
-            .into_iter()
-            .any(|net| new_cap.at(net) > old.at(net))
-}
-
-/// The two independently measured parts of the structural-evacuation diagnostic.
-///
-/// This is deliberately a pure wallet-core calculation.  The executor produces the evidence and
-/// the durable journal admits it, so duplicating the slope/intercept arithmetic at those two
-/// boundaries would let a future rounding change make the journal accept evidence the producer
-/// would not have emitted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EvacuationStructuralRefusalAssessment {
-    /// The measured fee rises no faster than the cap over the two delivered-net samples.
-    pub fee_rises_no_faster_than_cap: bool,
-    /// The fitted fixed component exceeds the cap base while the measured fee rises at least as
-    /// fast as the cap and the low sample misses its cap.
-    pub fixed_component_exceeds_cap_base: bool,
-    /// The fitted fixed component, in msat, used solely for the producer's operator diagnostic.
-    pub fixed_component_msat: i128,
-}
-
-impl EvacuationStructuralRefusalAssessment {
-    pub fn is_structural(self) -> bool {
-        self.fee_rises_no_faster_than_cap || self.fixed_component_exceeds_cap_base
-    }
-}
-
-/// Assess the exact two-point structural-refusal predicate used for a fresh evacuation.
-///
-/// `low` and `high` are delivered-net quote samples, not invoice asks.  The caller separately
-/// establishes that both samples are currently affordable and over their respective caps.
-pub fn assess_evacuation_structural_refusal(
-    cap: EvacFeeCap,
-    low: &EvacuationQuoteSample,
-    high: &EvacuationQuoteSample,
-) -> Option<EvacuationStructuralRefusalAssessment> {
-    let low_amount = i128::from(low.delivered_net.0);
-    let low_fee = i128::from(low.total_fee.0);
-    let high_amount = i128::from(high.delivered_net.0);
-    let high_fee = i128::from(high.total_fee.0);
-    let span = high_amount - low_amount;
-    if span <= 0 {
-        return None;
-    }
-    let rise = high_fee - low_fee;
-    let cap_rise = i128::from(cap.bps) * span;
-    let fee_rise = rise * 10_000;
-    let fixed_component_msat = low_fee - rise * low_amount / span;
-    Some(EvacuationStructuralRefusalAssessment {
-        fee_rises_no_faster_than_cap: cap_rise >= fee_rise,
-        fixed_component_exceeds_cap_base: fee_rise >= cap_rise
-            && fixed_component_msat > i128::from(cap.base_msat.0)
-            && low.total_fee > cap.at(low.delivered_net),
-        fixed_component_msat,
-    })
 }
 
 /// Project the strict reservation view used for fresh user admission.
@@ -396,21 +296,6 @@ pub fn allocator_record_is_trusted(intent: &Intent, record: &MoveRecord) -> bool
     }
 }
 
-/// Whether a move cache is exactly the harmless draft which may be discarded when replacing a
-/// structurally refused evacuation.  This deliberately builds on the allocator's identity check:
-/// the replacement path and reservation projection must agree about which row belongs to an
-/// intent.  Quotes are observations, not protocol progress, so the two quote fields remain
-/// permitted; every protocol artifact must still be absent.
-pub fn replaceable_evacuation_record_is_pristine(intent: &Intent, record: &MoveRecord) -> bool {
-    record.phase == crate::types::MovePhase::Created
-        && allocator_record_is_trusted(intent, record)
-        && record.invoice.is_none()
-        && record.recv_op.is_none()
-        && record.send_op.is_none()
-        && record.preimage.is_none()
-        && record.outcome.is_none()
-}
-
 fn project_strict_intent(out: &mut Reservations, intent: &Intent) {
     project_strict_action(out, &intent.action);
 }
@@ -511,9 +396,6 @@ pub enum PerformOutcome {
 pub enum ExecError {
     /// Transient: leave the intent `Pending` so the next [`reconcile`] retries it.
     Retryable(String),
-    /// A retryable fresh-evacuation refusal with durable, typed structural evidence.  Keep its
-    /// diagnostic in the evidence so logging and summary accounting remain identical to Retryable.
-    StructuralEvacuationRefusal(EvacuationRefusalEvidence),
     /// Terminal: mark `Failed`. NOT auto-re-driven; only a manual retry resets it.
     Permanent(String),
     /// The action is not one this executor implementation performs (an `Executor`
@@ -550,24 +432,6 @@ pub trait Journal: Send + Sync {
         expected: IntentStatus,
         new: IntentStatus,
     ) -> Result<bool, ExecError>;
-    /// Atomically return an executing attempt to Pending.  Only a measured structural evacuation
-    /// refusal leaves a marker; every ordinary retry clears one from an earlier pass.
-    async fn reset_retryable(
-        &self,
-        key: &IdempotencyKey,
-        expected_attempt: u32,
-        structural_refusal: Option<EvacuationRefusalEvidence>,
-    ) -> Result<(), ExecError> {
-        // Compatibility for narrow test journals. Production journals override this so the marker
-        // and status transition share one durable transaction.
-        if structural_refusal.is_some() {
-            return Err(ExecError::Permanent(
-                "journal: structural retry marker requires a durable reset implementation".into(),
-            ));
-        }
-        self.set_status(key, expected_attempt, IntentStatus::Pending, None)
-            .await
-    }
     /// Intents to re-drive on the next pass: `Pending | Executing` ONLY (never
     /// `Awaiting`/`Failed`, which are terminal-or-subscription-owned).
     async fn pending(&self) -> Result<Vec<Intent>, ExecError>;
@@ -745,33 +609,10 @@ impl Journal for MemJournal {
                     && intent_status_transition_allowed(intent.status, new) =>
             {
                 intent.status = new;
-                if expected == IntentStatus::Pending && new == IntentStatus::Executing {
-                    intent.evacuation_refusal = None;
-                }
                 Ok(true)
             }
             _ => Ok(false),
         }
-    }
-
-    async fn reset_retryable(
-        &self,
-        key: &IdempotencyKey,
-        expected_attempt: u32,
-        structural_refusal: Option<EvacuationRefusalEvidence>,
-    ) -> Result<(), ExecError> {
-        let mut intents = self.intents.lock().expect("journal mutex poisoned");
-        let intent = intents
-            .get_mut(key)
-            .ok_or_else(|| ExecError::Permanent("journal: intent not found".into()))?;
-        if intent.attempt != expected_attempt || intent.status != IntentStatus::Executing {
-            return Err(ExecError::Permanent(
-                "journal: retryable reset requires the current Executing attempt".into(),
-            ));
-        }
-        intent.status = IntentStatus::Pending;
-        intent.evacuation_refusal = structural_refusal;
-        Ok(())
     }
 
     async fn pending(&self) -> Result<Vec<Intent>, ExecError> {
@@ -1417,7 +1258,12 @@ pub async fn drive_intent_step<J: Journal, E: Executor + ?Sized>(
             // Leave the intent Pending so the next reconcile retries it (NOT Failed). A
             // retry is not a terminal failure, so no ledger `error` string is threaded (§8.3).
             let reset = journal
-                .reset_retryable(&executing.idempotency_key, executing.attempt, None)
+                .set_status(
+                    &executing.idempotency_key,
+                    executing.attempt,
+                    IntentStatus::Pending,
+                    None,
+                )
                 .await;
             // Retryable: count it in `failed` (unchanged gating) AND in the `retryable` subset
             // (§15.11), so a scheduler can tell a left-Pending retry from a terminal failure.
@@ -1425,24 +1271,6 @@ pub async fn drive_intent_step<J: Journal, E: Executor + ?Sized>(
             summary.retryable += 1;
             reset?;
             Err(ExecError::Retryable(reason))
-        }
-        Err(ExecError::StructuralEvacuationRefusal(evidence)) => {
-            tracing::warn!(
-                key = %intent.idempotency_key.0,
-                reason = %evidence.diagnostic,
-                "executor perform failed retryably with structural evacuation evidence"
-            );
-            let reset = journal
-                .reset_retryable(
-                    &executing.idempotency_key,
-                    executing.attempt,
-                    Some(evidence.clone()),
-                )
-                .await;
-            summary.failed += 1;
-            summary.retryable += 1;
-            reset?;
-            Err(ExecError::StructuralEvacuationRefusal(evidence))
         }
         Err(ExecError::Permanent(reason)) => {
             tracing::warn!(
