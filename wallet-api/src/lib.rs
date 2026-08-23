@@ -447,17 +447,6 @@ pub struct WatchStatusView {
     pub last_discover_ms: u64,
     pub discover_cursor: Option<FederationId>,
     pub discover_backlog: bool,
-    /// False while legacy floor migration still has a bounded ledger-scan backlog or awaits repair
-    /// of unreadable rows. Agent occurrence allocation and new Agent-ledger admission are fenced
-    /// until this becomes true. Pair with `unreadable_ledger_rows`: zero means only scan backlog
-    /// remains.
-    #[serde(default)]
-    pub agent_floor_reconciled: bool,
-    /// Number of exact ledger rows the next watch access will retry after operator repair. A zero
-    /// count with `agent_floor_reconciled == false` is a bounded valid-row scan backlog, not repair
-    /// work.
-    #[serde(default)]
-    pub unreadable_ledger_rows: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -541,26 +530,6 @@ mod tests {
         let encoded = serde_json::to_string(&value).expect("serialize DTO");
         let decoded: T = serde_json::from_str(&encoded).expect("deserialize DTO");
         assert_eq!(decoded, value);
-    }
-
-    #[test]
-    fn watch_status_missing_migration_health_fields_decode_for_rolling_clients() {
-        let mut json = serde_json::to_value(WatchStatusView {
-            occurrence: 7,
-            last_discover_ms: 13,
-            discover_cursor: Some(fed(3)),
-            discover_backlog: true,
-            agent_floor_reconciled: true,
-            unreadable_ledger_rows: 2,
-        })
-        .expect("serialize current watch status");
-        let object = json.as_object_mut().expect("object");
-        object.remove("agent_floor_reconciled");
-        object.remove("unreadable_ledger_rows");
-        let decoded: WatchStatusView =
-            serde_json::from_value(json).expect("rolling client response still decodes");
-        assert!(!decoded.agent_floor_reconciled);
-        assert_eq!(decoded.unreadable_ledger_rows, 0);
     }
 
     #[test]
@@ -996,8 +965,6 @@ mod tests {
             last_discover_ms: 13,
             discover_cursor: Some(fed(3)),
             discover_backlog: true,
-            agent_floor_reconciled: true,
-            unreadable_ledger_rows: 0,
         });
         assert_json_roundtrip(HistoryResponse {
             operations: vec![operation],

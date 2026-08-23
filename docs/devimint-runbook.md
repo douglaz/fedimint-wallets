@@ -964,16 +964,8 @@ evidence and reports `"evacuation_refusal_active": false`. The field is omitted 
 read an exact linked intent (including malformed/degraded rows), and history omits it because it
 does not perform intent reads. Only the literal value `true` is authority to replace it.
 
-## 8. Recovering a bounded WatchState floor reconciliation
+## 8. Recovering from a corrupt federation registry
 
-An incomplete WatchState floor is an allocation fence, not a reason to delete ledger rows. On a
-daemon, retry `GET /v1/watch/status` until its bounded valid backlog converges. For a standalone
-`wallet-cli --standalone ... tick`, re-run the same tick (with the same occurrence) until it
-converges. If the diagnostic reports unreadable ledger rows, stop the daemon, preserve the store,
-restore those rows from a trusted backup, then use the applicable retry above. User-ledger appends
-intentionally do not rewrite the WatchState hot row; the next drain or Agent admission accounts
-for their suffix. A watch response with `agent_floor_reconciled=false` and
-`unreadable_ledger_rows=0` is a bounded valid backlog; a positive unreadable count requires exact
-row repair. If standalone `tick` or dry-run `status` instead reports a corrupt federation registry,
-repair that registry from a consistent backup before retrying—those world-complete commands do not
-open or plan only the healthy subset.
+If standalone `tick` or dry-run `status` reports a corrupt federation registry, repair that registry
+from a consistent backup before retrying — those world-complete commands do not open or plan only
+the healthy subset.

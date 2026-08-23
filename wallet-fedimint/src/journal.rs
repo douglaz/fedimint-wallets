@@ -82,15 +82,6 @@ const TAG_CANDIDATE: u8 = 0x09; // `0x09 ++ fed_id` → JSON row v1(CandidateRec
 const TAG_WATCH_STATE: u8 = 0x0a; // `0x0a` → JSON row v1(WatchState) (phase 5 §5.2.5)
 const TAG_POLICY: u8 = 0x0b; // `0x0b` → JSON row v1(wallet_api::Policy) (phase 6a §6a.6)
 
-/// Exact corrupt/missing ledger keys are durable operator-repair work, not an unbounded queue.
-/// Counter-driven direct-row reconciliation advances in chunks of this size, so a corrupt counter
-/// cannot turn one watch access into an enormous loop or allocation.
-const WATCH_FLOOR_UNREADABLE_KEY_LIMIT: usize = 256;
-/// A caller which needs an occurrence drains several durable reconciliation chunks without waiting
-/// for the outer watch cadence. Each chunk is its own autocommit and the yield between chunks keeps
-/// the actor cancellable and fair. This is a work budget, not a time budget.
-const WATCH_FLOOR_IMMEDIATE_DRAIN_CHUNK_BUDGET: usize = 16;
-
 // Immutable evacuation supersession audit relation.  The canonical row is indexed by its old key;
 // the reverse row maps the child key back to it without a scan.
 const TAG_EVACUATION_SUPERSESSION: u8 = 0x0c;
@@ -308,41 +299,6 @@ pub struct WatchState {
     /// Candidate order snapshot for a deadline/cap-truncated discovery rotation. A cursor alone
     /// cannot distinguish older deferred source-only ids from fresh ids announced on restart.
     pub discover_rotation: Vec<FederationId>,
-    /// Whether every canonical, counter-addressable ledger sequence through the observed counter has
-    /// been validated and no unreadable or missing canonical row remains, so `occurrence` is the
-    /// complete durable Agent floor. Noncanonical poison rows remain the separate concern of the
-    /// history and budget readers; this bit does not certify them.
-    ///
-    /// Old direct Agent admissions predate this proof and can leave a persisted WatchState lower
-    /// than the ledger. Conversely, an opaque canonical row may encode *any* `u64` occurrence: a
-    /// supplied scalar bound, even `u64::MAX`, is not evidence that it is high enough. There is no
-    /// safe scalar override; repairing this requires the exact row bytes or a new allocation
-    /// epoch/key namespace. Older checkpoints lack the migration metadata below, so each access
-    /// scans one bounded canonical ledger chunk and writes its known floor atomically. A complete
-    /// scan sets this bit and makes later reads and ordinary checkpoint updates constant-time.
-    /// While bounded scan backlog or an unreadable/missing row remains, the bit stays false and
-    /// later accesses continue the backlog and retry exact keys. This compatibility metadata is
-    /// intentional: watch checkpoints are live production rows.
-    #[serde(default)]
-    pub agent_floor_reconciled: bool,
-    /// Whether the bounded legacy-ledger migration has initialized its canonical cursor. This deliberately differs from
-    /// `agent_floor_reconciled`: an initialized scan can still have bounded sequence backlog or
-    /// await operator repair of an exact unreadable/missing row.
-    #[serde(default)]
-    pub agent_floor_scan_initialized: bool,
-    /// Exclusive ledger sequence high-water examined by the floor migration. A named serde default
-    /// is required because old live rows must start at the beginning of the append-only ledger.
-    #[serde(default = "watch_state_scan_high_water_default")]
-    pub agent_floor_scan_high_water: u64,
-    /// Exact raw `TAG_LEDGER_ROW` keys which were unreadable or missing during migration. This is
-    /// bounded by the number of repair rows and lets later access retry only those exact keys rather
-    /// than repeatedly scanning the full history.
-    #[serde(default)]
-    pub agent_floor_unreadable_ledger_keys: Vec<Vec<u8>>,
-}
-
-fn watch_state_scan_high_water_default() -> u64 {
-    0
 }
 
 /// A generation at this value cannot name a strictly newer successor.  Do not
@@ -479,11 +435,6 @@ pub struct FedimintJournal {
     /// production pre-scan solely to make that race deterministic.
     #[cfg(test)]
     replacement_scan_pause: Arc<Mutex<Option<Arc<PendingReadPause>>>>,
-    /// A one-shot pause after the scheduler's raw watch-floor retry checkpoint read.  The
-    /// scheduler owns cancellation around this read, so this seam proves an abort does not wait
-    /// behind post-cycle inspection.
-    #[cfg(test)]
-    watch_floor_immediate_retry_read_pause: Arc<Mutex<WatchFloorImmediateRetryReadPause>>,
     /// Key-scoped one-shot transaction rendezvous.  It is deliberately not a
     /// global test barrier: unrelated journal tests and keys must never join
     /// this forced overlap.
@@ -494,10 +445,6 @@ pub struct FedimintJournal {
     /// synchronization primitive.
     #[cfg(test)]
     post_move_write_pauses: Arc<Mutex<BTreeMap<IdempotencyKey, Arc<PostMoveWritePause>>>>,
-    /// Barrier after the WatchState read/check/write closure has read its snapshot and before its
-    /// autocommit returns. It deterministically makes two callers race the commit boundary.
-    #[cfg(test)]
-    watch_state_autocommit_pause: Arc<Mutex<Option<Arc<WatchStateAutocommitPause>>>>,
 }
 
 #[cfg(test)]
@@ -508,20 +455,10 @@ pub(crate) struct PendingReadPause {
 }
 
 #[cfg(test)]
-type WatchFloorImmediateRetryReadPause = Option<(usize, Arc<PendingReadPause>)>;
-
-#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct PostMoveWritePause {
     committed: tokio::sync::Notify,
     release: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-struct WatchStateAutocommitPause {
-    barrier: tokio::sync::Barrier,
-    arrivals: AtomicUsize,
 }
 
 #[cfg(test)]
@@ -648,13 +585,9 @@ impl FedimintJournal {
             #[cfg(test)]
             replacement_scan_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
-            watch_floor_immediate_retry_read_pause: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
             replacement_write_rendezvous: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(test)]
             post_move_write_pauses: Arc::new(Mutex::new(BTreeMap::new())),
-            #[cfg(test)]
-            watch_state_autocommit_pause: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -690,78 +623,6 @@ impl FedimintJournal {
             "only one post-move-write pause may be installed per key"
         );
         pause
-    }
-
-    #[cfg(test)]
-    pub(crate) fn rendezvous_two_watch_state_autocommits_for_test(&self) {
-        *self
-            .watch_state_autocommit_pause
-            .lock()
-            .expect("watch-state autocommit pause lock poisoned") =
-            Some(Arc::new(WatchStateAutocommitPause {
-                barrier: tokio::sync::Barrier::new(2),
-                arrivals: AtomicUsize::new(0),
-            }));
-    }
-
-    /// Pause exactly one raw `watch_floor_immediate_retry_needed` checkpoint after it has read
-    /// the durable row.  This is deliberately a read seam rather than a scheduler hook: the
-    /// regression is that the outer scheduler must cancel the real inspection future.
-    #[cfg(test)]
-    pub(crate) fn pause_watch_floor_immediate_retry_read_after_for_test(
-        &self,
-        successful_reads_before_pause: usize,
-    ) -> Arc<PendingReadPause> {
-        let pause = Arc::new(PendingReadPause {
-            started: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-        });
-        let previous = self
-            .watch_floor_immediate_retry_read_pause
-            .lock()
-            .expect("watch-floor immediate-retry pause lock poisoned")
-            .replace((successful_reads_before_pause, Arc::clone(&pause)));
-        assert!(
-            previous.is_none(),
-            "only one watch-floor immediate-retry pause may be installed"
-        );
-        pause
-    }
-
-    #[cfg(test)]
-    async fn wait_watch_floor_immediate_retry_read_for_test(&self) {
-        // Remove before waiting so cancellation cannot leave a later scheduler cycle paused.
-        let pause = {
-            let mut configured = self
-                .watch_floor_immediate_retry_read_pause
-                .lock()
-                .expect("watch-floor immediate-retry pause lock poisoned");
-            let Some((remaining, _)) = configured.as_mut() else {
-                return;
-            };
-            if *remaining > 0 {
-                *remaining -= 1;
-                return;
-            }
-            configured
-                .take()
-                .expect("watch-floor immediate-retry pause remains installed")
-                .1
-        };
-        pause.started.notify_one();
-        pause.release.notified().await;
-    }
-
-    #[cfg(test)]
-    async fn wait_watch_state_autocommit_rendezvous_for_test(
-        pause: &Option<Arc<WatchStateAutocommitPause>>,
-    ) {
-        let Some(pause) = pause else {
-            return;
-        };
-        if pause.arrivals.fetch_add(1, Ordering::SeqCst) < 2 {
-            pause.barrier.wait().await;
-        }
     }
 
     #[cfg(test)]
@@ -1181,7 +1042,7 @@ impl FedimintJournal {
         let (next_seq, successor) = next_ledger_sequence_in(&mut dbtx).await?;
         let now = self.now_ms();
         let row = fresh_intent_record(next_seq, refreshed, OperationStatus::Started, now, None);
-        note_ledger_insert_in(&mut dbtx, &row, next_seq).await?;
+        note_ledger_insert_in(&mut dbtx, &row).await?;
         dbtx.raw_insert_bytes(&ledger_counter_key(), &successor.to_be_bytes())
             .await
             .map_err(db_err)?;
@@ -4547,36 +4408,14 @@ impl FedimintJournal {
 
     // --- watch scheduler state (phase 5 §5.2.5, tag 0x0a) ---
 
-    /// Load the single watch-state row. An absent or legacy row makes one bounded pass over the
-    /// canonical ledger sequence and persists its known Agent floor. Reusing an already-journaled
-    /// occurrence could collide with operation keys. A corrupt checkpoint still fails closed, while
-    /// a corrupt history row is warned and skipped and keeps migration pending for a later retry.
+    /// Load the single watch-state row. A corrupt checkpoint fails closed.
     pub async fn get_watch_state(&self) -> Result<WatchState, ExecError> {
         let raw_key = watch_state_key();
-        #[cfg(test)]
-        let pause = self
-            .watch_state_autocommit_pause
-            .lock()
-            .expect("watch-state autocommit pause lock poisoned")
-            .clone();
-        self.db
-            .autocommit(
-                move |dbtx, _| {
-                    let raw_key = raw_key.clone();
-                    #[cfg(test)]
-                    let pause = pause.clone();
-                    Box::pin(async move {
-                        let bytes = dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)?;
-                        let state = watch_state_with_agent_floor_in(dbtx, &raw_key, bytes).await?;
-                        #[cfg(test)]
-                        Self::wait_watch_state_autocommit_rendezvous_for_test(&pause).await;
-                        Ok(state)
-                    })
-                },
-                None,
-            )
-            .await
-            .map_err(map_autocommit_error)
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        let Some(bytes) = dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? else {
+            return Ok(WatchState::default());
+        };
+        decode_row_result("watch state", &raw_key, &bytes)
     }
 
     /// Store the complete watch-state checkpoint.
@@ -4600,86 +4439,52 @@ impl FedimintJournal {
         discover_rotation: Vec<FederationId>,
     ) -> Result<WatchState, ExecError> {
         let raw_key = watch_state_key();
-        #[cfg(test)]
-        let pause = self
-            .watch_state_autocommit_pause
-            .lock()
-            .expect("watch-state autocommit pause lock poisoned")
-            .clone();
-        self.db
-            .autocommit(
-                move |dbtx, _| {
-                    let raw_key = raw_key.clone();
-                    let discover_cursor = discover_cursor;
-                    let discover_rotation = discover_rotation.clone();
-                    #[cfg(test)]
-                    let pause = pause.clone();
-                    Box::pin(async move {
-                        let bytes = dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)?;
-                        let mut state =
-                            watch_state_with_agent_floor_in(dbtx, &raw_key, bytes).await?;
-                        state.discover_cursor = discover_cursor;
-                        state.discover_backlog = discover_backlog;
-                        state.discover_rotation = discover_rotation;
-                        if let Some(last_discover_ms) = last_discover_ms {
-                            state.last_discover_ms = last_discover_ms;
-                        }
-                        dbtx.raw_insert_bytes(&raw_key, &encode_row(&state)?)
-                            .await
-                            .map_err(db_err)?;
-                        #[cfg(test)]
-                        Self::wait_watch_state_autocommit_rendezvous_for_test(&pause).await;
-                        Ok(state)
-                    })
-                },
-                None,
-            )
+        let mut dbtx = self.db.begin_transaction().await;
+        let mut state = match dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? {
+            Some(bytes) => decode_row_result::<WatchState>("watch state", &raw_key, &bytes)?,
+            None => WatchState::default(),
+        };
+        state.discover_cursor = discover_cursor;
+        state.discover_backlog = discover_backlog;
+        state.discover_rotation = discover_rotation;
+        if let Some(last_discover_ms) = last_discover_ms {
+            state.last_discover_ms = last_discover_ms;
+        }
+        dbtx.raw_insert_bytes(&raw_key, &encode_row(&state)?)
             .await
-            .map_err(map_autocommit_error)
+            .map_err(db_err)?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(state)
     }
 
     /// Advance the persisted occurrence by one, preserving the discovery checkpoint fields.
+    ///
+    /// An ABSENT row seeds from the highest `Tick` occurrence already in the ledger: restarting at
+    /// zero would re-allocate an occurrence that already names journaled operation keys.
     pub async fn advance_watch_occurrence(&self) -> Result<WatchState, ExecError> {
-        self.drain_watch_floor_immediately().await?;
         let raw_key = watch_state_key();
-        #[cfg(test)]
-        let pause = self
-            .watch_state_autocommit_pause
-            .lock()
-            .expect("watch-state autocommit pause lock poisoned")
-            .clone();
-        self.db
-            .autocommit(
-                move |dbtx, _| {
-                    let raw_key = raw_key.clone();
-                    #[cfg(test)]
-                    let pause = pause.clone();
-                    Box::pin(async move {
-                        let bytes = dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)?;
-                        let mut state =
-                            watch_state_with_agent_floor_in(dbtx, &raw_key, bytes).await?;
-                        if !state.agent_floor_reconciled {
-                            return Err(watch_floor_reconciliation_required_error(&state));
-                        }
-                        state.occurrence = state.occurrence.checked_add(1).ok_or_else(|| {
-                            ExecError::Permanent(
-                                "watch scheduler occurrence exhausted at u64::MAX; restore a checkpoint below \
-                                 u64::MAX before scheduling another cycle"
-                                    .to_owned(),
-                            )
-                        })?;
-                        dbtx.raw_insert_bytes(&raw_key, &encode_row(&state)?)
-                            .await
-                            .map_err(db_err)?;
-                        #[cfg(test)]
-                        Self::wait_watch_state_autocommit_rendezvous_for_test(&pause).await;
-                        Ok(state)
-                    })
-                },
-                None,
+        let mut dbtx = self.db.begin_transaction().await;
+        let mut state = match dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? {
+            Some(bytes) => decode_row_result::<WatchState>("watch state", &raw_key, &bytes)?,
+            None => WatchState {
+                occurrence: max_agent_occurrence_in(&mut dbtx).await?,
+                ..WatchState::default()
+            },
+        };
+        // NOT saturating: a floor pinned at u64::MAX would silently hand out a non-newer
+        // occurrence, and a replacement child must be strictly newer than the parent it retires.
+        state.occurrence = state.occurrence.checked_add(1).ok_or_else(|| {
+            ExecError::Permanent(
+                "watch scheduler occurrence exhausted at u64::MAX; restore a checkpoint below \
+                 u64::MAX before scheduling another cycle"
+                    .to_owned(),
             )
+        })?;
+        dbtx.raw_insert_bytes(&raw_key, &encode_row(&state)?)
             .await
-            .map_err(map_autocommit_error)
+            .map_err(db_err)?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(state)
     }
 
     /// Record an occurrence used by a standalone tick without moving the watch checkpoint
@@ -4690,88 +4495,21 @@ impl FedimintJournal {
         // cannot ever yield a strictly newer daemon child, so it must not poison
         // the durable watch floor.
         ensure_occurrence_has_successor(occurrence)?;
-        self.drain_watch_floor_immediately().await?;
         let raw_key = watch_state_key();
-        self.db
-            .autocommit(
-                move |dbtx, _| {
-                    let raw_key = raw_key.clone();
-                    Box::pin(async move {
-                        let bytes = dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)?;
-                        let mut state =
-                            watch_state_with_agent_floor_in(dbtx, &raw_key, bytes).await?;
-                        if !state.agent_floor_reconciled {
-                            return Err(watch_floor_reconciliation_required_error(&state));
-                        }
-                        state.occurrence = state.occurrence.max(occurrence);
-                        dbtx.raw_insert_bytes(&raw_key, &encode_row(&state)?)
-                            .await
-                            .map_err(db_err)?;
-                        Ok(state)
-                    })
-                },
-                None,
-            )
-            .await
-            .map_err(map_autocommit_error)
-    }
-
-    /// Reconcile only the bounded WatchState migration before a scheduler cycle reads any other
-    /// state. This deliberately does not allocate an occurrence: partial-view and reconcile
-    /// semantics remain the authority boundary for actual work.
-    ///
-    /// A valid suffix can need several calls because each call commits at most the fixed immediate
-    /// drain budget. Callers that schedule continuously may yield and retry the preflight; callers
-    /// that run one standalone operation receive the actionable reconciliation error instead.
-    pub async fn preflight_watch_floor_drain(&self) -> Result<WatchState, ExecError> {
-        self.drain_watch_floor_immediately().await
-    }
-
-    /// Drain a valid legacy-ledger floor before allocation without waiting for a normal scheduler
-    /// interval. One direct-row chunk commits per iteration, and yielding after every commit makes
-    /// this safe to cancel and prevents it from monopolising an actor turn. An unreadable/missing
-    /// row remains repair-only: it never authorises an occurrence.
-    async fn drain_watch_floor_immediately(&self) -> Result<WatchState, ExecError> {
-        let mut last = None;
-        for _ in 0..WATCH_FLOOR_IMMEDIATE_DRAIN_CHUNK_BUDGET {
-            let state = self.get_watch_state().await?;
-            if state.agent_floor_reconciled {
-                return Ok(state);
-            }
-            if !state.agent_floor_unreadable_ledger_keys.is_empty() {
-                // Retrying the same unreadable repair keys in the remaining batch cannot make
-                // forward progress. Persisted state records them for an operator restore, so stop
-                // now and let recovery work continue without monopolising this scheduler turn.
-                return Err(watch_floor_reconciliation_required_error(&state));
-            }
-            last = Some(state);
-            tokio::task::yield_now().await;
-        }
-        // Do not perform a seventeenth transaction for a sixteen-chunk budget. The caller can
-        // inspect this exact durable checkpoint and either immediately retry (scheduler) or follow
-        // the actionable status procedure (standalone).
-        Err(watch_floor_reconciliation_required_error(
-            &last.expect("nonzero drain budget always records a state"),
-        ))
-    }
-
-    /// Whether a scheduler should promptly start another bounded allocation-drain batch. This
-    /// deliberately excludes unreadable repair rows: they require an operator repair and must never
-    /// turn into a busy retry loop. It is a non-mutating checkpoint read: calling `get_watch_state`
-    /// here would secretly consume a seventeenth chunk after a sixteen-chunk budget.
-    pub async fn watch_floor_immediate_retry_needed(&self) -> Result<bool, ExecError> {
-        let raw_key = watch_state_key();
-        let mut dbtx = self.db.begin_transaction_nc().await;
-        let Some(bytes) = dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? else {
-            return Ok(false);
+        let mut dbtx = self.db.begin_transaction().await;
+        let mut state = match dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? {
+            Some(bytes) => decode_row_result::<WatchState>("watch state", &raw_key, &bytes)?,
+            None => WatchState {
+                occurrence: max_agent_occurrence_in(&mut dbtx).await?,
+                ..WatchState::default()
+            },
         };
-        #[cfg(test)]
-        self.wait_watch_floor_immediate_retry_read_for_test().await;
-        let state: WatchState = decode_row_result("watch state", &raw_key, &bytes)?;
-        // A concurrent status/read may have completed the final chunk after the allocation's
-        // typed bounded-backlog error. Retry immediately in that case too: the next cycle can
-        // allocate, whereas sleeping the routine cadence would strand already-complete work.
-        Ok(state.agent_floor_unreadable_ledger_keys.is_empty())
+        state.occurrence = state.occurrence.max(occurrence);
+        dbtx.raw_insert_bytes(&raw_key, &encode_row(&state)?)
+            .await
+            .map_err(db_err)?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(state)
     }
 
     // --- user policy (phase 6a §6a.6, tag 0x0b) ---
@@ -4815,108 +4553,37 @@ impl FedimintJournal {
     }
 }
 
-async fn watch_state_with_agent_floor_in(
+/// The highest Agent occurrence already recorded in the ledger.
+///
+/// Used only to seed an ABSENT watch checkpoint: restarting the agent occurrence at zero would
+/// re-allocate values that already name journaled operation keys. `note_ledger_insert_in` keeps a
+/// PRESENT checkpoint at or above every Agent append, so this scan runs at most once per store.
+///
+/// It reads `Actor::Agent` rather than only `OperationKind::Tick`: a tick can journal `Move`,
+/// `Evacuate` and `Join` rows at its occurrence, and an evacuation replacement child must be
+/// strictly newer than any of them. Undecodable rows are warned and skipped — this is a
+/// best-effort floor for a missing row, not a proof about ledger integrity.
+async fn max_agent_occurrence_in(
     dbtx: &mut impl IDatabaseTransactionOpsCore,
-    raw_key: &[u8],
-    bytes: Option<Vec<u8>>,
-) -> Result<WatchState, ExecError> {
-    // The counter is an allocation authority only if it names the immediate successor of the
-    // physical ledger tail. Checking the descending tail costs O(1), prevents a low or absent
-    // counter from hiding a later Agent occurrence, and prevents a direct writer from overwriting
-    // that tail at the falsely low sequence.
-    let next_seq = ledger_counter_matches_tail_in(dbtx).await?;
-    watch_state_with_agent_floor_at_next_in(dbtx, raw_key, bytes, next_seq).await
-}
-
-/// Reconcile a watch checkpoint against a counter value already validated by
-/// [`ledger_counter_matches_tail_in`]. The allocation path passes its single authoritative counter
-/// read here so an Agent admission does not perform a redundant descending tail scan.
-async fn watch_state_with_agent_floor_at_next_in(
-    dbtx: &mut impl IDatabaseTransactionOpsCore,
-    raw_key: &[u8],
-    bytes: Option<Vec<u8>>,
-    next_seq: u64,
-) -> Result<WatchState, ExecError> {
-    let mut state = match bytes {
-        Some(bytes) => decode_row_result::<WatchState>("watch state", raw_key, &bytes)?,
-        None => WatchState::default(),
-    };
-    if !state.agent_floor_scan_initialized {
-        // Legacy checkpoints used to scan the entire row prefix here. A corrupt counter or a large
-        // valid history made that first status read unbounded. Start the durable direct-row cursor
-        // instead; every access below advances at most one chunk.
-        state.agent_floor_scan_initialized = true;
-        state.agent_floor_scan_high_water = 0;
-        state.agent_floor_unreadable_ledger_keys.clear();
-        state.agent_floor_reconciled = false;
-    }
-    if state.agent_floor_scan_high_water > next_seq {
-        // A partial WatchState can also be restored independently of its ledger. Its frontier and
-        // exact repair keys may name a newer, incompatible snapshot, so retaining them would turn a
-        // safe older ledger restore into a permanent backward-cursor failure. Restart a bounded
-        // canonical pass, but retain `occurrence` as a monotonic floor.
-        state.agent_floor_scan_high_water = 0;
-        state.agent_floor_unreadable_ledger_keys.clear();
-        state.agent_floor_reconciled = false;
-    } else if state.agent_floor_reconciled && state.agent_floor_scan_high_water != next_seq {
-        // Never trust a completed bit when its asserted frontier no longer names the validated
-        // counter: scan the newly exposed suffix before another Agent allocation.
-        state.agent_floor_reconciled = false;
-    }
-    if !state.agent_floor_reconciled {
-        // The bounded legacy pass remembers every unreadable raw key and a durable append-only
-        // high-water. Retry only those keys, then direct-read the rows appended since that
-        // high-water; never rescan the already-covered canonical range while repair is outstanding.
-        if state.agent_floor_unreadable_ledger_keys.len() > WATCH_FLOOR_UNREADABLE_KEY_LIMIT {
-            return Err(watch_floor_repair_bound_error(
-                "persisted unreadable-key list exceeds the repair bound",
-            ));
-        }
-        let mut unreadable_keys = BTreeSet::new();
-        let mut max_agent_occurrence = state.occurrence;
-        for key in &state.agent_floor_unreadable_ledger_keys {
-            match dbtx.raw_get_bytes(key).await.map_err(db_err)? {
-                None => {
-                    warn_missing_watch_ledger_row(key);
-                    remember_unreadable_watch_ledger_key(&mut unreadable_keys, key.clone())?;
-                }
-                Some(value) => {
-                    match observe_agent_occurrence(key, &value, &mut max_agent_occurrence) {
-                        Ok(()) => {}
-                        Err(error) => {
-                            warn_unreadable_watch_ledger_row(&error, key);
-                            remember_unreadable_watch_ledger_key(
-                                &mut unreadable_keys,
-                                key.clone(),
-                            )?;
-                        }
-                    }
-                }
+) -> Result<u64, ExecError> {
+    let mut stream = dbtx
+        .raw_find_by_prefix(&[TAG_LEDGER_ROW])
+        .await
+        .map_err(db_err)?;
+    let mut max_occurrence = 0;
+    while let Some((raw_key, value)) = stream.next().await {
+        let row = match decode_row_result::<OperationRecord>("ledger row", &raw_key, &value) {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!(?raw_key, error = ?e, "journal: skipping undecodable ledger row");
+                continue;
             }
+        };
+        if let Actor::Agent { occurrence } = row.actor {
+            max_occurrence = max_occurrence.max(occurrence.0);
         }
-        if next_seq < state.agent_floor_scan_high_water {
-            return Err(watch_floor_repair_bound_error(
-                "ledger counter moved backward below the durable scan high-water",
-            ));
-        }
-        let scan_high_water = scan_watch_floor_ledger_chunk(
-            dbtx,
-            state.agent_floor_scan_high_water,
-            next_seq,
-            &mut max_agent_occurrence,
-            &mut unreadable_keys,
-        )
-        .await?;
-        state.occurrence = max_agent_occurrence;
-        state.agent_floor_scan_high_water = scan_high_water;
-        state.agent_floor_unreadable_ledger_keys = unreadable_keys.into_iter().collect();
-        state.agent_floor_reconciled =
-            state.agent_floor_unreadable_ledger_keys.is_empty() && scan_high_water == next_seq;
-        dbtx.raw_insert_bytes(raw_key, &encode_row(&state)?)
-            .await
-            .map_err(db_err)?;
     }
-    Ok(state)
+    Ok(max_occurrence)
 }
 
 async fn ledger_next_seq_in(dbtx: &mut impl IDatabaseTransactionOpsCore) -> Result<u64, ExecError> {
@@ -5018,39 +4685,6 @@ fn decode_canonical_ledger_row(raw_key: &[u8], value: &[u8]) -> Result<Operation
     Ok(row)
 }
 
-fn observe_agent_occurrence(
-    raw_key: &[u8],
-    value: &[u8],
-    max_occurrence: &mut u64,
-) -> Result<(), ExecError> {
-    let row = decode_canonical_ledger_row(raw_key, value)?;
-    if let Actor::Agent { occurrence } = row.actor {
-        *max_occurrence = (*max_occurrence).max(occurrence.0);
-    }
-    Ok(())
-}
-
-fn warn_unreadable_watch_ledger_row(error: &ExecError, raw_key: &[u8]) {
-    tracing::warn!(
-        ?error,
-        raw_key = ?raw_key,
-        "watch-state floor migration skipped unreadable ledger row; repair from backup and retry watch access"
-    );
-}
-
-fn warn_missing_watch_ledger_row(raw_key: &[u8]) {
-    tracing::warn!(
-        raw_key = ?raw_key,
-        "watch-state floor migration found missing ledger row; restore from backup and retry watch access"
-    );
-}
-
-fn watch_floor_repair_bound_error(detail: &str) -> ExecError {
-    ExecError::Permanent(format!(
-        "journal: watch-state floor migration {detail}; stop walletd, preserve the store, and restore malformed ledger rows from backup"
-    ))
-}
-
 /// A physical-tail/counter disagreement makes the next sequence unknowable. This is an allocation
 /// fence for every fresh ledger row, regardless of whether its actor is User or Agent.
 fn ledger_tail_counter_error(detail: &str) -> ExecError {
@@ -5059,91 +4693,6 @@ fn ledger_tail_counter_error(detail: &str) -> ExecError {
          are fenced; stop walletd, preserve the store, and restore the counter and ledger from one \
          consistent trusted backup"
     ))
-}
-
-/// An Agent occurrence is an allocation, not merely a checkpoint update.  A caller can observe
-/// bounded migration progress through `get_watch_state`/`GET /v1/watch/status`; a nonzero repair
-/// count requires restoring those rows before retrying.
-fn watch_floor_reconciliation_required_error(state: &WatchState) -> ExecError {
-    let next_step = if state.agent_floor_unreadable_ledger_keys.is_empty() {
-        "daemon: retry GET /v1/watch/status until the bounded ledger backlog converges; \
-         standalone: re-run the same tick until it converges"
-    } else {
-        "restore the unreadable ledger rows from backup, then retry the applicable daemon GET \
-         /v1/watch/status or standalone tick"
-    };
-    ExecError::Permanent(format!(
-        "journal: watch-state floor reconciliation is incomplete \
-          (scan high-water {}, {} unreadable rows); {next_step}",
-        state.agent_floor_scan_high_water,
-        state.agent_floor_unreadable_ledger_keys.len(),
-    ))
-}
-
-/// Narrow classifier for the *valid-or-repair* allocation fence emitted above. Scheduler retry
-/// policy must not treat a tail/counter fence, arbitrary storage error, or another cycle failure as
-/// a reason to spin merely because a stale WatchState happens to show backlog.
-pub(crate) fn is_watch_floor_reconciliation_required(error: &ExecError) -> bool {
-    matches!(
-        error,
-        ExecError::Permanent(message)
-            if message.starts_with(
-                "journal: watch-state floor reconciliation is incomplete"
-            )
-    )
-}
-
-fn remember_unreadable_watch_ledger_key(
-    unreadable_keys: &mut BTreeSet<Vec<u8>>,
-    raw_key: Vec<u8>,
-) -> Result<(), ExecError> {
-    if unreadable_keys.contains(&raw_key) {
-        return Ok(());
-    }
-    if unreadable_keys.len() == WATCH_FLOOR_UNREADABLE_KEY_LIMIT {
-        return Err(watch_floor_repair_bound_error(
-            "has more unreadable or missing ledger rows than the repair bound",
-        ));
-    }
-    unreadable_keys.insert(raw_key);
-    Ok(())
-}
-
-/// Direct-read at most one bounded range of canonical ledger rows. If existing unreadable repair
-/// work fills the durable key budget, retain it and make no speculative progress: advancing past a
-/// new missing row we cannot name would falsely certify the floor.
-async fn scan_watch_floor_ledger_chunk(
-    dbtx: &mut impl IDatabaseTransactionOpsCore,
-    start: u64,
-    next_seq: u64,
-    max_agent_occurrence: &mut u64,
-    unreadable_keys: &mut BTreeSet<Vec<u8>>,
-) -> Result<u64, ExecError> {
-    if unreadable_keys.len() == WATCH_FLOOR_UNREADABLE_KEY_LIMIT {
-        return Ok(start);
-    }
-    let end = start
-        .saturating_add(WATCH_FLOOR_UNREADABLE_KEY_LIMIT as u64)
-        .min(next_seq);
-    for seq in start..end {
-        let key = ledger_row_key(seq);
-        match dbtx.raw_get_bytes(&key).await.map_err(db_err)? {
-            None => {
-                warn_missing_watch_ledger_row(&key);
-                remember_unreadable_watch_ledger_key(unreadable_keys, key)?;
-            }
-            Some(value) => {
-                if let Err(error) = observe_agent_occurrence(&key, &value, max_agent_occurrence) {
-                    warn_unreadable_watch_ledger_row(&error, &key);
-                    remember_unreadable_watch_ledger_key(unreadable_keys, key)?;
-                }
-            }
-        }
-        if unreadable_keys.len() == WATCH_FLOOR_UNREADABLE_KEY_LIMIT {
-            return Ok(seq.saturating_add(1));
-        }
-    }
-    Ok(end)
 }
 
 // --- repair support (spec §10.3) -------------------------------------------------------
@@ -6383,48 +5932,32 @@ fn read_be64(bytes: &[u8]) -> Option<u64> {
     <[u8; 8]>::try_from(bytes).ok().map(u64::from_be_bytes)
 }
 
-/// Note every Agent ledger append in the same transaction. An initialized, reconciled WatchState
-/// advances its exclusive scan frontier only when that frontier exactly names this append's
-/// sequence: jumping a partial or stale frontier would falsely certify unseen history. User appends
-/// return before reading WatchState, leaving their suffix for the next bounded drain.
+/// Raise the durable Agent occurrence floor in the SAME transaction as an Agent ledger append.
 ///
-/// If migration has a valid backlog, this transaction cannot commit its progress without also
-/// committing the caller's prospective admission. Fail closed instead; callers must use
-/// `get_watch_state` (and therefore `/v1/watch/status`) to converge the bounded migration first.
+/// `advance_watch_occurrence` and `observe_watch_occurrence` cover the daemon scheduler and the
+/// standalone tick, but `wallet-core`'s admission surface is public (ADR-0031), so an in-process
+/// caller can journal an Agent row without either. Keeping the checkpoint monotonically at or above
+/// every journaled Agent occurrence is what lets a replacement child be strictly newer than the
+/// parent it retires. Sealing that public surface is `br-seal-agent-admission-yfr`.
+///
+/// User appends deliberately do not touch this row: they carry no allocator authority, and reading
+/// and rewriting a single hot row on every user operation would be a needless write hotspot.
 async fn note_ledger_insert_in(
     dbtx: &mut impl IDatabaseTransactionOpsCore,
     record: &OperationRecord,
-    seq: u64,
 ) -> Result<(), ExecError> {
-    // User appends have no allocator authority. In particular, never read or rewrite the hot
-    // WatchState row on their path: the next drain/Agent admission scans their suffix durably.
-    // This trades immediate frontier maintenance for avoiding a global write hotspot on user ops.
-    if matches!(record.actor, Actor::User) {
+    let Actor::Agent { occurrence } = record.actor else {
+        return Ok(());
+    };
+    let raw_watch_key = watch_state_key();
+    let mut watch = match dbtx.raw_get_bytes(&raw_watch_key).await.map_err(db_err)? {
+        Some(bytes) => decode_row_result::<WatchState>("watch state", &raw_watch_key, &bytes)?,
+        None => WatchState::default(),
+    };
+    if watch.occurrence >= occurrence.0 {
         return Ok(());
     }
-
-    let raw_watch_key = watch_state_key();
-    let watch_bytes = dbtx.raw_get_bytes(&raw_watch_key).await.map_err(db_err)?;
-    let Actor::Agent { occurrence } = record.actor else {
-        unreachable!("User rows returned before WatchState access");
-    };
-    let mut watch =
-        watch_state_with_agent_floor_at_next_in(dbtx, &raw_watch_key, watch_bytes, seq).await?;
-    if !watch.agent_floor_reconciled {
-        return Err(watch_floor_reconciliation_required_error(&watch));
-    }
-    watch.occurrence = watch.occurrence.max(occurrence.0);
-    let inserted_high_water = seq.checked_add(1).ok_or_else(|| {
-        ExecError::Permanent("journal: ledger sequence exhausted at u64::MAX".to_owned())
-    })?;
-    if !(watch.agent_floor_scan_initialized
-        && watch.agent_floor_reconciled
-        && watch.agent_floor_scan_high_water == seq)
-    {
-        return Err(watch_floor_reconciliation_required_error(&watch));
-    }
-    // The row is being inserted in this transaction and is therefore known readable.
-    watch.agent_floor_scan_high_water = inserted_high_water;
+    watch.occurrence = occurrence.0;
     dbtx.raw_insert_bytes(&raw_watch_key, &encode_row(&watch)?)
         .await
         .map_err(db_err)?;
@@ -6469,10 +6002,8 @@ async fn ledger_upsert_in(
         let (next_seq, successor) = next_ledger_sequence_in(dbtx).await?;
         if let Some(rec) = build(None, next_seq) {
             // An Agent ledger admission can be made by public paths that never touch the watch
-            // scheduler. Raise the durable floor and its append-only scan high-water in this SAME
-            // transaction. A legacy checkpoint is initialized through its bounded canonical cursor,
-            // never by assuming historical rows were readable.
-            note_ledger_insert_in(dbtx, &rec, next_seq).await?;
+            // scheduler. Raise the durable occurrence floor in this SAME transaction.
+            note_ledger_insert_in(dbtx, &rec).await?;
             dbtx.raw_insert_bytes(&ledger_counter_key(), &successor.to_be_bytes())
                 .await
                 .map_err(db_err)?;
@@ -6897,15 +6428,6 @@ fn db_err(e: DatabaseError) -> ExecError {
     ExecError::Retryable(format!("journal db error: {e}"))
 }
 
-/// Keep all optimistic WatchState read/check/write operations on the same repository error
-/// boundary as the other journal autocommits.
-fn map_autocommit_error(error: AutocommitError<ExecError>) -> ExecError {
-    match error {
-        AutocommitError::CommitFailed { last_error, .. } => db_err(last_error),
-        AutocommitError::ClosureError { error, .. } => error,
-    }
-}
-
 #[derive(serde::Serialize)]
 struct StoredRowRef<'a, T> {
     version: u8,
@@ -7063,352 +6585,24 @@ mod replacement_foundation_tests {
             .expect("seed non-Tick Agent ledger row");
     }
 
-    /// Seed a legacy checkpoint with more canonical valid rows than one migration access can read.
-    /// The one Agent row inside the first chunk makes the post-convergence successor deterministic.
-    async fn seed_legacy_valid_watch_backlog(journal: &FedimintJournal) {
-        seed_agent_refusal(journal, 29).await;
-        journal
-            .put_watch_state(&WatchState::default())
-            .await
-            .expect("replace the current checkpoint with a legacy shape");
-        let mut valid = journal
-            .history(10, None)
-            .await
-            .expect("read valid ledger template")
-            .into_iter()
-            .next()
-            .expect("seed Agent refusal exists");
-        valid.actor = Actor::User;
-        let mut dbtx = journal.db.begin_transaction().await;
-        for seq in 1..=WATCH_FLOOR_UNREADABLE_KEY_LIMIT as u64 {
-            valid.seq = seq;
-            if seq == 10 {
-                valid.actor = Actor::Agent {
-                    occurrence: Occurrence(73),
-                };
-            } else {
-                valid.actor = Actor::User;
-            }
-            dbtx.raw_insert_bytes(
-                &ledger_row_key(seq),
-                &encode_row(&valid).expect("encode valid backlog row"),
-            )
-            .await
-            .expect("seed canonical valid backlog row");
-        }
-        dbtx.raw_insert_bytes(
-            &ledger_counter_key(),
-            &(WATCH_FLOOR_UNREADABLE_KEY_LIMIT as u64 + 1).to_be_bytes(),
-        )
-        .await
-        .expect("publish valid backlog counter");
-        dbtx.commit_tx_result()
-            .await
-            .expect("commit valid legacy backlog");
-    }
-
-    #[tokio::test]
-    async fn advance_and_observe_immediately_drain_valid_multi_chunk_backlog() {
-        let journal = make_journal();
-        seed_legacy_valid_watch_backlog(&journal).await;
-
-        assert_eq!(
-            journal
-                .advance_watch_occurrence()
-                .await
-                .expect(
-                    "advance drains valid chunks without waiting for status or scheduler cadence"
-                )
-                .occurrence,
-            74,
-            "the first allocation is strictly greater than the historical Agent maximum"
-        );
-
-        journal
-            .put_watch_state(&WatchState::default())
-            .await
-            .expect("repeat from a legacy checkpoint for standalone observation");
-        assert!(
-            journal
-                .observe_watch_occurrence(90)
-                .await
-                .expect("standalone observation drains valid backlog immediately")
-                .agent_floor_reconciled
-        );
-        assert_eq!(
-            journal
-                .observe_watch_occurrence(90)
-                .await
-                .expect("observe remains monotonic after immediate drain")
-                .occurrence,
-            90
-        );
-    }
-
-    #[tokio::test]
-    async fn autocommit_retries_a_forced_concurrent_watch_advance_conflict() {
-        let journal = Arc::new(make_journal());
-        journal
-            .get_watch_state()
-            .await
-            .expect("seed reconciled empty state");
-        journal.rendezvous_two_watch_state_autocommits_for_test();
-        let (left, right) = tokio::join!(
-            journal.advance_watch_occurrence(),
-            journal.advance_watch_occurrence()
-        );
-        let mut occurrences = [
-            left.expect("left advance").occurrence,
-            right.expect("right advance").occurrence,
-        ];
-        occurrences.sort_unstable();
-        assert_eq!(
-            occurrences,
-            [1, 2],
-            "one autocommit closure must retry its stale read rather than losing an occurrence"
-        );
-        assert_eq!(
-            journal
-                .get_watch_state()
-                .await
-                .expect("read authoritative state")
-                .occurrence,
-            2
-        );
-    }
-
-    #[tokio::test]
-    async fn forced_migration_get_and_advance_conflict_preserves_floor_and_allocation() {
-        let journal = Arc::new(make_journal());
-        seed_legacy_valid_watch_backlog(journal.as_ref()).await;
-        journal.rendezvous_two_watch_state_autocommits_for_test();
-        let (migration, advance) = tokio::join!(
-            journal.get_watch_state(),
-            journal.advance_watch_occurrence()
-        );
-        assert!(
-            migration.is_ok(),
-            "migration reader retries its forced stale snapshot"
-        );
-        let advanced = advance.expect("advance retries after migration conflict");
-        assert_eq!(advanced.occurrence, 74);
-        assert!(advanced.agent_floor_reconciled);
-        assert_eq!(
-            advanced.agent_floor_scan_high_water,
-            WATCH_FLOOR_UNREADABLE_KEY_LIMIT as u64 + 1
-        );
-    }
-
-    #[tokio::test]
-    async fn forced_discovery_and_advance_conflict_preserves_both_fields() {
-        let journal = Arc::new(make_journal());
-        journal
-            .get_watch_state()
-            .await
-            .expect("seed reconciled watch state");
-        journal.rendezvous_two_watch_state_autocommits_for_test();
-        let (discovery, advance) = tokio::join!(
-            journal.put_watch_discovery_state(
-                Some(FederationId([0x33; 32])),
-                true,
-                Some(77),
-                vec![]
-            ),
-            journal.advance_watch_occurrence()
-        );
-        assert_eq!(advance.expect("advance").occurrence, 1);
-        let discovery = discovery.expect("discovery update retries its stale snapshot");
-        assert_eq!(discovery.occurrence, 1);
-        assert_eq!(discovery.discover_cursor, Some(FederationId([0x33; 32])));
-        assert!(discovery.discover_backlog);
-        assert_eq!(discovery.last_discover_ms, 77);
-    }
-
-    #[tokio::test]
-    async fn opaque_canonical_row_fences_high_legacy_watch_state_until_exact_restore() {
-        let journal = make_journal();
-        seed_agent_refusal(&journal, 29).await;
-        journal
-            .put_watch_state(&WatchState {
-                // A nonzero/high old scalar is still not an allocation proof: the opaque canonical
-                // row may encode any u64 Agent occurrence. Old direct Agent admissions could also
-                // have left this scalar below their ledger row, so neither direction is authority.
-                occurrence: 9_000,
-                last_discover_ms: 17,
-                ..WatchState::default()
-            })
-            .await
-            .expect("seed legacy checkpoint");
-        let row_key = ledger_row_key(0);
-        let mut dbtx = journal.db.begin_transaction_nc().await;
-        let original = dbtx
-            .raw_get_bytes(&row_key)
-            .await
-            .expect("read valid row for later restore")
-            .expect("seed row exists");
-        drop(dbtx);
-        let mut dbtx = journal.db.begin_transaction().await;
-        dbtx.raw_insert_bytes(&row_key, b"corrupt Agent row")
-            .await
-            .expect("corrupt canonical row");
-        dbtx.commit_tx_result().await.expect("commit corruption");
-
-        assert!(
-            journal.advance_watch_occurrence().await.is_err(),
-            "unreadable canonical row must block occurrence allocation"
-        );
-        assert!(
-            journal.observe_watch_occurrence(9_001).await.is_err(),
-            "a supplied standalone observation cannot override an opaque canonical occurrence"
-        );
-        let blocked_key = IdempotencyKey("refuse:watch-floor:opaque-blocked-direct".to_owned());
-        let blocked_decision = AllocatorDecision {
-            action: Action::RefuseInflow {
-                fed: fed(1),
-                reason: ReasonCode::SpendingBelowTarget,
-                diagnostics: Default::default(),
-            },
-            reason: ReasonCode::SpendingBelowTarget,
-            occurrence: Occurrence(9_001),
-            idempotency_key: blocked_key.clone(),
-        };
-        assert!(
-            journal
-                .record_refusals(
-                    std::slice::from_ref(&blocked_decision),
-                    Occurrence(9_001),
-                    NOW,
-                )
-                .await
-                .is_err(),
-            "a fresh direct Agent append cannot bypass an unreadable canonical occurrence"
-        );
-        let blocked = journal
-            .get_watch_state()
-            .await
-            .expect("status remains available while repair is required");
-        assert!(!blocked.agent_floor_reconciled);
-        assert_eq!(
-            blocked.agent_floor_unreadable_ledger_keys,
-            vec![row_key.clone()]
-        );
-        assert_eq!(
-            journal
-                .get(&blocked_key)
-                .await
-                .expect("read blocked fresh append"),
-            None,
-            "the blocked Agent admission creates neither an intent nor a ledger row"
-        );
-
-        let mut dbtx = journal.db.begin_transaction().await;
-        dbtx.raw_insert_bytes(&row_key, &original)
-            .await
-            .expect("restore exact valid row");
-        dbtx.commit_tx_result()
-            .await
-            .expect("commit row restoration");
-        assert!(
-            journal
-                .get_watch_state()
-                .await
-                .expect("restored row converges status")
-                .agent_floor_reconciled
-        );
-        assert_eq!(
-            journal
-                .advance_watch_occurrence()
-                .await
-                .expect("allocation resumes only after valid restore")
-                .occurrence,
-            9_001
-        );
-        journal
-            .record_refusals(&[blocked_decision], Occurrence(9_002), NOW)
-            .await
-            .expect("a fresh Agent append resumes only after exact-row restoration");
-        assert_eq!(
-            journal
-                .get_watch_state()
-                .await
-                .expect("read converged restored checkpoint")
-                .occurrence,
-            9_002,
-            "the restored canonical scan and new direct Agent append share one durable floor"
-        );
-    }
-
-    #[tokio::test]
-    async fn direct_agent_admission_cannot_bypass_unreconciled_watch_floor() {
-        let journal = make_journal();
-        seed_legacy_valid_watch_backlog(&journal).await;
-        let key = IdempotencyKey("refuse:watch-floor:blocked-direct".to_owned());
+    /// A direct Agent ledger admission, which allocates a sequence through the validated
+    /// counter/tail check. Returns whether it was admitted.
+    async fn direct_agent_admission_succeeds(journal: &FedimintJournal, occurrence: u64) -> bool {
+        let reason = ReasonCode::SpendingBelowTarget;
         let decision = AllocatorDecision {
             action: Action::RefuseInflow {
                 fed: fed(1),
-                reason: ReasonCode::SpendingBelowTarget,
+                reason,
                 diagnostics: Default::default(),
             },
-            reason: ReasonCode::SpendingBelowTarget,
-            occurrence: Occurrence(90),
-            idempotency_key: key.clone(),
+            reason,
+            occurrence: Occurrence(occurrence),
+            idempotency_key: IdempotencyKey(format!("refuse:tail-probe:{occurrence}")),
         };
-        assert!(
-            journal
-                .record_refusals(std::slice::from_ref(&decision), Occurrence(90), NOW)
-                .await
-                .is_err(),
-            "direct Agent admission must fail closed before a partial floor can be certified"
-        );
-        let mut dbtx = journal.db.begin_transaction_nc().await;
-        assert!(dbtx
-            .raw_get_bytes(&ledger_row_key(257))
-            .await
-            .expect("inspect prospective ledger row")
-            .is_none());
-        assert!(dbtx
-            .raw_get_bytes(&ledger_key_index(&key))
-            .await
-            .expect("inspect prospective key index")
-            .is_none());
-        assert!(
-            dbtx.raw_get_bytes(&ledger_counter_key())
-                .await
-                .expect("inspect ledger counter")
-                .is_some_and(|counter| read_be64(&counter) == Some(257)),
-            "blocked admission must not allocate or burn a ledger sequence"
-        );
-        drop(dbtx);
-
-        assert!(
-            !journal
-                .get_watch_state()
-                .await
-                .expect("first status chunk remains observable")
-                .agent_floor_reconciled
-        );
-        assert!(
-            journal
-                .get_watch_state()
-                .await
-                .expect("second status chunk converges")
-                .agent_floor_reconciled
-        );
         journal
-            .record_refusals(&[decision], Occurrence(90), NOW)
+            .record_refusals(&[decision], Occurrence(occurrence), NOW)
             .await
-            .expect("direct Agent admission succeeds after status convergence");
-        let mut dbtx = journal.db.begin_transaction_nc().await;
-        assert!(dbtx
-            .raw_get_bytes(&ledger_row_key(257))
-            .await
-            .expect("read admitted ledger row")
-            .is_some());
-        assert!(dbtx
-            .raw_get_bytes(&ledger_key_index(&key))
-            .await
-            .expect("read admitted key index")
-            .is_some());
+            .is_ok()
     }
 
     #[tokio::test]
@@ -7439,7 +6633,7 @@ mod replacement_foundation_tests {
             .await
             .expect("commit missing-counter mismatch");
         assert!(
-            journal.get_watch_state().await.is_err(),
+            !direct_agent_admission_succeeds(&journal, 82).await,
             "a missing counter cannot hide the physical high Agent tail"
         );
 
@@ -7676,231 +6870,6 @@ mod replacement_foundation_tests {
     }
 
     #[tokio::test]
-    async fn mismatched_ledger_row_sequence_remains_unreadable_until_repaired() {
-        let journal = make_journal();
-        seed_agent_refusal(&journal, 29).await;
-        journal
-            .put_watch_state(&WatchState::default())
-            .await
-            .expect("seed legacy checkpoint");
-        let key = ledger_row_key(0);
-        let mut row = journal
-            .history(10, None)
-            .await
-            .expect("read valid row")
-            .into_iter()
-            .next()
-            .expect("seed row exists");
-        row.seq = 7;
-        let mut dbtx = journal.db.begin_transaction().await;
-        dbtx.raw_insert_bytes(&key, &encode_row(&row).expect("encode mismatched row"))
-            .await
-            .expect("seed valid JSON with mismatched sequence");
-        dbtx.commit_tx_result()
-            .await
-            .expect("commit sequence mismatch");
-
-        let first = journal
-            .get_watch_state()
-            .await
-            .expect("status records a sequence mismatch as repair work");
-        assert!(!first.agent_floor_reconciled);
-        assert_eq!(first.agent_floor_unreadable_ledger_keys, vec![key.clone()]);
-        let retry = journal
-            .get_watch_state()
-            .await
-            .expect("unrepaired valid JSON must remain unreadable");
-        assert!(!retry.agent_floor_reconciled);
-        assert_eq!(retry.agent_floor_unreadable_ledger_keys, vec![key]);
-    }
-
-    #[tokio::test]
-    async fn short_valid_agent_key_is_skipped_by_history_budget_and_watch_floor() {
-        let journal = make_journal();
-        seed_agent_refusal(&journal, 29).await;
-        let mut malformed = journal
-            .history(10, None)
-            .await
-            .expect("read canonical Agent template")
-            .into_iter()
-            .next()
-            .expect("canonical Agent row exists");
-        malformed.seq = 0;
-        malformed.actor = Actor::Agent {
-            occurrence: Occurrence(99),
-        };
-        let short_key = vec![TAG_LEDGER_ROW, 0];
-        let mut dbtx = journal.db.begin_transaction().await;
-        dbtx.raw_insert_bytes(
-            &short_key,
-            &encode_row(&malformed).expect("encode valid Agent-shaped poison"),
-        )
-        .await
-        .expect("seed short ledger key");
-        dbtx.commit_tx_result()
-            .await
-            .expect("commit short ledger key");
-
-        let report = journal
-            .scan_ledger_rows_report()
-            .await
-            .expect("scan tolerates malformed key as poison");
-        assert_eq!(report.skipped_rows, 1);
-        assert!(
-            report
-                .rows
-                .iter()
-                .all(|row| !matches!(row.actor, Actor::Agent { occurrence } if occurrence.0 == 99)),
-            "a short key must not become Agent history evidence"
-        );
-        assert!(journal
-            .history(10, None)
-            .await
-            .expect("public history omits malformed keys")
-            .iter()
-            .all(|row| !matches!(row.actor, Actor::Agent { occurrence } if occurrence.0 == 99)));
-        assert!(
-            journal.probe_budget_ledger_rows(NOW, 1).await.is_err(),
-            "hard probe-budget reconstruction must fail closed on malformed ledger key poison"
-        );
-
-        journal
-            .put_watch_state(&WatchState::default())
-            .await
-            .expect("force canonical watch-floor migration");
-        let watch = journal
-            .get_watch_state()
-            .await
-            .expect("tail and canonical counter range ignore noncanonical extra key");
-        assert!(watch.agent_floor_reconciled);
-        assert_eq!(
-            watch.occurrence, 29,
-            "watch floor uses only canonical counter-addressable Agent rows"
-        );
-    }
-
-    #[tokio::test]
-    async fn direct_agent_ledger_admission_raises_and_reconciles_watch_floor() {
-        let journal = make_journal();
-        seed_agent_refusal(&journal, 29).await;
-
-        let state = journal
-            .get_watch_state()
-            .await
-            .expect("recover watch floor");
-        assert_eq!(state.occurrence, 29);
-        let mut dbtx = journal.db.begin_transaction_nc().await;
-        let bytes = dbtx
-            .raw_get_bytes(&watch_state_key())
-            .await
-            .expect("inspect watch row")
-            .expect("Agent ledger admission creates watch floor");
-        let persisted: WatchState =
-            decode_row_result("watch state", &watch_state_key(), &bytes).expect("decode watch row");
-        assert_eq!(persisted.occurrence, 29);
-        assert!(persisted.agent_floor_reconciled);
-    }
-
-    #[tokio::test]
-    async fn reconciled_watch_reads_fail_closed_on_an_out_of_counter_tail() {
-        let journal = make_journal();
-        seed_agent_refusal(&journal, 29).await;
-        let initialized = journal
-            .get_watch_state()
-            .await
-            .expect("first access completes the one-time legacy migration");
-        assert!(initialized.agent_floor_reconciled);
-        assert!(initialized.agent_floor_scan_initialized);
-
-        // The O(1) tail check must reject a row the allocation counter does not cover, even after
-        // a prior reconciliation. Otherwise a low counter could hide a high Agent occurrence.
-        let mut dbtx = journal.db.begin_transaction().await;
-        dbtx.raw_insert_bytes(&ledger_row_key(999), b"not valid json")
-            .await
-            .expect("seed out-of-counter poison ledger tail");
-        dbtx.commit_tx_result().await.expect("commit poison row");
-
-        assert!(
-            journal.get_watch_state().await.is_err(),
-            "a tail beyond the counter is inconsistent append state, not ignorable poison"
-        );
-    }
-
-    #[tokio::test]
-    async fn unreconciled_watch_floor_retries_only_tracked_counter_rows_and_appended_rows() {
-        let journal = make_journal();
-        seed_agent_refusal(&journal, 29).await;
-        journal
-            .put_watch_state(&WatchState::default())
-            .await
-            .expect("seed legacy checkpoint without migration metadata");
-        let tracked_key = ledger_row_key(1);
-        let mut dbtx = journal.db.begin_transaction().await;
-        dbtx.raw_insert_bytes(&tracked_key, b"not valid json")
-            .await
-            .expect("seed corrupt canonical counter row");
-        dbtx.raw_insert_bytes(&ledger_counter_key(), &2_u64.to_be_bytes())
-            .await
-            .expect("publish the corrupt canonical row");
-        dbtx.commit_tx_result().await.expect("commit corrupt row");
-
-        let first = journal
-            .get_watch_state()
-            .await
-            .expect("first migration records exact unreadable key");
-        assert_eq!(first.occurrence, 29);
-        assert!(first.agent_floor_scan_initialized);
-        assert!(!first.agent_floor_reconciled);
-        assert_eq!(
-            first.agent_floor_unreadable_ledger_keys,
-            vec![tracked_key.clone()]
-        );
-        assert_eq!(
-            first.agent_floor_scan_high_water, 2,
-            "the bounded initial scan reaches the published counter high-water"
-        );
-
-        let mut repaired = journal
-            .history(10, None)
-            .await
-            .expect("read a valid row shape")
-            .into_iter()
-            .next()
-            .expect("Agent refusal exists");
-        repaired.seq = 1;
-        repaired.actor = Actor::Agent {
-            occurrence: Occurrence(47),
-        };
-        let mut dbtx = journal.db.begin_transaction().await;
-        dbtx.raw_insert_bytes(
-            &tracked_key,
-            &encode_row(&repaired).expect("encode repaired row"),
-        )
-        .await
-        .expect("restore tracked row from valid data");
-        dbtx.commit_tx_result()
-            .await
-            .expect("commit operator repair");
-
-        let repaired = journal
-            .get_watch_state()
-            .await
-            .expect("bounded retry accepts repaired tracked row");
-        assert!(
-            repaired.agent_floor_reconciled,
-            "only the exact tracked canonical key and direct appended sequences are reconsidered"
-        );
-        assert!(
-            repaired.agent_floor_unreadable_ledger_keys.is_empty(),
-            "a valid repair clears the exact durable retry key"
-        );
-        assert_eq!(
-            repaired.occurrence, 47,
-            "a repaired Agent row still raises the durable floor"
-        );
-    }
-
-    #[tokio::test]
     async fn counter_hole_fails_closed_until_the_physical_tail_is_restored() {
         let journal = make_journal();
         seed_agent_refusal(&journal, 29).await;
@@ -7916,8 +6885,8 @@ mod replacement_foundation_tests {
         dbtx.commit_tx_result().await.expect("commit counter hole");
 
         assert!(
-            journal.get_watch_state().await.is_err(),
-            "a counter hole is inconsistent append state and cannot be migrated past"
+            !direct_agent_admission_succeeds(&journal, 44).await,
+            "a counter hole is inconsistent append state and cannot be appended past"
         );
 
         let mut restored = journal
@@ -7942,13 +6911,19 @@ mod replacement_foundation_tests {
             .await
             .expect("commit valid hole restoration");
 
-        let repaired = journal
-            .get_watch_state()
-            .await
-            .expect("restored physical tail completes bounded reconciliation");
-        assert!(repaired.agent_floor_reconciled);
-        assert!(repaired.agent_floor_unreadable_ledger_keys.is_empty());
-        assert_eq!(repaired.occurrence, 43);
+        assert!(
+            direct_agent_admission_succeeds(&journal, 44).await,
+            "a restored physical tail makes the append sequence knowable again"
+        );
+        assert_eq!(
+            journal
+                .get_watch_state()
+                .await
+                .expect("read the checkpoint raised by the admitted append")
+                .occurrence,
+            44,
+            "an Agent append raises the durable occurrence floor in its own transaction"
+        );
     }
 
     #[tokio::test]
@@ -7963,676 +6938,9 @@ mod replacement_foundation_tests {
             .expect("commit corrupt huge counter");
 
         assert!(
-            journal.get_watch_state().await.is_err(),
-            "a nonzero counter with no tail cannot safely name a bounded canonical range"
+            !direct_agent_admission_succeeds(&journal, 7).await,
+            "a nonzero counter with no ledger tail cannot name a safe append sequence"
         );
-    }
-
-    #[tokio::test]
-    async fn counter_hole_fails_closed_before_watch_floor_migration() {
-        let journal = make_journal();
-        seed_agent_refusal(&journal, 29).await;
-        let mut dbtx = journal.db.begin_transaction().await;
-        dbtx.raw_insert_bytes(&ledger_counter_key(), &2_u64.to_be_bytes())
-            .await
-            .expect("append a counter sequence without its row");
-        dbtx.commit_tx_result().await.expect("commit appended hole");
-
-        assert!(
-            journal.get_watch_state().await.is_err(),
-            "the counter must not claim a successor beyond the physical ledger tail"
-        );
-    }
-
-    #[tokio::test]
-    async fn unreconciled_valid_appended_range_over_bound_converges_in_bounded_chunks() {
-        let journal = make_journal();
-        seed_agent_refusal(&journal, 29).await;
-        let checkpoint = WatchState {
-            occurrence: 29,
-            agent_floor_scan_initialized: true,
-            agent_floor_scan_high_water: 1,
-            agent_floor_unreadable_ledger_keys: vec![ledger_row_key(0)],
-            ..WatchState::default()
-        };
-        journal
-            .put_watch_state(&checkpoint)
-            .await
-            .expect("seed unresolved bounded-retry checkpoint");
-        let mut valid = journal
-            .history(10, None)
-            .await
-            .expect("read valid ledger shape")
-            .into_iter()
-            .next()
-            .expect("Agent refusal exists");
-        valid.actor = Actor::User;
-        let mut dbtx = journal.db.begin_transaction().await;
-        dbtx.raw_insert_bytes(&ledger_row_key(0), b"still corrupt")
-            .await
-            .expect("seed the one pending repair key");
-        for seq in 1..=WATCH_FLOOR_UNREADABLE_KEY_LIMIT as u64 + 1 {
-            valid.seq = seq;
-            dbtx.raw_insert_bytes(
-                &ledger_row_key(seq),
-                &encode_row(&valid).expect("encode valid appended row"),
-            )
-            .await
-            .expect("append a valid row");
-        }
-        dbtx.raw_insert_bytes(
-            &ledger_counter_key(),
-            &(WATCH_FLOOR_UNREADABLE_KEY_LIMIT as u64 + 2).to_be_bytes(),
-        )
-        .await
-        .expect("publish more than one chunk of valid appends");
-        dbtx.commit_tx_result()
-            .await
-            .expect("commit valid appended range");
-
-        let first = journal
-            .get_watch_state()
-            .await
-            .expect("first access processes only one bounded chunk");
-        assert!(!first.agent_floor_reconciled);
-        assert_eq!(
-            first.agent_floor_scan_high_water,
-            WATCH_FLOOR_UNREADABLE_KEY_LIMIT as u64 + 1
-        );
-        let second = journal
-            .get_watch_state()
-            .await
-            .expect("second access completes the valid append backlog");
-        assert_eq!(
-            second.agent_floor_scan_high_water,
-            WATCH_FLOOR_UNREADABLE_KEY_LIMIT as u64 + 2
-        );
-        assert!(
-            !second.agent_floor_reconciled,
-            "the one original corrupt key remains unresolved while valid rows converge"
-        );
-
-        valid.seq = 0;
-        let mut dbtx = journal.db.begin_transaction().await;
-        dbtx.raw_insert_bytes(
-            &ledger_row_key(0),
-            &encode_row(&valid).expect("encode repaired key"),
-        )
-        .await
-        .expect("restore exact corrupt key");
-        dbtx.commit_tx_result().await.expect("commit exact repair");
-        assert!(
-            journal
-                .get_watch_state()
-                .await
-                .expect("repair clears after backlog converged")
-                .agent_floor_reconciled
-        );
-    }
-
-    #[tokio::test]
-    async fn valid_appended_backlog_reports_false_with_zero_unreadable_rows_until_caught_up() {
-        let journal = make_journal();
-        seed_agent_refusal(&journal, 29).await;
-        journal
-            .put_watch_state(&WatchState {
-                occurrence: 29,
-                agent_floor_scan_initialized: true,
-                agent_floor_scan_high_water: 1,
-                ..WatchState::default()
-            })
-            .await
-            .expect("seed an initialized scan frontier behind valid append-only rows");
-
-        let mut valid = journal
-            .history(10, None)
-            .await
-            .expect("read valid ledger shape")
-            .into_iter()
-            .next()
-            .expect("Agent refusal exists");
-        valid.actor = Actor::User;
-        let mut dbtx = journal.db.begin_transaction().await;
-        for seq in 1..=WATCH_FLOOR_UNREADABLE_KEY_LIMIT as u64 + 1 {
-            valid.seq = seq;
-            dbtx.raw_insert_bytes(
-                &ledger_row_key(seq),
-                &encode_row(&valid).expect("encode valid appended row"),
-            )
-            .await
-            .expect("append valid row");
-        }
-        dbtx.raw_insert_bytes(
-            &ledger_counter_key(),
-            &(WATCH_FLOOR_UNREADABLE_KEY_LIMIT as u64 + 2).to_be_bytes(),
-        )
-        .await
-        .expect("publish more than one bounded chunk");
-        dbtx.commit_tx_result()
-            .await
-            .expect("commit valid append backlog");
-
-        let first = journal
-            .get_watch_state()
-            .await
-            .expect("first bounded backlog scan");
-        assert!(!first.agent_floor_reconciled);
-        assert!(
-            first.agent_floor_unreadable_ledger_keys.is_empty(),
-            "false reconciliation with no keys is valid scan backlog, not repair work"
-        );
-        assert_eq!(
-            first.agent_floor_scan_high_water,
-            WATCH_FLOOR_UNREADABLE_KEY_LIMIT as u64 + 1
-        );
-
-        let complete = journal
-            .get_watch_state()
-            .await
-            .expect("second bounded scan catches up");
-        assert!(complete.agent_floor_reconciled);
-        assert!(complete.agent_floor_unreadable_ledger_keys.is_empty());
-        assert_eq!(
-            complete.agent_floor_scan_high_water,
-            WATCH_FLOOR_UNREADABLE_KEY_LIMIT as u64 + 2
-        );
-    }
-
-    #[tokio::test]
-    async fn initialized_watch_state_agent_insert_updates_floor_and_high_water_without_migration() {
-        let journal = make_journal();
-        journal
-            .put_watch_state(&WatchState {
-                occurrence: 3,
-                agent_floor_reconciled: true,
-                agent_floor_scan_initialized: true,
-                ..WatchState::default()
-            })
-            .await
-            .expect("seed initialized reconciled state");
-        seed_agent_refusal(&journal, 29).await;
-
-        let mut dbtx = journal.db.begin_transaction_nc().await;
-        let bytes = dbtx
-            .raw_get_bytes(&watch_state_key())
-            .await
-            .expect("read raw watch row")
-            .expect("Agent insert keeps watch state durable");
-        let state: WatchState =
-            decode_row_result("watch state", &watch_state_key(), &bytes).expect("decode raw row");
-        assert_eq!(state.occurrence, 29);
-        assert_eq!(state.agent_floor_scan_high_water, 1);
-        assert!(state.agent_floor_scan_initialized);
-        assert!(state.agent_floor_reconciled);
-    }
-
-    #[tokio::test]
-    async fn agent_insert_is_fenced_while_a_partial_scan_has_prior_sequences() {
-        let journal = make_journal();
-        seed_agent_refusal(&journal, 29).await;
-        let mut valid = journal
-            .history(10, None)
-            .await
-            .expect("read valid ledger shape")
-            .into_iter()
-            .next()
-            .expect("Agent refusal exists");
-        valid.seq = 2;
-        valid.actor = Actor::User;
-        let mut dbtx = journal.db.begin_transaction().await;
-        dbtx.raw_insert_bytes(
-            &ledger_row_key(2),
-            &encode_row(&valid).expect("encode valid prior row"),
-        )
-        .await
-        .expect("seed later valid row while sequence 1 remains absent");
-        dbtx.raw_insert_bytes(&ledger_counter_key(), &3_u64.to_be_bytes())
-            .await
-            .expect("publish prior counter range");
-        dbtx.commit_tx_result()
-            .await
-            .expect("commit partial backlog");
-        journal
-            .put_watch_state(&WatchState {
-                occurrence: 29,
-                agent_floor_scan_initialized: true,
-                agent_floor_scan_high_water: 1,
-                ..WatchState::default()
-            })
-            .await
-            .expect("seed partial scan frontier");
-
-        let blocked = journal
-            .record_refusals(
-                &[AllocatorDecision {
-                    action: Action::RefuseInflow {
-                        fed: fed(1),
-                        reason: ReasonCode::SpendingBelowTarget,
-                        diagnostics: Default::default(),
-                    },
-                    reason: ReasonCode::SpendingBelowTarget,
-                    occurrence: Occurrence(47),
-                    idempotency_key: IdempotencyKey("refuse:watch-floor:47".to_owned()),
-                }],
-                Occurrence(47),
-                NOW,
-            )
-            .await;
-        assert!(
-            blocked.is_err(),
-            "a direct Agent admission must not skip an unreconciled floor"
-        );
-        let mut dbtx = journal.db.begin_transaction_nc().await;
-        let bytes = dbtx
-            .raw_get_bytes(&watch_state_key())
-            .await
-            .expect("read raw partial checkpoint")
-            .expect("blocked Agent insert leaves the prior watch row");
-        let after_insert: WatchState =
-            decode_row_result("watch state", &watch_state_key(), &bytes).expect("decode watch row");
-        assert_eq!(after_insert.occurrence, 29);
-        assert_eq!(
-            after_insert.agent_floor_scan_high_water, 1,
-            "blocked Agent admission must not advance the unknown older counter range"
-        );
-        assert!(
-            dbtx.raw_get_bytes(&ledger_row_key(3))
-                .await
-                .expect("inspect blocked prospective ledger row")
-                .is_none(),
-            "the blocked admission must not create a ledger row"
-        );
-        drop(dbtx);
-
-        let after_scan = journal
-            .get_watch_state()
-            .await
-            .expect("bounded reader inspects the earlier range");
-        assert!(!after_scan.agent_floor_reconciled);
-        assert_eq!(
-            after_scan.agent_floor_unreadable_ledger_keys,
-            vec![ledger_row_key(1)],
-            "the formerly skipped hole is durably named for repair"
-        );
-        assert_eq!(after_scan.agent_floor_scan_high_water, 3);
-    }
-
-    #[tokio::test]
-    async fn retry_failed_agent_intent_updates_watch_high_water_without_public_migration_read() {
-        let journal = make_journal();
-        let parent = unmarked_parent("evac:retry-watch-high-water");
-        journal.upsert(&parent).await.expect("seed Agent parent");
-        journal
-            .put_watch_state(&WatchState {
-                occurrence: 1,
-                agent_floor_reconciled: true,
-                agent_floor_scan_initialized: true,
-                agent_floor_scan_high_water: 1,
-                ..WatchState::default()
-            })
-            .await
-            .expect("seed current initialized state");
-        journal
-            .set_status(
-                &parent.idempotency_key,
-                parent.attempt,
-                IntentStatus::Failed,
-                Some("retry"),
-            )
-            .await
-            .expect("terminalize first attempt");
-        let mut retry = parent.clone();
-        retry.attempt += 1;
-        retry.status = IntentStatus::Pending;
-        journal
-            .retry_failed_intent(&retry)
-            .await
-            .expect("retry appends a second Agent ledger row");
-
-        let mut dbtx = journal.db.begin_transaction_nc().await;
-        let bytes = dbtx
-            .raw_get_bytes(&watch_state_key())
-            .await
-            .expect("read raw watch row")
-            .expect("retry preserves watch state");
-        let state: WatchState =
-            decode_row_result("watch state", &watch_state_key(), &bytes).expect("decode raw row");
-        assert_eq!(state.occurrence, 1);
-        assert_eq!(
-            state.agent_floor_scan_high_water, 2,
-            "the retry append bypasses ledger_upsert_in but still advances durable metadata"
-        );
-        assert!(state.agent_floor_reconciled);
-    }
-
-    #[tokio::test]
-    async fn retry_failed_agent_intent_rolls_back_all_staged_writes_when_floor_is_unreconciled() {
-        let journal = make_journal();
-        let parent = unmarked_parent("evac:retry-watch-floor-fence");
-        let cache = pristine_record(&parent);
-        seed_parent_and_cache(&journal, &parent, &cache).await;
-        journal
-            .set_status(
-                &parent.idempotency_key,
-                parent.attempt,
-                IntentStatus::Failed,
-                Some("retry"),
-            )
-            .await
-            .expect("terminalize parent before manual retry");
-
-        let mut template = journal
-            .history(10, None)
-            .await
-            .expect("read a valid ledger template")
-            .into_iter()
-            .next()
-            .expect("parent ledger row exists");
-        template.actor = Actor::User;
-        let mut dbtx = journal.db.begin_transaction().await;
-        for seq in 1..=WATCH_FLOOR_UNREADABLE_KEY_LIMIT as u64 {
-            template.seq = seq;
-            dbtx.raw_insert_bytes(
-                &ledger_row_key(seq),
-                &encode_row(&template).expect("encode valid backlog row"),
-            )
-            .await
-            .expect("seed valid canonical backlog row");
-        }
-        dbtx.raw_insert_bytes(
-            &ledger_counter_key(),
-            &(WATCH_FLOOR_UNREADABLE_KEY_LIMIT as u64 + 1).to_be_bytes(),
-        )
-        .await
-        .expect("publish canonical backlog counter");
-        dbtx.commit_tx_result()
-            .await
-            .expect("commit canonical backlog");
-        journal
-            .put_watch_state(&WatchState::default())
-            .await
-            .expect("make retry encounter an incomplete legacy migration");
-
-        let snapshot_keys = vec![
-            intent_key(&parent.idempotency_key),
-            pending_index_key(IntentStatus::Failed, &parent.idempotency_key),
-            pending_index_key(IntentStatus::Pending, &parent.idempotency_key),
-            move_key(&parent.idempotency_key),
-            ledger_counter_key(),
-            ledger_key_index(&parent.idempotency_key),
-            ledger_row_key(0),
-            watch_state_key(),
-        ];
-        let mut dbtx = journal.db.begin_transaction_nc().await;
-        let mut before = Vec::new();
-        for key in &snapshot_keys {
-            before.push(
-                dbtx.raw_get_bytes(key)
-                    .await
-                    .expect("snapshot retry transaction input"),
-            );
-        }
-        drop(dbtx);
-
-        let mut retry = parent.clone();
-        retry.attempt += 1;
-        retry.status = IntentStatus::Pending;
-        assert!(
-            journal.retry_failed_intent(&retry).await.is_err(),
-            "retry append must be fenced while bounded floor migration remains incomplete"
-        );
-
-        let mut dbtx = journal.db.begin_transaction_nc().await;
-        let mut after = Vec::new();
-        for key in &snapshot_keys {
-            after.push(
-                dbtx.raw_get_bytes(key)
-                    .await
-                    .expect("snapshot rolled-back retry transaction input"),
-            );
-        }
-        assert_eq!(
-            after, before,
-            "the refused retry must roll back intent/index/cache/ledger/watch writes byte-for-byte"
-        );
-    }
-
-    #[tokio::test]
-    async fn pre_change_watch_state_json_defaults_new_migration_metadata() {
-        let journal = make_journal();
-        let old_json = serde_json::json!({
-            "version": ROW_VERSION,
-            "data": {
-                "occurrence": 7,
-                "last_discover_ms": 8,
-                "discover_cursor": null,
-                "discover_backlog": false,
-                "discover_rotation": []
-            }
-        });
-        let mut dbtx = journal.db.begin_transaction().await;
-        dbtx.raw_insert_bytes(
-            &watch_state_key(),
-            &serde_json::to_vec(&old_json).expect("encode pre-change JSON"),
-        )
-        .await
-        .expect("seed old watch JSON shape");
-        dbtx.commit_tx_result()
-            .await
-            .expect("commit old watch JSON");
-
-        let state = journal
-            .get_watch_state()
-            .await
-            .expect("old JSON shape migrates through serde defaults");
-        assert_eq!(state.occurrence, 7);
-        assert!(state.agent_floor_scan_initialized);
-        assert_eq!(state.agent_floor_scan_high_water, 0);
-        assert!(state.agent_floor_reconciled);
-        assert!(state.agent_floor_unreadable_ledger_keys.is_empty());
-    }
-
-    #[tokio::test]
-    async fn legacy_watch_floor_scan_skips_corrupt_rows_without_marking_reconciled() {
-        let journal = make_journal();
-        seed_agent_refusal(&journal, 29).await;
-        journal
-            .put_watch_state(&WatchState::default())
-            .await
-            .expect("seed legacy unreconciled watch checkpoint");
-        let mut dbtx = journal.db.begin_transaction().await;
-        dbtx.raw_insert_bytes(&ledger_row_key(1), b"not valid json")
-            .await
-            .expect("seed corrupt canonical ledger row");
-        dbtx.raw_insert_bytes(&ledger_counter_key(), &2_u64.to_be_bytes())
-            .await
-            .expect("publish corrupt canonical row");
-        dbtx.commit_tx_result().await.expect("commit corrupt row");
-
-        let state = journal
-            .get_watch_state()
-            .await
-            .expect("corrupt legacy row must not halt watch access");
-        assert_eq!(
-            state.occurrence, 29,
-            "known Agent rows still raise the floor"
-        );
-        assert!(
-            !state.agent_floor_reconciled,
-            "a skipped canonical row must force a retry after repair"
-        );
-        let mut dbtx = journal.db.begin_transaction_nc().await;
-        let bytes = dbtx
-            .raw_get_bytes(&watch_state_key())
-            .await
-            .expect("inspect incomplete migration")
-            .expect("incomplete migration persists its known floor");
-        let persisted: WatchState =
-            decode_row_result("watch state", &watch_state_key(), &bytes).expect("decode watch row");
-        assert_eq!(persisted.occurrence, 29);
-        assert!(
-            !persisted.agent_floor_reconciled,
-            "corrupt canonical data must not be recorded as fully reconciled"
-        );
-        drop(dbtx);
-
-        let mut restored = journal
-            .history(10, None)
-            .await
-            .expect("read valid row shape")
-            .into_iter()
-            .next()
-            .expect("Agent refusal exists");
-        restored.seq = 1;
-        restored.actor = Actor::Agent {
-            occurrence: Occurrence(31),
-        };
-        let mut dbtx = journal.db.begin_transaction().await;
-        dbtx.raw_insert_bytes(
-            &ledger_row_key(1),
-            &encode_row(&restored).expect("encode valid restored row"),
-        )
-        .await
-        .expect("restore corrupt row from valid backup bytes");
-        dbtx.commit_tx_result().await.expect("commit valid restore");
-
-        let restored = journal
-            .get_watch_state()
-            .await
-            .expect("only valid restoration completes migration");
-        assert!(restored.agent_floor_reconciled);
-        assert_eq!(restored.occurrence, 31);
-    }
-
-    #[tokio::test]
-    async fn missing_watch_discovery_write_recovers_non_tick_agent_floor() {
-        let journal = make_journal();
-        seed_agent_refusal(&journal, 29).await;
-
-        let state = journal
-            .put_watch_discovery_state(Some(fed(2)), true, Some(NOW), vec![fed(3)])
-            .await
-            .expect("write discovery state above recovered floor");
-        assert_eq!(state.occurrence, 29);
-        assert_eq!(
-            journal
-                .get_watch_state()
-                .await
-                .expect("read persisted watch state")
-                .occurrence,
-            29
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_watch_advance_recovers_non_tick_agent_floor() {
-        let journal = make_journal();
-        seed_agent_refusal(&journal, 29).await;
-
-        let state = journal
-            .advance_watch_occurrence()
-            .await
-            .expect("advance above recovered floor");
-        assert_eq!(state.occurrence, 30);
-    }
-
-    #[tokio::test]
-    async fn missing_watch_observation_recovers_non_tick_agent_floor() {
-        let journal = make_journal();
-        seed_agent_refusal(&journal, 29).await;
-
-        let state = journal
-            .observe_watch_occurrence(7)
-            .await
-            .expect("preserve recovered floor while observing an older occurrence");
-        assert_eq!(state.occurrence, 29);
-    }
-
-    async fn seed_stale_watch_checkpoint(journal: &FedimintJournal) {
-        // Simulate an on-disk legacy checkpoint written before the direct Agent ledger admission
-        // floor was centralized. `put_watch_state` is a test-only raw seed seam, so this leaves
-        // the old JSON shape's defaulted reconciliation bit false for the next public access.
-        seed_agent_refusal(journal, 29).await;
-        journal
-            .put_watch_state(&WatchState {
-                occurrence: 3,
-                last_discover_ms: 17,
-                discover_cursor: Some(fed(4)),
-                discover_backlog: true,
-                discover_rotation: vec![fed(5)],
-                ..Default::default()
-            })
-            .await
-            .expect("seed stale persisted watch checkpoint");
-    }
-
-    #[tokio::test]
-    async fn stale_watch_read_recovers_and_persists_non_tick_agent_floor() {
-        let journal = make_journal();
-        seed_stale_watch_checkpoint(&journal).await;
-
-        let state = journal
-            .get_watch_state()
-            .await
-            .expect("read recovered watch floor");
-        assert_eq!(state.occurrence, 29);
-        let mut dbtx = journal.db.begin_transaction_nc().await;
-        let bytes = dbtx
-            .raw_get_bytes(&watch_state_key())
-            .await
-            .expect("inspect persisted watch row")
-            .expect("watch row remains present");
-        let persisted: WatchState =
-            decode_row_result("watch state", &watch_state_key(), &bytes).expect("decode watch row");
-        assert_eq!(
-            persisted.occurrence, 29,
-            "legacy recovery persists the reconciled floor"
-        );
-        assert!(persisted.agent_floor_reconciled);
-    }
-
-    #[tokio::test]
-    async fn stale_watch_discovery_write_recovers_non_tick_agent_floor() {
-        let journal = make_journal();
-        seed_stale_watch_checkpoint(&journal).await;
-
-        let state = journal
-            .put_watch_discovery_state(Some(fed(2)), false, Some(NOW), vec![fed(3)])
-            .await
-            .expect("write discovery state above historical floor");
-        assert_eq!(state.occurrence, 29);
-        assert_eq!(
-            journal
-                .get_watch_state()
-                .await
-                .expect("read repaired watch checkpoint")
-                .occurrence,
-            29
-        );
-    }
-
-    #[tokio::test]
-    async fn stale_watch_advance_recovers_non_tick_agent_floor() {
-        let journal = make_journal();
-        seed_stale_watch_checkpoint(&journal).await;
-
-        let state = journal
-            .advance_watch_occurrence()
-            .await
-            .expect("advance above historical floor");
-        assert_eq!(state.occurrence, 30);
-    }
-
-    #[tokio::test]
-    async fn stale_watch_observation_recovers_non_tick_agent_floor() {
-        let journal = make_journal();
-        seed_stale_watch_checkpoint(&journal).await;
-
-        let state = journal
-            .observe_watch_occurrence(7)
-            .await
-            .expect("preserve historical floor while observing an older occurrence");
-        assert_eq!(state.occurrence, 29);
     }
 
     #[tokio::test]
@@ -8644,9 +6952,6 @@ mod replacement_foundation_tests {
             discover_cursor: Some(fed(9)),
             discover_backlog: true,
             discover_rotation: vec![fed(8)],
-            agent_floor_reconciled: true,
-            agent_floor_scan_initialized: true,
-            ..WatchState::default()
         };
         journal
             .put_watch_state(&initial)

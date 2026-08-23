@@ -51,59 +51,22 @@ federation's guardians), but without it recovery means hunting guardians down by
   processes spending the same notes; the federation will let exactly one win and the
   bookkeeping of both is garbage. One seed, one live `client.db`, one daemon.
 
-### 3a. Watch-floor migration alert: preserve, repair, then retry
-
-`GET /v1/watch/status` is not a passive health read on an old database:
-`get_watch_state` is a migration **writer**. Its first access records the Agent-operation
-occurrence floor, a ledger scan high-water, and any unreadable canonical ledger-row keys. The response
-reports `agent_floor_reconciled` and `unreadable_ledger_rows`. The reconciliation bit covers only
-canonical, counter-addressable ledger rows (`TAG_LEDGER_ROW || be64(sequence)`); it does **not**
-certify noncanonical poison rows. History and budget readers retain their separate poison-row
-handling and alerts. A false reconciliation flag means the scheduler is still processing a bounded
-historical-ledger scan or has unreadable historical rows. A positive `unreadable_ledger_rows` count
-identifies operator repair work; a zero count means only valid-row scan backlog remains. A restored
-WatchState whose persisted high-water differs from the currently validated ledger counter is also
-forced back through this bounded reconciliation before another Agent occurrence is allocated. If that
-state's high-water is ahead of the restored ledger, its incompatible remembered repair keys are
-discarded and the canonical pass restarts at zero while retaining its occurrence floor. None of these
-states means it is safe to discard ledger data. A positive unreadable count remains repair-only and
-fails closed for scheduler advancement, standalone observation, and new Agent rows. A *valid* zero-key
-backlog is different: daemon allocation and a standalone tick immediately drain a bounded number of
-256-row transactions (yielding between them) before allocating. If that budget is exhausted, the daemon
-scheduler immediately starts the next bounded batch rather than sleeping its normal interval; a
-standalone tick returns the durable high-water and directs the operator to retry `GET
-/v1/watch/status`/the tick. `GET /v1/watch/status` is available to observe that same durable progress.
-
-Do not treat a legacy nonzero (even very high or `u64::MAX`) `WatchState.occurrence` as an override
-for an unreadable canonical row. Older direct Agent admissions can leave the persisted WatchState
-lower than the ledger, and opaque row bytes may encode **any** `u64`; a supplied bound is therefore
-not proof of a safe floor. There is no safe scalar override. Restore the exact canonical row and
-matching counter from one trusted backup, or use a deliberately designed new allocation epoch/key
-namespace in a future recovery procedure; until then leave advance, standalone observation, and every
-fresh Agent append fenced.
-
-`GET /v1/status` is money-dry (it admits no operation), **not necessarily DB-read-only**:
-after its live-runtime and membership checks it calls that same bounded `get_watch_state` migration
-writer. A status request can therefore advance one valid reconciliation batch and then return
-`503`, directing the operator to `GET /v1/watch/status` until `agent_floor_reconciled` is true.
-Do not retry it as a blind health check; inspect the watch response and repair any unreadable rows
-first.
+### 3a. Ledger integrity alerts: preserve, repair, then retry
 
 For a usable `/v1/status` preview, walletd must have both its live `Runtime` and live
 `MultiClient`, and **every** federation recorded as joined must be open in that `MultiClient`.
-It performs live probes, not an offline cached preview. It returns `503` for a missing runtime/client,
-an unopened joined federation, a skipped corrupt federation-registry row, or a provisional watch
-floor. A corrupt registry row is not an absent federation: `/v1/status` refuses it before its
-watch-state read or live probes, so no preview is based on the healthy subset. Stop `walletd`,
+It performs live probes, not an offline cached preview. It returns `503` for a missing
+runtime/client, an unopened joined federation, or a skipped corrupt federation-registry row.
+A corrupt registry row is not an absent federation: `/v1/status` refuses it before its live probes,
+so no preview is based on the healthy subset. Stop `walletd`,
 preserve and copy the entire data directory, and repair the exact registry row from a consistent
 backup; do **not** delete it or run `join` as a substitute. Its successor arithmetic is checked:
-an occurrence floor of `u64::MAX - 1` previews the one legal `u64::MAX` daemon cycle; a floor already
-at `u64::MAX` returns `503` because no next occurrence exists. In each `503` floor case, use
-`/v1/watch/status` to distinguish bounded progress from repair work before retrying.
+an occurrence floor of `u64::MAX - 1` previews the one legal `u64::MAX` daemon cycle; a floor
+already at `u64::MAX` returns `503` because no next occurrence exists.
 
 The exclusive one-shot equivalents, `wallet-cli --standalone tick` and
 `wallet-cli --standalone status`, apply the same registry fence before opening a federation,
-planning, probing, or reading/migrating WatchState. A skipped row refuses the command rather
+planning, or probing. A skipped row refuses the command rather
 than planning the healthy subset. Preserve and copy the data directory, restore the exact
 registry row from a consistent backup, and retry; do **not** delete the row or re-join as a
 repair. This fence is specific to the world-complete planning verbs: explicit user/admin
@@ -118,32 +81,15 @@ recovery. That recovery may still re-drive an already-admitted operation (includ
 decision. Treat the warning as a data-repair incident using the preservation procedure above; do
 not infer that the remaining open federations make the world safe to plan.
 
-If `unreadable_ledger_rows` is positive, stop `walletd`, preserve and copy the entire data directory,
-and take exclusive ownership of the stopped wallet before changing its DB. Restore the **exact valid
-canonical row bytes and matching counter** from a trusted DB backup, or restore the affected store
-from that backup. **Do not delete, skip, or manufacture a replacement row:** it is append-only audit
-evidence and may contain the highest Agent occurrence. If the exact bytes/counter are unavailable,
-leave the wallet fail-closed and escalate; there is no safe delete-or-skip repair. After a valid
-repair, restart the daemon; the next watch-state access retries the exact recorded rows and any ledger
-sequences appended after its durable high-water, then clears the alert only when all are readable.
-
-Before every migration/status or Agent-admission access, an O(1) descending tail check requires the
-ledger counter to be exactly one greater than the highest canonical ledger-row key (and both to be
-empty/zero together). An interior missing/corrupt **canonical** row is migration repair work and
-appears as `agent_floor_reconciled: false` with a positive unreadable count. A physical tail/counter
-mismatch is different: a missing or low counter, counter hole, or malformed highest physical tail
-makes the next sequence unknowable. It fences **all fresh ledger admissions**, User and Agent, not
-just Agent-floor migration. Stop the daemon and restore both counter and ledger from one consistent
-trusted backup under exclusive stopped-wallet ownership. If no such backup exists, leave the wallet
-fail-closed and escalate. Reads and updates to an already-addressed row can remain available subject
-to their own integrity checks; do not infer from that that a new money operation is safe to admit.
-With a tail-consistent counter, a valid User admission can remain possible while only Agent allocation
-is fenced for floor reconciliation. A large or merely busy but tail-consistent ledger never makes one
-request walk an unbounded range: each transaction examines at most 256 newly appended sequences and
-durably advances its high-water by that bounded amount. Allocation/tick may chain only a fixed, yielding
-number of those transactions for a valid backlog; unreadable keys never enter that fast drain. Do not
-try to manufacture a large range of rows; preserve the store and restore any named bad key from backup
-before retrying.
+Before every ledger append, an O(1) descending tail check requires the ledger counter to be exactly
+one greater than the highest canonical ledger-row key (and both to be empty/zero together). A missing
+or low counter, a counter hole, or a malformed highest physical tail makes the next sequence
+unknowable, so it fences **all fresh ledger admissions**, User and Agent alike, rather than letting an
+append overwrite physical history at a falsely low sequence. Stop the daemon and restore both counter
+and ledger from one consistent trusted backup under exclusive stopped-wallet ownership. If no such
+backup exists, leave the wallet fail-closed and escalate. Reads and updates to an already-addressed
+row can remain available subject to their own integrity checks; do not infer from that that a new
+money operation is safe to admit.
 
 ### 3b. Prefer WSS-transport federations
 
@@ -216,9 +162,9 @@ Do not infer the marker from a generic failed row, a no-op policy edit, or a cro
 For a marked structural refusal, preserve the diagnostic and increase the evacuation cap
 component-wise (`evac_fee_base_msat` and/or `evac_fee_bps`) so the **effective cap at the marker's
 measured delivered-net sample** is monotone higher. Store the policy change and verify it with
-`wallet-cli policy get`. On its next **healthy whole-view, reconciled-floor** scheduler tick, a daemon
-atomically retires the marked parent and creates a linked fresh replacement. A partial-view or
-watch-floor-fenced recovery-only cycle cannot create that sidecar: it may instead retry the
+`wallet-cli policy get`. On its next **healthy whole-view** scheduler tick, a daemon atomically
+retires the marked parent and creates a linked fresh replacement. A partial-view recovery-only
+cycle cannot create that sidecar: it may instead retry the
 already-admitted old work (which can finish without a replacement) or re-mark it for the later
 healthy planner tick. For an exclusive standalone
 `wallet-cli --standalone tick`, supply a fresh `--occurrence` strictly greater than the marked
@@ -306,8 +252,7 @@ curl -s -H "Authorization: Bearer $(cat "$WALLETD_TOKEN_PATH")" \
   http://127.0.0.1:9736/v1/health \
   | jq -e '.scheduler_alive == true' >/dev/null && echo alive || echo "SCHEDULER DOWN"
 
-# 5. Watch-floor admission safety: this is deliberately a separate operator-visible check, not a
-#    change to /v1/health semantics. A successful check can make bounded migration progress.
+# 5. Watch checkpoint: a non-200 here is a storage or tail/counter fence, not a scheduler stall.
 watch_body=$(mktemp)
 if watch_http=$(curl -sS -o "$watch_body" -w '%{http_code}' \
   -H "Authorization: Bearer $(cat "$WALLETD_TOKEN_PATH")" \
@@ -321,13 +266,8 @@ if [ "$watch_curl" -ne 0 ]; then
 elif [ "$watch_http" != 200 ]; then
   echo "WATCH STATUS NON-200 ($watch_http): possible tail/counter or storage fence" >&2
   cat "$watch_body" >&2
-elif jq -e '.agent_floor_reconciled == true' "$watch_body" >/dev/null; then
-  echo "WATCH FLOOR RECONCILED"
-elif jq -e '.agent_floor_reconciled == false and .unreadable_ledger_rows == 0' \
-  "$watch_body" >/dev/null; then
-  echo "WATCH FLOOR BACKLOG: bounded valid-row scan; retry this check until reconciled" >&2
 else
-  echo "WATCH FLOOR REPAIR: unreadable/missing canonical rows; stop, preserve, and restore exact trusted bytes" >&2
+  jq -r '"watch occurrence \(.occurrence), discover_backlog \(.discover_backlog)"' "$watch_body"
 fi
 rm -f "$watch_body"
 ```

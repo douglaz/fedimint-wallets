@@ -264,67 +264,6 @@ async fn daemon_status_refuses_a_consumed_final_scheduler_occurrence_without_wri
     service.shutdown().await.expect("shutdown fixture service");
 }
 
-async fn assert_daemon_status_refuses_provisional_watch_floor(occurrence: Option<u64>) {
-    let (mut state, service, journal) = empty_fixture().await;
-    attach_empty_runtime(&mut state, &journal).await;
-    if let Some(occurrence) = occurrence {
-        assert_eq!(
-            journal
-                .observe_watch_occurrence(occurrence)
-                .await
-                .expect("seed reconciled positive occurrence")
-                .occurrence,
-            occurrence
-        );
-    }
-    // The handler's one permitted `get_watch_state` migration pass processes only 256 rows. A
-    // 257-row User suffix therefore leaves the floor unreconciled, without adding an Agent
-    // occurrence or any scheduler tick.
-    for n in 0..257 {
-        journal
-            .record_started(
-                &IdempotencyKey(format!("join:status-provisional-{occurrence:?}-{n}")),
-                wallet_core::OperationKind::Join { fed: fed(9) },
-                Actor::User,
-                ReasonCode::UserInitiated,
-                n,
-                None,
-            )
-            .await
-            .expect("append User-only ledger suffix");
-    }
-
-    let (status, body) = send(&state, request("GET", "/v1/status", Some(TOKEN), None)).await;
-
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(
-        body["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("provisional watch occurrence")),
-        "{body}"
-    );
-    assert!(
-        journal
-            .history(usize::MAX, None)
-            .await
-            .expect("read history")
-            .iter()
-            .all(|row| !matches!(row.kind, wallet_core::OperationKind::Tick { .. })),
-        "the provisional dry-run must not plan or journal a scheduler tick"
-    );
-    service.shutdown().await.expect("shutdown fixture service");
-}
-
-#[tokio::test]
-async fn daemon_status_refuses_an_unreconciled_zero_watch_floor() {
-    assert_daemon_status_refuses_provisional_watch_floor(None).await;
-}
-
-#[tokio::test]
-async fn daemon_status_refuses_an_unreconciled_positive_watch_floor() {
-    assert_daemon_status_refuses_provisional_watch_floor(Some(7)).await;
-}
-
 #[tokio::test]
 async fn daemon_status_refuses_a_joined_but_unopened_federation_without_writing() {
     let (state, service, journal) = fixture_with_unopened_dest().await;
@@ -1053,8 +992,6 @@ async fn history_and_watch_status_read_detached() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["occurrence"], 0);
     assert_eq!(body["discover_backlog"], false);
-    assert_eq!(body["agent_floor_reconciled"], true);
-    assert_eq!(body["unreadable_ledger_rows"], 0);
     service.shutdown().await.expect("shutdown");
 }
 
@@ -1146,96 +1083,6 @@ async fn history_cursor_uses_the_effective_capped_limit_without_losing_rows() {
             .map(|seq| seq as u64)
             .collect::<Vec<_>>(),
         "the two pages must have no gap, duplicate, or ordering loss"
-    );
-    service.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test]
-async fn watch_status_reports_a_bounded_valid_ledger_backlog_in_its_json_view() {
-    let (state, service, journal) = empty_fixture().await;
-    // `get_watch_state` scans at most 256 canonical rows per access. A 257-row valid User suffix
-    // therefore exercises the production handler's bounded migration mapping, not a DTO literal.
-    for seq in 0..257 {
-        journal
-            .record_started(
-                &IdempotencyKey(format!("watch-status-valid-backlog-{seq}")),
-                wallet_core::OperationKind::Join { fed: fed(9) },
-                Actor::User,
-                ReasonCode::UserInitiated,
-                seq,
-                None,
-            )
-            .await
-            .expect("append valid canonical User row");
-    }
-
-    let (status, body) = send(
-        &state,
-        request("GET", "/v1/watch/status", Some(TOKEN), None),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body,
-        json!({
-            "occurrence": 0,
-            "last_discover_ms": 0,
-            "discover_cursor": null,
-            "discover_backlog": false,
-            "agent_floor_reconciled": false,
-            "unreadable_ledger_rows": 0,
-        }),
-        "a valid suffix beyond one bounded chunk is progress, not repair work"
-    );
-    service.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test]
-async fn watch_status_reports_an_unreadable_canonical_row_in_its_json_view() {
-    use fedimint_core::db::IDatabaseTransactionOpsCore as _;
-
-    let (state, service, journal, db) = empty_fixture_with_db().await;
-    journal
-        .record_started(
-            &IdempotencyKey("watch-status-unreadable-row".to_owned()),
-            wallet_core::OperationKind::Join { fed: fed(9) },
-            Actor::User,
-            ReasonCode::UserInitiated,
-            0,
-            None,
-        )
-        .await
-        .expect("append canonical row to corrupt");
-    let app_db = db.with_prefix(vec![0x00]);
-    let mut dbtx = app_db.begin_transaction().await;
-    let mut key = vec![0x05];
-    key.extend_from_slice(&0_u64.to_be_bytes());
-    dbtx.raw_insert_bytes(&key, b"not valid json")
-        .await
-        .expect("make canonical ledger row unreadable");
-    dbtx.commit_tx_result()
-        .await
-        .expect("commit unreadable canonical row");
-
-    let (status, body) = send(
-        &state,
-        request("GET", "/v1/watch/status", Some(TOKEN), None),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body,
-        json!({
-            "occurrence": 0,
-            "last_discover_ms": 0,
-            "discover_cursor": null,
-            "discover_backlog": false,
-            "agent_floor_reconciled": false,
-            "unreadable_ledger_rows": 1,
-        }),
-        "a corrupt canonical row is durable repair work, not merely bounded scan backlog"
     );
     service.shutdown().await.expect("shutdown");
 }

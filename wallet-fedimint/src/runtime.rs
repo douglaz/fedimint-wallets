@@ -5819,46 +5819,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standalone_tick_reports_the_same_tick_watch_floor_retry() {
-        let (runtime, journal) = runtime_fixture().await;
-        for n in 0..(256 * 16 + 1) {
-            journal
-                .record_started(
-                    &IdempotencyKey(format!("join:standalone-watch-floor-{n}")),
-                    OperationKind::Join { fed: FED_A },
-                    Actor::User,
-                    ReasonCode::UserInitiated,
-                    n as u64,
-                    None,
-                )
-                .await
-                .expect("append valid User suffix without touching WatchState");
-        }
-
-        let error = runtime
-            .tick(&TickPolicy {
-                occurrence: Occurrence(1),
-                ..TickPolicy::default()
-            })
-            .await
-            .expect_err("one standalone tick must stop at its bounded WatchState drain budget");
-        let diagnostic = error.to_string();
-        assert!(
-            diagnostic
-                .starts_with("Permanent(\"journal: watch-state floor reconciliation is incomplete"),
-            "the stable typed diagnostic prefix must survive Runtime::tick: {diagnostic}"
-        );
-        assert!(
-            diagnostic.contains("standalone: re-run the same tick until it converges"),
-            "standalone callers need an actionable retry, not a daemon-only instruction: {diagnostic}"
-        );
-        assert!(
-            diagnostic.contains("daemon: retry GET /v1/watch/status"),
-            "the shared diagnostic must remain mode-neutral: {diagnostic}"
-        );
-    }
-
-    #[tokio::test]
     async fn join_rejects_a_federation_that_disagrees_with_the_invite() {
         use fedimint_core::config::FederationId as SdkFederationId;
         use fedimint_core::util::SafeUrl;
@@ -8002,8 +7962,6 @@ mod tests {
         let checkpoint = WatchState {
             occurrence: 41,
             last_discover_ms: 42,
-            agent_floor_reconciled: true,
-            agent_floor_scan_initialized: true,
             ..WatchState::default()
         };
         journal
@@ -8045,8 +8003,6 @@ mod tests {
         let checkpoint = WatchState {
             occurrence: 51,
             last_discover_ms: 52,
-            agent_floor_reconciled: true,
-            agent_floor_scan_initialized: true,
             ..WatchState::default()
         };
         journal
@@ -8087,8 +8043,6 @@ mod tests {
         let (mut runtime, journal) = runtime_fixture().await;
         let checkpoint = WatchState {
             occurrence: u64::MAX - 1,
-            agent_floor_reconciled: true,
-            agent_floor_scan_initialized: true,
             ..WatchState::default()
         };
         journal

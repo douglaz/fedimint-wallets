@@ -34,12 +34,6 @@ impl fmt::Display for WatchAdvanceCycleError {
 
 impl std::error::Error for WatchAdvanceCycleError {}
 
-fn is_immediate_watch_floor_drain_error(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<WatchAdvanceCycleError>()
-        .is_some_and(|error| crate::journal::is_watch_floor_reconciliation_required(&error.0))
-}
-
 /// The settlement-stall deadline (host-operational, env-overridable for the devimint gates).
 fn settlement_stall_deadline() -> Duration {
     std::env::var("WALLETD_SETTLEMENT_STALL_SECS")
@@ -593,30 +587,6 @@ pub(super) async fn run(
             Ok(cycle) => cycle,
             Err(error) => {
                 tracing::warn!(?error, "watch scheduler: cycle failed");
-                // A valid restored ledger may need more than this turn's bounded allocation-drain
-                // budget. Do not turn each batch into the routine min/base watch sleep; every batch
-                // committed durable progress and yielding here preserves cancellation/fairness.
-                if is_immediate_watch_floor_drain_error(&error) {
-                    match abortable(
-                        runtime
-                            .service_journal()
-                            .watch_floor_immediate_retry_needed(),
-                        &mut abort,
-                    )
-                    .await
-                    {
-                        None => return,
-                        Some(Ok(true)) => {
-                            tokio::task::yield_now().await;
-                            continue;
-                        }
-                        Some(Ok(false)) => {}
-                        Some(Err(retry_error)) => tracing::warn!(
-                            ?retry_error,
-                            "watch scheduler: could not inspect failed watch-floor drain"
-                        ),
-                    }
-                }
                 CycleResult {
                     deadlines: wallet_core::AdaptiveSleepDeadlines::default(),
                     noop: false,
@@ -766,39 +736,10 @@ async fn run_cycle(
     client: &WalletClient,
     sources: &[Box<dyn CandidateSource>],
 ) -> anyhow::Result<CycleResult> {
-    // A restored valid User-ledger suffix may take more than one bounded drain batch. Do this
-    // before reconcile, repair, or federation opening: those actions can otherwise release a
-    // marked replacement parent before its allocator floor has converged. This is drain-only;
-    // occurrence allocation remains below the partial-view and reconcile boundaries.
     let journal = runtime.service_journal();
-    let preflight_error = match journal.preflight_watch_floor_drain().await {
-        Ok(_) => None,
-        // Only a valid, zero-unreadable bounded suffix is allowed to short-circuit the cycle
-        // before recovery. It cannot release a parked marker because ReconcileDecide is untouched.
-        Err(error) if crate::journal::is_watch_floor_reconciliation_required(&error) => {
-            match journal.watch_floor_immediate_retry_needed().await {
-                Ok(true) => return Err(anyhow::Error::new(WatchAdvanceCycleError(error))),
-                Ok(false) => Some(error),
-                Err(inspect_error) => {
-                    tracing::warn!(
-                        ?error,
-                        ?inspect_error,
-                        "watch scheduler: could not inspect preflight floor; limiting cycle to durable recovery"
-                    );
-                    Some(error)
-                }
-            }
-        }
-        // A tail/counter or storage failure does not permit a fresh allocation, but durable
-        // recovery must still re-drive admitted work without capturing or releasing parked markers.
-        Err(error) => Some(error),
-    };
-    // Recovery always precedes membership opening. A known floor fault has already committed this
-    // cycle not to plan, so immediately re-drive even an old marker. Otherwise preserve planner
-    // ownership until the whole view reaches the CaptureForPlanner reconciliation below.
-    if preflight_error.is_some() {
-        redrive_without_planner(client, "preflight floor recovery").await;
-    } else if let Err(error) = client.reconcile_durable().await {
+    // Recovery always precedes membership opening, and preserves planner ownership until the whole
+    // view reaches the CaptureForPlanner reconciliation below.
+    if let Err(error) = client.reconcile_durable().await {
         tracing::warn!(
             ?error,
             "watch scheduler: durable reconciliation failed; continuing cycle"
@@ -865,25 +806,6 @@ async fn run_cycle(
         let _ = multi_client
             .open_all_with_membership_lease(&missing, client)
             .await;
-        if let Some(error) = preflight_error {
-            // Opening can publish membership, so rehydrate its durable work too. This cycle still
-            // cannot plan because its floor is provisional, so it must redrive rather than park.
-            redrive_without_planner(client, "preflight recovery after membership open").await;
-            if let Err(repair_error) = super::repair_ledger_with_actor(
-                runtime.service_journal().as_ref(),
-                runtime.service_multi_client().as_ref(),
-                client,
-            )
-            .await
-            {
-                tracing::warn!(
-                    ?repair_error,
-                    "watch scheduler: ledger repair after preflight recovery open failed"
-                );
-            }
-            after_recovery_before_watch_allocation_test_hook(runtime).await;
-            return Err(anyhow::Error::new(WatchAdvanceCycleError(error)));
-        }
         let open: BTreeSet<_> = multi_client.federations().into_iter().collect();
         let unopened: Vec<_> = joined
             .iter()
@@ -905,12 +827,8 @@ async fn run_cycle(
             });
         }
     }
-    if let Some(error) = preflight_error {
-        after_recovery_before_watch_allocation_test_hook(runtime).await;
-        return Err(anyhow::Error::new(WatchAdvanceCycleError(error)));
-    }
-    // The world is whole and the floor is valid. Mint the one scheduler handoff immediately
-    // before occurrence allocation; a partial/recovery-only cycle never captures a parked marker.
+    // The world is whole. Mint the one scheduler handoff immediately before occurrence
+    // allocation; a partial/recovery-only cycle never captures a parked marker.
     let reconcile = match client.reconcile().await {
         Ok(report) => Some(report),
         Err(error) => {
@@ -922,32 +840,11 @@ async fn run_cycle(
         }
     };
     after_reconcile_before_watch_advance_test_hook(runtime).await;
-    let watch_state = loop {
-        match journal.advance_watch_occurrence().await {
-            Ok(state) => break state,
-            Err(error) if crate::journal::is_watch_floor_reconciliation_required(&error) => {
-                // A suffix may have arrived after the cycle's initial preflight (for example
-                // while reconcile re-drives an append). Drain only the next fixed batch; do not
-                // return to the outer scheduler loop and repeat reconcile/repair/open work.
-                match journal.watch_floor_immediate_retry_needed().await {
-                    Ok(true) => {
-                        tokio::task::yield_now().await;
-                        continue;
-                    }
-                    Ok(false) => {
-                        abandon_parked_handoff_after_watch_fault(client).await;
-                        return Err(anyhow::Error::new(WatchAdvanceCycleError(error)));
-                    }
-                    Err(retry_error) => {
-                        abandon_parked_handoff_after_watch_fault(client).await;
-                        return Err(anyhow::anyhow!("{retry_error:?}"));
-                    }
-                }
-            }
-            Err(error) => {
-                abandon_parked_handoff_after_watch_fault(client).await;
-                return Err(anyhow::Error::new(WatchAdvanceCycleError(error)));
-            }
+    let watch_state = match journal.advance_watch_occurrence().await {
+        Ok(state) => state,
+        Err(error) => {
+            abandon_parked_handoff_after_watch_fault(client).await;
+            return Err(anyhow::Error::new(WatchAdvanceCycleError(error)));
         }
     };
     let occurrence = Occurrence(watch_state.occurrence);
@@ -1212,16 +1109,6 @@ type AfterTickPlanTestHooks = BTreeMap<AfterTickPlanTestHookKey, AfterTickPlanTe
 #[cfg(test)]
 static AFTER_TICK_PLAN_TEST_HOOKS: OnceLock<Mutex<AfterTickPlanTestHooks>> = OnceLock::new();
 
-/// Test-only proof that a preflight fault did not skip durable recovery before fresh allocation is
-/// refused. The hook is after both reconcile and ledger repair, and before federation opening or
-/// occurrence allocation.
-#[cfg(test)]
-type AfterRecoveryBeforeWatchAllocationTestHooks = BTreeMap<usize, oneshot::Sender<()>>;
-#[cfg(test)]
-static AFTER_RECOVERY_BEFORE_WATCH_ALLOCATION_TEST_HOOKS: OnceLock<
-    Mutex<AfterRecoveryBeforeWatchAllocationTestHooks>,
-> = OnceLock::new();
-
 #[cfg(test)]
 type AfterReconcileBeforeWatchAdvanceTestHooks =
     BTreeMap<usize, oneshot::Sender<oneshot::Sender<()>>>;
@@ -1263,38 +1150,6 @@ async fn after_reconcile_before_watch_advance_test_hook(runtime: &Runtime) {
 
 #[cfg(not(test))]
 async fn after_reconcile_before_watch_advance_test_hook(_runtime: &Runtime) {}
-
-#[cfg(test)]
-fn install_after_recovery_before_watch_allocation_test_hook(
-    runtime: &Runtime,
-) -> oneshot::Receiver<()> {
-    let (sent, receive) = oneshot::channel();
-    let previous = AFTER_RECOVERY_BEFORE_WATCH_ALLOCATION_TEST_HOOKS
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .expect("post-recovery hook lock poisoned")
-        .insert(runtime as *const Runtime as usize, sent);
-    assert!(
-        previous.is_none(),
-        "a test installed two post-recovery hooks for the same runtime"
-    );
-    receive
-}
-
-#[cfg(test)]
-async fn after_recovery_before_watch_allocation_test_hook(runtime: &Runtime) {
-    let hook = AFTER_RECOVERY_BEFORE_WATCH_ALLOCATION_TEST_HOOKS
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .expect("post-recovery hook lock poisoned")
-        .remove(&(runtime as *const Runtime as usize));
-    if let Some(hook) = hook {
-        let _ = hook.send(());
-    }
-}
-
-#[cfg(not(test))]
-async fn after_recovery_before_watch_allocation_test_hook(_runtime: &Runtime) {}
 
 #[cfg(test)]
 type BeforeDueProbesTestHook = oneshot::Sender<(
@@ -1483,23 +1338,6 @@ mod tests {
         FederationStatus, GoalBlockers, Journal, ReasonCode, SourceStatus,
     };
 
-    #[test]
-    fn immediate_watch_drain_retry_classifier_rejects_unrelated_failures() {
-        let floor = anyhow::Error::new(WatchAdvanceCycleError(
-            wallet_core::ExecError::Permanent(
-                "journal: watch-state floor reconciliation is incomplete (scan high-water 4096, 0 unreadable rows); daemon: retry GET /v1/watch/status until the bounded ledger backlog converges; standalone: re-run the same tick until it converges".to_owned(),
-            ),
-        ));
-        assert!(is_immediate_watch_floor_drain_error(&floor));
-
-        let tail = anyhow::Error::new(WatchAdvanceCycleError(wallet_core::ExecError::Permanent(
-            "journal: ledger tail/counter inconsistency: counter is corrupt".to_owned(),
-        )));
-        assert!(!is_immediate_watch_floor_drain_error(&tail));
-        let unrelated = anyhow::anyhow!("corrupt candidate registry");
-        assert!(!is_immediate_watch_floor_drain_error(&unrelated));
-    }
-
     fn scheduler_replacement_plan(parent: wallet_core::Intent, occurrence: Occurrence) -> TickPlan {
         let Action::Evacuate {
             from,
@@ -1679,224 +1517,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preflight_drains_before_reconcile_and_preserves_a_marked_parent_until_converged() {
-        let executor = Arc::new(KeyRecordingExecutor::default());
-        let (runtime, service) =
-            scheduler_runtime_fixture_with_executor(0xF1, executor.clone()).await;
-        let client = service.client();
-        let journal = runtime.service_journal();
-        let mut policy = client.get_policy().await.expect("read policy");
-        policy.evac_fee_base_msat = Msat(20_000);
-        policy.evac_fee_bps = 0;
-        client
-            .put_policy(policy)
-            .await
-            .expect("install the qualifying replacement cap");
-        let parent_key = IdempotencyKey("evac:preflight-marked-parent".to_owned());
-        let cap = wallet_core::EvacFeeCap {
-            base_msat: Msat(10_000),
-            bps: 0,
-        };
-        let evidence = wallet_core::EvacuationRefusalEvidence {
-            cap_components: cap,
-            requested_net: Msat(100_000),
-            source_spendable: Msat(500_000),
-            low: wallet_core::EvacuationQuoteSample {
-                delivered_net: Msat(10_000),
-                total_fee: Msat(15_000),
-                fee_cap: cap.at(Msat(10_000)),
-            },
-            high: wallet_core::EvacuationQuoteSample {
-                delivered_net: Msat(100_000),
-                total_fee: Msat(25_000),
-                fee_cap: cap.at(Msat(100_000)),
-            },
-            diagnostic: "scheduler preflight fixture".to_owned(),
-            measured_at_ms: 1,
-        };
-        let parent = wallet_core::Intent {
-            idempotency_key: parent_key.clone(),
-            attempt: 0,
-            action: Action::Evacuate {
-                from: wallet_core::FederationId([0xA1; 32]),
-                to: wallet_core::FederationId([0xB1; 32]),
-                amount: Msat(100_000),
-                fee_cap: cap.at(Msat(100_000)),
-                gateway: None,
-                fee_cap_components: Some(cap),
-            },
-            max_fee: Some(cap.at(Msat(100_000))),
-            status: wallet_core::IntentStatus::Pending,
-            reason: ReasonCode::ShutdownNotice,
-            actor: Actor::Agent {
-                occurrence: Occurrence(8),
-            },
-            created_at_ms: 1,
-            operation_id: None,
-            invoice: None,
-            evacuation_refusal: Some(evidence),
-        };
-        journal.upsert(&parent).await.expect("seed marked parent");
-        runtime.set_scheduler_tick_test_fixture(scheduler_replacement_plan(
-            parent.clone(),
-            Occurrence(9),
-        ));
-        runtime.set_scheduler_probe_fixture(scheduler_replacement_probes(&parent));
-        for n in 0..(256 * 16 + 1) {
-            journal
-                .record_started(
-                    &IdempotencyKey(format!("join:preflight-backlog-{n}")),
-                    wallet_core::OperationKind::Join {
-                        fed: wallet_core::FederationId([0xC1; 32]),
-                    },
-                    Actor::User,
-                    ReasonCode::UserInitiated,
-                    n as u64,
-                    None,
-                )
-                .await
-                .expect("append User suffix without rewriting WatchState");
-        }
-
-        let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
-        journal.reset_pending_reads_for_test();
-        let first = match run_cycle(runtime.as_ref(), &client, &sources).await {
-            Ok(_) => panic!("the first preflight must stop at its fixed drain budget"),
-            Err(error) => error,
-        };
-        assert!(
-            is_immediate_watch_floor_drain_error(&first),
-            "only the typed bounded WatchState failure may request an immediate retry: {first:?}"
-        );
-        assert_eq!(
-            journal.pending_reads_for_test(),
-            0,
-            "the exhausted preflight must stop before either durable reconciliation or planning"
-        );
-        assert_eq!(
-            journal
-                .get(&parent_key)
-                .await
-                .expect("read marked parent after exhausted preflight"),
-            Some(parent.clone()),
-            "preflight must run before reconcile can release a qualifying marked parent"
-        );
-        assert!(
-            !executor
-                .performed
-                .lock()
-                .expect("recording executor lock poisoned")
-                .contains(&parent_key),
-            "a valid bounded backlog must not launch an old-marker driver"
-        );
-        assert!(
-            !journal
-                .history(usize::MAX, None)
-                .await
-                .expect("history before convergence")
-                .iter()
-                .any(|row| matches!(
-                    row.kind,
-                    wallet_core::OperationKind::Tick {
-                        occurrence: Occurrence(9),
-                        ..
-                    }
-                )),
-            "the exhausted preflight must not give the planner an early opportunity"
-        );
-
-        run_cycle(runtime.as_ref(), &client, &sources)
-            .await
-            .expect("the converged scheduler cycle commits its real replacement");
-        let child = IdempotencyKey(format!(
-            "evac:{}:{}:9",
-            wallet_core::FederationId([0xA1; 32]).to_hex(),
-            wallet_core::FederationId([0xB1; 32]).to_hex()
-        ));
-        let relation = journal
-            .evacuation_supersession(&parent_key)
-            .await
-            .expect("read committed replacement sidecar")
-            .expect("replacement writes a parent-to-child sidecar");
-        assert_eq!(relation.old_key, parent_key);
-        assert_eq!(relation.old_attempt, 0);
-        assert_eq!(relation.new_key, child);
-        assert_eq!(relation.occurrence, Occurrence(9));
-        assert!(
-            !executor
-                .performed
-                .lock()
-                .expect("recording executor lock poisoned")
-                .contains(&parent_key),
-            "the healthy whole-view CaptureForPlanner path must replace, never ordinarily drive, the old key"
-        );
-        let retired = journal
-            .get(&parent_key)
-            .await
-            .expect("read retired marked parent")
-            .expect("replacement retains an auditable parent");
-        assert_eq!(retired.status, wallet_core::IntentStatus::Failed);
-        assert_eq!(retired.attempt, 0);
-        assert_eq!(
-            retired.evacuation_refusal, parent.evacuation_refusal,
-            "the retired parent retains the exact refusal evidence linked to its child"
-        );
-        let parent_rows = journal
-            .history(usize::MAX, None)
-            .await
-            .expect("history after replacement")
-            .into_iter()
-            .filter(|row| row.correlation_key == parent_key)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            parent_rows.len(),
-            1,
-            "the old parent has exactly its replacement terminal row, not an ordinary redrive: {parent_rows:#?}"
-        );
-        assert_eq!(parent_rows[0].status, OperationStatus::Failed);
-        assert!(
-            parent_rows[0]
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains(&child.0)),
-            "the sole old-parent terminal must name its deterministic replacement child: {parent_rows:#?}"
-        );
-        let ticks = journal
-            .history(usize::MAX, None)
-            .await
-            .expect("history after convergence")
-            .into_iter()
-            .filter(|row| {
-                matches!(
-                    row.kind,
-                    wallet_core::OperationKind::Tick {
-                        occurrence: Occurrence(9),
-                        ..
-                    }
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(ticks.len(), 1, "the real cycle opens one Tick(9)");
-        assert_eq!(ticks[0].status, OperationStatus::Succeeded, "{ticks:#?}");
-        assert!(
-            !journal
-                .history(usize::MAX, None)
-                .await
-                .expect("history after convergence")
-                .iter()
-                .any(|row| matches!(
-                    row.kind,
-                    wallet_core::OperationKind::Tick {
-                        occurrence: Occurrence(10),
-                        ..
-                    }
-                )),
-            "the scheduler must not create a stale successor tick"
-        );
-        service.shutdown().await.expect("shutdown");
-    }
-
-    #[tokio::test]
     async fn partial_joined_view_recovery_only_redrives_old_marker_without_a_tick() {
         let (runtime, service) = scheduler_runtime_fixture(0xF5).await;
         let client = service.client();
@@ -1911,8 +1531,6 @@ mod tests {
         journal
             .put_watch_state(&WatchState {
                 occurrence: 8,
-                agent_floor_reconciled: true,
-                agent_floor_scan_initialized: true,
                 ..WatchState::default()
             })
             .await
@@ -2040,8 +1658,6 @@ mod tests {
         journal
             .put_watch_state(&WatchState {
                 occurrence: 8,
-                agent_floor_reconciled: true,
-                agent_floor_scan_initialized: true,
                 ..WatchState::default()
             })
             .await
@@ -2196,187 +1812,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreadable_preflight_recovery_claims_a_prior_parked_marker_without_a_tick() {
-        let (runtime, service) = empty_scheduler_fixture(0xF2).await;
-        let client = service.client();
-        let journal = runtime.service_journal();
-        // Cycle A's scheduler reconcile captures this qualifying marker as its parked handoff.
-        // Cycle B below installs an unreadable floor after that handoff. Its committed
-        // no-planning decision must discard the stale handoff and claim (not directly clear) this
-        // exact old parent.
-        let parent_key = IdempotencyKey("evac:unreadable-preflight-parked".to_owned());
-        let cap = wallet_core::EvacFeeCap {
-            base_msat: Msat(10_000),
-            bps: 0,
-        };
-        let evidence = wallet_core::EvacuationRefusalEvidence {
-            cap_components: cap,
-            requested_net: Msat(100_000),
-            source_spendable: Msat(500_000),
-            low: wallet_core::EvacuationQuoteSample {
-                delivered_net: Msat(10_000),
-                total_fee: Msat(15_000),
-                fee_cap: cap.at(Msat(10_000)),
-            },
-            high: wallet_core::EvacuationQuoteSample {
-                delivered_net: Msat(100_000),
-                total_fee: Msat(25_000),
-                fee_cap: cap.at(Msat(100_000)),
-            },
-            diagnostic: "parked before unreadable floor".to_owned(),
-            measured_at_ms: 1,
-        };
-        let parent = wallet_core::Intent {
-            idempotency_key: parent_key.clone(),
-            attempt: 0,
-            action: Action::Evacuate {
-                from: wallet_core::FederationId([0xA2; 32]),
-                to: wallet_core::FederationId([0xB2; 32]),
-                amount: Msat(100_000),
-                fee_cap: cap.at(Msat(100_000)),
-                gateway: None,
-                fee_cap_components: Some(cap),
-            },
-            max_fee: Some(cap.at(Msat(100_000))),
-            status: wallet_core::IntentStatus::Pending,
-            reason: ReasonCode::ShutdownNotice,
-            actor: Actor::Agent {
-                occurrence: Occurrence(8),
-            },
-            created_at_ms: 1,
-            operation_id: None,
-            invoice: None,
-            evacuation_refusal: Some(evidence),
-        };
-        journal
-            .upsert(&parent)
-            .await
-            .expect("seed qualifying marker");
-        client
-            .reconcile()
-            .await
-            .expect("cycle A parks the marker for its scheduler handoff");
-        journal
-            .put_watch_state(&WatchState {
-                occurrence: Occurrence(8).0,
-                agent_floor_reconciled: false,
-                agent_floor_scan_initialized: true,
-                agent_floor_unreadable_ledger_keys: vec![vec![0x05, 0, 0, 0, 0, 0, 0, 3, 0xe7]],
-                ..WatchState::default()
-            })
-            .await
-            .expect("seed an unreadable repair key");
-        let recovered = install_after_recovery_before_watch_allocation_test_hook(runtime.as_ref());
-        let cycle_runtime = Arc::clone(&runtime);
-        let cycle_client = client.clone();
-        let cycle = tokio::spawn(async move {
-            let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
-            run_cycle(cycle_runtime.as_ref(), &cycle_client, &sources).await
-        });
-        tokio::time::timeout(Duration::from_secs(5), recovered)
-            .await
-            .expect("unreadable preflight must still reach reconcile and repair")
-            .expect("recovery hook remains installed until reached");
-        let error = match cycle.await.expect("cycle task") {
-            Ok(_) => panic!("unreadable floor must still fence fresh occurrence allocation"),
-            Err(error) => error,
-        };
-        assert!(
-            is_immediate_watch_floor_drain_error(&error),
-            "the later allocation keeps the stable typed floor diagnostic: {error:?}"
-        );
-        let redriven = journal
-            .get(&parent_key)
-            .await
-            .expect("read parent after recovery-only cycle")
-            .expect("old parent remains durable after its failed runtime drive");
-        assert_eq!(redriven.status, wallet_core::IntentStatus::Pending);
-        assert_eq!(
-            redriven.evacuation_refusal, None,
-            "recovery-only must claim the prior handoff, atomically consuming old evidence instead of directly clearing it"
-        );
-        assert!(
-            !journal
-                .history(usize::MAX, None)
-                .await
-                .expect("history")
-                .iter()
-                .any(|row| matches!(row.kind, wallet_core::OperationKind::Tick { .. })),
-            "recovery may run, but an unreadable preflight cannot allocate a fresh tick"
-        );
-        service.shutdown().await.expect("shutdown");
-    }
-
-    #[tokio::test]
-    async fn tail_preflight_reaches_durable_recovery_but_refuses_fresh_allocation() {
-        let client_db = MemDatabase::new().into_database();
-        let journal_db = MemDatabase::new().into_database();
-        let mnemonic =
-            Mnemonic::from_entropy(&[0xF3; 16]).expect("valid scheduler fixture mnemonic");
-        let multi_client =
-            Arc::new(MultiClient::new(client_db, journal_db.clone(), mnemonic).await);
-        let journal = Arc::new(FedimintJournal::new(journal_db.clone()));
-        let runtime = Arc::new(Runtime::new(
-            multi_client,
-            journal.clone(),
-            None,
-            None,
-            None,
-        ));
-        let service = super::super::WalletService::start_parts(
-            None,
-            journal.clone(),
-            Arc::new(runtime.service_executor(None)),
-            Policy::default(),
-            None,
-        )
-        .await
-        .expect("start actor-only scheduler fixture");
-        let client = service.client();
-        let app_db = journal_db.with_prefix(vec![0x00]);
-        let mut dbtx = app_db.begin_transaction().await;
-        dbtx.raw_insert_bytes(&[0x05, 0, 0, 0, 0, 0, 0, 0, 0], b"not valid json")
-            .await
-            .expect("insert malformed physical tail");
-        dbtx.raw_insert_bytes(&[0x07], &0_u64.to_be_bytes())
-            .await
-            .expect("counter disagrees with malformed tail successor");
-        dbtx.commit_tx_result()
-            .await
-            .expect("commit malformed tail fixture");
-        let recovered = install_after_recovery_before_watch_allocation_test_hook(runtime.as_ref());
-        let cycle_runtime = Arc::clone(&runtime);
-        let cycle_client = client.clone();
-        let cycle = tokio::spawn(async move {
-            let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
-            run_cycle(cycle_runtime.as_ref(), &cycle_client, &sources).await
-        });
-        tokio::time::timeout(Duration::from_secs(5), recovered)
-            .await
-            .expect("tail preflight must still reach reconcile and repair")
-            .expect("recovery hook remains installed until reached");
-        let error = match cycle.await.expect("cycle task") {
-            Ok(_) => panic!("tail mismatch must fence fresh occurrence allocation"),
-            Err(error) => error,
-        };
-        assert!(
-            !is_immediate_watch_floor_drain_error(&error),
-            "a tail fence is not a valid-backlog retry: {error:?}"
-        );
-        assert!(
-            !journal
-                .history(usize::MAX, None)
-                .await
-                .expect("history")
-                .iter()
-                .any(|row| matches!(row.kind, wallet_core::OperationKind::Tick { .. })),
-            "recovery may run, but a tail mismatch cannot allocate a fresh tick"
-        );
-        service.shutdown().await.expect("shutdown");
-    }
-
-    #[tokio::test]
-    async fn post_reconcile_floor_fault_abandons_handoff_and_preserves_marker_for_retry() {
+    async fn post_reconcile_watch_advance_fault_abandons_handoff_and_preserves_marker_for_retry() {
         let (runtime, service) = empty_scheduler_fixture(0xF4).await;
         let client = service.client();
         let journal = runtime.service_journal();
@@ -2438,20 +1874,20 @@ mod tests {
             .expect("post-reconcile hook installed");
         journal
             .put_watch_state(&WatchState {
-                occurrence: 8,
-                agent_floor_reconciled: false,
-                agent_floor_scan_initialized: true,
-                agent_floor_unreadable_ledger_keys: vec![vec![0x05, 0, 0, 0, 0, 0, 0, 3, 0xe7]],
+                occurrence: u64::MAX,
                 ..WatchState::default()
             })
             .await
-            .expect("race an unreadable floor after handoff");
+            .expect("race an exhausted occurrence floor in after the handoff");
         resume.send(()).expect("resume allocation");
         let error = match cycle.await.expect("cycle task") {
-            Ok(_) => panic!("post-reconcile unreadable floor must fence allocation"),
+            Ok(_) => panic!("a post-reconcile allocation fault must fence the cycle"),
             Err(error) => error,
         };
-        assert!(is_immediate_watch_floor_drain_error(&error), "{error:?}");
+        assert!(
+            format!("{error:?}").contains("occurrence exhausted"),
+            "{error:?}"
+        );
         assert_eq!(
             journal.get(&key).await.expect("read parent after fault"),
             Some(parent.clone()),
@@ -2460,13 +1896,10 @@ mod tests {
         journal
             .put_watch_state(&WatchState {
                 occurrence: 8,
-                agent_floor_reconciled: true,
-                agent_floor_scan_initialized: true,
-                agent_floor_scan_high_water: 1,
                 ..WatchState::default()
             })
             .await
-            .expect("repair floor for next cycle");
+            .expect("restore an allocatable checkpoint for the next cycle");
         let planned = install_after_reconcile_before_watch_advance_test_hook(runtime.as_ref());
         let retry_runtime = Arc::clone(&runtime);
         let retry_client = client.clone();
@@ -2654,8 +2087,6 @@ mod tests {
         journal
             .put_watch_state(&WatchState {
                 occurrence: u64::MAX - 1,
-                agent_floor_reconciled: true,
-                agent_floor_scan_initialized: true,
                 ..WatchState::default()
             })
             .await
@@ -2744,55 +2175,6 @@ mod tests {
         abort.send(()).expect("scheduler is listening");
         tokio::task::yield_now().await;
         assert_eq!(task.await.expect("join"), None);
-    }
-
-    #[tokio::test]
-    async fn abort_cancels_the_post_cycle_watch_floor_retry_inspection() {
-        let (runtime, service) = empty_scheduler_fixture(0xF6).await;
-        let journal = runtime.service_journal();
-        for n in 0..(256 * 16 + 1) {
-            journal
-                .record_started(
-                    &IdempotencyKey(format!("join:abortable-watch-floor-backlog-{n}")),
-                    wallet_core::OperationKind::Join {
-                        fed: wallet_core::FederationId([0xF6; 32]),
-                    },
-                    Actor::User,
-                    ReasonCode::UserInitiated,
-                    n as u64,
-                    None,
-                )
-                .await
-                .expect("append valid backlog row");
-        }
-        // `run_cycle` makes the first checkpoint read while classifying its bounded-preflight
-        // error. Pause the second raw read, which is the outer scheduler's post-cycle inspection.
-        let paused = journal.pause_watch_floor_immediate_retry_read_after_for_test(1);
-        let (policy_wake_tx, policy_wake) = watch::channel(0_u64);
-        let (abort_tx, abort_rx) = oneshot::channel();
-        let scheduler_runtime = Arc::clone(&runtime);
-        let scheduler_client = service.client();
-        let task = tokio::spawn(async move {
-            let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
-            run(
-                scheduler_runtime,
-                scheduler_client,
-                sources,
-                policy_wake,
-                abort_rx,
-            )
-            .await;
-        });
-        paused.wait_until_started().await;
-        abort_tx
-            .send(())
-            .expect("the paused scheduler still owns its abort receiver");
-        tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .expect("outer scheduler abort must cancel the paused raw inspection")
-            .expect("scheduler task joins");
-        drop(policy_wake_tx);
-        service.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]

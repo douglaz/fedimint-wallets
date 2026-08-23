@@ -282,12 +282,6 @@ pub async fn status(State(state): State<AppState>) -> Result<impl IntoResponse, 
     // verdicts against the live clock — `From<&Policy>` leaves both at 0, which would emit
     // occurrence-0 keys (possibly already terminal) and mis-score every TTL-gated probe.
     let watch = state.journal.get_watch_state().await.map_err(storage)?;
-    if !watch.agent_floor_reconciled {
-        return Err(HttpError::unavailable(
-            "status dry-run cannot preview a provisional watch occurrence; inspect /v1/watch/status \
-             and retry after its bounded reconciliation completes or unreadable rows are repaired",
-        ));
-    }
     tick_policy.occurrence = Occurrence(watch.occurrence.checked_add(1).ok_or_else(|| {
         HttpError::unavailable(
             "watch scheduler occurrence exhausted at u64::MAX; restore a checkpoint below u64::MAX \
@@ -331,8 +325,6 @@ pub async fn watch_status(State(state): State<AppState>) -> Result<impl IntoResp
         last_discover_ms: watch.last_discover_ms,
         discover_cursor: watch.discover_cursor,
         discover_backlog: watch.discover_backlog,
-        agent_floor_reconciled: watch.agent_floor_reconciled,
-        unreadable_ledger_rows: watch.agent_floor_unreadable_ledger_keys.len(),
     }))
 }
 
