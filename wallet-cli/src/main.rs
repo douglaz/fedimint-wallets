@@ -809,17 +809,10 @@ async fn run_standalone(cli: Cli) -> Result<(), CliExit> {
         other => other,
     };
 
-    // Read the poison-tolerant registry report once for the rest of this invocation. Most explicit
-    // user/admin verbs intentionally retain the historic "healthy rows still work" behavior, but
-    // `tick` and its dry-run `status` make a world-complete planning claim. They must not open,
-    // probe, or migrate WatchState from a healthy subset while a damaged registry row could name
-    // another federation holding funds.
-    let joined_report = journal
-        .list_federations_report()
+    let joined = journal
+        .list_federations()
         .await
         .map_err(|e| CliExit::Usage(anyhow::anyhow!("reading federation registry: {e:?}")))?;
-    refuse_on_incomplete_registry(&command, joined_report.skipped_rows)?;
-    let joined = joined_report.federations;
 
     // Recovery rebuilds a funded client from an EXISTING seed and must NEVER mint one: unlike every
     // other verb, `recover` on a seedless store must refuse (exit 2, nothing journaled) rather than
@@ -879,35 +872,6 @@ async fn run_standalone(cli: Cli) -> Result<(), CliExit> {
     )
     .await
     .map_err(CliExit::from)
-}
-
-/// `tick` and its dry-run `status` reason about the entire joined-federation world. A skipped
-/// registry row is therefore a safety boundary, unlike the explicit user/admin verbs which have
-/// historically continued over healthy rows.
-fn requires_complete_federation_registry(command: &Command) -> bool {
-    matches!(command, Command::Tick { .. } | Command::Status { .. })
-}
-
-/// Refuse world-complete standalone planning before opening any federation or touching WatchState.
-/// The report is deliberately passed rather than a boolean so the bootstrap cannot accidentally
-/// regress to [`FedimintJournal::list_federations`], whose convenience projection drops poison-row
-/// evidence.
-fn refuse_on_incomplete_registry(command: &Command, skipped_rows: usize) -> Result<(), CliExit> {
-    if !requires_complete_federation_registry(command) || skipped_rows == 0 {
-        return Ok(());
-    }
-
-    let verb = match command {
-        Command::Tick { .. } => "tick",
-        Command::Status { .. } => "status",
-        _ => unreachable!("only world-complete commands reach the corrupt-registry refusal"),
-    };
-    Err(CliExit::Refused(format!(
-        "standalone {verb} refused: federation registry has {skipped_rows} corrupt row(s); \
-         repair the corrupt federation registry from a consistent backup (preserve the data \
-         directory; do not delete or re-join the missing federation), then retry. Planning from \
-         the healthy subset could ignore funds"
-    )))
 }
 
 /// The host-config fields accepted by `walletd`. Standalone only consumes `data_dir`, but parsing

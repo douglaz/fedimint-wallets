@@ -53,33 +53,10 @@ federation's guardians), but without it recovery means hunting guardians down by
 
 ### 3a. Ledger integrity alerts: preserve, repair, then retry
 
-For a usable `/v1/status` preview, walletd must have both its live `Runtime` and live
-`MultiClient`, and **every** federation recorded as joined must be open in that `MultiClient`.
-It performs live probes, not an offline cached preview. It returns `503` for a missing
-runtime/client, an unopened joined federation, or a skipped corrupt federation-registry row.
-A corrupt registry row is not an absent federation: `/v1/status` refuses it before its live probes,
-so no preview is based on the healthy subset. Stop `walletd`,
-preserve and copy the entire data directory, and repair the exact registry row from a consistent
-backup; do **not** delete it or run `join` as a substitute. Its successor arithmetic is checked:
-an occurrence floor of `u64::MAX - 1` previews the one legal `u64::MAX` daemon cycle; a floor
-already at `u64::MAX` returns `503` because no next occurrence exists.
-
-The exclusive one-shot equivalents, `wallet-cli --standalone tick` and
-`wallet-cli --standalone status`, apply the same registry fence before opening a federation,
-planning, or probing. A skipped row refuses the command rather
-than planning the healthy subset. Preserve and copy the data directory, restore the exact
-registry row from a consistent backup, and retry; do **not** delete the row or re-join as a
-repair. This fence is specific to the world-complete planning verbs: explicit user/admin
-standalone verbs keep their established poison-tolerant registry behavior unless they require
-the same complete-world guarantee.
-
-The production scheduler applies the same poison-row gate. While its scan reports any skipped
-federation row, it opens no registered federation and starts no fresh Tick, probe, or discovery
-work; it logs the skipped-row count, retains default scheduler deadlines, and runs durable-only
-recovery. That recovery may still re-drive an already-admitted operation (including a
-`RecoveryOnly` structural-marker claim), but it cannot create a replacement or other fresh
-decision. Treat the warning as a data-repair incident using the preservation procedure above; do
-not infer that the remaining open federations make the world safe to plan.
+`/v1/status` is money-dry (it admits no operation) but performs live probes, not an offline cached
+preview: it requires a live `Runtime` and returns `503` without one. Its successor arithmetic is
+checked — an occurrence floor of `u64::MAX - 1` previews the one legal `u64::MAX` daemon cycle; a
+floor already at `u64::MAX` returns `503` because no next occurrence exists.
 
 Before every ledger append, an O(1) descending tail check requires the ledger counter to be exactly
 one greater than the highest canonical ledger-row key (and both to be empty/zero together). A missing

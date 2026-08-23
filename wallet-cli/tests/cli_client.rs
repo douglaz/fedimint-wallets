@@ -12,7 +12,6 @@ use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::Router;
-use fedimint_core::db::{Database, IDatabaseTransactionOpsCore as _};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +22,6 @@ use wallet_api::{
     OperationAccepted, OperationStatusDto, OperationView, Policy, ReceiveAccepted, RefuseReason,
 };
 use wallet_core::{FederationId, Msat};
-use wallet_fedimint::{FederationInfo, FedimintJournal};
 
 const BIN: &str = env!("CARGO_BIN_EXE_wallet-cli");
 
@@ -166,72 +164,6 @@ async fn run_raw(xdg: &Path, args: &[&str]) -> CliOutput {
 
 fn fed(byte: u8) -> FederationId {
     FederationId([byte; 32])
-}
-
-/// Seed a real standalone journal with one decodable federation plus one raw poison row. The
-/// healthy row makes a tolerant registry projection dangerous; the poison row is the evidence
-/// `tick`/`status` must see before opening clients or migrating WatchState.
-async fn seed_corrupt_standalone_federation_registry(data_dir: &Path) {
-    let db: Database = fedimint_rocksdb::RocksDb::build(data_dir.join("journal.db"))
-        .open()
-        .await
-        .expect("open standalone test journal")
-        .into();
-    let journal = FedimintJournal::new(db.clone());
-    journal
-        .put_federation(
-            &fed(0x11),
-            &FederationInfo {
-                // A genuine parseable invite. The gate must fire before this row is opened.
-                invite: "fed11qgqpu8rhwden5te0vejkg6tdd9h8gepwd4cxcumxv4jzuen0duhsqqfqh6nl7sgk72caxfx8khtfnn8y436q3nhyrkev3qp8ugdhdllnh86qmp42pm".to_owned(),
-                db_prefix: 17,
-                joined_at: 0,
-            },
-        )
-        .await
-        .expect("seed healthy federation row");
-    let app_db = db.with_prefix(vec![0x00]);
-    let mut dbtx = app_db.begin_transaction().await;
-    let mut poison_key = vec![0x03];
-    poison_key.extend_from_slice(&fed(0xc3).0);
-    dbtx.raw_insert_bytes(&poison_key, b"not valid json")
-        .await
-        .expect("seed corrupt federation registry row");
-    dbtx.commit_tx_result()
-        .await
-        .expect("commit corrupt federation registry row");
-}
-
-async fn assert_corrupt_registry_gate_left_no_watch_or_work(data_dir: &Path) {
-    let db: Database = fedimint_rocksdb::RocksDb::build(data_dir.join("journal.db"))
-        .open()
-        .await
-        .expect("reopen standalone test journal")
-        .into();
-    let journal = FedimintJournal::new(db.clone());
-    let report = journal
-        .list_federations_report()
-        .await
-        .expect("read corrupt registry report");
-    assert_eq!(report.federations.len(), 1, "healthy row remains present");
-    assert_eq!(report.skipped_rows, 1, "raw poison must remain visible");
-    assert!(
-        journal
-            .history(usize::MAX, None)
-            .await
-            .expect("read operation history")
-            .is_empty(),
-        "the registry gate must prevent probe/tick/runtime work"
-    );
-    let app_db = db.with_prefix(vec![0x00]);
-    let mut dbtx = app_db.begin_transaction_nc().await;
-    assert!(
-        dbtx.raw_get_bytes(&[0x0a])
-            .await
-            .expect("read WatchState key")
-            .is_none(),
-        "the registry gate must run before WatchState migration"
-    );
 }
 
 fn json<T: serde::Serialize>(value: &T) -> String {
@@ -1135,42 +1067,6 @@ async fn standalone_defaults_to_walletd_data_directory() {
         !dir.join(".wallet-cli-data").exists(),
         "the retired CWD-relative store must not be created"
     );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn standalone_tick_and_status_refuse_a_corrupt_registry_before_watch_migration() {
-    for verb in ["tick", "status"] {
-        let dir = scratch();
-        let data_dir = dir.join(format!("data-{verb}"));
-        seed_corrupt_standalone_federation_registry(&data_dir).await;
-
-        let out = run_raw(
-            &dir,
-            &[
-                "--standalone",
-                "--data-dir",
-                data_dir.to_str().expect("UTF-8 test path"),
-                verb,
-            ],
-        )
-        .await;
-
-        assert_eq!(out.code, Some(2), "{verb} stderr: {}", out.stderr);
-        assert!(
-            out.stderr.contains(&format!("standalone {verb} refused"))
-                && out
-                    .stderr
-                    .contains("repair the corrupt federation registry"),
-            "{verb} stderr: {}",
-            out.stderr
-        );
-        assert!(
-            out.stdout.is_empty(),
-            "{verb} must not emit a partial-world planning result: {}",
-            out.stdout
-        );
-        assert_corrupt_registry_gate_left_no_watch_or_work(&data_dir).await;
-    }
 }
 
 #[tokio::test]
