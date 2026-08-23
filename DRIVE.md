@@ -30,15 +30,31 @@ BELOW this section predates that removal and does not count the current tree.
   fields, a chunked canonical-ledger rescan that wrote on read, a 16-chunk immediate drain, a
   scheduler preflight, an allocation fence on every Agent admission, and a two-field
   `/v1/watch/status` health surface. It was justified as compatibility for "old direct Agent
-  admissions" on a live production store. That store was inspected on 2026-08-23: `/v1/balance`
-  reported `{"total":0,"federations":[]}`, no money operation has ever been journaled
-  (14,818 sampled ledger rows are `tick`/`discover`/`autojoin` only), and `WatchState.occurrence`
-  (5343) already equals the highest Agent occurrence in the ledger — so the stale-checkpoint
-  condition the migration existed to repair does not exist on it. The invariant it protected is
-  now held by `note_ledger_insert_in` (raises the floor in the same transaction as any Agent
-  ledger append) plus `max_agent_occurrence_in` (seeds an absent checkpoint from `Actor::Agent`
-  rows, not only `OperationKind::Tick`). The O(1) counter/tail check is retained; it fences every
-  fresh ledger append and is unrelated to the floor scan.
+  admissions" on a live production store, so that store was inspected on 2026-08-23.
+
+  **The live store is the hetzner k3s `walletd`** (namespace `walletd`, image `walletd:b5f46de`,
+  27d uptime, 0 restarts), holding **5,760,084 msat across two mainnet federations** with real
+  `receive`/`pay`/`move`/`join` history. (A first pass mistakenly checked the local systemd
+  walletd at `~/.local/share/walletd`, which is an empty duplicate — 0 sats, no federations. That
+  was the wrong wallet; the conclusion below is from the right one.)
+
+  Checked against it, the stale-checkpoint condition the migration existed to repair **does not
+  exist**: `/v1/watch/status` reports occurrence 10551, and a full ledger scan (22 pages,
+  seq 0..10677) finds the highest `Actor::Agent` occurrence is also 10551. Exactly equal.
+
+  That same scan found something else: ledger seqs **611, 614, 615 are permanently undecodable**
+  (`missing field \`diagnostics\``, 21,843 log warnings — filed as `br-yjg`). The deleted
+  subsystem treats an unreadable canonical row as repair-only, so `agent_floor_reconciled` would
+  have stayed false and `advance_watch_occurrence`, `observe_watch_occurrence`, the scheduler
+  preflight, and every fresh Agent ledger admission would have failed closed until an operator
+  restored those exact bytes from backup — pinned by its own deleted test
+  `legacy_watch_floor_scan_skips_corrupt_rows_without_marking_reconciled`. Deploying it onto this
+  wallet would have permanently stopped the automated scheduler on a store holding real sats.
+
+  The invariant it protected is now held by `note_ledger_insert_in` (raises the floor in the same
+  transaction as any Agent ledger append) plus `max_agent_occurrence_in` (seeds an absent
+  checkpoint from `Actor::Agent` rows, not only `OperationKind::Tick`). The O(1) counter/tail
+  check is retained; it fences every fresh ledger append and is unrelated to the floor scan.
 - **Partial/corrupt federation world-view gates — SPLIT to `fix/corrupt-registry-partial-world-gates`,
   stacked on this branch.** `/v1/status` 503s, the scheduler poison-row gate, and the standalone
   `tick`/`status` refusal. Unchanged; stacked rather than rebased onto `main` because the
