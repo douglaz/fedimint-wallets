@@ -20,18 +20,79 @@ pub fn decide(snapshot: &AllocatorSnapshot, occurrence: Occurrence) -> Vec<Alloc
     decide_with_blockers(snapshot, occurrence, &GoalBlockers::default()).0
 }
 
+/// Which floor withheld a funding goal, so an operator can tell a protocol dust gap from a
+/// pair whose economics do not (yet) justify the move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DeferralFloor {
+    /// lnv2's minimum incoming contract. Nothing but a bigger gap will clear it.
+    ProtocolMinMove,
+    /// The pair's `RouteEconomics::min_viable_amount` — the smallest net whose modelled cost
+    /// still fits `max_fee_bps_of_move`. Clears if the gap grows, the route gets cheaper, or the
+    /// proportional cap is raised.
+    RouteMinViable,
+}
+
+/// A funding goal [`decide_with_blockers`] wanted to act on and withheld because the shortfall is
+/// below the move floor.
+///
+/// This is DIAGNOSTIC ONLY. It is never admitted, never reserved, and deliberately never journaled
+/// per tick — a refusal row every cycle for a gap not worth moving is exactly the noise the floor
+/// exists to remove. It exists because the withholding is otherwise invisible: a standby only
+/// drains when something spends from it, so a shortfall parked below the floor can stay there
+/// forever while the wallet looks idle and healthy (br-0vg).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeferredFunding {
+    pub dest: FederationId,
+    pub source: Option<FederationId>,
+    /// Why the goal existed: `SpendingBelowTarget` or `StandbyBelowTarget`.
+    pub reason: ReasonCode,
+    /// The shortfall the goal would have funded.
+    pub want: Msat,
+    /// The floor it failed to clear. Always `>= want`.
+    pub floor: Msat,
+    pub floor_source: DeferralFloor,
+}
+
+/// Everything one pass of the allocator produced, including the work it withheld.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AllocatorOutcome {
+    /// What the tick may act on.
+    pub decisions: Vec<AllocatorDecision>,
+    /// Withheld because another durable intent already owns the logical goal (br-p93).
+    pub suppressed: Vec<AllocatorDecision>,
+    /// Withheld because the shortfall is below the move floor (br-0vg). Diagnostic only.
+    pub deferred: Vec<DeferredFunding>,
+}
+
 /// Decide while withholding logical allocator goals that durable work already owns.
 ///
 /// The second vector contains the withheld decisions for diagnostics. Filtering happens before
 /// [`push_and_reserve`], so suppressed work cannot consume the intra-tick capacity needed by an
 /// independent evacuation or funding move.
+///
+/// Use [`decide_with_diagnostics`] where the withheld-for-dust goals are also wanted; this
+/// function's emitted and suppressed sets are byte-identical either way.
 pub fn decide_with_blockers(
     snapshot: &AllocatorSnapshot,
     occurrence: Occurrence,
     blocked: &GoalBlockers,
 ) -> (Vec<AllocatorDecision>, Vec<AllocatorDecision>) {
+    let outcome = decide_with_diagnostics(snapshot, occurrence, blocked);
+    (outcome.decisions, outcome.suppressed)
+}
+
+/// [`decide_with_blockers`] plus the funding goals withheld by the move floor.
+///
+/// Adding a diagnostic channel must never change what the tick acts on, so the caller that
+/// commits money keeps using the pair above and this one is read by `status`.
+pub fn decide_with_diagnostics(
+    snapshot: &AllocatorSnapshot,
+    occurrence: Occurrence,
+    blocked: &GoalBlockers,
+) -> AllocatorOutcome {
     let mut decisions = Vec::new();
     let mut suppressed = Vec::new();
+    let mut deferred = Vec::new();
 
     // Per-tick reservation (§4.2): every decision in this pass is computed against ONE
     // immutable snapshot, so without bookkeeping two evacuations into the same
@@ -127,6 +188,7 @@ pub fn decide_with_blockers(
                 &mut debited,
                 &mut decisions,
                 &mut suppressed,
+                &mut deferred,
             );
         }
     }
@@ -167,11 +229,16 @@ pub fn decide_with_blockers(
                 &mut debited,
                 &mut decisions,
                 &mut suppressed,
+                &mut deferred,
             );
         }
     }
 
-    (decisions, suppressed)
+    AllocatorOutcome {
+        decisions,
+        suppressed,
+        deferred,
+    }
 }
 
 /// Pending reserved amount for `fed` in a per-tick `credited`/`debited` map (`0` when
@@ -258,6 +325,7 @@ fn fund_into(
     debited: &mut BTreeMap<FederationId, u64>,
     out: &mut Vec<AllocatorDecision>,
     suppressed: &mut Vec<AllocatorDecision>,
+    deferred: &mut Vec<DeferredFunding>,
 ) {
     // Source-side figures, shared by every refusal this function can emit. `source`-derived
     // fields are `None` exactly when there is no usable source. `max_fee` is NOT among them:
@@ -332,6 +400,20 @@ fn fund_into(
     // `UneconomicAtAnySize` is the deliberate exception: §Q5 requires its standing
     // misconfiguration to remain visible rather than disappear behind the dust rule.
     if want < floor && !uneconomic {
+        // Silent on the MONEY path, not silent to an operator who asks. `status` reads this;
+        // nothing here is admitted, reserved, or journaled, so the dust rule is unchanged.
+        deferred.push(DeferredFunding {
+            dest: dest.id,
+            source: source_id,
+            reason: kind.reason(),
+            want: Msat(want),
+            floor: Msat(floor),
+            floor_source: if floor > snapshot.min_move.0 {
+                DeferralFloor::RouteMinViable
+            } else {
+                DeferralFloor::ProtocolMinMove
+            },
+        });
         return;
     }
 

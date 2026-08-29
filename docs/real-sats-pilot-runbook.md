@@ -61,6 +61,47 @@ failure mode entirely. (The daemon still bounds each `perform` via
 `WALLETD_PERFORM_TIMEOUT_SECS` — 120s in the shipped k8s config — so even an iroh stall
 self-recovers in ~2 min, but prefer WSS so the stall does not happen in the first place.)
 
+### 3b. "decisions: none" is two different states — read `deferred:` to tell them apart
+
+A tick that finds nothing to do and a tick that *wants* to rebalance and permanently cannot look
+identical from the outside. Both print `decisions: none`, both write no ledger row, and neither
+logs anything.
+
+The second state is real. A funding move whose shortfall is below the pair's move floor is
+withheld as dust: a sub-floor move could only fail at perform time, every tick, forever, so the
+allocator declines it. That rule is correct, and deliberately silent on the money path — a refusal
+row every cycle for a gap not worth moving is exactly the noise the floor removes.
+
+What makes it a trap is the standby. The rule assumes a deferred shortfall keeps growing until it
+clears the floor. A **spending** fed's does, because payments drain it. A **standby** fed's does
+not: it only drains when something spends from it, so a shortfall parked below the floor can sit
+there for months while the wallet reports a clean bill of health.
+
+`wallet-cli --standalone status` and `GET /v1/status` therefore report withheld goals explicitly.
+Both always print the field, so its absence means "old build", never "nothing withheld":
+
+```
+spending_fed: 04e550da…
+standby_fed: 9f84da75…
+decisions: none
+deferred: 9f84da75… want=301586 msat floor=5000000 msat (route min_viable_amount) reason=StandbyBelowTarget source=04e550da…
+```
+
+Read the floor kind, because the two need different actions:
+
+- **`protocol min_move`** — lnv2's minimum incoming contract. Only a bigger gap clears it. Nothing
+  to do; the destination is effectively at target.
+- **`route min_viable_amount`** — the smallest net whose modelled cost still fits
+  `max_fee_bps_of_move` for that pair. It clears if the gap grows, the route gets cheaper, or you
+  raise the proportional cap. **Check the fee arithmetic before raising the cap**: at 300 bps a
+  301,586 msat move gets a 9,047 msat budget, and if the honest route cost exceeds that, the
+  allocator declining is correct and raising the cap just buys an expensive move. Compare the
+  floor against what the pair's gateways actually charge first.
+
+A `deferred:` line that persists across many checks with an unchanging `want` is the signal that a
+target will never be met on its own. Decide deliberately: lower the target so there is no shortfall,
+raise the cap if the route is genuinely affordable, or accept a colder standby.
+
 ### 4. Cap the exposure
 
 Pilot policy: keep the total at an amount you are genuinely willing to lose.

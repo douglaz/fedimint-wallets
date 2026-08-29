@@ -12,7 +12,10 @@ pub mod scorer;
 pub mod types;
 pub mod watch;
 
-pub use allocator::{decide, decide_with_blockers, funding_shortfall, max_fundable, move_fee_cap};
+pub use allocator::{
+    decide, decide_with_blockers, decide_with_diagnostics, funding_shortfall, max_fundable,
+    move_fee_cap, AllocatorOutcome, DeferralFloor, DeferredFunding,
+};
 pub use conflict::{AllocatorGoal, GoalBlockers};
 pub use discovery::{
     auto_join_budget, BudgetVerdict, DiscoveryPolicy, DiscoverySource, SourceStatus,
