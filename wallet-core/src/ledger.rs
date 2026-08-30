@@ -140,6 +140,13 @@ pub enum OperationKind {
         /// shortfall arithmetic — an over-cap fed, an evacuation with no destination, or an
         /// ordinary commit-time tick drop. A conflict-suppressed commit-time tick drop instead
         /// records its emitted zero plus the observational suppression discriminator.
+        ///
+        /// `#[serde(default)]` is load-bearing (br-yjg): this key was added to an ALREADY
+        /// PERSISTED variant, so rows written before it decode only with an explicit default.
+        /// Ledger rows are append-only audit evidence the runbook forbids deleting, and
+        /// `probe_budget_ledger_rows` fails closed on any undecodable row — so a missing default
+        /// here does not degrade, it permanently disables automated probing.
+        #[serde(default)]
         diagnostics: RefusalDiagnostics,
     },
     /// The active probe's UMBRELLA row (phase 5 §5.0.5), keyed `probe:<fed-hex>:<nonce>`:

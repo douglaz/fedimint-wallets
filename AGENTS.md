@@ -126,11 +126,21 @@ and — where the change alters a money path — a live devimint gate. Unit test
 necessary and not sufficient; see [docs/devimint-runbook.md](./docs/devimint-runbook.md).
 
 **This repo is greenfield and does not carry compatibility shims** — with one deliberate
-exception. `Policy`, `Action`, and the move records ride **live production stores** written
-by the running daemon, so new fields on those types use `#[serde(default)]` (with a *named*
-default function for numeric fields, since a bare default yields zero) so an existing row
-still decodes. A move record cannot be re-created by re-running a command. Do not remove
-these as cleanup; every other kind of back-compat shim is still unwelcome.
+exception. `Policy`, `Action`, the move records, and **ledger rows** (`OperationRecord` and
+every `OperationKind` variant) ride **live production stores** written by the running daemon,
+so new fields on those types use `#[serde(default)]` (with a *named* default function for
+numeric fields, since a bare default yields zero) so an existing row still decodes. A move
+record cannot be re-created by re-running a command. Do not remove these as cleanup; every
+other kind of back-compat shim is still unwelcome.
+
+The rule applies to a field added to an ALREADY-SHIPPED variant, not just to a new type — that
+distinction is what br-yjg cost. `RefusalDiagnostics`' own later fields carried the attribute
+correctly while the `diagnostics` key that introduced them did not, which permanently killed
+three rows on the funded wallet. Ledger rows are append-only audit evidence the runbook forbids
+deleting, so an undecodable one can never be repaired in place, and `probe_budget_ledger_rows`
+fails closed on any skipped row — the blast radius is a disabled subsystem, not a display gap.
+When you add such a field, pin it with a test that strips the key from a persisted row and
+re-reads it.
 
 **Work is tracked in beads** (`.beads/issues.jsonl` is the tracked truth; `.beads/beads.db`
 is a gitignored cache). Never hand-edit the JSONL — the cache will silently revert it on the
