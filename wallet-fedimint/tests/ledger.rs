@@ -1322,6 +1322,80 @@ fn refusal_diagnostics_missing_observational_fields_decode_to_defaults() {
     assert_eq!(decoded.source_spendable, Some(Msat(10_000)));
 }
 
+/// br-yjg: a `Refusal` row written BEFORE the variant gained `diagnostics` must still decode.
+///
+/// The sibling test above pins the same rule one level DOWN — fields inside
+/// `RefusalDiagnostics` — and that is exactly the gap this closes: the inner struct's evolution
+/// was guarded, the key that introduced it was not. Three rows on the funded k8s wallet (seqs
+/// 611/614/615) are undecodable for this reason, and because a ledger row is append-only audit
+/// evidence the runbook forbids deleting, they cannot be repaired by rewriting them.
+///
+/// This is not cosmetic. `probe_budget_ledger_rows` fails CLOSED on any skipped row, so those
+/// three permanently disable automated probing — see the companion test in `service::tests`.
+#[tokio::test]
+async fn a_legacy_refusal_row_without_the_diagnostics_key_still_decodes() {
+    let db = MemDatabase::new().into_database();
+    let j = FedimintJournal::with_clock(db.clone(), clock_base);
+    let decision = AllocatorDecision {
+        action: Action::RefuseInflow {
+            fed: fed(1),
+            reason: ReasonCode::SpendingBelowTarget,
+            diagnostics: RefusalDiagnostics {
+                want: Some(Msat(50_000)),
+                ..Default::default()
+            },
+        },
+        reason: ReasonCode::SpendingBelowTarget,
+        occurrence: Occurrence(3),
+        idempotency_key: key("refuse:legacy:0101:3"),
+    };
+    j.record_refusals(std::slice::from_ref(&decision), Occurrence(3), BASE)
+        .await
+        .expect("refusals");
+    let seq = j.history(10, None).await.expect("history")[0].seq;
+
+    // Rewrite that row in the legacy shape: valid JSON, but with no `diagnostics` key at all.
+    let app = db.with_prefix(vec![0x00]);
+    let mut row_key = vec![0x05];
+    row_key.extend_from_slice(&seq.to_be_bytes());
+    let mut dbtx = app.begin_transaction().await;
+    let raw = dbtx
+        .raw_get_bytes(&row_key)
+        .await
+        .expect("read row")
+        .expect("row present");
+    let mut row: serde_json::Value = serde_json::from_slice(&raw).expect("parse row");
+    let removed = row["data"]["kind"]["Refusal"]
+        .as_object_mut()
+        .expect("Refusal is a struct variant")
+        .remove("diagnostics");
+    assert!(removed.is_some(), "the legacy shape must actually differ");
+    dbtx.raw_insert_bytes(&row_key, &serde_json::to_vec(&row).expect("re-encode"))
+        .await
+        .expect("write legacy row");
+    dbtx.commit_tx_result().await.expect("commit legacy row");
+
+    let hist = j.history(10, None).await.expect("history");
+    assert_eq!(
+        hist.len(),
+        1,
+        "a legacy refusal row must decode, not be silently skipped as corrupt"
+    );
+    assert_eq!(hist[0].seq, seq);
+    match &hist[0].kind {
+        OperationKind::Refusal {
+            fed: f,
+            diagnostics,
+        } => {
+            assert_eq!(*f, fed(1));
+            // An empty diagnostic is the honest reading: the row predates the arithmetic.
+            assert_eq!(diagnostics.want, None);
+            assert_eq!(diagnostics.source, None);
+        }
+        other => panic!("expected a refusal row, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn conflict_dropped_tick_row_records_an_observable_emitted_zero() {
     let journal = mem_ledger();
