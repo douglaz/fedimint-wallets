@@ -406,6 +406,9 @@ pub(crate) struct PlannedTickRound {
     /// intent already owns. Kept separately from admitted work because it did not complete route
     /// preflight and can only supply the narrow source-associated pin voucher.
     pub(crate) suppressed: Vec<AllocatorDecision>,
+    /// Funding goals the move floor withheld (br-0vg). Diagnostic only: never admitted, never
+    /// reserved, never journaled per tick — `status` is where an operator reads them.
+    pub(crate) deferred: Vec<wallet_core::DeferredFunding>,
     pub(crate) probes: Vec<(FederationId, crate::probe::ProbeResult)>,
     pub(crate) active_probes: BTreeMap<FederationId, ActiveProbeVerdict>,
     pub(crate) snapshot: AllocatorSnapshot,
@@ -576,6 +579,7 @@ async fn plan_tick_off_actor(
             PlannedTickRound {
                 decisions: round.decisions,
                 suppressed: round.suppressed,
+                deferred: round.deferred,
                 probes: round.probes,
                 active_probes: round.active_probes,
                 snapshot: round.snapshot,
@@ -740,8 +744,21 @@ async fn build_tick_round(
     let actor = Actor::Agent {
         occurrence: policy.occurrence,
     };
-    let (decisions, suppressed) =
-        wallet_core::decide_with_blockers(&snapshot, policy.occurrence, &policy.blocked);
+    let wallet_core::AllocatorOutcome {
+        decisions,
+        suppressed,
+        deferred,
+    } = wallet_core::decide_with_diagnostics(&snapshot, policy.occurrence, &policy.blocked);
+    for goal in &deferred {
+        tracing::debug!(
+            dest = %goal.dest.to_hex(),
+            reason = ?goal.reason,
+            want_msat = goal.want.0,
+            floor_msat = goal.floor.0,
+            floor_source = ?goal.floor_source,
+            "tick: funding goal deferred below the move floor"
+        );
+    }
     for decision in &suppressed {
         tracing::warn!(
             key = %decision.idempotency_key.0,
@@ -753,6 +770,7 @@ async fn build_tick_round(
     Ok(PlannedTickRound {
         decisions,
         suppressed,
+        deferred,
         probes: probes.to_vec(),
         active_probes,
         snapshot,
@@ -4086,6 +4104,7 @@ mod route_blocked_designation_tests {
         PlannedTickRound {
             decisions,
             suppressed: vec![],
+            deferred: vec![],
             probes: vec![],
             active_probes: BTreeMap::new(),
             snapshot,

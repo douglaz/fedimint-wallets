@@ -177,6 +177,23 @@ struct StatusResponse {
     standby_fed: Option<String>,
     decisions: Vec<StatusDecision>,
     scored: Vec<StatusScored>,
+    /// Funding goals the tick wants but withholds because the shortfall is below the move floor.
+    /// A tick emits no decision and no ledger row for these, so this is the only place they are
+    /// visible; an empty array means nothing is being withheld for dust (br-0vg).
+    deferred: Vec<StatusDeferred>,
+}
+
+/// A withheld funding goal: what it wanted, what blocked it, and which floor that was.
+#[derive(Serialize)]
+struct StatusDeferred {
+    dest: String,
+    source: Option<String>,
+    reason: String,
+    want_msat: u64,
+    floor_msat: u64,
+    /// `protocol_min_move` (lnv2's minimum incoming contract) or `route_min_viable` (the pair's
+    /// economics under `max_fee_bps_of_move`).
+    floor_source: &'static str,
 }
 
 #[derive(Serialize)]
@@ -229,6 +246,21 @@ pub async fn status(State(state): State<AppState>) -> Result<impl IntoResponse, 
             .map(|scored| StatusScored {
                 id: scored.id.to_hex(),
                 gated_eligible: scored.gated_eligible,
+            })
+            .collect(),
+        deferred: report
+            .deferred
+            .iter()
+            .map(|goal| StatusDeferred {
+                dest: goal.dest.to_hex(),
+                source: goal.source.map(|id| id.to_hex()),
+                reason: reason_tag(goal.reason).to_owned(),
+                want_msat: goal.want.0,
+                floor_msat: goal.floor.0,
+                floor_source: match goal.floor_source {
+                    wallet_core::DeferralFloor::ProtocolMinMove => "protocol_min_move",
+                    wallet_core::DeferralFloor::RouteMinViable => "route_min_viable",
+                },
             })
             .collect(),
     }))
