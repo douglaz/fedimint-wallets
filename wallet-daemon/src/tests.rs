@@ -1201,3 +1201,60 @@ async fn receive_rejects_a_nonce_with_reserved_characters() {
     assert!(journal.history(10, None).await.expect("history").is_empty());
     service.shutdown().await.expect("shutdown");
 }
+
+/// br-c3j: a policy row written by a NEWER build must still decode here.
+///
+/// `Policy` is both a validated wire DTO and a persisted row. `#[serde(deny_unknown_fields)]` is
+/// right for the request — it stops a typo'd field silently taking the shipped default — and is a
+/// downgrade FENCE on the store: once a newer build writes a policy carrying a field this build
+/// has never heard of, this build cannot read its own policy row and will not start.
+///
+/// That is a one-way door on a funded wallet. Every other forward-compat test in this repo asks
+/// whether a NEW build reads an OLD row; this asks the opposite, which is the direction a rollback
+/// actually needs.
+#[test]
+fn a_policy_row_from_a_newer_build_still_decodes() {
+    let mut row = serde_json::to_value(fixture_policy()).expect("serialize policy");
+    row.as_object_mut()
+        .expect("policy is a JSON object")
+        .insert("a_field_from_the_future".to_owned(), serde_json::json!(7));
+
+    let decoded: Policy = serde_json::from_value(row)
+        .expect("a policy row carrying an unknown future field must still decode");
+    assert_eq!(
+        decoded,
+        fixture_policy(),
+        "the known fields must survive unchanged"
+    );
+}
+
+/// The other half: making the STORE permissive must not make the REQUEST permissive. A typo'd
+/// field in `PUT /v1/policy` must still be refused by name, or an operator silently keeps the old
+/// value while believing they changed it.
+#[tokio::test]
+async fn put_policy_still_rejects_an_unknown_field() {
+    let (state, service, _) = fixture().await;
+    let mut body = serde_json::to_value(fixture_policy()).expect("serialize policy");
+    body.as_object_mut()
+        .expect("policy is a JSON object")
+        .insert("standby_targett".to_owned(), serde_json::json!(1));
+
+    let (status, response) = send(
+        &state,
+        request("PUT", "/v1/policy", Some(TOKEN), Some(body)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a misspelled policy field must be refused, not silently ignored: {response:?}"
+    );
+    assert!(
+        response["message"]
+            .as_str()
+            .expect("message string")
+            .contains("standby_targett"),
+        "the refusal must name the offending field: {response:?}"
+    );
+    service.shutdown().await.expect("shutdown");
+}

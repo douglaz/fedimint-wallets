@@ -576,6 +576,10 @@ pub struct StatusReport {
     pub spending_fed: Option<FederationId>,
     pub standby_fed: Option<FederationId>,
     pub decisions: Vec<AllocatorDecision>,
+    /// Funding goals the move floor withheld (br-0vg). A tick emits no decision and no ledger row
+    /// for these — a dry-run `status` is the one place an operator can see them, and without it a
+    /// permanently-deferred rebalance is indistinguishable from an idle, healthy wallet.
+    pub deferred: Vec<wallet_core::DeferredFunding>,
 }
 
 #[cfg(test)]
