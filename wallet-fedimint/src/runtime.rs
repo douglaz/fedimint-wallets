@@ -380,6 +380,8 @@ pub(crate) struct TickPlan {
     /// Ordinary work deferred solely by replacement one-child exclusivity. Audit-only: it never
     /// becomes an apply candidate or a conflict-suppression voucher.
     pub(crate) replacement_deferred: Vec<AllocatorDecision>,
+    /// Funding goals withheld by the move floor (br-0vg). Diagnostic only.
+    pub(crate) deferred: Vec<wallet_core::DeferredFunding>,
     /// Durable rebalance endpoints observed while planning. `status` reports against this planning
     /// view; `tick` re-scans and uses a fresh value after its final conflict retention.
     pub(crate) blockers: GoalBlockers,
@@ -3994,11 +3996,24 @@ impl Runtime {
                 gated_eligible,
             });
         }
+        for goal in &plan.deferred {
+            tracing::warn!(
+                dest = %goal.dest.to_hex(),
+                reason = ?goal.reason,
+                want_msat = goal.want.0,
+                floor_msat = goal.floor.0,
+                floor_source = ?goal.floor_source,
+                "status: a funding goal is deferred below the move floor; it will not be funded \
+                 until the shortfall grows past the floor, the route gets cheaper, or the \
+                 proportional cap is raised"
+            );
+        }
         Ok(StatusReport {
             scored,
             spending_fed: plan.snapshot.spending_fed,
             standby_fed: plan.snapshot.standby_fed,
             decisions: status_decisions,
+            deferred: plan.deferred,
         })
     }
 
@@ -4070,6 +4085,7 @@ impl Runtime {
             raw_probes,
             suppressed: round.suppressed,
             replacement_deferred: round.replacement_deferred,
+            deferred: round.deferred,
             probes: round.probes,
             active_probes: round.active_probes,
             snapshot: round.snapshot,
@@ -6089,6 +6105,7 @@ mod tests {
             decisions: vec![],
             suppressed: vec![],
             replacement_deferred: vec![],
+            deferred: vec![],
             blockers: GoalBlockers::default(),
             replacement: Some(crate::service::EvacuationReplacementPlan {
                 old_key: parent.idempotency_key.clone(),
@@ -8208,6 +8225,7 @@ mod tests {
         runtime.set_tick_test_fixture(
             Arc::new(wallet_core::MockExecutor::new()),
             TickPlan {
+                deferred: vec![],
                 raw_probes: vec![],
                 probes: vec![(FED_A, raw_a)],
                 active_probes: BTreeMap::new(),
@@ -8366,6 +8384,7 @@ mod tests {
         runtime.set_tick_test_fixture(
             executor.clone(),
             TickPlan {
+                deferred: vec![],
                 raw_probes: vec![],
                 // FED_A is pinned but fails its own coarse gateway probe. Its only rebalance is
                 // moved into `suppressed` by `tick`'s fresh re-scan; pin checking receives that

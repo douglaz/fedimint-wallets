@@ -1658,8 +1658,10 @@ occurrence without moving funds. It exited 0; the complete log is
 - `/v1/status` documentation now states its operational prerequisites and side effect precisely:
   live `Runtime` and `MultiClient`, every joined federation open, reconciled `get_watch_state`, checked
   successor (`MAX-1` previews `MAX`; `MAX` is 503), and live probes. The real-sats runbook also calls
-  out that status is money-dry but `get_watch_state` is a bounded migration writer: one status request
-  can advance a valid batch and then return 503 directing the operator to `/v1/watch/status`.
+  out that status is money-dry. (SUPERSEDED: `get_watch_state` was a bounded migration WRITER when
+  this was written — one status request could advance a batch and then 503. The WatchState
+  agent-floor migration subsystem was deleted in br-e29 for an O(1) counter/tail check, so status
+  now performs a plain read and never advances a batch.)
 - Focused green evidence: all 23 scheduler tests exited 0 in
   `/tmp/opus-p2-scheduler-tests.log`; the recovery wake test and poisoned-marker recovery test exited
   0 in `/tmp/opus-p2-recovery-test.log` and `/tmp/opus-p2-poison-test.log`. Mutation evidence:

@@ -222,6 +222,23 @@ struct StatusResponse {
     standby_fed: Option<String>,
     decisions: Vec<StatusDecision>,
     scored: Vec<StatusScored>,
+    /// Funding goals the tick wants but withholds because the shortfall is below the move floor.
+    /// A tick emits no decision and no ledger row for these, so this is the only place they are
+    /// visible; an empty array means nothing is being withheld for dust (br-0vg).
+    deferred: Vec<StatusDeferred>,
+}
+
+/// A withheld funding goal: what it wanted, what blocked it, and which floor that was.
+#[derive(Serialize)]
+struct StatusDeferred {
+    dest: String,
+    source: Option<String>,
+    reason: String,
+    want_msat: u64,
+    floor_msat: u64,
+    /// `protocol_min_move` (lnv2's minimum incoming contract) or `route_min_viable` (the pair's
+    /// economics under `max_fee_bps_of_move`).
+    floor_source: &'static str,
 }
 
 #[derive(Serialize)]
@@ -279,6 +296,21 @@ pub async fn status(State(state): State<AppState>) -> Result<impl IntoResponse, 
             .map(|scored| StatusScored {
                 id: scored.id.to_hex(),
                 gated_eligible: scored.gated_eligible,
+            })
+            .collect(),
+        deferred: report
+            .deferred
+            .iter()
+            .map(|goal| StatusDeferred {
+                dest: goal.dest.to_hex(),
+                source: goal.source.map(|id| id.to_hex()),
+                reason: reason_tag(goal.reason).to_owned(),
+                want_msat: goal.want.0,
+                floor_msat: goal.floor.0,
+                floor_source: match goal.floor_source {
+                    wallet_core::DeferralFloor::ProtocolMinMove => "protocol_min_move",
+                    wallet_core::DeferralFloor::RouteMinViable => "route_min_viable",
+                },
             })
             .collect(),
     }))
@@ -632,11 +664,45 @@ pub async fn get_policy(State(state): State<AppState>) -> Result<impl IntoRespon
     Ok(Json(state.client.get_policy().await?))
 }
 
+/// The known `Policy` field names, derived from the type itself so the wire contract cannot drift
+/// from the struct (br-c3j). `Policy` carries no `rename`/`flatten`/`skip_serializing_if`, so
+/// serializing the default yields exactly its field set.
+fn known_policy_fields() -> std::collections::BTreeSet<String> {
+    let serialized =
+        serde_json::to_value(Policy::default()).expect("Policy always serializes to JSON");
+    serialized
+        .as_object()
+        .expect("Policy serializes to a JSON object")
+        .keys()
+        .cloned()
+        .collect()
+}
+
 pub async fn put_policy(
     State(state): State<AppState>,
-    policy: Result<Json<Policy>, JsonRejection>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Result<impl IntoResponse, HttpError> {
-    let Json(policy) = policy?;
+    let Json(body) = body?;
+    // The STORED row is permissive so a rollback can still read a policy written by a newer build
+    // (br-c3j); strictness belongs here, on the request, where a typo'd field would otherwise
+    // silently leave the old value in place while the operator believes they changed it.
+    let object = body
+        .as_object()
+        .ok_or_else(|| HttpError::invalid_request("policy must be a JSON object"))?;
+    let known = known_policy_fields();
+    let unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|field| !known.contains(*field))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(HttpError::invalid_request(format!(
+            "unknown policy field(s): {}",
+            unknown.join(", ")
+        )));
+    }
+    let policy: Policy = serde_json::from_value(body)
+        .map_err(|e| HttpError::invalid_request(format!("policy is not well-formed: {e}")))?;
     // Validation + journal + scheduler wake all happen in the actor; an invalid policy comes
     // back as a refused ApiError naming the offending field (§6a.6).
     Ok(Json(state.client.put_policy(policy).await?))

@@ -1231,6 +1231,7 @@ async fn run_standalone_direct(
                 println!("{}: unavailable (failed to open)", id.to_hex());
             }
             print_decisions(&report.decisions);
+            print_deferred(&report.deferred);
             if !unopened.is_empty() {
                 anyhow::bail!(
                     "{} joined federation(s) failed to open ({}); the scored view above covers \
@@ -2450,6 +2451,42 @@ fn print_decisions(decisions: &[AllocatorDecision]) {
     }
 }
 
+/// Print the funding goals the move floor withheld, one `deferred: …` line each.
+///
+/// `decisions: none` alone cannot distinguish an idle wallet from one that wants to rebalance and
+/// permanently cannot: a shortfall below the floor produces no decision and no ledger row, and a
+/// standby's shortfall only grows when something spends from it (br-0vg). These lines are that
+/// difference. Printed even when empty, so its absence is never mistaken for "not checked".
+fn print_deferred(deferred: &[wallet_core::DeferredFunding]) {
+    if deferred.is_empty() {
+        println!("deferred: none");
+        return;
+    }
+    for goal in deferred {
+        println!("deferred: {}", describe_deferred(goal));
+    }
+}
+
+/// One withheld funding goal as an operator-readable line. Names the destination, the shortfall,
+/// the floor, and WHICH floor — a protocol dust gap clears only when the gap grows, whereas a
+/// route floor also clears if the route gets cheaper or `max_fee_bps_of_move` is raised.
+fn describe_deferred(goal: &wallet_core::DeferredFunding) -> String {
+    format!(
+        "{} want={} msat floor={} msat ({}) reason={:?}{}",
+        goal.dest.to_hex(),
+        goal.want.0,
+        goal.floor.0,
+        match goal.floor_source {
+            wallet_core::DeferralFloor::ProtocolMinMove => "protocol min_move",
+            wallet_core::DeferralFloor::RouteMinViable => "route min_viable_amount",
+        },
+        goal.reason,
+        goal.source
+            .map(|id| format!(" source={}", id.to_hex()))
+            .unwrap_or_default()
+    )
+}
+
 /// The non-zero-exit message for a `tick` whose apply did not settle every executable decision,
 /// or `None` when it did. A tick is a money operation, so — like `move`/`await-move`/
 /// `direct-inflow` — it must exit NON-ZERO on any failed decision, including an existing terminal
@@ -3481,6 +3518,39 @@ mod tests {
     use wallet_fedimint::{
         DiscoverPassProgress, EvacuationSupersessionNeighbors, EvacuationSupersessionRecord,
     };
+
+    /// The two floors must read differently. They imply different operator actions: a protocol
+    /// dust gap clears only when the gap itself grows, while a route floor also clears if the
+    /// route gets cheaper or the proportional cap is raised (br-0vg).
+    #[test]
+    fn deferred_lines_name_the_shortfall_and_which_floor_blocked_it() {
+        let goal = wallet_core::DeferredFunding {
+            dest: FederationId([0x0b; 32]),
+            source: Some(FederationId([0x0a; 32])),
+            reason: wallet_core::ReasonCode::StandbyBelowTarget,
+            want: Msat(301_586),
+            floor: Msat(5_000_000),
+            floor_source: wallet_core::DeferralFloor::RouteMinViable,
+        };
+        let line = describe_deferred(&goal);
+        assert!(line.contains("want=301586 msat"), "{line}");
+        assert!(line.contains("floor=5000000 msat"), "{line}");
+        assert!(line.contains("route min_viable_amount"), "{line}");
+        assert!(line.contains("StandbyBelowTarget"), "{line}");
+        assert!(line.contains(&FederationId([0x0a; 32]).to_hex()), "{line}");
+
+        let protocol = describe_deferred(&wallet_core::DeferredFunding {
+            floor: Msat(5_000),
+            floor_source: wallet_core::DeferralFloor::ProtocolMinMove,
+            source: None,
+            ..goal
+        });
+        assert!(protocol.contains("protocol min_move"), "{protocol}");
+        assert!(
+            !protocol.contains("source="),
+            "no source means no source field: {protocol}"
+        );
+    }
 
     #[test]
     fn gate_policy_override_maps_window_flags_or_none() {

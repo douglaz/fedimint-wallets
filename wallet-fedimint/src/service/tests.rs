@@ -14014,3 +14014,65 @@ async fn ambiguous_exchange_recovery_drives_the_committed_child_while_planning_s
     );
     service.shutdown().await.expect("shutdown");
 }
+
+/// br-yjg, the outage half: a legacy `Refusal` ledger row must not disable automated probing.
+///
+/// `probe_budget_ledger_rows` fails CLOSED on any skipped row — correctly, since a skipped row
+/// could be an in-window probe spend the weekly limit must count. But the skip counter is
+/// incremented in the decode `Err` arm, BEFORE the time-window filter, so a row too old to be in
+/// any budget window still poisons every future reconstruction. `load_probe_budget` then stores
+/// the error and `ensure_probe_budget_loaded` refuses every probe, forever.
+///
+/// That is the live failure on the funded k8s wallet: three rows at seqs 611/614/615, written
+/// before `OperationKind::Refusal` gained `diagnostics`, have silently disabled probing and
+/// discovery since long before anyone noticed. Fail-closed is right; decoding a legacy row as
+/// corrupt is not.
+#[tokio::test]
+async fn a_legacy_refusal_row_does_not_permanently_disable_the_probe_budget() {
+    let db = MemDatabase::new().into_database();
+    let journal = FedimintJournal::new(db.clone());
+    let decision = AllocatorDecision {
+        action: Action::RefuseInflow {
+            fed: fed(1),
+            reason: ReasonCode::SpendingBelowTarget,
+            diagnostics: RefusalDiagnostics::default(),
+        },
+        reason: ReasonCode::SpendingBelowTarget,
+        occurrence: Occurrence(1),
+        idempotency_key: IdempotencyKey("refuse:probe-budget:0101:1".to_owned()),
+    };
+    journal
+        .record_refusals(std::slice::from_ref(&decision), Occurrence(1), 1_000)
+        .await
+        .expect("record refusal");
+    let seq = journal.history(10, None).await.expect("history")[0].seq;
+
+    // Rewrite it in the legacy shape (no `diagnostics` key), exactly as the live rows are.
+    let app = db.with_prefix(vec![0x00]);
+    let mut row_key = vec![0x05];
+    row_key.extend_from_slice(&seq.to_be_bytes());
+    let mut dbtx = app.begin_transaction().await;
+    let raw = dbtx
+        .raw_get_bytes(&row_key)
+        .await
+        .expect("read row")
+        .expect("row present");
+    let mut row: serde_json::Value = serde_json::from_slice(&raw).expect("parse row");
+    assert!(row["data"]["kind"]["Refusal"]
+        .as_object_mut()
+        .expect("Refusal is a struct variant")
+        .remove("diagnostics")
+        .is_some());
+    dbtx.raw_insert_bytes(&row_key, &serde_json::to_vec(&row).expect("re-encode"))
+        .await
+        .expect("write legacy row");
+    dbtx.commit_tx_result().await.expect("commit legacy row");
+
+    // The row is ANCIENT relative to the budget window, so it cannot legitimately affect any
+    // budget — yet before the fix it poisoned the scan and refused every probe.
+    let now_ms = 1_000 + crate::runtime::PROBE_BUDGET_WINDOW_MS * 10;
+    journal
+        .probe_budget_ledger_rows(now_ms, crate::runtime::PROBE_BUDGET_WINDOW_MS)
+        .await
+        .expect("a legacy refusal row must not fail the probe budget closed");
+}

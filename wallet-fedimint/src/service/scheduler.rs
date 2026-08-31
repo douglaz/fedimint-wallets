@@ -1409,6 +1409,7 @@ mod tests {
             decisions: vec![],
             suppressed: vec![],
             replacement_deferred: vec![],
+            deferred: vec![],
             blockers: GoalBlockers::default(),
             replacement: Some(crate::service::EvacuationReplacementPlan {
                 parent,
@@ -2683,6 +2684,7 @@ mod tests {
         runtime.set_tick_test_fixture(
             Arc::new(wallet_core::MockExecutor::new()),
             TickPlan {
+                deferred: vec![],
                 raw_probes: sampled_probes.clone(),
                 probes: sampled_probes.clone(),
                 active_probes: BTreeMap::new(),
@@ -2835,6 +2837,7 @@ mod tests {
         runtime.set_tick_test_fixture(
             Arc::new(wallet_core::MockExecutor::new()),
             TickPlan {
+                deferred: vec![],
                 raw_probes: sampled_probes.clone(),
                 probes: sampled_probes.clone(),
                 active_probes: BTreeMap::new(),
