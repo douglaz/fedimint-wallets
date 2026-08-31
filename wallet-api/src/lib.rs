@@ -22,8 +22,20 @@ fn default_evac_fee_bps() -> u16 {
 }
 
 /// The standing instruction's user-owned allocation and automation parameters.
+///
+/// Deliberately NOT `#[serde(deny_unknown_fields)]`, unlike every request type below (br-c3j).
+/// `Policy` is both a validated wire DTO and a PERSISTED row, and those two roles want opposite
+/// strictness. On the wire, rejecting an unknown key stops a typo silently taking the shipped
+/// default — so the daemon still enforces that, in `handlers::put_policy`, against the key set
+/// derived from this very type. On the store, rejecting an unknown key is a DOWNGRADE FENCE: the
+/// moment a newer build writes a policy carrying a field an older build has never heard of, that
+/// older build cannot read its own policy row and will not start, so a bad deploy cannot be rolled
+/// back. `seed_policy` decodes this row before the actor starts, which is exactly where a hard
+/// failure strands the wallet.
+///
+/// The `serde(default)` attributes below cover the other direction (a new build reading an old
+/// row). Both directions are load-bearing on a funded wallet; keep them.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Policy {
     pub per_fed_cap: Msat,
     pub spending_target: Msat,
