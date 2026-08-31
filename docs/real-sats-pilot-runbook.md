@@ -389,6 +389,23 @@ a policy row persisted by a previous release still decodes and walletd starts no
 zero fee cap or zero threshold silently disables the thing it was meant to bound. Just deploy and restart; re-run `policy set` afterward only if you want to set the new
 field to a non-default value.
 
+### Rolling BACK across a policy-schema change
+
+Adding a field also has to stay readable by the release you might roll back TO. `Policy` used to
+carry `#[serde(deny_unknown_fields)]`, which made that impossible: once a newer walletd wrote a
+policy row carrying a field the older one had never heard of, the older binary could not decode
+its own policy row at startup — `seed_policy` reads it before the actor starts — so the rollback
+did not merely lose the new setting, it failed to boot. That attribute is gone from `Policy`
+(br-c3j); the strict check now lives in the `PUT /v1/policy` handler, so a typo'd field is still
+refused by name while the stored row stays readable by older builds.
+
+**Interim rule, until the currently deployed release carries that fix:** when you upgrade PAST a
+release that predates br-c3j, do NOT issue `policy set` / `PUT /v1/policy` during the canary.
+The stored row keeps its old shape and rollback stays available; the first policy write is what
+closes the door. Check what the deployed binary actually does before assuming otherwise:
+
+    git show <deployed-commit>:wallet-api/src/lib.rs | grep -B2 'pub struct Policy'
+
 **Do NOT try to "reset" a stuck policy by wiping `journal.db`.** The federation registry
 (federation id → client db-prefix) lives in `journal.db`; wiping it deliberately discards
 bookkeeping and leaves the funded client partition inert. `wallet-cli join` then allocates a fresh

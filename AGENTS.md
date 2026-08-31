@@ -133,8 +133,18 @@ numeric fields, since a bare default yields zero) so an existing row still decod
 record cannot be re-created by re-running a command. Do not remove these as cleanup; every
 other kind of back-compat shim is still unwelcome.
 
-The rule applies to a field added to an ALREADY-SHIPPED variant, not just to a new type — that
-distinction is what br-yjg cost. `RefusalDiagnostics`' own later fields carried the attribute
+Forward compatibility is only half of it. A persisted type must ALSO stay readable by the
+PREVIOUS build, or a bad deploy cannot be rolled back — so **never put
+`#[serde(deny_unknown_fields)]` on a type that is written to a live store**. It is correct on a
+request DTO (a typo'd field would otherwise silently take the shipped default) and a downgrade
+fence on a row. `Policy` was both at once and carried the attribute, which meant one `PUT
+/v1/policy` after an upgrade would stop the older binary from reading its own policy row at
+startup (br-c3j). The fix pattern: keep the stored type permissive and enforce strictness in the
+handler against a key set derived from the type itself, so the wire contract cannot drift. Every
+other `deny_unknown_fields` in `wallet-api` is a request-only `*Request` DTO; keep it that way.
+
+The `serde(default)` rule applies to a field added to an ALREADY-SHIPPED variant, not just to a
+new type — that distinction is what br-yjg cost. `RefusalDiagnostics`' own later fields carried the attribute
 correctly while the `diagnostics` key that introduced them did not, which permanently killed
 three rows on the funded wallet. Ledger rows are append-only audit evidence the runbook forbids
 deleting, so an undecodable one can never be repaired in place, and `probe_budget_ledger_rows`
