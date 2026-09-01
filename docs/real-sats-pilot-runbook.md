@@ -151,6 +151,41 @@ bps value entered as if it were msat silently widens the cap by orders of magnit
 
 `--evac-fee-base-msat` is msat, like the rest. Raise any of them only after a clean first week.)
 
+## Automated — page on what the glance cannot catch
+
+The daily glance below is a HUMAN check, and every outage this wallet has had survived precisely
+because nobody ran one for weeks. All three were fail-CLOSED and correct to refuse, and none of
+them moved a balance, crashed the process, or failed a liveness probe:
+
+* a funding shortfall parked below the route floor for 27 days — `decisions: []`, no log line;
+* three undecodable ledger rows that disabled automated probing for weeks — one `warn!` per read;
+* a partial federation view skips the whole automated cycle while `scheduler_alive` stays `true`,
+  because the scheduler loop is genuinely healthy.
+
+`scheduler_alive` is LIVENESS. `automation_ready` is READINESS, and they disagree in exactly the
+cases that matter. Run the poller from cron and let cron mail non-zero output:
+
+```bash
+export WALLETD_URL=http://127.0.0.1:9736
+export WALLETD_TOKEN_FILE=/secrets/token
+ops/walletd-watch.py --state ~/.cache/walletd-watch.state   # 0 quiet · 1 alert · 2 unreachable
+```
+
+It pages on `scheduler_alive=false`, `automation_ready=false` (with the blocking reason), any
+route-floor deferral, and an unreachable daemon; it reports balance changes as notes. A standing
+problem pages on transition, not every pass — delete the state file to force a re-page.
+
+Two behaviours worth knowing before you trust it:
+
+* Against a daemon predating these fields it prints `automation_ready absent` as a NOTE and exits
+  0. Absent is UNKNOWN, never healthy — on that build a silent fence is simply not observable, and
+  the fix is to upgrade, not to trust the quiet.
+* A deferral whose `floor_source` is `protocol_min_move` is reported as a note rather than an
+  alert. It can be permanently unclosable — nothing drains a standby, and no exact-net inflow
+  smaller than the protocol floor can close the remainder — so alerting on it forever would train
+  you to ignore the deferred list, which is the one signal that would have caught the 27-day
+  outage. Route-floor deferrals always alert.
+
 ## Daily — the one-minute glance
 
 ```bash
