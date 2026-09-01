@@ -93,6 +93,7 @@ async fn empty_fixture_with_db() -> (
     let state = AppState {
         client: service.client(),
         journal: journal.clone(),
+        automation_blocker: service.automation_blocker(),
         mc: None,
         runtime: None,
         scheduler_alive: service.scheduler_liveness(),
@@ -731,6 +732,45 @@ async fn health_reports_the_observability_shape() {
     assert!(body["actor_queue_depth"].is_number());
     assert!(body["inflight_drivers"].is_number());
     // A detached fixture has no scheduler, so liveness is honestly `false`.
+    assert_eq!(body["scheduler_alive"], false);
+    assert_eq!(body["automation_ready"], true);
+    assert!(body["automation_blocked"].is_null());
+    service.shutdown().await.expect("shutdown");
+}
+
+/// `/v1/health` must carry the scheduler's suppression reason, not just its liveness.
+///
+/// `scheduler_alive` answers "is the task running", which stays `true` through every fail-closed
+/// refusal — the fence skips the cycle and loops. An operator polling only that cannot tell an
+/// idle healthy wallet from one that is alive and permanently refusing to plan. This wallet has
+/// lost weeks to exactly that gap twice.
+#[tokio::test]
+async fn health_surfaces_the_reason_automation_is_suppressed() {
+    let (state, service, _) = fixture().await;
+    *state.automation_blocker.lock().expect("blocker mutex") =
+        Some(wallet_api::AutomationBlocked {
+            reason: "partial_federation_view".to_owned(),
+            detail: "1 joined federation(s) could not be opened: 5151".to_owned(),
+        });
+
+    let (status, body) = send(&state, request("GET", "/v1/health", Some(TOKEN), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["automation_ready"], false,
+        "a fenced scheduler must not report ready: {body}"
+    );
+    assert_eq!(
+        body["automation_blocked"]["reason"],
+        "partial_federation_view"
+    );
+    assert!(
+        body["automation_blocked"]["detail"]
+            .as_str()
+            .expect("detail string")
+            .contains("5151"),
+        "the page must name the offending federation: {body}"
+    );
+    // Liveness is unchanged and still honest — which is precisely why it cannot carry this.
     assert_eq!(body["scheduler_alive"], false);
     service.shutdown().await.expect("shutdown");
 }

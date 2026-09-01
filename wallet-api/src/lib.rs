@@ -450,7 +450,39 @@ pub struct CandidateView {
 pub struct HealthView {
     pub actor_queue_depth: usize,
     pub inflight_drivers: usize,
+    /// Whether the scheduler TASK is running. It stays `true` while the scheduler loops and
+    /// refuses to plan, so it is a liveness signal only — read [`Self::automation_ready`] to
+    /// learn whether the wallet is actually automating anything.
     pub scheduler_alive: bool,
+    /// `false` while the scheduler is alive but is refusing to plan money work — the whole
+    /// automated cycle (tick, scheduled probes, discovery) is being skipped every pass.
+    ///
+    /// This exists because `scheduler_alive` cannot express it, and that gap has cost this
+    /// wallet real outages: a funding shortfall parked below the move floor went unnoticed for
+    /// 27 days, and three undecodable ledger rows disabled automated probing for weeks. Both
+    /// were fail-CLOSED by design and correct to refuse; neither was observable. A refusal that
+    /// nothing can see is indistinguishable from an idle, healthy wallet.
+    ///
+    /// Absent on a daemon too old to report it, which defaults to `true` rather than inventing
+    /// an alarm — a poller should treat a missing field as unknown, not as healthy.
+    #[serde(default = "default_automation_ready")]
+    pub automation_ready: bool,
+    /// Why automation is suppressed, when it is. `None` whenever `automation_ready` is `true`.
+    #[serde(default)]
+    pub automation_blocked: Option<AutomationBlocked>,
+}
+
+fn default_automation_ready() -> bool {
+    true
+}
+
+/// A machine-readable reason the scheduler is skipping its automated cycle.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationBlocked {
+    /// Stable snake_case tag for alerting to match on; the set grows as new fences are added.
+    pub reason: String,
+    /// Operator-facing detail naming the specific offending input where one is known.
+    pub detail: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -971,6 +1003,11 @@ mod tests {
             actor_queue_depth: 2,
             inflight_drivers: 3,
             scheduler_alive: true,
+            automation_ready: false,
+            automation_blocked: Some(AutomationBlocked {
+                reason: "partial_federation_view".to_owned(),
+                detail: "1 joined federation(s) could not be opened: aa".to_owned(),
+            }),
         });
         assert_json_roundtrip(WatchStatusView {
             occurrence: 7,
