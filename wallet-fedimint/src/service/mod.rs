@@ -994,6 +994,7 @@ pub struct WalletService {
     /// reports scheduler liveness without owning the join handle. Seeded `false` when no
     /// runtime is present (a detached fixture service has no scheduler).
     scheduler_alive: Arc<AtomicBool>,
+    automation_blocker: Arc<Mutex<Option<wallet_api::AutomationBlocked>>>,
     critical_exit: mpsc::UnboundedReceiver<&'static str>,
     #[cfg(test)]
     policy_wake: tokio::sync::watch::Receiver<u64>,
@@ -1009,6 +1010,13 @@ impl WalletService {
     /// scheduler task runs, flipped `false` when it returns or panics.
     pub fn scheduler_liveness(&self) -> Arc<AtomicBool> {
         self.scheduler_alive.clone()
+    }
+
+    /// A cloneable handle to the reason automation is suppressed, for `/v1/health`. `None` means
+    /// the last cycle reached planning. Distinct from [`Self::scheduler_liveness`], which stays
+    /// `true` while the scheduler loops and refuses — the gap this closes.
+    pub fn automation_blocker(&self) -> Arc<Mutex<Option<wallet_api::AutomationBlocked>>> {
+        self.automation_blocker.clone()
     }
 
     /// Wait for the actor or scheduler to stop unexpectedly. The daemon races this against
@@ -1162,11 +1170,14 @@ impl WalletService {
             .await;
         });
         let scheduler_alive = Arc::new(AtomicBool::new(scheduler_runtime.is_some()));
+        let automation_blocker: Arc<Mutex<Option<wallet_api::AutomationBlocked>>> =
+            Arc::new(Mutex::new(None));
         let (scheduler_abort, scheduler_task) = match scheduler_runtime {
             Some(runtime) => {
                 let (abort, abort_rx) = oneshot::channel();
                 let scheduler_client = client.clone();
                 let liveness = scheduler_alive.clone();
+                let blocker = automation_blocker.clone();
                 let scheduler_exit = critical_exit_tx.clone();
                 let task = tokio::spawn(async move {
                     let _guard = CriticalTaskGuard {
@@ -1180,6 +1191,7 @@ impl WalletService {
                         scheduler::default_sources(),
                         policy_wake_rx,
                         abort_rx,
+                        blocker,
                     )
                     .await;
                 });
@@ -1194,6 +1206,7 @@ impl WalletService {
             scheduler_abort,
             scheduler_task,
             scheduler_alive,
+            automation_blocker,
             critical_exit,
             #[cfg(test)]
             policy_wake: test_policy_wake,

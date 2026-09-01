@@ -553,6 +553,7 @@ pub(super) async fn run(
     sources: Vec<Box<dyn CandidateSource>>,
     mut policy_wake: watch::Receiver<u64>,
     mut abort: oneshot::Receiver<()>,
+    automation_blocker: Arc<std::sync::Mutex<Option<wallet_api::AutomationBlocked>>>,
 ) {
     let (expiry_wake_tx, mut expiry_wake_rx) = mpsc::channel(32);
     let multi_client = runtime.service_multi_client();
@@ -576,9 +577,20 @@ pub(super) async fn run(
                 CycleResult {
                     deadlines: wallet_core::AdaptiveSleepDeadlines::default(),
                     noop: false,
+                    // A cycle that ERRORED did not reach planning either. Report it under its
+                    // own tag rather than leaving `/v1/health` claiming automation is ready.
+                    automation_blocked: Some(wallet_api::AutomationBlocked {
+                        reason: "cycle_failed".to_owned(),
+                        detail: format!("{error}"),
+                    }),
                 }
             }
         };
+        // Publish before the wait: this is the value `/v1/health` reads between cycles, and a
+        // cleared blocker is as important to publish as a set one.
+        if let Ok(mut slot) = automation_blocker.lock() {
+            slot.clone_from(&cycle.automation_blocked);
+        }
         // Settlement-stall watchdog: exit for a supervised restart if the client's receive path
         // has died (see `detect_settlement_stall`). Runs off-actor each cycle; the history scan
         // is gated behind the cheap awaiting scan so it only fires when receives are stuck.
@@ -756,6 +768,11 @@ async fn run_cycle(
             .filter(|id| !open.contains(id))
             .collect();
         if !unopened.is_empty() {
+            let named = unopened
+                .iter()
+                .map(|id| id.to_hex())
+                .collect::<Vec<_>>()
+                .join(", ");
             tracing::warn!(
                 unopened = ?unopened.iter().map(|id| id.to_hex()).collect::<Vec<_>>(),
                 "watch scheduler: partial federation view; skipping the automated cycle (§15.8)"
@@ -763,6 +780,15 @@ async fn run_cycle(
             return Ok(CycleResult {
                 deadlines: wallet_core::AdaptiveSleepDeadlines::default(),
                 noop: false,
+                // Refusing is right; refusing invisibly is not. Every pass re-fences until the
+                // opens succeed, so without this an operator sees only `scheduler_alive: true`.
+                automation_blocked: Some(wallet_api::AutomationBlocked {
+                    reason: "partial_federation_view".to_owned(),
+                    detail: format!(
+                        "{} joined federation(s) could not be opened: {named}",
+                        unopened.len()
+                    ),
+                }),
             });
         }
         // Every successful final open publication advances membership_epoch and the allocator
@@ -1027,6 +1053,8 @@ async fn run_cycle(
             && commit.refused.is_empty()
             && attempted_probes == 0
             && discovery_before == discovery_after,
+        // A cycle that reached planning is by definition not fenced.
+        automation_blocked: None,
     })
 }
 
@@ -1212,6 +1240,9 @@ async fn before_decide_probes_test_hook(
 struct CycleResult {
     deadlines: wallet_core::AdaptiveSleepDeadlines,
     noop: bool,
+    /// Set when this cycle refused to plan money work at all. `run` publishes it so `/v1/health`
+    /// can report `automation_ready: false` instead of a bare `scheduler_alive: true`.
+    automation_blocked: Option<wallet_api::AutomationBlocked>,
 }
 
 #[cfg(test)]
@@ -1543,6 +1574,70 @@ mod tests {
             "discovery continues after a designation read fault"
         );
         assert!(!cycle.noop, "a designation-fault cycle is not a no-op");
+        service.shutdown().await.expect("shutdown");
+    }
+
+    /// A scheduler that is ALIVE but refusing to plan must say so.
+    ///
+    /// The §15.8 partial-view fence is correct — an unopened joined federation would silently
+    /// vanish from balances, probes, and every allocation the cycle plans, so refusing is right.
+    /// What is wrong is that it refuses in silence: `scheduler_alive` stays `true` because the
+    /// loop is healthy, and a `warn!` line is the only trace. This wallet has already lost weeks
+    /// to two other fail-closed refusals nothing could see (a shortfall below the move floor for
+    /// 27 days; three undecodable ledger rows disabling probing). An operator must be able to
+    /// poll the difference between "idle and healthy" and "alive and permanently fenced".
+    #[tokio::test]
+    async fn a_partial_federation_view_reports_why_automation_is_blocked() {
+        let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
+        let mnemonic = Mnemonic::from_entropy(&[0x51; 16]).expect("valid test mnemonic");
+        let multi_client = Arc::new(MultiClient::new(db, journal_db.clone(), mnemonic).await);
+        let journal = Arc::new(FedimintJournal::new(journal_db));
+        let runtime = Runtime::new(multi_client.clone(), journal.clone(), None, None, None);
+        let service = super::super::WalletService::start_parts(
+            None,
+            journal.clone(),
+            Arc::new(runtime.service_executor(None)),
+            Policy::default(),
+            None,
+        )
+        .await
+        .expect("start actor-only service");
+        let client = service.client();
+
+        // Registered but not openable: the invite never parses, so the retry-open leaves it
+        // missing and the cycle must fence. No retry-open fixture is installed here.
+        let unopenable = wallet_core::FederationId([0x51; 32]);
+        journal
+            .put_federation(
+                &unopenable,
+                &FederationInfo {
+                    invite: "not-a-parseable-invite".to_owned(),
+                    db_prefix: 51,
+                    joined_at: 0,
+                },
+            )
+            .await
+            .expect("register unopened federation");
+
+        let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+        let cycle = run_cycle(&runtime, &client, &sources)
+            .await
+            .expect("the fence skips the cycle; it does not abort the scheduler");
+
+        assert!(
+            !multi_client.federations().contains(&unopenable),
+            "the fixture must actually leave the federation unopened"
+        );
+        let blocked = cycle
+            .automation_blocked
+            .expect("a fenced cycle must report WHY, not just skip silently");
+        assert_eq!(blocked.reason, "partial_federation_view");
+        assert!(
+            blocked.detail.contains(&unopenable.to_hex()),
+            "the detail must name the offending federation so an operator can act on the page              without reading logs: {}",
+            blocked.detail
+        );
         service.shutdown().await.expect("shutdown");
     }
 

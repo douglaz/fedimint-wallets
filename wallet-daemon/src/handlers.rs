@@ -285,12 +285,20 @@ pub async fn health(State(state): State<AppState>) -> Result<impl IntoResponse, 
         Ok(Snapshot::Registry { drivers }) => drivers,
         _ => 0,
     };
+    // A poisoned blocker mutex must not read as "ready": that would report the healthy answer
+    // for an unknown state, which is the exact failure mode this field exists to remove.
+    let automation_blocked = match state.automation_blocker.lock() {
+        Ok(slot) => slot.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
     Ok(Json(HealthView {
         actor_queue_depth: state.client.queue_depth(),
         inflight_drivers,
         scheduler_alive: state
             .scheduler_alive
             .load(std::sync::atomic::Ordering::Relaxed),
+        automation_ready: automation_blocked.is_none(),
+        automation_blocked,
     }))
 }
 
