@@ -6366,6 +6366,100 @@ mod tests {
         }
     }
 
+    /// br-n8o's load-bearing seam: evidence the REAL producer builds must be qualifiable.
+    ///
+    /// Every replacement test in `service::tests` hand-builds its `EvacuationRefusalEvidence`
+    /// (`ReplacementHandoffExecutor` picks `low.delivered_net = Msat(10)` and
+    /// `total_fee = cap.at(net) + 1`). That proves the exchange machinery, but it proves nothing
+    /// about the object production actually emits — the two are structurally disjoint, and
+    /// `evacuation_cap_qualifies_replacement` is the gate BOTH the journal and the planner apply
+    /// to the real one.
+    ///
+    /// So the whole br-n8o mechanism rests on a property nothing asserted: that a cap raise can
+    /// ever gain integer room at one of the samples `size_evacuation` chose. Qualification needs
+    /// `new_cap.at(net) > old.at(net)` at `low` or `high`; if the producer emitted a degenerate
+    /// pair the mechanism would ship dead on arrival with every other test green. This drives the
+    /// real search and hands its output to the real gate.
+    #[tokio::test]
+    async fn production_built_refusal_evidence_can_qualify_a_cap_raise() {
+        // The same shape the structural-refusal fixture above uses: a fat send base the cap
+        // cannot absorb at any affordable size.
+        let route = TestRoute::new(gw(3, 0), gw(99_999, 29_999));
+        let cap = EvacFeeCap {
+            base_msat: Msat(100_000),
+            bps: 300,
+        };
+        let spendable = Msat(1_130_002);
+
+        let EvacuationSizing::StructuralRefused(evidence) =
+            route.size(spendable, spendable, cap).await
+        else {
+            panic!("this fixture must produce a STRUCTURAL refusal to have evidence to test");
+        };
+
+        // The producer must record what it actually measured, not placeholders: a degenerate or
+        // zero sample is exactly what would silently break qualification.
+        assert_eq!(evidence.cap_components, cap);
+        assert!(
+            evidence.low.delivered_net.0 > 0 && evidence.high.delivered_net.0 > 0,
+            "both samples must be real amounts: {evidence:?}"
+        );
+        assert!(
+            evidence.low.delivered_net < evidence.high.delivered_net,
+            "the two samples must be DISTINCT, or a bps raise can never gain room at either:              {evidence:?}"
+        );
+        for sample in [&evidence.low, &evidence.high] {
+            assert!(
+                sample.total_fee > sample.fee_cap,
+                "each sample must actually miss its cap, or it was not a refusal: {sample:?}"
+            );
+            assert_eq!(
+                sample.fee_cap,
+                cap.at(sample.delivered_net),
+                "the recorded cap must be the cap AT that sample, since qualification recomputes                  exactly this: {sample:?}"
+            );
+        }
+
+        // A no-op edit must NOT qualify — otherwise any policy write would retire a live marker.
+        assert!(
+            !wallet_core::evacuation_cap_qualifies_replacement(&evidence, cap),
+            "an unchanged cap must never qualify a replacement"
+        );
+        // Nor may a component go backwards, even if the other rises enough to gain room.
+        assert!(
+            !wallet_core::evacuation_cap_qualifies_replacement(
+                &evidence,
+                EvacFeeCap {
+                    base_msat: Msat(cap.base_msat.0 * 4),
+                    bps: cap.bps - 1,
+                },
+            ),
+            "a lowered component must veto qualification regardless of the other"
+        );
+
+        // THE property: raising a component gains integer room at a sample the PRODUCER chose.
+        let raised_base = EvacFeeCap {
+            base_msat: Msat(cap.base_msat.0 * 4),
+            bps: cap.bps,
+        };
+        assert!(
+            wallet_core::evacuation_cap_qualifies_replacement(&evidence, raised_base),
+            "a base raise must qualify production-built evidence, or an operator following the              runbook can never retire a real structural marker: {evidence:?}"
+        );
+        let raised_bps = EvacFeeCap {
+            base_msat: cap.base_msat,
+            bps: cap.bps + 100,
+        };
+        assert!(
+            wallet_core::evacuation_cap_qualifies_replacement(&evidence, raised_bps),
+            "a bps raise must also qualify: at {} and {} msat a +100 bps step is worth {} and {}              msat of room, and integer FLOOR division must not round both away: {evidence:?}",
+            evidence.low.delivered_net.0,
+            evidence.high.delivered_net.0,
+            raised_bps.at(evidence.low.delivered_net).0 - cap.at(evidence.low.delivered_net).0,
+            raised_bps.at(evidence.high.delivered_net).0 - cap.at(evidence.high.delivered_net).0,
+        );
+    }
+
     /// THE PPM WARNING FIRES, AND DOES NOT GATE. Both halves: the warning is produced for a send
     /// ppm of 29_999 under a sub-limit base, and the very same route is still ADMITTED when the
     /// cap admits it. Rejecting on ppm would contradict ADR-0029 and could strand funds behind
