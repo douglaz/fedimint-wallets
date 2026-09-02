@@ -146,8 +146,13 @@ Rules (load-bearing):
    evidence-carrying write; repair writes never supersede anything terminal.
    **Evacuation supersession is different:** for the narrow pre-artifact, structurally marked
    agent case, the parent and a fresh child are distinct operation rows. One atomic journal
-   transaction marks the parent `Failed`, inserts the child `Pending` at an advanced occurrence
-   and distinct key, and writes durable forward/reverse sidecars. It does not mutate either
+   transaction marks the parent `Failed`, inserts the child at an advanced occurrence
+   and distinct key, and writes durable forward/reverse sidecars. The child's *`Intent`* is
+   `Pending`; its *operation row* is `Started`, because `status_from_intent` maps
+   `Pending`/`Executing` onto `OperationStatus::Started` and `OperationStatus` has no `Pending`
+   variant (see the enum above). The two vocabularies stay distinct here: the ledger cannot
+   represent an intent lifecycle state, and calling the ROW `Pending` invites a projection the
+   declared enum cannot express. It does not mutate either
     row's identity or erase the parent's evidence. `show` projects a live `evacuation_refusal`
     marker for its exact key; history intentionally omits that projection rather than doing an
     intent lookup per row. Standalone `status` is dry: a stale/default occurrence warns and returns

@@ -306,7 +306,10 @@ curl -s -H "Authorization: Bearer $(cat "$WALLETD_TOKEN_PATH")" \
 
 # 5. Watch checkpoint: a non-200 here is a storage or tail/counter fence, not a scheduler stall.
 watch_body=$(mktemp)
-if watch_http=$(curl -sS -o "$watch_body" -w '%{http_code}' \
+# Bounded on purpose: /v1/watch/status is a durable checkpoint read, so a daemon that accepts
+# the connection but never answers is itself the finding. Without these an unresponsive walletd
+# hangs the operator's check forever instead of reporting a transport failure.
+if watch_http=$(curl -sS --connect-timeout 5 --max-time 15 -o "$watch_body" -w '%{http_code}' \
   -H "Authorization: Bearer $(cat "$WALLETD_TOKEN_PATH")" \
   http://127.0.0.1:9736/v1/watch/status); then
   watch_curl=0
