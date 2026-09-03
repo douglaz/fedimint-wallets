@@ -1743,6 +1743,70 @@ async fn operation_resolves_by_key_and_by_seq() {
         .is_none());
 }
 
+/// A public Agent admission must not park the watch floor BELOW the ledger's historical max.
+///
+/// `advance_watch_occurrence` seeds an ABSENT checkpoint from `max_agent_occurrence_in`, but
+/// `note_ledger_insert_in` seeded the same absent row from `WatchState::default()` — zero. Two
+/// functions, one absent-row condition, two different seeds.
+///
+/// So on a store carrying Agent rows but no checkpoint (one populated by the previously supported
+/// standalone `tick` path, or restored from a backup predating the row), a single direct public
+/// Agent admission at a LOW occurrence would CREATE the checkpoint at that low value. The row now
+/// exists, so `advance_watch_occurrence` takes its `Some` arm and never scans — and proceeds to
+/// hand out occurrences that collide with historical ones, producing duplicate allocator keys.
+/// `wallet-core`'s admission surface is public per ADR-0031, so this is reachable.
+#[tokio::test]
+async fn a_low_agent_admission_cannot_park_the_watch_floor_under_the_ledger() {
+    let db = MemDatabase::new().into_database();
+    let j = FedimintJournal::with_clock(db.clone(), clock_base);
+
+    // History: an Agent row at occurrence 100.
+    let historical = AllocatorDecision {
+        action: Action::RefuseInflow {
+            fed: fed(1),
+            reason: ReasonCode::SpendingBelowTarget,
+            diagnostics: RefusalDiagnostics::default(),
+        },
+        reason: ReasonCode::SpendingBelowTarget,
+        occurrence: Occurrence(100),
+        idempotency_key: key("refuse:historical:0101:100"),
+    };
+    j.record_refusals(std::slice::from_ref(&historical), Occurrence(100), BASE)
+        .await
+        .expect("historical agent row");
+
+    // Simulate the store shape this guards: Agent rows present, checkpoint absent.
+    let app = db.with_prefix(vec![0x00]);
+    let mut dbtx = app.begin_transaction().await;
+    dbtx.raw_remove_entry(&[0x0a])
+        .await
+        .expect("drop the watch checkpoint");
+    dbtx.commit_tx_result().await.expect("commit");
+
+    // A direct public Agent admission at a MUCH lower occurrence.
+    let low = AllocatorDecision {
+        action: Action::RefuseInflow {
+            fed: fed(1),
+            reason: ReasonCode::SpendingBelowTarget,
+            diagnostics: RefusalDiagnostics::default(),
+        },
+        reason: ReasonCode::SpendingBelowTarget,
+        occurrence: Occurrence(5),
+        idempotency_key: key("refuse:low:0101:5"),
+    };
+    j.record_refusals(std::slice::from_ref(&low), Occurrence(5), BASE)
+        .await
+        .expect("low agent row");
+
+    let next = j.advance_watch_occurrence().await.expect("advance");
+    assert!(
+        next.occurrence > 100,
+        "the next allocator occurrence must be strictly above every journaled Agent occurrence; \
+         got {} while the ledger already holds 100 — this hands out colliding allocator keys",
+        next.occurrence
+    );
+}
+
 #[tokio::test]
 async fn ledger_scans_skip_poison_rows() {
     let db = MemDatabase::new().into_database();

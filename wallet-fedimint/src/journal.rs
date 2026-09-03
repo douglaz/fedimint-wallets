@@ -5952,7 +5952,17 @@ async fn note_ledger_insert_in(
     let raw_watch_key = watch_state_key();
     let mut watch = match dbtx.raw_get_bytes(&raw_watch_key).await.map_err(db_err)? {
         Some(bytes) => decode_row_result::<WatchState>("watch state", &raw_watch_key, &bytes)?,
-        None => WatchState::default(),
+        // An ABSENT checkpoint must be seeded from the ledger, exactly as
+        // `advance_watch_occurrence` seeds it — NOT from zero. A store can hold Agent rows with
+        // no checkpoint (the previously supported standalone `tick` path; a backup predating the
+        // row). Seeding from zero here would let one low public admission CREATE the row below
+        // the historical maximum; the row then exists, so `advance_watch_occurrence` takes its
+        // `Some` arm, never scans, and hands out occurrences that collide with historical ones.
+        // The scan is O(ledger) but runs only while the row is absent, which is once.
+        None => WatchState {
+            occurrence: max_agent_occurrence_in(dbtx).await?,
+            ..WatchState::default()
+        },
     };
     if watch.occurrence >= occurrence.0 {
         return Ok(());
