@@ -439,7 +439,7 @@ pub struct FedimintJournal {
     /// global test barrier: unrelated journal tests and keys must never join
     /// this forced overlap.
     #[cfg(test)]
-    replacement_write_rendezvous: Arc<Mutex<BTreeMap<IdempotencyKey, Arc<tokio::sync::Barrier>>>>,
+    replacement_write_rendezvous: Arc<Mutex<BTreeMap<IdempotencyKey, Arc<ReplacementWritePause>>>>,
     /// A one-shot pause immediately after a `put_move_if_attempt` write commits and before its
     /// postverify read.  It makes cleanup-race tests deterministic without being a production
     /// synchronization primitive.
@@ -472,6 +472,28 @@ impl PostMoveWritePause {
     }
 }
 
+/// A one-shot park inside an open replacement transaction, so a competing writer can be driven to
+/// a durable commit underneath it.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ReplacementWritePause {
+    parked: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ReplacementWritePause {
+    /// Resolve once the exchange is parked mid-transaction.  `notify_one` stores a permit, so this
+    /// cannot miss a seam that parked before the test got here.
+    pub(crate) async fn wait_until_parked(&self) {
+        self.parked.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
 #[cfg(test)]
 impl PendingReadPause {
     pub(crate) async fn wait_until_started(&self) {
@@ -483,31 +505,25 @@ impl PendingReadPause {
     }
 }
 
+/// Park at this key's seam exactly once, announcing arrival first.
+///
+/// The seam sits inside an `autocommit` closure, so the loser of the forced overlap re-enters it on
+/// its `WriteConflict` retry.  Removing before waiting is what lets that retry run to completion
+/// against the durable winner instead of parking a second time with nobody left to release it.
 #[cfg(test)]
 async fn wait_replacement_write_rendezvous_for_test(
-    rendezvous: &Arc<Mutex<BTreeMap<IdempotencyKey, Arc<tokio::sync::Barrier>>>>,
+    rendezvous: &Arc<Mutex<BTreeMap<IdempotencyKey, Arc<ReplacementWritePause>>>>,
     key: &IdempotencyKey,
 ) {
-    let barrier = rendezvous
-        .lock()
-        .expect("replacement write rendezvous lock poisoned")
-        .get(key)
-        .cloned();
-    let Some(barrier) = barrier else {
-        return;
-    };
-    barrier.wait().await;
-}
-
-#[cfg(test)]
-fn clear_replacement_write_rendezvous_for_test(
-    rendezvous: &Arc<Mutex<BTreeMap<IdempotencyKey, Arc<tokio::sync::Barrier>>>>,
-    key: &IdempotencyKey,
-) {
-    rendezvous
+    let pause = rendezvous
         .lock()
         .expect("replacement write rendezvous lock poisoned")
         .remove(key);
+    let Some(pause) = pause else {
+        return;
+    };
+    pause.parked.notify_one();
+    pause.release.notified().await;
 }
 
 impl FedimintJournal {
@@ -602,6 +618,26 @@ impl FedimintJournal {
     #[cfg(test)]
     async fn wait_replacement_write_rendezvous_for_test(&self, key: &IdempotencyKey) {
         wait_replacement_write_rendezvous_for_test(&self.replacement_write_rendezvous, key).await;
+    }
+
+    /// Park the next transaction that reaches this key's replacement seam until the returned handle
+    /// is released.
+    ///
+    /// The seam is placed after the exchange has read the parent and confirmed the parent owns no
+    /// artifact, and before it retires that parent.  Arming it therefore holds a replacement inside
+    /// its own uncommitted transaction while the caller drives a competing writer to a durable
+    /// commit -- the interleave a sequential test cannot reach.
+    #[cfg(test)]
+    pub(crate) fn arm_replacement_write_rendezvous_for_test(
+        &self,
+        key: IdempotencyKey,
+    ) -> Arc<ReplacementWritePause> {
+        let pause = Arc::new(ReplacementWritePause::default());
+        self.replacement_write_rendezvous
+            .lock()
+            .expect("replacement write rendezvous lock poisoned")
+            .insert(key, pause.clone());
+        pause
     }
 
     #[cfg(test)]
@@ -1314,10 +1350,7 @@ impl FedimintJournal {
         dbtx.raw_insert_bytes(&mkey, &value).await.map_err(db_err)?;
         dbtx.commit_tx_result().await.map_err(db_err)?;
         #[cfg(test)]
-        {
-            self.wait_replacement_write_rendezvous_for_test(key).await;
-            clear_replacement_write_rendezvous_for_test(&self.replacement_write_rendezvous, key);
-        }
+        self.wait_replacement_write_rendezvous_for_test(key).await;
         #[cfg(test)]
         self.wait_after_move_write_for_test(key).await;
         // A replacement can have retired this parent between our Pending read
@@ -1943,11 +1976,7 @@ impl FedimintJournal {
                 AutocommitError::ClosureError { error, .. } => error,
             })?;
         #[cfg(test)]
-        {
-            wait_replacement_write_rendezvous_for_test(&replacement_write_rendezvous, &old_key)
-                .await;
-            clear_replacement_write_rendezvous_for_test(&replacement_write_rendezvous, &old_key);
-        }
+        wait_replacement_write_rendezvous_for_test(&replacement_write_rendezvous, &old_key).await;
         #[cfg(test)]
         if self
             .corrupt_after_evacuation_replacements
@@ -8199,6 +8228,113 @@ mod replacement_foundation_tests {
                 );
             }
         }
+    }
+
+    /// br-n8o: "Pin it with a CONCURRENT test that races replacement against a receive commit and
+    /// proves at most one intent remains executable. A sequential test cannot observe this: it
+    /// never interleaves the two steps, so it passes against the racy implementation."
+    ///
+    /// `set_status_if(Pending -> Executing)` is the receive commit's precursor: it is the step that
+    /// hands the parent to a driver, and it consumes the planner's marker in the same transaction.
+    /// The two are forced to genuinely overlap here.  The exchange is parked inside its own
+    /// uncommitted transaction at the point where it has already read the marked-Pending parent and
+    /// confirmed the parent owns no artifact -- precisely the "reads no artifact yet" window the
+    /// bead names -- and the claim is then driven to a durable commit underneath it before the
+    /// exchange is released to write.
+    ///
+    /// `MemDatabase` gives this real teeth: `begin_transaction` snapshots under a read lock and
+    /// `commit_tx` replays every op against the live map, so the exchange's stale parent write is
+    /// rejected with `WriteConflict` and `autocommit` retries the closure against the claim's
+    /// durable result.
+    #[tokio::test]
+    async fn a_claim_committing_inside_the_exchange_window_leaves_one_executable_intent() {
+        let journal = make_journal();
+        let parent = marked_parent(&journal, "evac:interleaved-parent").await;
+        let child = decision("evac:interleaved-child", 2, cap(10, 200));
+
+        let pause =
+            journal.arm_replacement_write_rendezvous_for_test(parent.idempotency_key.clone());
+
+        let exchange_journal = journal.clone();
+        let exchange_parent = parent.clone();
+        let exchange_child = child.clone();
+        let exchange = tokio::spawn(async move {
+            exchange_journal
+                .replace_marked_evacuation(
+                    &exchange_parent.idempotency_key,
+                    exchange_parent.attempt,
+                    &evidence(),
+                    &exchange_child,
+                    NOW,
+                    &exchange_parent,
+                )
+                .await
+        });
+
+        // Do not race the spawn: wait until the exchange has actually read the marked-Pending
+        // parent, confirmed it owns no artifact, and parked inside its still-open transaction.
+        pause.wait_until_parked().await;
+
+        // Commit the competing claim underneath that open transaction.
+        let claimed = Journal::set_status_if(
+            &journal,
+            &parent.idempotency_key,
+            parent.attempt,
+            IntentStatus::Pending,
+            IntentStatus::Executing,
+        )
+        .await
+        .expect("the claim runs while the exchange holds an open transaction");
+        assert!(claimed, "the claim commits durably inside the window");
+
+        // Release the parked exchange onto a parent that changed under it.
+        pause.release();
+        let exchanged = exchange
+            .await
+            .expect("the exchange task did not panic")
+            .expect("the exchange resolves rather than erroring");
+
+        assert!(
+            !exchanged,
+            "an exchange whose parent was claimed mid-transaction must lose, not overwrite it"
+        );
+
+        let parent_after = journal
+            .get(&parent.idempotency_key)
+            .await
+            .expect("read raced parent")
+            .expect("parent remains auditable");
+        assert_eq!(parent_after.status, IntentStatus::Executing);
+        assert_eq!(
+            parent_after.evacuation_refusal, None,
+            "the claim consumed the marker"
+        );
+        assert!(
+            journal
+                .get(&child.idempotency_key)
+                .await
+                .expect("child lookup")
+                .is_none(),
+            "the loser must not leave a second intent for the same money"
+        );
+        assert_eq!(
+            journal.pending().await.expect("live index"),
+            vec![parent_after.clone()],
+            "the claimed parent is the only executable intent"
+        );
+        assert_eq!(
+            journal
+                .evacuation_supersession_neighbors(&parent.idempotency_key)
+                .await
+                .expect("neighbor read"),
+            EvacuationSupersessionNeighbors::default(),
+            "a losing exchange records no supersession link"
+        );
+        assert!(journal
+            .get_move(&parent.idempotency_key)
+            .await
+            .expect("artifact read")
+            .is_none());
     }
 
     #[tokio::test]
