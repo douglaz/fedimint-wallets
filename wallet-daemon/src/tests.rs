@@ -105,6 +105,47 @@ async fn empty_fixture_with_db() -> (
     (state, service, journal, db)
 }
 
+/// A real malformed federation value under a well-formed registry key. This uses the same raw
+/// poison boundary as a damaged on-disk journal rather than a mock report, so the status handler
+/// must refuse before it reaches its live dry-run.
+async fn fixture_with_corrupt_federation_registry_row() -> (
+    AppState,
+    WalletService,
+    Arc<FedimintJournal>,
+    fedimint_core::db::Database,
+) {
+    use fedimint_core::db::mem_impl::MemDatabase;
+    use fedimint_core::db::{IDatabaseTransactionOpsCore as _, IRawDatabaseExt as _};
+
+    let db = MemDatabase::new().into_database();
+    let journal = Arc::new(FedimintJournal::new(db.clone()));
+    let service =
+        WalletService::start_detached(journal.clone(), Arc::new(PendingExecutor), fixture_policy())
+            .await
+            .expect("start detached fixture service");
+    let app_db = db.with_prefix(vec![0x00]);
+    let mut dbtx = app_db.begin_transaction().await;
+    let mut key = vec![0x03];
+    key.extend_from_slice(&[0xC3; 32]);
+    dbtx.raw_insert_bytes(&key, b"not valid json")
+        .await
+        .expect("insert corrupt federation registry row");
+    dbtx.commit_tx_result()
+        .await
+        .expect("commit corrupt federation registry row");
+    let state = AppState {
+        client: service.client(),
+        journal: journal.clone(),
+        mc: None,
+        runtime: None,
+        scheduler_alive: service.scheduler_liveness(),
+        token: Arc::from(TOKEN),
+        invoice_deadline: Duration::from_millis(120),
+        await_deadline: Duration::from_millis(120),
+    };
+    (state, service, journal, db)
+}
+
 async fn attach_empty_runtime(state: &mut AppState, journal: &Arc<FedimintJournal>) {
     use fedimint_bip39::Mnemonic;
     use fedimint_core::db::mem_impl::MemDatabase;
@@ -220,6 +261,126 @@ async fn daemon_status_refuses_a_consumed_final_scheduler_occurrence_without_wri
             .iter()
             .all(|row| !matches!(row.kind, wallet_core::OperationKind::Tick { .. })),
         "the rejected dry-run must not open a tick row"
+    );
+    service.shutdown().await.expect("shutdown fixture service");
+}
+
+#[tokio::test]
+async fn daemon_status_refuses_a_joined_but_unopened_federation_without_writing() {
+    let (state, service, journal) = fixture_with_unopened_dest().await;
+    let checkpoint = journal
+        .get_watch_state()
+        .await
+        .expect("initialize checkpoint");
+
+    let (status, body) = send(&state, request("GET", "/v1/status", Some(TOKEN), None)).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("every joined federation to be open")),
+        "{body}"
+    );
+    assert_eq!(
+        journal.get_watch_state().await.expect("read checkpoint"),
+        checkpoint,
+        "the partial membership view must be refused before any scheduler planning"
+    );
+    assert!(
+        journal
+            .history(usize::MAX, None)
+            .await
+            .expect("read history")
+            .is_empty(),
+        "the partial membership view must not create scheduler work"
+    );
+    service.shutdown().await.expect("shutdown fixture service");
+}
+
+#[tokio::test]
+async fn daemon_status_refuses_corrupt_federation_registry_before_dry_run() {
+    use fedimint_core::db::IDatabaseTransactionOpsCore as _;
+
+    let (mut state, service, journal, db) = fixture_with_corrupt_federation_registry_row().await;
+    attach_empty_runtime(&mut state, &journal).await;
+    let app_db = db.with_prefix(vec![0x00]);
+    let mut dbtx = app_db.begin_transaction_nc().await;
+    let watch_before = dbtx
+        .raw_get_bytes(&[0x0a])
+        .await
+        .expect("read raw absent watch checkpoint");
+    assert!(
+        watch_before.is_none(),
+        "the corrupt-registry fence must begin before absent WatchState migration"
+    );
+    drop(dbtx);
+
+    let (status, body) = send(&state, request("GET", "/v1/status", Some(TOKEN), None)).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("incomplete federation registry")),
+        "{body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("repair the corrupt federation registry")),
+        "{body}"
+    );
+    let mut dbtx = app_db.begin_transaction_nc().await;
+    let watch_after = dbtx
+        .raw_get_bytes(&[0x0a])
+        .await
+        .expect("read raw watch checkpoint after refused status");
+    assert_eq!(
+        watch_after, watch_before,
+        "a skipped registry row must return 503 before it can migrate an absent WatchState"
+    );
+    assert!(
+        journal
+            .history(usize::MAX, None)
+            .await
+            .expect("read history")
+            .iter()
+            .all(|row| {
+                !matches!(
+                    row.kind,
+                    wallet_core::OperationKind::Probe { .. }
+                        | wallet_core::OperationKind::Tick { .. }
+                )
+            }),
+        "a corrupt registry must not create probe or Tick work"
+    );
+    service.shutdown().await.expect("shutdown fixture service");
+}
+
+#[tokio::test]
+async fn daemon_status_requires_a_live_membership_view_without_writing() {
+    let (mut state, service, journal) = empty_fixture().await;
+    attach_empty_runtime(&mut state, &journal).await;
+    state.mc = None;
+    let checkpoint = journal
+        .get_watch_state()
+        .await
+        .expect("initialize checkpoint");
+
+    let (status, body) = send(&state, request("GET", "/v1/status", Some(TOKEN), None)).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("live federation membership view")),
+        "{body}"
+    );
+    assert_eq!(
+        journal.get_watch_state().await.expect("read checkpoint"),
+        checkpoint,
+        "a missing membership view must be refused before scheduler planning"
     );
     service.shutdown().await.expect("shutdown fixture service");
 }

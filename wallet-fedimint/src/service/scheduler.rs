@@ -781,11 +781,29 @@ async fn run_cycle(
     // Crash-recovery (the reconcile + repair above) still runs: re-driving already-admitted
     // intents is not a fresh money decision over the world-view.
     let multi_client = runtime.service_multi_client();
-    let joined = runtime
+    let joined_report = runtime
         .service_journal()
-        .list_federations()
+        .list_federations_report()
         .await
         .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    if joined_report.skipped_rows > 0 {
+        // A poison registry row is not an absent federation. Its funds and membership may be part
+        // of the world the allocator would otherwise score, so the healthy subset is not a safe
+        // planning view. Do not retry opens from that subset; recovery-only is still allowed to
+        // redrive work that was admitted under an earlier durable authority (including a parked
+        // RecoveryOnly marker).
+        tracing::warn!(
+            skipped_rows = joined_report.skipped_rows,
+            "watch scheduler: corrupt federation registry rows make the membership view unknown; \
+             skipping fresh tick, probes, discovery, and federation opening until repaired"
+        );
+        redrive_without_planner(client, "corrupt federation registry recovery").await;
+        return Ok(CycleResult {
+            deadlines: wallet_core::AdaptiveSleepDeadlines::default(),
+            noop: false,
+        });
+    }
+    let joined = joined_report.federations;
     let open: BTreeSet<_> = multi_client.federations().into_iter().collect();
     let missing: Vec<_> = joined
         .iter()
@@ -1342,8 +1360,9 @@ mod tests {
     use crate::runtime::TickPlan;
     use fedimint_bip39::Mnemonic;
     use fedimint_core::db::mem_impl::MemDatabase;
+    use fedimint_core::db::IDatabaseTransactionOpsCore as _;
     use fedimint_core::db::IRawDatabaseExt as _;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use wallet_api::Policy;
     use wallet_core::{
         Action, Actor, AllocatorDecision, AllocatorSnapshot, DiscoverySource, FedBalance,
@@ -1655,6 +1674,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn corrupt_federation_registry_redrives_old_marker_without_fresh_scheduler_work() {
+        let executor = Arc::new(KeyRecordingExecutor::default());
+        let (runtime, service, journal_db) =
+            scheduler_runtime_fixture_with_executor_and_journal_db(0xF6, executor.clone()).await;
+        let client = service.client();
+        let journal = runtime.service_journal();
+        let mut policy = client.get_policy().await.expect("read policy");
+        policy.evac_fee_base_msat = Msat(20_000);
+        policy.evac_fee_bps = 0;
+        client
+            .put_policy(policy)
+            .await
+            .expect("install the qualifying replacement cap");
+        journal
+            .put_watch_state(&WatchState {
+                occurrence: 8,
+                ..WatchState::default()
+            })
+            .await
+            .expect("seed scheduler occurrence");
+        let parent_key = IdempotencyKey("evac:corrupt-registry-marked-parent".to_owned());
+        let cap = wallet_core::EvacFeeCap {
+            base_msat: Msat(10_000),
+            bps: 0,
+        };
+        let parent = wallet_core::Intent {
+            idempotency_key: parent_key.clone(),
+            attempt: 0,
+            action: Action::Evacuate {
+                from: wallet_core::FederationId([0xA6; 32]),
+                to: wallet_core::FederationId([0xB6; 32]),
+                amount: Msat(100_000),
+                fee_cap: cap.at(Msat(100_000)),
+                gateway: None,
+                fee_cap_components: Some(cap),
+            },
+            max_fee: Some(cap.at(Msat(100_000))),
+            status: wallet_core::IntentStatus::Pending,
+            reason: ReasonCode::ShutdownNotice,
+            actor: Actor::Agent {
+                occurrence: Occurrence(8),
+            },
+            created_at_ms: 1,
+            operation_id: None,
+            invoice: None,
+            evacuation_refusal: Some(wallet_core::EvacuationRefusalEvidence {
+                cap_components: cap,
+                requested_net: Msat(100_000),
+                source_spendable: Msat(500_000),
+                low: wallet_core::EvacuationQuoteSample {
+                    delivered_net: Msat(10_000),
+                    total_fee: Msat(15_000),
+                    fee_cap: cap.at(Msat(10_000)),
+                },
+                high: wallet_core::EvacuationQuoteSample {
+                    delivered_net: Msat(100_000),
+                    total_fee: Msat(25_000),
+                    fee_cap: cap.at(Msat(100_000)),
+                },
+                diagnostic: "corrupt registry scheduler fixture".to_owned(),
+                measured_at_ms: 1,
+            }),
+        };
+        journal.upsert(&parent).await.expect("seed marked parent");
+        let healthy = wallet_core::FederationId([0xD6; 32]);
+        let healthy_db_prefix = 0xD6;
+        journal
+            .put_federation(
+                &healthy,
+                &FederationInfo {
+                    // This explicit open seam makes the healthy subset observable: removing or
+                    // moving the poison gate would publish it before discovery/probes can run.
+                    invite: "corrupt-registry-healthy-open-fixture".to_owned(),
+                    db_prefix: healthy_db_prefix,
+                    joined_at: 0,
+                },
+            )
+            .await
+            .expect("register healthy federation alongside poison row");
+        runtime
+            .service_multi_client()
+            .install_retry_open_fixture(healthy_db_prefix, healthy);
+        let app_db = journal_db.with_prefix(vec![0x00]);
+        let mut dbtx = app_db.begin_transaction().await;
+        let mut key = vec![0x03];
+        key.extend_from_slice(&[0xC6; 32]);
+        dbtx.raw_insert_bytes(&key, b"not valid json")
+            .await
+            .expect("insert corrupt federation registry row");
+        dbtx.commit_tx_result()
+            .await
+            .expect("commit corrupt federation registry row");
+
+        let discovery_calls = Arc::new(AtomicUsize::new(0));
+        let sources: Vec<Box<dyn CandidateSource>> = vec![Box::new(CountingDiscoverySource {
+            calls: Arc::clone(&discovery_calls),
+        })];
+        let cycle = run_cycle(runtime.as_ref(), &client, &sources)
+            .await
+            .expect("corrupt registry limits the cycle to recovery");
+
+        assert_eq!(
+            cycle.deadlines,
+            wallet_core::AdaptiveSleepDeadlines::default(),
+            "an unknown world must retain conservative default deadlines"
+        );
+        assert!(
+            !cycle.noop,
+            "the warning recovery cycle is not a scheduler no-op"
+        );
+        assert!(
+            !runtime
+                .service_multi_client()
+                .federations()
+                .contains(&healthy),
+            "a corrupt registry must fence healthy-subset federation opening before probes"
+        );
+        assert_eq!(
+            discovery_calls.load(Ordering::SeqCst),
+            0,
+            "a corrupt registry must not collect fresh discovery candidates from the healthy subset"
+        );
+        for _ in 0..100 {
+            let terminal = journal
+                .get(&parent_key)
+                .await
+                .expect("read recovery-only parent")
+                .is_some_and(|intent| intent.status == wallet_core::IntentStatus::Done);
+            if terminal && service.inflight_drivers() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let redriven = journal
+            .get(&parent_key)
+            .await
+            .expect("read recovery-only parent")
+            .expect("recovery-only keeps an auditable old parent");
+        assert_eq!(redriven.status, wallet_core::IntentStatus::Done);
+        assert_eq!(
+            redriven.evacuation_refusal, None,
+            "the RecoveryOnly claim consumes the durable marker instead of planning a replacement"
+        );
+        assert!(
+            journal
+                .evacuation_supersession(&parent_key)
+                .await
+                .expect("read replacement sidecar")
+                .is_none(),
+            "an unknown registry cannot produce a fresh replacement decision"
+        );
+        assert!(
+            !journal
+                .history(usize::MAX, None)
+                .await
+                .expect("history during corrupt-registry cycle")
+                .iter()
+                .any(|row| {
+                    matches!(
+                        row.kind,
+                        wallet_core::OperationKind::Probe { .. }
+                            | wallet_core::OperationKind::Tick { .. }
+                    )
+                }),
+            "a corrupt registry must not allocate fresh probe or Tick work"
+        );
+        service.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
     async fn post_reconcile_watch_advance_fault_abandons_handoff_and_preserves_marker_for_retry() {
         let (runtime, service) = empty_scheduler_fixture(0xF4).await;
         let client = service.client();
@@ -1836,16 +2025,67 @@ mod tests {
         (runtime, service)
     }
 
+    #[derive(Default)]
+    struct KeyRecordingExecutor {
+        performed: Mutex<Vec<IdempotencyKey>>,
+    }
+
+    struct CountingDiscoverySource {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl CandidateSource for CountingDiscoverySource {
+        fn source(&self) -> DiscoverySource {
+            DiscoverySource::Manual
+        }
+
+        async fn candidates(&self) -> crate::discovery::SourceResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            crate::discovery::SourceResult {
+                candidates: Vec::new(),
+                status: SourceStatus::Ok,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl wallet_core::Executor for KeyRecordingExecutor {
+        async fn perform(
+            &self,
+            intent: &wallet_core::Intent,
+        ) -> Result<wallet_core::PerformOutcome, wallet_core::ExecError> {
+            self.performed
+                .lock()
+                .expect("recording executor lock poisoned")
+                .push(intent.idempotency_key.clone());
+            Ok(wallet_core::PerformOutcome::Done)
+        }
+    }
+
     async fn scheduler_runtime_fixture_with_executor(
         entropy: u8,
         executor: Arc<dyn wallet_core::Executor>,
     ) -> (Arc<Runtime>, super::super::WalletService) {
+        let (runtime, service, _) =
+            scheduler_runtime_fixture_with_executor_and_journal_db(entropy, executor).await;
+        (runtime, service)
+    }
+
+    async fn scheduler_runtime_fixture_with_executor_and_journal_db(
+        entropy: u8,
+        executor: Arc<dyn wallet_core::Executor>,
+    ) -> (
+        Arc<Runtime>,
+        super::super::WalletService,
+        fedimint_core::db::Database,
+    ) {
         let db = MemDatabase::new().into_database();
         let journal_db = MemDatabase::new().into_database();
         let mnemonic =
             Mnemonic::from_entropy(&[entropy; 16]).expect("valid scheduler fixture mnemonic");
         let multi_client = Arc::new(MultiClient::new(db, journal_db.clone(), mnemonic).await);
-        let journal = Arc::new(FedimintJournal::new(journal_db));
+        let journal = Arc::new(FedimintJournal::new(journal_db.clone()));
         let runtime = Arc::new(Runtime::new(
             multi_client,
             journal.clone(),
@@ -1864,7 +2104,7 @@ mod tests {
         )
         .await
         .expect("start runtime-backed scheduler fixture");
-        (runtime, service)
+        (runtime, service, journal_db)
     }
 
     async fn scheduler_runtime_fixture(entropy: u8) -> (Arc<Runtime>, super::super::WalletService) {
