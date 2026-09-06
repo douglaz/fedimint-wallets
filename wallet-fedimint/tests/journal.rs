@@ -18,6 +18,7 @@ use wallet_core::{
     ExecutionSummary, Executor, FederationId, IdempotencyKey, Intent, IntentStatus, Journal,
     MockExecutor, Msat, Occurrence, OperationKind, OperationStatus, PerformOutcome, ReasonCode,
 };
+
 use wallet_fedimint::{
     CandidateRecord, CandidateState, FederationInfo, FedimintJournal, GatewayUrl, Invoice,
     MovePhase, MoveRecord, OperationId, OperationRef, Preimage, StructuralOutcome, WatchState,
@@ -54,7 +55,19 @@ fn intent(key: &str, status: IntentStatus) -> Intent {
         created_at_ms: 0,
         operation_id: None,
         invoice: None,
+        evacuation_refusal: None,
     }
+}
+
+#[test]
+fn legacy_intent_json_defaults_structural_refusal_marker() {
+    let current = intent("legacy-marker", IntentStatus::Pending);
+    let mut old = serde_json::to_value(current).expect("serialize current intent");
+    old.as_object_mut()
+        .expect("intent object")
+        .remove("evacuation_refusal");
+    let decoded: Intent = serde_json::from_value(old).expect("decode legacy intent");
+    assert_eq!(decoded.evacuation_refusal, None);
 }
 
 fn move_record(key: &str) -> MoveRecord {
@@ -319,17 +332,20 @@ async fn watch_state_occurrence_advance_is_monotonic_and_preserves_discovery_fie
 }
 
 #[tokio::test]
-async fn watch_state_absent_row_seeds_occurrence_from_tick_history() {
+async fn ledger_tail_counter_mismatch_fences_fresh_user_and_agent_admissions() {
     let db = MemDatabase::new().into_database();
     let journal = FedimintJournal::new(db.clone());
     journal
-        .record_tick_started(
-            &IdempotencyKey("tick:7:test".to_owned()),
-            Occurrence(7),
+        .record_started(
+            &IdempotencyKey("join:seed".to_owned()),
+            OperationKind::Join { fed: fed(7) },
+            Actor::User,
+            ReasonCode::UserInitiated,
             1_000,
+            None,
         )
         .await
-        .expect("seed tick row");
+        .expect("seed user row");
     let app_db = db.with_prefix(vec![0x00]);
     let mut dbtx = app_db.begin_transaction().await;
     dbtx.raw_insert_bytes(&tagged_key(0x05, &999_u64.to_be_bytes()), b"not valid json")
@@ -339,18 +355,56 @@ async fn watch_state_absent_row_seeds_occurrence_from_tick_history() {
         .await
         .expect("commit corrupt ledger row");
 
-    let first = journal
-        .advance_watch_occurrence()
+    let user_error = journal
+        .record_started(
+            &IdempotencyKey("join:fenced".to_owned()),
+            OperationKind::Join { fed: fed(8) },
+            Actor::User,
+            ReasonCode::UserInitiated,
+            1_001,
+            None,
+        )
         .await
-        .expect("advance seeded from tick history");
+        .expect_err("a tail/counter mismatch fences fresh User admission");
+    assert!(
+        format!("{user_error:?}").contains("ledger tail/counter inconsistency"),
+        "User admission must report the generic allocation fence: {user_error:?}"
+    );
 
-    assert_eq!(first.occurrence, 8);
+    let agent_error = journal
+        .record_tick_started(
+            &IdempotencyKey("tick:7:fenced".to_owned()),
+            Occurrence(7),
+            1_002,
+        )
+        .await
+        .expect_err("a tail/counter mismatch fences fresh Agent admission");
+    assert!(
+        format!("{agent_error:?}").contains("ledger tail/counter inconsistency"),
+        "Agent admission must report the generic allocation fence: {agent_error:?}"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_watch_advances_are_serialized_by_autocommit() {
+    let journal = Arc::new(mem_journal());
+    journal
+        .get_watch_state()
+        .await
+        .expect("seed checkpoint before concurrent advances");
+    let (left, right) = tokio::join!(
+        journal.advance_watch_occurrence(),
+        journal.advance_watch_occurrence()
+    );
+    assert_eq!(left.expect("left advance").occurrence, 1);
+    assert_eq!(right.expect("right advance").occurrence, 2);
     assert_eq!(
         journal
             .get_watch_state()
             .await
-            .expect("persisted watch state"),
-        first
+            .expect("read final checkpoint")
+            .occurrence,
+        2
     );
 }
 
@@ -943,6 +997,7 @@ async fn recovery_registration_terminalizes_the_intent_atomically() {
         created_at_ms: fixed_clock(),
         operation_id: None,
         invoice: None,
+        evacuation_refusal: None,
     };
     let info = FederationInfo {
         invite: "fed1recover".to_string(),
@@ -1012,6 +1067,7 @@ fn recover_intent(key: &IdempotencyKey, id: FederationId, invite_str: &str) -> I
         created_at_ms: fixed_clock(),
         operation_id: None,
         invoice: None,
+        evacuation_refusal: None,
     }
 }
 

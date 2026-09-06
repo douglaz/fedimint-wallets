@@ -8,7 +8,10 @@
 //! `/v1/federations` with live client balances. Here we prove the HTTP contract itself: 401,
 //! the 202 contract, the invoice-mint deadline, and policy get/put.
 
-use crate::server::{router, AppState};
+use crate::{
+    handlers::HISTORY_PAGE_LIMIT_MAX,
+    server::{router, AppState},
+};
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use serde_json::{json, Value};
@@ -17,12 +20,12 @@ use std::time::Duration;
 use tower::ServiceExt as _;
 use wallet_api::Policy;
 use wallet_core::{
-    Action, Actor, AllocatorDecision, ExecError, Executor, FederationId, Intent, IntentStatus,
-    Journal, Msat, Occurrence, PerformOutcome, ReasonCode,
+    Action, Actor, AllocatorDecision, ExecError, Executor, FederationId, IdempotencyKey, Intent,
+    IntentStatus, Journal, Msat, Occurrence, PerformOutcome, ReasonCode,
 };
 use wallet_fedimint::{
     move_key, raw_receive_key, CandidateRecord, CandidateState, FederationInfo, FedimintJournal,
-    Invoice, MultiClient, StructuralOutcome, WalletService,
+    Invoice, MultiClient, Runtime, StructuralOutcome, WalletService,
 };
 
 const TOKEN: &str = "test-bearer-token";
@@ -53,9 +56,7 @@ fn fixture_policy() -> Policy {
 }
 
 async fn fixture() -> (AppState, WalletService, Arc<FedimintJournal>) {
-    use fedimint_core::db::mem_impl::MemDatabase;
-    use fedimint_core::db::IRawDatabaseExt as _;
-    let journal = Arc::new(FedimintJournal::new(MemDatabase::new().into_database()));
+    let (state, service, journal) = empty_fixture().await;
     journal
         .put_federation(
             &fed(2),
@@ -67,6 +68,24 @@ async fn fixture() -> (AppState, WalletService, Arc<FedimintJournal>) {
         )
         .await
         .expect("seed joined federation");
+    (state, service, journal)
+}
+
+async fn empty_fixture() -> (AppState, WalletService, Arc<FedimintJournal>) {
+    let (state, service, journal, _) = empty_fixture_with_db().await;
+    (state, service, journal)
+}
+
+async fn empty_fixture_with_db() -> (
+    AppState,
+    WalletService,
+    Arc<FedimintJournal>,
+    fedimint_core::db::Database,
+) {
+    use fedimint_core::db::mem_impl::MemDatabase;
+    use fedimint_core::db::IRawDatabaseExt as _;
+    let db = MemDatabase::new().into_database();
+    let journal = Arc::new(FedimintJournal::new(db.clone()));
     let service =
         WalletService::start_detached(journal.clone(), Arc::new(PendingExecutor), fixture_policy())
             .await
@@ -83,7 +102,26 @@ async fn fixture() -> (AppState, WalletService, Arc<FedimintJournal>) {
         invoice_deadline: Duration::from_millis(120),
         await_deadline: Duration::from_millis(120),
     };
-    (state, service, journal)
+    (state, service, journal, db)
+}
+
+async fn attach_empty_runtime(state: &mut AppState, journal: &Arc<FedimintJournal>) {
+    use fedimint_bip39::Mnemonic;
+    use fedimint_core::db::mem_impl::MemDatabase;
+    use fedimint_core::db::IRawDatabaseExt as _;
+
+    let client_db = MemDatabase::new().into_database();
+    let client_journal_db = MemDatabase::new().into_database();
+    let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
+    let mc = Arc::new(MultiClient::new(client_db, client_journal_db, mnemonic).await);
+    state.runtime = Some(Arc::new(Runtime::new(
+        mc.clone(),
+        journal.clone(),
+        None,
+        None,
+        None,
+    )));
+    state.mc = Some(mc);
 }
 
 /// Like [`fixture`], but with a REAL (empty) `MultiClient` attached. fed(2) stays JOINED in the
@@ -107,8 +145,83 @@ async fn fixture_with_unopened_dest() -> (AppState, WalletService, Arc<FedimintJ
     );
     // No `open_all` — the open set is empty, so every joined fed reads as joined-but-not-open.
     assert!(mc.federations().is_empty());
+    state.runtime = Some(Arc::new(Runtime::new(
+        mc.clone(),
+        journal.clone(),
+        None,
+        None,
+        None,
+    )));
     state.mc = Some(mc);
     (state, service, journal)
+}
+
+#[tokio::test]
+async fn daemon_status_describes_the_final_scheduler_occurrence() {
+    let (mut state, service, journal) = empty_fixture().await;
+    attach_empty_runtime(&mut state, &journal).await;
+    let checkpoint = journal
+        .observe_watch_occurrence(u64::MAX - 1)
+        .await
+        .expect("seed final scheduler floor");
+
+    let (status, body) = send(&state, request("GET", "/v1/status", Some(TOKEN), None)).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the daemon previews its one valid final scheduler occurrence: {body}"
+    );
+    assert_eq!(body["decisions"], json!([]));
+    assert_eq!(
+        journal.get_watch_state().await.expect("read checkpoint"),
+        checkpoint,
+        "the dry-run remains read-only"
+    );
+    service.shutdown().await.expect("shutdown fixture service");
+}
+
+#[tokio::test]
+async fn daemon_status_refuses_a_consumed_final_scheduler_occurrence_without_writing() {
+    let (mut state, service, journal) = empty_fixture().await;
+    attach_empty_runtime(&mut state, &journal).await;
+    journal
+        .observe_watch_occurrence(u64::MAX - 1)
+        .await
+        .expect("seed final scheduler floor");
+    let consumed = journal
+        .advance_watch_occurrence()
+        .await
+        .expect("allocate the one final scheduler occurrence");
+    assert_eq!(consumed.occurrence, u64::MAX);
+
+    let (status, body) = send(&state, request("GET", "/v1/status", Some(TOKEN), None)).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("watch scheduler occurrence exhausted")),
+        "{body}"
+    );
+    assert_eq!(
+        journal
+            .get_watch_state()
+            .await
+            .expect("read final checkpoint"),
+        consumed,
+        "the exhausted preview must not rewrite the consumed final checkpoint"
+    );
+    assert!(
+        journal
+            .history(usize::MAX, None)
+            .await
+            .expect("read history")
+            .iter()
+            .all(|row| !matches!(row.kind, wallet_core::OperationKind::Tick { .. })),
+        "the rejected dry-run must not open a tick row"
+    );
+    service.shutdown().await.expect("shutdown fixture service");
 }
 
 fn request(method: &str, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
@@ -758,6 +871,98 @@ async fn history_and_watch_status_read_detached() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["occurrence"], 0);
     assert_eq!(body["discover_backlog"], false);
+    service.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn history_cursor_uses_the_effective_capped_limit_without_losing_rows() {
+    const REQUEST_OVERAGE: usize = 7;
+
+    let (state, service, journal) = empty_fixture().await;
+    let row_count = HISTORY_PAGE_LIMIT_MAX + 1;
+    // Typed Tick rows exercise the real ledger and history projection without starting money work.
+    for seq in 0..row_count {
+        journal
+            .record_tick_started(
+                &IdempotencyKey(format!("tick:history-pagination:{seq}")),
+                Occurrence(seq as u64),
+                seq as u64,
+            )
+            .await
+            .expect("seed history tick row");
+    }
+
+    let requested_limit = HISTORY_PAGE_LIMIT_MAX + REQUEST_OVERAGE;
+    let (status, first_page) = send(
+        &state,
+        request(
+            "GET",
+            &format!("/v1/history?limit={requested_limit}"),
+            Some(TOKEN),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let first_seqs = first_page["operations"]
+        .as_array()
+        .expect("history operations array")
+        .iter()
+        .map(|operation| operation["seq"].as_u64().expect("history operation seq"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        first_seqs,
+        (1..row_count)
+            .rev()
+            .map(|seq| seq as u64)
+            .collect::<Vec<_>>(),
+        "the over-limit request must return exactly the capped newest-first page"
+    );
+    let cursor = first_page["next_before_seq"]
+        .as_u64()
+        .expect("a full effective page has a cursor");
+    assert_eq!(
+        Some(cursor),
+        first_seqs.last().copied(),
+        "the cursor must be the last row of the effective capped page"
+    );
+
+    let (status, second_page) = send(
+        &state,
+        request(
+            "GET",
+            &format!("/v1/history?limit={requested_limit}&before_seq={cursor}"),
+            Some(TOKEN),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let remaining_seqs = second_page["operations"]
+        .as_array()
+        .expect("history operations array")
+        .iter()
+        .map(|operation| operation["seq"].as_u64().expect("history operation seq"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        remaining_seqs,
+        (0..cursor).rev().collect::<Vec<_>>(),
+        "following the cursor must return every older row in newest-first order"
+    );
+    assert_eq!(second_page["next_before_seq"], Value::Null);
+
+    let all_seqs = first_seqs
+        .into_iter()
+        .chain(remaining_seqs)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        all_seqs,
+        (0..row_count)
+            .rev()
+            .map(|seq| seq as u64)
+            .collect::<Vec<_>>(),
+        "the two pages must have no gap, duplicate, or ordering loss"
+    );
     service.shutdown().await.expect("shutdown");
 }
 

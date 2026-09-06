@@ -16,6 +16,8 @@
 //! - `0x02` `MoveKey(IdempotencyKey)`       → JSON row v1([`MoveRecord`])
 //! - `0x03` `FederationKey(FederationId)`   → JSON row v1([`FederationInfo`])
 //! - `0x04` `PendingIndexKey(status, key)`  → `()` (empty) — drives the status scans
+//! - `0x05` `LedgerRowKey(be64(seq))`       → JSON row v1([`OperationRecord`]); this is
+//!   exactly nine bytes, and the embedded `OperationRecord.seq` must equal the key sequence
 //! - `0x0a` `WatchStateKey`                 → JSON row v1([`WatchState`])
 //! - `0x0b` `PolicyKey`                     → JSON row v1([`wallet_api::Policy`])
 //!
@@ -48,17 +50,18 @@ use futures::StreamExt;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
 use wallet_api::Policy;
 use wallet_core::{
-    advance, intent_status_transition_allowed, kind_from_action, status_from_intent, Action, Actor,
-    AllocatorDecision, DiscoverySource, ExecError, FederationId, FeeBreakdown, GatewayUrl,
-    IdempotencyKey, Intent, IntentStatus, Journal, Msat, Occurrence, OperationId, OperationKind,
-    OperationRecord, OperationStatus, ProbeAttempt, ProbePolicy, RawOpUpdate, ReasonCode,
-    RefusalDiagnostics, WriteKind,
+    advance, assess_evacuation_structural_refusal, intent_status_transition_allowed,
+    kind_from_action, replaceable_evacuation_record_is_pristine, status_from_intent, Action, Actor,
+    AllocatorDecision, DiscoverySource, EvacuationRefusalEvidence, ExecError, FederationId,
+    FeeBreakdown, GatewayUrl, IdempotencyKey, Intent, IntentStatus, Journal, Msat, Occurrence,
+    OperationId, OperationKind, OperationRecord, OperationStatus, ProbeAttempt, ProbePolicy,
+    RawOpUpdate, ReasonCode, RefusalDiagnostics, WriteKind,
 };
 
 /// The app-state partition prefix (spec §4/§8). Clients live at `[0x01, ..]`, see
@@ -78,6 +81,11 @@ const TAG_PROBE: u8 = 0x08; // `0x08 ++ fed_id` → JSON row v1(ProbeRecord) (ph
 const TAG_CANDIDATE: u8 = 0x09; // `0x09 ++ fed_id` → JSON row v1(CandidateRecord) (phase 5 §5.1.1)
 const TAG_WATCH_STATE: u8 = 0x0a; // `0x0a` → JSON row v1(WatchState) (phase 5 §5.2.5)
 const TAG_POLICY: u8 = 0x0b; // `0x0b` → JSON row v1(wallet_api::Policy) (phase 6a §6a.6)
+
+// Immutable evacuation supersession audit relation.  The canonical row is indexed by its old key;
+// the reverse row maps the child key back to it without a scan.
+const TAG_EVACUATION_SUPERSESSION: u8 = 0x0c;
+const TAG_EVACUATION_SUPERSESSION_REVERSE: u8 = 0x0d;
 
 /// Rows older than this are eligible for reconcile's NEGATIVE-inference repairs (§10.3): a
 /// fresh non-terminal row may belong to an operation still in flight in another process, so
@@ -110,6 +118,45 @@ pub struct FederationInfo {
     pub invite: String,
     pub db_prefix: u32,
     pub joined_at: u64,
+}
+
+/// Immutable audit relation between a structurally refused agent evacuation and its fresh
+/// replacement.  It deliberately duplicates the evidence held briefly on the old intent: after the
+/// exchange the old row is terminal and the sidecar is the durable, queryable explanation.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EvacuationSupersessionRecord {
+    pub old_key: IdempotencyKey,
+    pub old_attempt: u32,
+    pub new_key: IdempotencyKey,
+    pub new_attempt: u32,
+    pub old_occurrence: Occurrence,
+    pub occurrence: Occurrence,
+    pub source: FederationId,
+    pub old_cap_components: Option<wallet_core::EvacFeeCap>,
+    pub new_cap_components: Option<wallet_core::EvacFeeCap>,
+    pub refusal: EvacuationRefusalEvidence,
+    pub superseded_at_ms: u64,
+}
+
+/// The two independent immediate links for an evacuation key.  A replacement may itself be
+/// replaced, so the middle of `A -> B -> C` has both fields populated.  Do not collapse this into
+/// a single relation: callers rendering audit history need both facts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EvacuationSupersessionNeighbors {
+    /// The relation whose child is the queried key.
+    pub predecessor: Option<EvacuationSupersessionRecord>,
+    /// The relation whose parent is the queried key.
+    pub successor: Option<EvacuationSupersessionRecord>,
+}
+
+/// Exact outcome of the child namespace half of an uncertain marked-evacuation
+/// exchange.  This is deliberately not a bool: callers must distinguish a
+/// positively proven empty namespace from one which contains a protocol
+/// artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplacementChildNamespace {
+    Pristine,
+    Contaminated,
 }
 
 /// Result of a federation-registry scan, including poison rows skipped along the way.
@@ -242,9 +289,7 @@ pub enum CandidateState {
     UserApproved,
 }
 
-/// Single-row watch scheduler checkpoint (phase 5 §5.2.5). The self-running loop is
-/// greenfield, so this is the v1 shape on disk: no compatibility shims or migration
-/// branches.
+/// Single-row watch scheduler checkpoint (phase 5 §5.2.5).
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WatchState {
     pub occurrence: u64,
@@ -254,6 +299,19 @@ pub struct WatchState {
     /// Candidate order snapshot for a deadline/cap-truncated discovery rotation. A cursor alone
     /// cannot distinguish older deferred source-only ids from fresh ids announced on restart.
     pub discover_rotation: Vec<FederationId>,
+}
+
+/// A generation at this value cannot name a strictly newer successor.  Do not
+/// persist it as the standalone floor or advance a watch checkpoint into a
+/// repeated generation.
+pub(crate) const OCCURRENCE_EXHAUSTED_ERROR: &str =
+    "occurrence exhausted at u64::MAX; choose an occurrence below u64::MAX because no newer successor exists";
+
+pub(crate) fn ensure_occurrence_has_successor(occurrence: u64) -> Result<(), ExecError> {
+    if occurrence == u64::MAX {
+        return Err(ExecError::Permanent(OCCURRENCE_EXHAUSTED_ERROR.to_owned()));
+    }
+    Ok(())
 }
 
 /// The note a no-op re-open `join:` row carries in its `error` (§10.2): a `Succeeded` join that
@@ -270,6 +328,10 @@ const AUTO_JOIN_WEEKLY_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 pub struct FedimintJournal {
     /// Already `with_prefix(vec![0x00])`; all raw keys here are relative to that partition.
     db: Database,
+    /// Retained in test builds so restart tests can make a fresh journal over
+    /// the same durable store without retaining any process-local test state.
+    #[cfg(test)]
+    test_root_db: Database,
     /// [`Journal::store_id`]: identity of `db`'s underlying storage, captured in [`Self::new`]
     /// from the pre-`with_prefix` handle (see there for why `with_prefix` itself can't supply
     /// it).
@@ -295,6 +357,11 @@ pub struct FedimintJournal {
     /// scoped durability-ambiguity recovery.
     #[cfg(test)]
     fail_after_status_writes: Arc<AtomicUsize>,
+    /// Inject an error after an atomic retryable reset committed.  This is separate from the
+    /// status writer because a structural marker and its scheduler wake have a distinct
+    /// post-commit ambiguity contract.
+    #[cfg(test)]
+    fail_after_retryable_resets: Arc<AtomicUsize>,
     /// Inject errors after the actor-routed artifact writers durably commit.
     #[cfg(test)]
     fail_after_artifact_writes: Arc<AtomicUsize>,
@@ -304,6 +371,42 @@ pub struct FedimintJournal {
     /// treats a storage refusal as a potentially durable fresh admission.
     #[cfg(test)]
     fail_after_upserts: Arc<AtomicUsize>,
+    /// Inject a pre-transaction marker-clear fault. This isolates CommitTick's already-Started
+    /// audit-row terminalization from exchange/admission faults.
+    #[cfg(test)]
+    fail_before_marker_clears: Arc<AtomicUsize>,
+    /// Inject a definite pre-transaction marker-clear refusal. Unlike an I/O fault, this cannot
+    /// have committed, so actor tests use it to distinguish permanent validation from ambiguity.
+    #[cfg(test)]
+    fail_before_marker_clears_permanently: Arc<AtomicUsize>,
+    /// Inject an error after a marker clear has durably committed. This models the same ambiguous
+    /// commit boundary as other writer seams; callers must exact-reread before deciding whether
+    /// the next marker wake is a continuation of their own clear.
+    #[cfg(test)]
+    fail_after_marker_clears: Arc<AtomicUsize>,
+    /// Inject an error after the marked-evacuation exchange has durably
+    /// committed.  Unlike a normal write error this leaves all three exchange
+    /// rows present, so actor code must prove the outcome by exact reread.
+    #[cfg(test)]
+    fail_after_evacuation_replacements: Arc<AtomicUsize>,
+    /// Arm one confirmation intent read only after the replacement commit has completed.
+    #[cfg(test)]
+    fail_confirmation_read_after_evacuation_replacements: Arc<AtomicUsize>,
+    /// Inject an exchange error before its transaction opens.  This models the
+    /// one outcome whose exact reread can prove that no child namespace was
+    /// touched.
+    #[cfg(test)]
+    fail_before_evacuation_replacements: Arc<AtomicUsize>,
+    /// Make a post-commit exchange error leave an intentionally incomplete
+    /// relation.  Service tests use this only to prove that confirmation poisons
+    /// authority rather than guessing which side of the exchange committed.
+    #[cfg(test)]
+    corrupt_after_evacuation_replacements: Arc<AtomicUsize>,
+    /// One-shot service-test seam.  The exchange is already durable when this is
+    /// consumed; stopping before the actor installs the child driver models a
+    /// process loss in exactly that narrow recovery window.
+    #[cfg(test)]
+    stop_after_evacuation_replacement_before_child_driver: Arc<AtomicBool>,
     /// Test-only durable corruption seam: replace the just-committed intent row before returning
     /// the configured post-upsert error.  This models a concurrent/corrupt row whose exact key is
     /// readable but whose request identity is not the one the fresh caller attempted.
@@ -314,12 +417,34 @@ pub struct FedimintJournal {
     /// replay read without making every intent read fail.
     #[cfg(test)]
     fail_intent_read_after_successes: Arc<Mutex<Option<usize>>>,
+    /// One-shot delayed scan faults let actor tests target the replacement's
+    /// second, pre-exchange admission scan rather than CommitTick's initial
+    /// whole-round projection.
+    #[cfg(test)]
+    fail_pending_read_after_successes: Arc<Mutex<Option<usize>>>,
+    #[cfg(test)]
+    fail_reservation_read_after_successes: Arc<Mutex<Option<usize>>>,
     #[cfg(test)]
     pending_reads: Arc<AtomicUsize>,
     /// A one-shot pause after a durable pending scan.  This lets the actor test queue a later
     /// `DriverFinished` read fault between the scan and its generation acknowledgement.
     #[cfg(test)]
     pending_read_pause: Arc<Mutex<Option<Arc<PendingReadPause>>>>,
+    /// A one-shot pause immediately before the planner's authoritative replacement-parent scan.
+    /// This lets service tests insert a marker after planning starts without retaining a redundant
+    /// production pre-scan solely to make that race deterministic.
+    #[cfg(test)]
+    replacement_scan_pause: Arc<Mutex<Option<Arc<PendingReadPause>>>>,
+    /// Key-scoped one-shot transaction rendezvous.  It is deliberately not a
+    /// global test barrier: unrelated journal tests and keys must never join
+    /// this forced overlap.
+    #[cfg(test)]
+    replacement_write_rendezvous: Arc<Mutex<BTreeMap<IdempotencyKey, Arc<ReplacementWritePause>>>>,
+    /// A one-shot pause immediately after a `put_move_if_attempt` write commits and before its
+    /// postverify read.  It makes cleanup-race tests deterministic without being a production
+    /// synchronization primitive.
+    #[cfg(test)]
+    post_move_write_pauses: Arc<Mutex<BTreeMap<IdempotencyKey, Arc<PostMoveWritePause>>>>,
 }
 
 #[cfg(test)]
@@ -327,6 +452,46 @@ pub struct FedimintJournal {
 pub(crate) struct PendingReadPause {
     started: tokio::sync::Notify,
     release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct PostMoveWritePause {
+    committed: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl PostMoveWritePause {
+    pub(crate) async fn wait_until_committed(&self) {
+        self.committed.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_waiters();
+    }
+}
+
+/// A one-shot park inside an open replacement transaction, so a competing writer can be driven to
+/// a durable commit underneath it.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ReplacementWritePause {
+    parked: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ReplacementWritePause {
+    /// Resolve once the exchange is parked mid-transaction.  `notify_one` stores a permit, so this
+    /// cannot miss a seam that parked before the test got here.
+    pub(crate) async fn wait_until_parked(&self) {
+        self.parked.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 #[cfg(test)]
@@ -338,6 +503,27 @@ impl PendingReadPause {
     pub(crate) fn release(&self) {
         self.release.notify_waiters();
     }
+}
+
+/// Park at this key's seam exactly once, announcing arrival first.
+///
+/// The seam sits inside an `autocommit` closure, so the loser of the forced overlap re-enters it on
+/// its `WriteConflict` retry.  Removing before waiting is what lets that retry run to completion
+/// against the durable winner instead of parking a second time with nobody left to release it.
+#[cfg(test)]
+async fn wait_replacement_write_rendezvous_for_test(
+    rendezvous: &Arc<Mutex<BTreeMap<IdempotencyKey, Arc<ReplacementWritePause>>>>,
+    key: &IdempotencyKey,
+) {
+    let pause = rendezvous
+        .lock()
+        .expect("replacement write rendezvous lock poisoned")
+        .remove(key);
+    let Some(pause) = pause else {
+        return;
+    };
+    pause.parked.notify_one();
+    pause.release.notified().await;
 }
 
 impl FedimintJournal {
@@ -364,6 +550,8 @@ impl FedimintJournal {
         let store_id = Arc::as_ptr(&db.clone().into_inner()) as *const () as usize;
         Self {
             db: db.with_prefix(vec![APP_PREFIX]),
+            #[cfg(test)]
+            test_root_db: db.clone(),
             store_id,
             clock,
             #[cfg(test)]
@@ -375,20 +563,118 @@ impl FedimintJournal {
             #[cfg(test)]
             fail_after_status_writes: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
+            fail_after_retryable_resets: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
             fail_after_artifact_writes: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             fail_after_move_writes: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             fail_after_upserts: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
+            fail_before_marker_clears: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_before_marker_clears_permanently: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_after_marker_clears: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_after_evacuation_replacements: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_confirmation_read_after_evacuation_replacements: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_before_evacuation_replacements: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            corrupt_after_evacuation_replacements: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            stop_after_evacuation_replacement_before_child_driver: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
             replace_after_upsert: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             fail_intent_read_after_successes: Arc::new(Mutex::new(None)),
             #[cfg(test)]
+            fail_pending_read_after_successes: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            fail_reservation_read_after_successes: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             pending_reads: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             pending_read_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            replacement_scan_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            replacement_write_rendezvous: Arc::new(Mutex::new(BTreeMap::new())),
+            #[cfg(test)]
+            post_move_write_pauses: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Construct a new journal/runtime-facing handle over this exact backing
+    /// store.  Unlike cloning the journal, this loses every test seam and cache
+    /// owned by the old process.
+    #[cfg(test)]
+    pub(crate) fn reopen_for_test(&self) -> Self {
+        Self::with_clock(self.test_root_db.clone(), self.clock)
+    }
+
+    #[cfg(test)]
+    async fn wait_replacement_write_rendezvous_for_test(&self, key: &IdempotencyKey) {
+        wait_replacement_write_rendezvous_for_test(&self.replacement_write_rendezvous, key).await;
+    }
+
+    /// Park the next transaction that reaches this key's replacement seam until the returned handle
+    /// is released.
+    ///
+    /// The seam is placed after the exchange has read the parent and confirmed the parent owns no
+    /// artifact, and before it retires that parent.  Arming it therefore holds a replacement inside
+    /// its own uncommitted transaction while the caller drives a competing writer to a durable
+    /// commit -- the interleave a sequential test cannot reach.
+    #[cfg(test)]
+    pub(crate) fn arm_replacement_write_rendezvous_for_test(
+        &self,
+        key: IdempotencyKey,
+    ) -> Arc<ReplacementWritePause> {
+        let pause = Arc::new(ReplacementWritePause::default());
+        self.replacement_write_rendezvous
+            .lock()
+            .expect("replacement write rendezvous lock poisoned")
+            .insert(key, pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_next_move_write_for_test(
+        &self,
+        key: IdempotencyKey,
+    ) -> Arc<PostMoveWritePause> {
+        let pause = Arc::new(PostMoveWritePause {
+            committed: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let previous = self
+            .post_move_write_pauses
+            .lock()
+            .expect("post-move-write pause lock poisoned")
+            .insert(key, Arc::clone(&pause));
+        assert!(
+            previous.is_none(),
+            "only one post-move-write pause may be installed per key"
+        );
+        pause
+    }
+
+    #[cfg(test)]
+    async fn wait_after_move_write_for_test(&self, key: &IdempotencyKey) {
+        // Remove before waiting: the test can make an N+1 writer run while the N writer is
+        // paused, and that newer writer must not inherit this one-shot pause.
+        let pause = self
+            .post_move_write_pauses
+            .lock()
+            .expect("post-move-write pause lock poisoned")
+            .remove(key);
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.committed.notify_one();
+        pause.release.notified().await;
     }
 
     #[cfg(test)]
@@ -426,6 +712,11 @@ impl FedimintJournal {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_after_next_retryable_reset_for_test(&self) {
+        self.fail_after_retryable_resets.store(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
     pub(crate) fn fail_after_next_artifact_write_for_test(&self) {
         self.fail_after_artifact_writes.store(1, Ordering::SeqCst);
     }
@@ -438,6 +729,87 @@ impl FedimintJournal {
     #[cfg(test)]
     pub(crate) fn fail_after_next_upsert_for_test(&self) {
         self.fail_after_upserts.store(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_before_next_marker_clear_for_test(&self) {
+        self.fail_before_marker_clears.store(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_before_next_marker_clear_permanently_for_test(&self) {
+        self.fail_before_marker_clears_permanently
+            .store(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_after_next_marker_clear_for_test(&self) {
+        self.fail_after_marker_clears.store(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_after_next_evacuation_replacement_for_test(&self) {
+        self.fail_after_evacuation_replacements
+            .store(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_after_next_evacuation_replacement_with_confirmation_read_for_test(&self) {
+        self.fail_after_evacuation_replacements
+            .store(1, Ordering::SeqCst);
+        self.fail_confirmation_read_after_evacuation_replacements
+            .store(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_before_next_evacuation_replacement_for_test(&self) {
+        self.fail_before_evacuation_replacements
+            .store(1, Ordering::SeqCst);
+    }
+
+    /// Seed one stale child-owned row without a child intent. The marked
+    /// replacement autocommit must reject this namespace during its pre-commit
+    /// validation; service tests use it to distinguish that definite outcome
+    /// from a retryable commit acknowledgement ambiguity.
+    #[cfg(test)]
+    pub(crate) async fn seed_stale_replacement_child_namespace_for_test(
+        &self,
+        key: &IdempotencyKey,
+    ) -> Result<(), ExecError> {
+        let mut dbtx = self.db.begin_transaction().await;
+        dbtx.raw_insert_bytes(&move_key(key), b"stale replacement child namespace")
+            .await
+            .map_err(db_err)?;
+        dbtx.commit_tx_result().await.map_err(db_err)
+    }
+
+    /// The exchange transaction completes, then its canonical audit half is
+    /// removed before the injected error is returned.  This is deliberately
+    /// impossible in production; it is a discriminating test seam for the
+    /// actor's ambiguous-confirmation fail-closed path.
+    #[cfg(test)]
+    pub(crate) fn fail_after_next_evacuation_replacement_ambiguously_for_test(&self) {
+        self.corrupt_after_evacuation_replacements
+            .store(1, Ordering::SeqCst);
+        self.fail_after_evacuation_replacements
+            .store(1, Ordering::SeqCst);
+    }
+
+    /// Make the next successful actor exchange return before it registers its
+    /// child driver.  Production never observes this seam; it exists solely to
+    /// verify restart recovery from the durable exchange boundary.
+    #[cfg(test)]
+    pub(crate) fn stop_after_evacuation_replacement_before_child_driver_for_test(&self) {
+        self.stop_after_evacuation_replacement_before_child_driver
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_stop_after_evacuation_replacement_before_child_driver_for_test(
+        &self,
+    ) -> bool {
+        self.stop_after_evacuation_replacement_before_child_driver
+            .swap(false, Ordering::SeqCst)
     }
 
     /// Replace the next successful `upsert`'s durable intent row before it reports its configured
@@ -457,6 +829,22 @@ impl FedimintJournal {
             .fail_intent_read_after_successes
             .lock()
             .expect("intent read fault lock poisoned") = Some(successes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_one_pending_read_after_successes_for_test(&self, successes: usize) {
+        *self
+            .fail_pending_read_after_successes
+            .lock()
+            .expect("pending read fault lock poisoned") = Some(successes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_one_reservation_read_after_successes_for_test(&self, successes: usize) {
+        *self
+            .fail_reservation_read_after_successes
+            .lock()
+            .expect("reservation read fault lock poisoned") = Some(successes);
     }
 
     #[cfg(test)]
@@ -480,6 +868,32 @@ impl FedimintJournal {
             .lock()
             .expect("pending read pause lock poisoned") = Some(Arc::clone(&pause));
         pause
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_before_next_replacement_scan_for_test(&self) -> Arc<PendingReadPause> {
+        let pause = Arc::new(PendingReadPause {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *self
+            .replacement_scan_pause
+            .lock()
+            .expect("replacement scan pause lock poisoned") = Some(Arc::clone(&pause));
+        pause
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_before_replacement_scan_for_test(&self) {
+        let pause = self
+            .replacement_scan_pause
+            .lock()
+            .expect("replacement scan pause lock poisoned")
+            .take();
+        if let Some(pause) = pause {
+            pause.started.notify_one();
+            pause.release.notified().await;
+        }
     }
 
     /// The ledger's wall-clock in unix millis (the injected [`Self::clock`]).
@@ -526,8 +940,7 @@ impl FedimintJournal {
                         else {
                             return Ok(false);
                         };
-                        let row: OperationRecord =
-                            decode_row_result("ledger row", &row_key, &row_bytes)?;
+                        let row = decode_canonical_ledger_row(&row_key, &row_bytes)?;
                         let Some((fed, op_id, _)) = raw_row_parts(&row.kind) else {
                             return Ok(false);
                         };
@@ -617,6 +1030,24 @@ impl FedimintJournal {
                 key.0
             )));
         }
+        // A structural replacement retires this public parent permanently.  Reopening it would
+        // create two live evacuations for one source while the immutable sidecar still says that
+        // the child is its sole successor.
+        if let Some(bytes) = dbtx
+            .raw_get_bytes(&evacuation_supersession_key(key))
+            .await
+            .map_err(db_err)?
+        {
+            let relation: EvacuationSupersessionRecord = decode_row_result(
+                "evacuation supersession",
+                &evacuation_supersession_key(key),
+                &bytes,
+            )?;
+            validate_supersession_endpoints(&relation)?;
+            return Err(ExecError::Permanent(
+                "journal: a superseded evacuation parent can never be retried".to_owned(),
+            ));
+        }
         let expected_attempt = old.attempt.checked_add(1).ok_or_else(|| {
             ExecError::Permanent("journal: manual retry attempt counter overflow".to_owned())
         })?;
@@ -644,15 +1075,11 @@ impl FedimintJournal {
             .await
             .map_err(db_err)?;
 
-        let counter_key = ledger_counter_key();
-        let next_seq = match dbtx.raw_get_bytes(&counter_key).await.map_err(db_err)? {
-            Some(bytes) => read_be64(&bytes)
-                .ok_or_else(|| ExecError::Permanent("journal: corrupt ledger counter".into()))?,
-            None => 0,
-        };
+        let (next_seq, successor) = next_ledger_sequence_in(&mut dbtx).await?;
         let now = self.now_ms();
         let row = fresh_intent_record(next_seq, refreshed, OperationStatus::Started, now, None);
-        dbtx.raw_insert_bytes(&counter_key, &(next_seq + 1).to_be_bytes())
+        note_ledger_insert_in(&mut dbtx, &row).await?;
+        dbtx.raw_insert_bytes(&ledger_counter_key(), &successor.to_be_bytes())
             .await
             .map_err(db_err)?;
         dbtx.raw_insert_bytes(&ledger_row_key(next_seq), &encode_row(&row)?)
@@ -873,8 +1300,12 @@ impl FedimintJournal {
     }
 
     /// Upsert an intent-backed derived [`MoveRecord`] only while `expected_attempt` still owns
-    /// `key`. A false result is a benign stale writer: callers must not recreate the cache that a
-    /// manual retry deliberately removed for a newer attempt.
+    /// `key`. `Ok(false)` means the cache was not retained because the attempt mismatched, the
+    /// intent was terminal, or a structural-evacuation marker owned the row. If a post-write
+    /// ownership check retires this attempt, it restores the exact pre-write cache only for that
+    /// same retired attempt (or removes this call's row when there was no prior cache). A missing
+    /// or newer attempt always loses its cache: callers must not recreate the cache that a manual
+    /// retry deliberately removed for a newer attempt.
     pub async fn put_move_if_attempt(
         &self,
         key: &IdempotencyKey,
@@ -893,13 +1324,87 @@ impl FedimintJournal {
             return Ok(false);
         };
         let intent: Intent = decode_row_result("intent", &ikey, &bytes)?;
-        if intent.idempotency_key != *key || intent.attempt != expected_attempt {
+        if intent.idempotency_key != *key
+            || intent.attempt != expected_attempt
+            || matches!(intent.status, IntentStatus::Done | IntentStatus::Failed)
+            // A structural evacuation marker is exclusively planner-owned and pre-artifact.
+            // A late driver/backfill must not poison either its replacement or one-cycle clear;
+            // a legitimate retry claim consumes this marker atomically before any cache write.
+            || intent.evacuation_refusal.is_some()
+        {
             return Ok(false);
         }
-        dbtx.raw_insert_bytes(&move_key(key), &value)
-            .await
-            .map_err(db_err)?;
+        #[cfg(test)]
+        self.wait_replacement_write_rendezvous_for_test(key).await;
+        // Claim the intent row in this transaction even though its bytes do
+        // not change.  The MoveRecord cache is derived state, but a structural
+        // replacement retires the intent in the same database: without this
+        // write-write fence, two snapshot transactions can both observe
+        // Pending and commit a retired parent plus its late artifact.
+        dbtx.raw_insert_bytes(&ikey, &bytes).await.map_err(db_err)?;
+        let mkey = move_key(key);
+        // This is derived state, but it may be a useful prior artifact from a concurrent durable
+        // recovery.  The post-write ownership fence below must undo only our own overwrite, never
+        // blindly delete that prior row.
+        let prior_move_bytes = dbtx.raw_get_bytes(&mkey).await.map_err(db_err)?;
+        dbtx.raw_insert_bytes(&mkey, &value).await.map_err(db_err)?;
         dbtx.commit_tx_result().await.map_err(db_err)?;
+        #[cfg(test)]
+        self.wait_replacement_write_rendezvous_for_test(key).await;
+        #[cfg(test)]
+        self.wait_after_move_write_for_test(key).await;
+        // A replacement can have retired this parent between our Pending read
+        // and this derived-row commit on stores whose snapshot transactions do
+        // not report a same-row write conflict. Re-read durably and undo only
+        // OUR bytes if we lost that race; callers then see the normal
+        // stale-writer `false`, never a terminal parent carrying executable
+        // artifacts or a deleted prior same-attempt cache. An attempt-N+1/manual
+        // retry must instead retain its cache deletion.
+        let mut verify = self.db.begin_transaction().await;
+        #[derive(Clone, Copy)]
+        enum OwnershipAfterWrite {
+            Current,
+            /// A terminal result or planner-owned refusal marker for this very attempt preserves
+            /// its prior cache. Both retire the driver before a cache may be retained.
+            RetiredSameAttempt,
+            /// A missing/retried row must not regain stale N state and never restores a prior row.
+            Other,
+        }
+        let ownership = match verify.raw_get_bytes(&ikey).await.map_err(db_err)? {
+            Some(current) => {
+                let current: Intent = decode_row_result("intent", &ikey, &current)?;
+                if current.idempotency_key != *key || current.attempt != expected_attempt {
+                    OwnershipAfterWrite::Other
+                } else if matches!(current.status, IntentStatus::Done | IntentStatus::Failed)
+                    || current.evacuation_refusal.is_some()
+                {
+                    OwnershipAfterWrite::RetiredSameAttempt
+                } else {
+                    OwnershipAfterWrite::Current
+                }
+            }
+            None => OwnershipAfterWrite::Other,
+        };
+        if !matches!(ownership, OwnershipAfterWrite::Current)
+            && verify.raw_get_bytes(&mkey).await.map_err(db_err)?.as_ref() == Some(&value)
+        {
+            // Raw-byte equality is this call's local writer token. The registered single per-key
+            // driver/awaiter plus ExternalTerminalMutationLease, or a standalone tick's exclusive
+            // database ownership, means another legitimate writer cannot ABA these bytes between
+            // this write and cleanup. A future multi-writer protocol must carry an explicit writer
+            // token instead.
+            match (ownership, prior_move_bytes) {
+                (OwnershipAfterWrite::RetiredSameAttempt, Some(prior)) => verify
+                    .raw_insert_bytes(&mkey, &prior)
+                    .await
+                    .map_err(db_err)?,
+                _ => verify.raw_remove_entry(&mkey).await.map_err(db_err)?,
+            };
+        }
+        verify.commit_tx_result().await.map_err(db_err)?;
+        if !matches!(ownership, OwnershipAfterWrite::Current) {
+            return Ok(false);
+        }
         #[cfg(test)]
         if self
             .fail_after_move_writes
@@ -913,6 +1418,604 @@ impl FedimintJournal {
             ));
         }
         Ok(true)
+    }
+
+    /// Read an immutable evacuation supersession relation by either the retired parent key or the
+    /// live child key.  A reverse row that cannot be decoded, or that points at a missing/mismatched
+    /// canonical row, is corruption and fails closed rather than silently hiding audit history.
+    pub async fn evacuation_supersession(
+        &self,
+        key: &IdempotencyKey,
+    ) -> Result<Option<EvacuationSupersessionRecord>, ExecError> {
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        let canonical = evacuation_supersession_key(key);
+        if let Some(bytes) = dbtx.raw_get_bytes(&canonical).await.map_err(db_err)? {
+            let row: EvacuationSupersessionRecord =
+                decode_row_result("evacuation supersession", &canonical, &bytes)?;
+            if row.old_key != *key {
+                return Err(ExecError::Permanent(
+                    "journal: evacuation supersession canonical key has mismatched endpoint".into(),
+                ));
+            }
+            validate_complete_supersession(&mut dbtx, &row).await?;
+            return Ok(Some(row));
+        }
+        let reverse = evacuation_supersession_reverse_key(key);
+        let Some(bytes) = dbtx.raw_get_bytes(&reverse).await.map_err(db_err)? else {
+            return Ok(None);
+        };
+        let old: IdempotencyKey =
+            decode_row_result("evacuation supersession reverse", &reverse, &bytes)?;
+        let old_key = evacuation_supersession_key(&old);
+        let row_bytes = dbtx
+            .raw_get_bytes(&old_key)
+            .await
+            .map_err(db_err)?
+            .ok_or_else(|| {
+                ExecError::Permanent(
+                    "journal: supersession reverse index points at a missing canonical row".into(),
+                )
+            })?;
+        let row: EvacuationSupersessionRecord =
+            decode_row_result("evacuation supersession", &old_key, &row_bytes)?;
+        if row.old_key != old || row.new_key != *key {
+            return Err(ExecError::Permanent(
+                "journal: incoherent evacuation supersession reverse index".into(),
+            ));
+        }
+        validate_complete_supersession(&mut dbtx, &row).await?;
+        Ok(Some(row))
+    }
+
+    /// Read only the immediate canonical successor of `key`.
+    ///
+    /// Unlike [`Self::evacuation_supersession`], this intentionally does not fall back to the
+    /// reverse index.  Exchange confirmation asks whether the *attempted parent* acquired its
+    /// child, so a predecessor (`A -> B` while confirming an uncommitted `B -> C`) is not evidence
+    /// that the attempted exchange committed.  A present canonical relation remains strict: its
+    /// endpoint and reverse half must both be coherent in this snapshot.
+    pub(crate) async fn evacuation_canonical_successor(
+        &self,
+        key: &IdempotencyKey,
+    ) -> Result<Option<EvacuationSupersessionRecord>, ExecError> {
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        evacuation_canonical_successor_in_tx(&mut dbtx, key).await
+    }
+
+    /// Read the predecessor and successor independently.  In particular, this preserves both
+    /// links for a replacement that is later replaced itself (`A -> B -> C`).  The older
+    /// [`Self::evacuation_supersession`] API remains available for callers that deliberately need
+    /// a relation by either endpoint.
+    pub async fn evacuation_supersession_neighbors(
+        &self,
+        key: &IdempotencyKey,
+    ) -> Result<EvacuationSupersessionNeighbors, ExecError> {
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        evacuation_supersession_neighbors_in_tx(&mut dbtx, key).await
+    }
+
+    /// Read one bounded display page of supersession neighbors from one snapshot.  Sidecars are
+    /// audit augmentation, not the ledger itself: malformed or half-written sidecars therefore
+    /// degrade to absent links for this display page, while the strict reader continues to reject
+    /// them at atomic replacement/confirmation boundaries. Storage faults still fail the read.
+    pub async fn evacuation_supersession_neighbors_for_display_keys(
+        &self,
+        keys: &[IdempotencyKey],
+    ) -> Result<BTreeMap<IdempotencyKey, EvacuationSupersessionNeighbors>, ExecError> {
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        let mut links = BTreeMap::new();
+        for key in keys {
+            if links.contains_key(key) {
+                continue;
+            }
+            match evacuation_supersession_neighbors_in_tx(&mut dbtx, key).await {
+                Ok(neighbors) => {
+                    links.insert(key.clone(), neighbors);
+                }
+                Err(ExecError::Permanent(error)) => {
+                    tracing::warn!(
+                        key = %key.0,
+                        %error,
+                        "ignoring malformed evacuation supersession sidecar in presentation"
+                    );
+                    links.insert(key.clone(), EvacuationSupersessionNeighbors::default());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(links)
+    }
+
+    /// Read the intent linked to one operation row for a DISPLAY projection.
+    ///
+    /// `show` resolves the ledger row first; this read only AUGMENTS it with the live linked
+    /// status and any structural-refusal marker.  So, exactly like the bulk sidecar projection
+    /// above, a MALFORMED intent row degrades to absent with a `warn!` instead of blanking the
+    /// ledger row an operator asked for mid-incident.  Storage faults still fail the read: they
+    /// are retryable, and answering a transient fault with "no marker" would be a false display.
+    /// Every money path keeps the strict [`Journal::get`].
+    pub async fn intent_for_display(
+        &self,
+        key: &IdempotencyKey,
+    ) -> Result<Option<Intent>, ExecError> {
+        match self.read_intent(key).await {
+            Ok(intent) => Ok(intent),
+            Err(ExecError::Permanent(error)) => {
+                tracing::warn!(
+                    key = %key.0,
+                    %error,
+                    "ignoring malformed linked intent row in presentation"
+                );
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Prove whether every key owned by a prospective replacement child is
+    /// absent.  A reported exchange failure is uncommitted only after this
+    /// exact check returns [`ReplacementChildNamespace::Pristine`].
+    pub(crate) async fn replacement_child_namespace(
+        &self,
+        key: &IdempotencyKey,
+    ) -> Result<ReplacementChildNamespace, ExecError> {
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        Ok(if child_namespace_is_empty(&mut dbtx, key).await? {
+            ReplacementChildNamespace::Pristine
+        } else {
+            ReplacementChildNamespace::Contaminated
+        })
+    }
+
+    /// Consume one planner-owned structural refusal marker only if every durable identity field
+    /// still exactly matches the shadow that produced the disposition. This leaves the evacuation
+    /// Pending and writes no supersession relation: ordinary reconciliation may retry it on the
+    /// next normal cycle, but this commit never starts a driver or policy wake.
+    pub(crate) async fn clear_marked_evacuation_if_pending(
+        &self,
+        planned_parent: &Intent,
+    ) -> Result<bool, ExecError> {
+        #[cfg(test)]
+        if self
+            .fail_before_marker_clears_permanently
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(ExecError::Permanent(
+                "injected permanent pre-marker-clear refusal".to_owned(),
+            ));
+        }
+        #[cfg(test)]
+        if self
+            .fail_before_marker_clears
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(ExecError::Retryable(
+                "injected pre-marker-clear fault".to_owned(),
+            ));
+        }
+        let planned_parent = planned_parent.clone();
+        let cleared = self
+            .db
+            .autocommit(
+                move |dbtx, _| {
+                    let planned_parent = planned_parent.clone();
+                    Box::pin(async move {
+                        let old_key = &planned_parent.idempotency_key;
+                        let ikey = intent_key(old_key);
+                        let Some(bytes) = dbtx.raw_get_bytes(&ikey).await.map_err(db_err)? else {
+                            return Ok(false);
+                        };
+                        let mut old: Intent = decode_row_result("intent", &ikey, &bytes)?;
+                        if old != planned_parent {
+                            return Ok(false);
+                        }
+                        let Action::Evacuate { from, .. } = &old.action else {
+                            return Ok(false);
+                        };
+                        if old.status != IntentStatus::Pending
+                            || !matches!(old.actor, Actor::Agent { .. })
+                            || old.evacuation_refusal.is_none()
+                            || old.operation_id.is_some()
+                            || old.invoice.is_some()
+                        {
+                            return Ok(false);
+                        }
+                        // A sidecar means this parent may have a child, and another live source
+                        // holder means this is no longer the planner's exclusive class. Neither is
+                        // a harmless stale disposition.
+                        if dbtx
+                            .raw_get_bytes(&evacuation_supersession_key(old_key))
+                            .await
+                            .map_err(db_err)?
+                            .is_some()
+                        {
+                            return Ok(false);
+                        }
+                        ensure_no_other_live_agent_evacuation_holder(dbtx, old_key, *from).await?;
+                        if let Some(bytes) = dbtx
+                            .raw_get_bytes(&move_key(old_key))
+                            .await
+                            .map_err(db_err)?
+                        {
+                            let record: MoveRecord =
+                                decode_row_result("move record", &move_key(old_key), &bytes)?;
+                            if !replaceable_evacuation_record_is_pristine(&old, &record) {
+                                return Err(ExecError::Permanent(
+                                    "journal: marker clear found committed or incoherent move artifacts"
+                                        .into(),
+                                ));
+                            }
+                        }
+                        old.evacuation_refusal = None;
+                        dbtx.raw_insert_bytes(&ikey, &encode_row(&old)?)
+                            .await
+                            .map_err(db_err)?;
+                        Ok(true)
+                    })
+                },
+                None,
+            )
+            .await
+            .map_err(|error| match error {
+                AutocommitError::CommitFailed { last_error, .. } => db_err(last_error),
+                AutocommitError::ClosureError { error, .. } => error,
+            })?;
+        #[cfg(test)]
+        if cleared
+            && self
+                .fail_after_marker_clears
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            return Err(ExecError::Retryable(
+                "injected post-marker-clear fault".to_owned(),
+            ));
+        }
+        Ok(cleared)
+    }
+
+    /// Atomically retire exactly the marker-bearing pending agent evacuation and create one fresh
+    /// child.
+    ///
+    /// `ServiceActor::commit_tick` and the exclusive-DB
+    /// `Runtime::replace_marked_evacuation_standalone` call this only after their
+    /// policy/world/balance/goal authority checks and generation fencing. It is deliberately
+    /// crate-private so no API or scheduler path can bypass that authority.
+    pub(crate) async fn replace_marked_evacuation(
+        &self,
+        old_key: &IdempotencyKey,
+        old_attempt: u32,
+        evidence: &EvacuationRefusalEvidence,
+        fresh: &AllocatorDecision,
+        now_ms: u64,
+        planned_parent: &Intent,
+    ) -> Result<bool, ExecError> {
+        #[cfg(test)]
+        if self
+            .fail_before_evacuation_replacements
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(ExecError::Retryable(
+                "journal: injected error before evacuation replacement".to_owned(),
+            ));
+        }
+        let old_key = old_key.clone();
+        let evidence = evidence.clone();
+        let fresh = fresh.clone();
+        let planned_parent = planned_parent.clone();
+        #[cfg(test)]
+        let replacement_write_rendezvous = self.replacement_write_rendezvous.clone();
+        let exchanged = self
+            .db
+            .autocommit(
+                |dbtx, _| {
+                    let old_key = old_key.clone();
+                    let evidence = evidence.clone();
+                    let fresh = fresh.clone();
+                    let planned_parent = planned_parent.clone();
+                    #[cfg(test)]
+                    let replacement_write_rendezvous = replacement_write_rendezvous.clone();
+                    Box::pin(async move {
+                        let old_ikey = intent_key(&old_key);
+                        let Some(old_bytes) =
+                            dbtx.raw_get_bytes(&old_ikey).await.map_err(db_err)?
+                        else {
+                            return Ok(false);
+                        };
+                        let mut old: Intent =
+                            decode_row_result("intent", &old_ikey, &old_bytes)?;
+                        let sidecar_key = evacuation_supersession_key(&old_key);
+                        let (old_from, old_components) = match &old.action {
+                            Action::Evacuate {
+                                from,
+                                fee_cap_components,
+                                ..
+                            } => (*from, *fee_cap_components),
+                            _ => {
+                                return Err(ExecError::Permanent(
+                                    "journal: marked replacement requires an Evacuate parent".into(),
+                                ))
+                            }
+                        };
+                        let (new_from, new_components, new_amount, new_fee_cap) = match &fresh.action {
+                            Action::Evacuate {
+                                from,
+                                amount,
+                                fee_cap,
+                                fee_cap_components,
+                                ..
+                            } => (*from, *fee_cap_components, *amount, *fee_cap),
+                            _ => {
+                                return Err(ExecError::Permanent(
+                                    "journal: marked replacement requires an Evacuate child".into(),
+                                ))
+                            }
+                        };
+                        let old_cap = old_components.unwrap_or(wallet_core::EvacFeeCap {
+                            base_msat: match &old.action {
+                                Action::Evacuate { fee_cap, .. } => *fee_cap,
+                                _ => unreachable!("Evacuate parent was checked above"),
+                            },
+                            bps: 0,
+                        });
+                        if let Actor::Agent {
+                            occurrence: old_occurrence,
+                        } = old.actor
+                        {
+                            if fresh.occurrence <= old_occurrence
+                                || fresh.idempotency_key == old_key
+                            {
+                                return Err(ExecError::Permanent(
+                                    crate::service::replacement_occurrence_error(
+                                        old_occurrence,
+                                        fresh.occurrence,
+                                    ),
+                                ));
+                            }
+                        }
+                        if let Some(sidecar_bytes) =
+                            dbtx.raw_get_bytes(&sidecar_key).await.map_err(db_err)?
+                        {
+                            let sidecar: EvacuationSupersessionRecord = decode_row_result(
+                                "evacuation supersession",
+                                &sidecar_key,
+                                &sidecar_bytes,
+                            )?;
+                            validate_complete_supersession(dbtx, &sidecar).await?;
+                            validate_marked_evacuation_evidence(
+                                &old,
+                                old_cap,
+                                &sidecar.refusal,
+                                new_components,
+                                new_amount,
+                                new_fee_cap,
+                            )?;
+                            if evidence != sidecar.refusal
+                                || !supersession_relation_matches_request(
+                                    &sidecar,
+                                    &old,
+                                    &fresh,
+                                )
+                            {
+                                return Err(ExecError::Permanent(
+                                    "journal: evacuation already has a different successor".into(),
+                                ));
+                            }
+                            if old.status != IntentStatus::Failed
+                                || old.attempt != old_attempt
+                                || old.evacuation_refusal.as_ref() != Some(&sidecar.refusal)
+                            {
+                                return Err(ExecError::Permanent(
+                                    "journal: supersession replay found an incoherent retired parent"
+                                        .into(),
+                                ));
+                            }
+                            let child_key = intent_key(&sidecar.new_key);
+                            let child_bytes = dbtx
+                                .raw_get_bytes(&child_key)
+                                .await
+                                .map_err(db_err)?
+                                .ok_or_else(|| {
+                                    ExecError::Permanent(
+                                        "journal: supersession replay is missing its child intent"
+                                            .into(),
+                                    )
+                                })?;
+                            let child: Intent =
+                                decode_row_result("intent", &child_key, &child_bytes)?;
+                            validate_replayed_supersession_child(
+                                &child,
+                                &fresh,
+                                sidecar.superseded_at_ms,
+                            )?;
+                            validate_intent_indexes_and_ledger_identity(dbtx, &old).await?;
+                            validate_intent_indexes_and_ledger_identity(dbtx, &child).await?;
+                            return Ok(true);
+                        }
+                        // This is an exact CAS on the complete row captured by the
+                        // planner, not a handful of fields which happen to govern
+                        // replacement today.  A changed action, actor, diagnostic,
+                        // timestamp, or artifact reference means this exchange was
+                        // not planned against the durable parent now in the store.
+                        // A pre-existing complete sidecar is the separately
+                        // validated idempotent replay path above.
+                        if old != planned_parent {
+                            return Ok(false);
+                        }
+                        validate_marked_evacuation_evidence(
+                            &old,
+                            old_cap,
+                            &evidence,
+                            new_components,
+                            new_amount,
+                            new_fee_cap,
+                        )?;
+                        let child = Intent::from_decision(
+                            &fresh,
+                            Actor::Agent {
+                                occurrence: fresh.occurrence,
+                            },
+                            now_ms,
+                        );
+                        if old.attempt != old_attempt
+                            || old.status != IntentStatus::Pending
+                            || old.evacuation_refusal.as_ref() != Some(&evidence)
+                            || !matches!(old.actor, Actor::Agent { .. })
+                            || old_from != new_from
+                            || fresh.idempotency_key == old_key
+                            || fresh.occurrence
+                                == match old.actor {
+                                    Actor::Agent { occurrence } => occurrence,
+                                    Actor::User => unreachable!(),
+                                }
+                            || old.operation_id.is_some()
+                            || old.invoice.is_some()
+                        {
+                            return Ok(false);
+                        }
+                        ensure_no_other_live_agent_evacuation_holder(dbtx, &old_key, old_from)
+                            .await?;
+                        let new_ikey = intent_key(&fresh.idempotency_key);
+                        ensure_child_namespace_empty(dbtx, &fresh.idempotency_key).await?;
+                        if let Some(bytes) = dbtx
+                            .raw_get_bytes(&move_key(&old_key))
+                            .await
+                            .map_err(db_err)?
+                        {
+                            let record: MoveRecord =
+                                decode_row_result("move record", &move_key(&old_key), &bytes)?;
+                            if !replaceable_evacuation_record_is_pristine(&old, &record) {
+                                return Err(ExecError::Permanent(
+                                    "journal: refused evacuation has committed or incoherent move artifacts"
+                                        .into(),
+                                ));
+                            }
+                        }
+                        #[cfg(test)]
+                        wait_replacement_write_rendezvous_for_test(
+                            &replacement_write_rendezvous,
+                            &old_key,
+                        )
+                        .await;
+
+                        let old_status = old.status;
+                        let old_occurrence = match old.actor {
+                            Actor::Agent { occurrence } => occurrence,
+                            Actor::User => unreachable!(),
+                        };
+                        old.status = IntentStatus::Failed;
+                        let diagnostic = format!(
+                            "superseded after measured structural evacuation refusal; successor {}",
+                            fresh.idempotency_key.0
+                        );
+                        write_intent_and_index(
+                            dbtx,
+                            &old_ikey,
+                            &old_key,
+                            old_status,
+                            &old,
+                            now_ms,
+                            Some(&diagnostic),
+                        )
+                        .await?;
+
+                        dbtx.raw_insert_bytes(&new_ikey, &encode_row(&child)?)
+                            .await
+                            .map_err(db_err)?;
+                        dbtx.raw_insert_bytes(
+                            &pending_index_key(IntentStatus::Pending, &fresh.idempotency_key),
+                            &[],
+                        )
+                        .await
+                        .map_err(db_err)?;
+                        // This is a distinct key, so append a distinct Started ledger identity in
+                        // the same exchange transaction; OperationRecord v1 remains untouched.
+                        write_intent_ledger_row(dbtx, &child, now_ms, None).await?;
+
+                        let relation = EvacuationSupersessionRecord {
+                            old_key: old_key.clone(),
+                            old_attempt,
+                            new_key: fresh.idempotency_key.clone(),
+                            new_attempt: 0,
+                            old_occurrence,
+                            occurrence: fresh.occurrence,
+                            source: old_from,
+                            old_cap_components: old_components,
+                            new_cap_components: new_components,
+                            refusal: evidence,
+                            superseded_at_ms: now_ms,
+                        };
+                        dbtx.raw_insert_bytes(&sidecar_key, &encode_row(&relation)?)
+                            .await
+                            .map_err(db_err)?;
+                        dbtx.raw_insert_bytes(
+                            &evacuation_supersession_reverse_key(&fresh.idempotency_key),
+                            &encode_row(&old_key)?,
+                        )
+                        .await
+                        .map_err(db_err)?;
+                        Ok(true)
+                    })
+                },
+                None,
+            )
+            .await
+            .map_err(|e| match e {
+                AutocommitError::CommitFailed { last_error, .. } => db_err(last_error),
+                AutocommitError::ClosureError { error, .. } => error,
+            })?;
+        #[cfg(test)]
+        wait_replacement_write_rendezvous_for_test(&replacement_write_rendezvous, &old_key).await;
+        #[cfg(test)]
+        if self
+            .corrupt_after_evacuation_replacements
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            let mut dbtx = self.db.begin_transaction().await;
+            dbtx.raw_remove_entry(&evacuation_supersession_key(&old_key))
+                .await
+                .map_err(db_err)?;
+            dbtx.commit_tx_result().await.map_err(db_err)?;
+        }
+        #[cfg(test)]
+        if self
+            .fail_after_evacuation_replacements
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            if self
+                .fail_confirmation_read_after_evacuation_replacements
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                *self
+                    .fail_intent_read_after_successes
+                    .lock()
+                    .expect("intent read fault lock poisoned") = Some(0);
+            }
+            return Err(ExecError::Retryable(
+                "journal: injected error after durable evacuation replacement".to_owned(),
+            ));
+        }
+        Ok(exchanged)
     }
 
     /// Register (or update) a federation in the durable registry (spec §8/§9.1, ADR-0003).
@@ -1361,7 +2464,7 @@ impl FedimintJournal {
         let Some(row_bytes) = dbtx.raw_get_bytes(&row_key).await.map_err(db_err)? else {
             return Ok(false);
         };
-        let row: OperationRecord = decode_row_result("ledger row", &row_key, &row_bytes)?;
+        let row = decode_canonical_ledger_row(&row_key, &row_bytes)?;
         let Some((fed, recorded_op, _)) = raw_row_parts(&row.kind) else {
             return Ok(false);
         };
@@ -1864,6 +2967,19 @@ impl FedimintJournal {
         occurrence: Occurrence,
         now_ms: u64,
     ) -> Result<(), ExecError> {
+        self.record_refusals_with_note(decisions, occurrence, now_ms, None)
+            .await
+    }
+
+    /// Record advisory refusals while preserving their allocator diagnostics and,
+    /// when supplied, an additional non-diagnostic audit note.
+    pub async fn record_refusals_with_note(
+        &self,
+        decisions: &[AllocatorDecision],
+        occurrence: Occurrence,
+        now_ms: u64,
+        note: Option<&str>,
+    ) -> Result<(), ExecError> {
         for decision in decisions {
             let Action::RefuseInflow {
                 fed, diagnostics, ..
@@ -1888,7 +3004,7 @@ impl FedimintJournal {
                     created_at_ms: now_ms,
                     updated_at_ms: now_ms,
                     fees: FeeBreakdown::default(),
-                    error: None,
+                    error: note.map(str::to_owned),
                     repaired: false,
                 }),
             })
@@ -1994,8 +3110,8 @@ impl FedimintJournal {
 
     // --- ledger scans (spec §9.3, poison-tolerant) ---
 
-    /// Every decodable ledger row, ascending by `seq` (the `0x05` prefix scan order). Poison
-    /// rows are skipped + warned like every other scan; a storage error surfaces.
+    /// Every canonically keyed, decodable ledger row, ascending by `seq`. Poison rows (including
+    /// malformed keys and key/row sequence mismatches) are skipped + warned; a storage error surfaces.
     async fn scan_ledger_rows(&self) -> Result<Vec<OperationRecord>, ExecError> {
         Ok(self.scan_ledger_rows_report().await?.rows)
     }
@@ -2012,7 +3128,7 @@ impl FedimintJournal {
         let mut rows = Vec::new();
         let mut skipped_rows = 0;
         while let Some((raw_key, value)) = stream.next().await {
-            match decode_row_result::<OperationRecord>("ledger row", &raw_key, &value) {
+            match decode_canonical_ledger_row(&raw_key, &value) {
                 Ok(rec) => rows.push(rec),
                 Err(e) => {
                     skipped_rows += 1;
@@ -2087,7 +3203,7 @@ impl FedimintJournal {
         let mut rows = Vec::new();
         let mut skipped_rows = 0;
         while let Some((raw_key, value)) = stream.next().await {
-            match decode_row_result::<OperationRecord>("ledger row", &raw_key, &value) {
+            match decode_canonical_ledger_row(&raw_key, &value) {
                 Ok(rec) => {
                     let unresolved_probe = matches!(
                         &rec.kind,
@@ -2148,7 +3264,7 @@ impl FedimintJournal {
         };
         let row_key = ledger_row_key(seq);
         match dbtx.raw_get_bytes(&row_key).await.map_err(db_err)? {
-            Some(bytes) => Ok(Some(decode_row_result("ledger row", &row_key, &bytes)?)),
+            Some(bytes) => Ok(Some(decode_canonical_ledger_row(&row_key, &bytes)?)),
             None => Ok(None),
         }
     }
@@ -2833,7 +3949,7 @@ impl FedimintJournal {
         let Some(row_bytes) = dbtx.raw_get_bytes(&row_key).await.map_err(db_err)? else {
             return Ok(None);
         };
-        let current: OperationRecord = decode_row_result("ledger row", &row_key, &row_bytes)?;
+        let current = decode_canonical_ledger_row(&row_key, &row_bytes)?;
         let Some((scanned_fed, scanned_op, _)) = raw_row_parts(&scanned.kind) else {
             return Ok(None);
         };
@@ -3321,9 +4437,7 @@ impl FedimintJournal {
 
     // --- watch scheduler state (phase 5 §5.2.5, tag 0x0a) ---
 
-    /// Load the single watch-state row, seeding an absent row as [`WatchState::default`].
-    /// A corrupt row fails closed like the targeted `0x08` probe read: reusing an unknown
-    /// occurrence could collide with already-journaled tick keys.
+    /// Load the single watch-state row. A corrupt checkpoint fails closed.
     pub async fn get_watch_state(&self) -> Result<WatchState, ExecError> {
         let raw_key = watch_state_key();
         let mut dbtx = self.db.begin_transaction_nc().await;
@@ -3373,17 +4487,53 @@ impl FedimintJournal {
     }
 
     /// Advance the persisted occurrence by one, preserving the discovery checkpoint fields.
+    ///
+    /// An ABSENT row seeds from the highest `Tick` occurrence already in the ledger: restarting at
+    /// zero would re-allocate an occurrence that already names journaled operation keys.
     pub async fn advance_watch_occurrence(&self) -> Result<WatchState, ExecError> {
         let raw_key = watch_state_key();
         let mut dbtx = self.db.begin_transaction().await;
         let mut state = match dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? {
             Some(bytes) => decode_row_result::<WatchState>("watch state", &raw_key, &bytes)?,
             None => WatchState {
-                occurrence: max_tick_occurrence_in(&mut dbtx).await?,
+                occurrence: max_agent_occurrence_in(&mut dbtx).await?,
                 ..WatchState::default()
             },
         };
-        state.occurrence = state.occurrence.saturating_add(1);
+        // NOT saturating: a floor pinned at u64::MAX would silently hand out a non-newer
+        // occurrence, and a replacement child must be strictly newer than the parent it retires.
+        state.occurrence = state.occurrence.checked_add(1).ok_or_else(|| {
+            ExecError::Permanent(
+                "watch scheduler occurrence exhausted at u64::MAX; restore a checkpoint below \
+                 u64::MAX before scheduling another cycle"
+                    .to_owned(),
+            )
+        })?;
+        dbtx.raw_insert_bytes(&raw_key, &encode_row(&state)?)
+            .await
+            .map_err(db_err)?;
+        dbtx.commit_tx_result().await.map_err(db_err)?;
+        Ok(state)
+    }
+
+    /// Record an occurrence used by a standalone tick without moving the watch checkpoint
+    /// backwards. The daemon advances this same row before planning; keeping its floor at every
+    /// standalone occurrence makes its next child strictly newer than a marked standalone parent.
+    pub async fn observe_watch_occurrence(&self, occurrence: u64) -> Result<WatchState, ExecError> {
+        // Check before starting the write transaction: a standalone MAX occurrence
+        // cannot ever yield a strictly newer daemon child, so it must not poison
+        // the durable watch floor.
+        ensure_occurrence_has_successor(occurrence)?;
+        let raw_key = watch_state_key();
+        let mut dbtx = self.db.begin_transaction().await;
+        let mut state = match dbtx.raw_get_bytes(&raw_key).await.map_err(db_err)? {
+            Some(bytes) => decode_row_result::<WatchState>("watch state", &raw_key, &bytes)?,
+            None => WatchState {
+                occurrence: max_agent_occurrence_in(&mut dbtx).await?,
+                ..WatchState::default()
+            },
+        };
+        state.occurrence = state.occurrence.max(occurrence);
         dbtx.raw_insert_bytes(&raw_key, &encode_row(&state)?)
             .await
             .map_err(db_err)?;
@@ -3432,7 +4582,17 @@ impl FedimintJournal {
     }
 }
 
-async fn max_tick_occurrence_in(
+/// The highest Agent occurrence already recorded in the ledger.
+///
+/// Used only to seed an ABSENT watch checkpoint: restarting the agent occurrence at zero would
+/// re-allocate values that already name journaled operation keys. `note_ledger_insert_in` keeps a
+/// PRESENT checkpoint at or above every Agent append, so this scan runs at most once per store.
+///
+/// It reads `Actor::Agent` rather than only `OperationKind::Tick`: a tick can journal `Move`,
+/// `Evacuate` and `Join` rows at its occurrence, and an evacuation replacement child must be
+/// strictly newer than any of them. Undecodable rows are warned and skipped — this is a
+/// best-effort floor for a missing row, not a proof about ledger integrity.
+async fn max_agent_occurrence_in(
     dbtx: &mut impl IDatabaseTransactionOpsCore,
 ) -> Result<u64, ExecError> {
     let mut stream = dbtx
@@ -3448,11 +4608,120 @@ async fn max_tick_occurrence_in(
                 continue;
             }
         };
-        if let OperationKind::Tick { occurrence, .. } = row.kind {
+        if let Actor::Agent { occurrence } = row.actor {
             max_occurrence = max_occurrence.max(occurrence.0);
         }
     }
     Ok(max_occurrence)
+}
+
+async fn ledger_next_seq_in(dbtx: &mut impl IDatabaseTransactionOpsCore) -> Result<u64, ExecError> {
+    match dbtx
+        .raw_get_bytes(&ledger_counter_key())
+        .await
+        .map_err(db_err)?
+    {
+        Some(bytes) => {
+            read_be64(&bytes).ok_or_else(|| ledger_tail_counter_error("ledger counter is corrupt"))
+        }
+        None => Ok(0),
+    }
+}
+
+/// Verify the append counter against only the lexicographically greatest ledger key. Ledger row
+/// keys are `[TAG_LEDGER_ROW] ++ be64(seq)`, so this catches both hidden out-of-counter rows and
+/// malformed tail keys without turning a status or admission path into a full scan.
+async fn ledger_counter_matches_tail_in(
+    dbtx: &mut impl IDatabaseTransactionOpsCore,
+) -> Result<u64, ExecError> {
+    let next_seq = ledger_next_seq_in(dbtx).await?;
+    let mut rows = dbtx
+        .raw_find_by_prefix_sorted_descending(&[TAG_LEDGER_ROW])
+        .await
+        .map_err(db_err)?;
+    match rows.next().await {
+        Some((raw_key, _)) => {
+            let highest_seq = canonical_ledger_seq_from_raw_key(&raw_key).map_err(|_| {
+                ledger_tail_counter_error(
+                    "physical ledger tail key is not the canonical 9-byte ledger sequence key",
+                )
+            })?;
+            let expected_next = highest_seq.checked_add(1).ok_or_else(|| {
+                ledger_tail_counter_error(
+                    "highest ledger row uses u64::MAX and has no valid append successor",
+                )
+            })?;
+            if next_seq != expected_next {
+                return Err(ledger_tail_counter_error(
+                    "ledger counter does not equal the successor of the highest ledger row",
+                ));
+            }
+        }
+        None if next_seq != 0 => {
+            return Err(ledger_tail_counter_error(
+                "ledger counter is nonzero but the ledger has no rows",
+            ));
+        }
+        None => {}
+    }
+    Ok(next_seq)
+}
+
+/// Reserve no state, but validate that `seq` is a safe next append sequence and compute its
+/// successor before a caller stages any ledger write. This is actor-independent: a stale counter
+/// must not let either User or Agent admissions overwrite physical history.
+async fn next_ledger_sequence_in(
+    dbtx: &mut impl IDatabaseTransactionOpsCore,
+) -> Result<(u64, u64), ExecError> {
+    let seq = ledger_counter_matches_tail_in(dbtx).await?;
+    let successor = seq.checked_add(1).ok_or_else(|| {
+        ExecError::Permanent(
+            "journal: ledger sequence exhausted at u64::MAX; restore a checkpoint with an allocatable ledger successor"
+                .to_owned(),
+        )
+    })?;
+    Ok((seq, successor))
+}
+
+fn canonical_ledger_seq_from_raw_key(raw_key: &[u8]) -> Result<u64, ExecError> {
+    let Some(seq_bytes) = raw_key.strip_prefix(&[TAG_LEDGER_ROW]) else {
+        return Err(ExecError::Permanent(
+            "journal: ledger row key has an invalid tag".to_owned(),
+        ));
+    };
+    let Some(seq) = read_be64(seq_bytes) else {
+        return Err(ExecError::Permanent(
+            "journal: ledger row key is not the canonical 9-byte ledger sequence key".to_owned(),
+        ));
+    };
+    if raw_key.len() != 9 {
+        return Err(ExecError::Permanent(
+            "journal: ledger row key is not the canonical 9-byte ledger sequence key".to_owned(),
+        ));
+    }
+    Ok(seq)
+}
+
+fn decode_canonical_ledger_row(raw_key: &[u8], value: &[u8]) -> Result<OperationRecord, ExecError> {
+    let key_seq = canonical_ledger_seq_from_raw_key(raw_key)?;
+    let row: OperationRecord = decode_row_result("ledger row", raw_key, value)?;
+    if row.seq != key_seq {
+        return Err(ExecError::Permanent(format!(
+            "journal: ledger row sequence {} does not match canonical key sequence {key_seq}",
+            row.seq
+        )));
+    }
+    Ok(row)
+}
+
+/// A physical-tail/counter disagreement makes the next sequence unknowable. This is an allocation
+/// fence for every fresh ledger row, regardless of whether its actor is User or Agent.
+fn ledger_tail_counter_error(detail: &str) -> ExecError {
+    ExecError::Permanent(format!(
+        "journal: ledger tail/counter inconsistency: {detail}; all fresh ledger append/admissions \
+         are fenced; stop walletd, preserve the store, and restore the counter and ledger from one \
+         consistent trusted backup"
+    ))
 }
 
 // --- repair support (spec §10.3) -------------------------------------------------------
@@ -3959,6 +5228,11 @@ impl Journal for FedimintJournal {
                             return Ok(false);
                         }
                         intent.status = new;
+                        if expected == IntentStatus::Pending && new == IntentStatus::Executing {
+                            // A fresh claim consumes any planning handoff.  A later refusal must
+                            // write new evidence for this attempt; stale evidence is never reused.
+                            intent.evacuation_refusal = None;
+                        }
 
                         write_intent_and_index(dbtx, &ikey, key, expected, &intent, now, None)
                             .await?;
@@ -3974,9 +5248,85 @@ impl Journal for FedimintJournal {
             })
     }
 
+    async fn reset_retryable(
+        &self,
+        key: &IdempotencyKey,
+        expected_attempt: u32,
+        structural_refusal: Option<EvacuationRefusalEvidence>,
+    ) -> Result<(), ExecError> {
+        let now = self.now_ms();
+        self.db
+            .autocommit(
+                |dbtx, _| {
+                    let structural_refusal = structural_refusal.clone();
+                    Box::pin(async move {
+                        let ikey = intent_key(key);
+                        let Some(bytes) = dbtx.raw_get_bytes(&ikey).await.map_err(db_err)? else {
+                            return Err(ExecError::Permanent("journal: intent not found".into()));
+                        };
+                        let mut intent = decode_row_result::<Intent>("intent", &ikey, &bytes)?;
+                        if intent.attempt != expected_attempt
+                            || intent.status != IntentStatus::Executing
+                        {
+                            return Err(ExecError::Permanent(
+                                "journal: retryable reset requires the current Executing attempt"
+                                    .into(),
+                            ));
+                        }
+                        intent.status = IntentStatus::Pending;
+                        intent.evacuation_refusal = structural_refusal;
+                        write_intent_and_index(
+                            dbtx,
+                            &ikey,
+                            key,
+                            IntentStatus::Executing,
+                            &intent,
+                            now,
+                            None,
+                        )
+                        .await
+                    })
+                },
+                None,
+            )
+            .await
+            .map_err(|e| match e {
+                AutocommitError::CommitFailed { last_error, .. } => db_err(last_error),
+                AutocommitError::ClosureError { error, .. } => error,
+            })?;
+        #[cfg(test)]
+        if self
+            .fail_after_retryable_resets
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(ExecError::Retryable(
+                "injected error after durable retryable reset".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn pending(&self) -> Result<Vec<Intent>, ExecError> {
         #[cfg(test)]
-        self.pending_reads.fetch_add(1, Ordering::SeqCst);
+        {
+            self.pending_reads.fetch_add(1, Ordering::SeqCst);
+            let mut after_successes = self
+                .fail_pending_read_after_successes
+                .lock()
+                .expect("pending read fault lock poisoned");
+            if matches!(*after_successes, Some(0)) {
+                *after_successes = None;
+                return Err(ExecError::Retryable(
+                    "journal: injected pending scan failure".to_owned(),
+                ));
+            }
+            if let Some(remaining) = after_successes.as_mut() {
+                *remaining -= 1;
+            }
+        }
         let pending = self
             .intents_indexed_as(&[IntentStatus::Pending, IntentStatus::Executing], false)
             .await;
@@ -4002,6 +5352,22 @@ impl Journal for FedimintJournal {
     }
 
     async fn reservation_intents(&self) -> Result<Vec<Intent>, ExecError> {
+        #[cfg(test)]
+        {
+            let mut after_successes = self
+                .fail_reservation_read_after_successes
+                .lock()
+                .expect("reservation read fault lock poisoned");
+            if matches!(*after_successes, Some(0)) {
+                *after_successes = None;
+                return Err(ExecError::Retryable(
+                    "journal: injected reservation scan failure".to_owned(),
+                ));
+            }
+            if let Some(remaining) = after_successes.as_mut() {
+                *remaining -= 1;
+            }
+        }
         self.intents_indexed_as(
             &[
                 IntentStatus::Pending,
@@ -4150,12 +5516,491 @@ fn ledger_key_index(key: &IdempotencyKey) -> Vec<u8> {
     tagged(TAG_LEDGER_KEY_INDEX, key.0.as_bytes())
 }
 
+const ALL_INTENT_STATUSES: [IntentStatus; 5] = [
+    IntentStatus::Pending,
+    IntentStatus::Executing,
+    IntentStatus::Awaiting,
+    IntentStatus::Done,
+    IntentStatus::Failed,
+];
+
+fn validate_supersession_endpoints(
+    relation: &EvacuationSupersessionRecord,
+) -> Result<(), ExecError> {
+    if relation.old_key == relation.new_key {
+        return Err(ExecError::Permanent(
+            "journal: evacuation supersession has identical parent and child keys".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn supersession_relation_matches_request(
+    relation: &EvacuationSupersessionRecord,
+    old: &Intent,
+    fresh: &AllocatorDecision,
+) -> bool {
+    let (old_source, old_cap_components) = match &old.action {
+        Action::Evacuate {
+            from,
+            fee_cap_components,
+            ..
+        } => (*from, *fee_cap_components),
+        _ => return false,
+    };
+    let new_cap_components = match &fresh.action {
+        Action::Evacuate {
+            fee_cap_components, ..
+        } => *fee_cap_components,
+        _ => return false,
+    };
+    relation.old_key == old.idempotency_key
+        && relation.old_attempt == old.attempt
+        && relation.new_key == fresh.idempotency_key
+        && relation.new_attempt == 0
+        && relation.old_occurrence
+            == match old.actor {
+                Actor::Agent { occurrence } => occurrence,
+                Actor::User => return false,
+            }
+        && relation.occurrence == fresh.occurrence
+        && relation.source == old_source
+        && relation.old_cap_components == old_cap_components
+        && relation.new_cap_components == new_cap_components
+}
+
+/// A replay may arrive after the child has progressed.  Its lifecycle is intentionally not part of
+/// request identity, but the immutable action/actor/reason/attempt/creation identity must still be
+/// exactly the exchange's child.
+fn validate_replayed_supersession_child(
+    child: &Intent,
+    fresh: &AllocatorDecision,
+    superseded_at_ms: u64,
+) -> Result<(), ExecError> {
+    if !matches!(
+        child.status,
+        IntentStatus::Pending
+            | IntentStatus::Executing
+            | IntentStatus::Awaiting
+            | IntentStatus::Done
+            | IntentStatus::Failed
+    ) || child.idempotency_key != fresh.idempotency_key
+        || child.attempt != 0
+        || child.action != fresh.action
+        || child.actor
+            != (Actor::Agent {
+                occurrence: fresh.occurrence,
+            })
+        || child.reason != fresh.reason
+        || child.created_at_ms != superseded_at_ms
+    {
+        return Err(ExecError::Permanent(
+            "journal: supersession replay found a changed child identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Read both immediate sides of a key from an already-open snapshot.  This is deliberately not
+/// built on `evacuation_supersession`: a middle node has a canonical successor and a reverse
+/// predecessor, and both must remain visible to an audit projection.
+async fn evacuation_supersession_neighbors_in_tx(
+    dbtx: &mut impl IDatabaseTransactionOpsCore,
+    key: &IdempotencyKey,
+) -> Result<EvacuationSupersessionNeighbors, ExecError> {
+    let canonical = evacuation_supersession_key(key);
+    let successor = match dbtx.raw_get_bytes(&canonical).await.map_err(db_err)? {
+        None => None,
+        Some(bytes) => {
+            let row: EvacuationSupersessionRecord =
+                decode_row_result("evacuation supersession", &canonical, &bytes)?;
+            if row.old_key != *key {
+                return Err(ExecError::Permanent(
+                    "journal: evacuation supersession canonical key has mismatched endpoint".into(),
+                ));
+            }
+            validate_complete_supersession(dbtx, &row).await?;
+            Some(row)
+        }
+    };
+
+    let reverse = evacuation_supersession_reverse_key(key);
+    let predecessor = match dbtx.raw_get_bytes(&reverse).await.map_err(db_err)? {
+        None => None,
+        Some(bytes) => {
+            let old: IdempotencyKey =
+                decode_row_result("evacuation supersession reverse", &reverse, &bytes)?;
+            let predecessor_key = evacuation_supersession_key(&old);
+            let row_bytes = dbtx
+                .raw_get_bytes(&predecessor_key)
+                .await
+                .map_err(db_err)?
+                .ok_or_else(|| {
+                    ExecError::Permanent(
+                        "journal: supersession reverse index points at a missing canonical row"
+                            .into(),
+                    )
+                })?;
+            let row: EvacuationSupersessionRecord =
+                decode_row_result("evacuation supersession", &predecessor_key, &row_bytes)?;
+            if row.old_key != old || row.new_key != *key {
+                return Err(ExecError::Permanent(
+                    "journal: incoherent evacuation supersession reverse index".into(),
+                ));
+            }
+            validate_complete_supersession(dbtx, &row).await?;
+            Some(row)
+        }
+    };
+    Ok(EvacuationSupersessionNeighbors {
+        predecessor,
+        successor,
+    })
+}
+
+/// Read the attempted parent's canonical successor in an already-open snapshot.  Absence is
+/// deliberately final even if this key has a reverse predecessor: the latter describes a different
+/// exchange and cannot confirm the attempted one.
+async fn evacuation_canonical_successor_in_tx(
+    dbtx: &mut impl IDatabaseTransactionOpsCore,
+    key: &IdempotencyKey,
+) -> Result<Option<EvacuationSupersessionRecord>, ExecError> {
+    let canonical = evacuation_supersession_key(key);
+    let Some(bytes) = dbtx.raw_get_bytes(&canonical).await.map_err(db_err)? else {
+        return Ok(None);
+    };
+    let row: EvacuationSupersessionRecord =
+        decode_row_result("evacuation supersession", &canonical, &bytes)?;
+    if row.old_key != *key {
+        return Err(ExecError::Permanent(
+            "journal: evacuation supersession canonical key has mismatched endpoint".into(),
+        ));
+    }
+    validate_complete_supersession(dbtx, &row).await?;
+    Ok(Some(row))
+}
+
+/// Validate the canonical row and its reverse half in the caller's existing snapshot.  Keeping
+/// this one helper behind both the reader and the replacement replay path prevents a successful
+/// lookup from silently accepting a half-written audit relation.
+async fn validate_complete_supersession(
+    dbtx: &mut impl IDatabaseTransactionOpsCore,
+    relation: &EvacuationSupersessionRecord,
+) -> Result<(), ExecError> {
+    validate_supersession_endpoints(relation)?;
+    let canonical_key = evacuation_supersession_key(&relation.old_key);
+    let canonical = dbtx
+        .raw_get_bytes(&canonical_key)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            ExecError::Permanent("journal: supersession canonical row disappeared".into())
+        })?;
+    let stored: EvacuationSupersessionRecord =
+        decode_row_result("evacuation supersession", &canonical_key, &canonical)?;
+    if stored != *relation || stored.old_key != relation.old_key {
+        return Err(ExecError::Permanent(
+            "journal: incoherent evacuation supersession canonical row".into(),
+        ));
+    }
+    let reverse_key = evacuation_supersession_reverse_key(&relation.new_key);
+    let reverse = dbtx
+        .raw_get_bytes(&reverse_key)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            ExecError::Permanent("journal: supersession canonical row has no reverse index".into())
+        })?;
+    let reverse_old: IdempotencyKey =
+        decode_row_result("evacuation supersession reverse", &reverse_key, &reverse)?;
+    if reverse_old != relation.old_key {
+        return Err(ExecError::Permanent(
+            "journal: incoherent evacuation supersession reverse index".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_child_namespace_empty(
+    dbtx: &mut impl IDatabaseTransactionOpsCore,
+    key: &IdempotencyKey,
+) -> Result<(), ExecError> {
+    if child_namespace_is_empty(dbtx, key).await? {
+        Ok(())
+    } else {
+        Err(ExecError::Permanent(format!(
+            "journal: replacement child namespace is not empty for {}",
+            key.0
+        )))
+    }
+}
+
+/// The common, complete namespace probe for both the exchange transaction and
+/// retryable-error outcome confirmation.  Keep all child-owned direct rows and
+/// every intent-status index here: checking only the intent row would turn a
+/// stale move, ledger identity, or index corruption into permission to retry.
+async fn child_namespace_is_empty(
+    dbtx: &mut impl IDatabaseTransactionOpsCore,
+    key: &IdempotencyKey,
+) -> Result<bool, ExecError> {
+    let direct_keys = [
+        intent_key(key),
+        move_key(key),
+        ledger_key_index(key),
+        evacuation_supersession_key(key),
+        evacuation_supersession_reverse_key(key),
+    ];
+    for raw_key in direct_keys {
+        if dbtx
+            .raw_get_bytes(&raw_key)
+            .await
+            .map_err(db_err)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+    }
+    for status in ALL_INTENT_STATUSES {
+        let index = pending_index_key(status, key);
+        if dbtx.raw_get_bytes(&index).await.map_err(db_err)?.is_some() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn validate_intent_indexes_and_ledger_identity(
+    dbtx: &mut impl IDatabaseTransactionOpsCore,
+    intent: &Intent,
+) -> Result<(), ExecError> {
+    for status in ALL_INTENT_STATUSES {
+        let has_index = dbtx
+            .raw_get_bytes(&pending_index_key(status, &intent.idempotency_key))
+            .await
+            .map_err(db_err)?
+            .is_some();
+        if has_index != (status == intent.status && is_indexed(status)) {
+            return Err(ExecError::Permanent(format!(
+                "journal: supersession replay found incoherent {:?} index for {}",
+                status, intent.idempotency_key.0
+            )));
+        }
+    }
+    let index_key = ledger_key_index(&intent.idempotency_key);
+    let seq_bytes = dbtx
+        .raw_get_bytes(&index_key)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            ExecError::Permanent(format!(
+                "journal: supersession replay missing ledger identity for {}",
+                intent.idempotency_key.0
+            ))
+        })?;
+    let seq = read_be64(&seq_bytes).ok_or_else(|| {
+        ExecError::Permanent("journal: corrupt ledger seq index during supersession replay".into())
+    })?;
+    let row_key = ledger_row_key(seq);
+    let row_bytes = dbtx
+        .raw_get_bytes(&row_key)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            ExecError::Permanent(
+                "journal: supersession replay ledger index points at no row".into(),
+            )
+        })?;
+    let row = decode_canonical_ledger_row(&row_key, &row_bytes)?;
+    if row.seq != seq
+        || row.correlation_key != intent.idempotency_key
+        || row.kind != kind_from_action(&intent.action)
+        || row.actor != intent.actor
+        || row.reason != intent.reason
+        || row.status != status_from_intent(intent.status)
+        || row.created_at_ms != intent.created_at_ms
+        || row.fees.fee_cap != intent.max_fee
+    {
+        return Err(ExecError::Permanent(format!(
+            "journal: supersession replay found changed ledger identity for {}",
+            intent.idempotency_key.0
+        )));
+    }
+    Ok(())
+}
+
+async fn ensure_no_other_live_agent_evacuation_holder(
+    dbtx: &mut impl IDatabaseTransactionOpsCore,
+    old_key: &IdempotencyKey,
+    source: FederationId,
+) -> Result<(), ExecError> {
+    for status in [
+        IntentStatus::Pending,
+        IntentStatus::Executing,
+        IntentStatus::Awaiting,
+    ] {
+        let prefix = pending_index_prefix(status);
+        let index_keys = {
+            let mut rows = dbtx.raw_find_by_prefix(&prefix).await.map_err(db_err)?;
+            let mut keys = Vec::new();
+            while let Some((index_key, _)) = rows.next().await {
+                keys.push(index_key);
+            }
+            keys
+        };
+        for index_key in index_keys {
+            let key_bytes = index_key.strip_prefix(prefix.as_slice()).ok_or_else(|| {
+                ExecError::Permanent("journal: malformed live evacuation status index".into())
+            })?;
+            let key = IdempotencyKey(String::from_utf8(key_bytes.to_vec()).map_err(|_| {
+                ExecError::Permanent(
+                    "journal: live evacuation status index has non-UTF-8 key".into(),
+                )
+            })?);
+            let ikey = intent_key(&key);
+            let bytes = dbtx
+                .raw_get_bytes(&ikey)
+                .await
+                .map_err(db_err)?
+                .ok_or_else(|| {
+                    ExecError::Permanent(
+                        "journal: live evacuation status index points at no intent".into(),
+                    )
+                })?;
+            let intent: Intent = decode_row_result("intent", &ikey, &bytes)?;
+            if intent.idempotency_key != key || intent.status != status {
+                return Err(ExecError::Permanent(
+                    "journal: incoherent live evacuation status index".into(),
+                ));
+            }
+            if intent.idempotency_key == *old_key {
+                continue;
+            }
+            if matches!(intent.actor, Actor::Agent { .. })
+                && matches!(intent.action, Action::Evacuate { from, .. } if from == source)
+            {
+                return Err(ExecError::Permanent(format!(
+                    "journal: another live agent evacuation already holds source {}",
+                    source.to_hex()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_marked_evacuation_evidence(
+    old: &Intent,
+    effective_old_cap: wallet_core::EvacFeeCap,
+    evidence: &EvacuationRefusalEvidence,
+    new_components: Option<wallet_core::EvacFeeCap>,
+    new_amount: Msat,
+    new_fee_cap: Msat,
+) -> Result<(), ExecError> {
+    let Action::Evacuate {
+        amount: old_amount,
+        fee_cap: old_fee_cap,
+        ..
+    } = old.action
+    else {
+        return Err(ExecError::Permanent(
+            "journal: marked replacement requires an Evacuate parent".into(),
+        ));
+    };
+    if old.max_fee != Some(old_fee_cap) {
+        return Err(ExecError::Permanent(
+            "journal: evacuation parent max_fee disagrees with its action fee cap".into(),
+        ));
+    }
+    let new_components = new_components.ok_or_else(|| {
+        ExecError::Permanent(
+            "journal: replacement child must carry evacuation fee-cap components".into(),
+        )
+    })?;
+    if new_components.at(new_amount) != new_fee_cap {
+        return Err(ExecError::Permanent(
+            "journal: fresh evacuation cap components do not match its fee cap".into(),
+        ));
+    }
+    if evidence.cap_components != effective_old_cap
+        || evidence.requested_net.0 == 0
+        || evidence.requested_net > old_amount
+        || evidence.diagnostic.is_empty()
+    {
+        return Err(ExecError::Permanent(
+            "journal: evacuation refusal evidence does not describe the current parent".into(),
+        ));
+    }
+    let sample_is_sensible = |sample: &wallet_core::EvacuationQuoteSample| {
+        sample.delivered_net.0 > 0
+            && sample.delivered_net <= evidence.requested_net
+            && sample.fee_cap == effective_old_cap.at(sample.delivered_net)
+            && sample.total_fee > sample.fee_cap
+            && u128::from(sample.delivered_net.0)
+                .checked_add(u128::from(sample.total_fee.0))
+                .is_some_and(|source_debit| source_debit <= u128::from(evidence.source_spendable.0))
+    };
+    if !sample_is_sensible(&evidence.low)
+        || !sample_is_sensible(&evidence.high)
+        || evidence.low.delivered_net >= evidence.high.delivered_net
+        || !assess_evacuation_structural_refusal(effective_old_cap, &evidence.low, &evidence.high)
+            .is_some_and(|assessment| assessment.is_structural())
+        || !wallet_core::evacuation_cap_qualifies_replacement(evidence, new_components)
+    {
+        return Err(ExecError::Permanent(
+            "journal: replacement evacuation cap is not a justified monotone increase".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn ledger_counter_key() -> Vec<u8> {
     vec![TAG_LEDGER_COUNTER]
 }
 
 fn read_be64(bytes: &[u8]) -> Option<u64> {
     <[u8; 8]>::try_from(bytes).ok().map(u64::from_be_bytes)
+}
+
+/// Raise the durable Agent occurrence floor in the SAME transaction as an Agent ledger append.
+///
+/// `advance_watch_occurrence` and `observe_watch_occurrence` cover the daemon scheduler and the
+/// standalone tick, but `wallet-core`'s admission surface is public (ADR-0031), so an in-process
+/// caller can journal an Agent row without either. Keeping the checkpoint monotonically at or above
+/// every journaled Agent occurrence is what lets a replacement child be strictly newer than the
+/// parent it retires. Sealing that public surface is `br-seal-agent-admission-yfr`.
+///
+/// User appends deliberately do not touch this row: they carry no allocator authority, and reading
+/// and rewriting a single hot row on every user operation would be a needless write hotspot.
+async fn note_ledger_insert_in(
+    dbtx: &mut impl IDatabaseTransactionOpsCore,
+    record: &OperationRecord,
+) -> Result<(), ExecError> {
+    let Actor::Agent { occurrence } = record.actor else {
+        return Ok(());
+    };
+    let raw_watch_key = watch_state_key();
+    let mut watch = match dbtx.raw_get_bytes(&raw_watch_key).await.map_err(db_err)? {
+        Some(bytes) => decode_row_result::<WatchState>("watch state", &raw_watch_key, &bytes)?,
+        // An ABSENT checkpoint must be seeded from the ledger, exactly as
+        // `advance_watch_occurrence` seeds it — NOT from zero. A store can hold Agent rows with
+        // no checkpoint (the previously supported standalone `tick` path; a backup predating the
+        // row). Seeding from zero here would let one low public admission CREATE the row below
+        // the historical maximum; the row then exists, so `advance_watch_occurrence` takes its
+        // `Some` arm, never scans, and hands out occurrences that collide with historical ones.
+        // The scan is O(ledger) but runs only while the row is absent, which is once.
+        None => WatchState {
+            occurrence: max_agent_occurrence_in(dbtx).await?,
+            ..WatchState::default()
+        },
+    };
+    if watch.occurrence >= occurrence.0 {
+        return Ok(());
+    }
+    watch.occurrence = occurrence.0;
+    dbtx.raw_insert_bytes(&raw_watch_key, &encode_row(&watch)?)
+        .await
+        .map_err(db_err)?;
+    Ok(())
 }
 
 /// The ONE writer for every ledger row (spec §9.2). Given a caller-supplied `dbtx` and a
@@ -4186,21 +6031,19 @@ async fn ledger_upsert_in(
                     key.0
                 ))
             })?;
-        let existing: OperationRecord = decode_row_result("ledger row", &row_key, &bytes)?;
+        let existing = decode_canonical_ledger_row(&row_key, &bytes)?;
         if let Some(next) = build(Some(existing), seq) {
             dbtx.raw_insert_bytes(&row_key, &encode_row(&next)?)
                 .await
                 .map_err(db_err)?;
         }
     } else {
-        let counter_key = ledger_counter_key();
-        let next_seq = match dbtx.raw_get_bytes(&counter_key).await.map_err(db_err)? {
-            Some(bytes) => read_be64(&bytes)
-                .ok_or_else(|| ExecError::Permanent("journal: corrupt ledger counter".into()))?,
-            None => 0,
-        };
+        let (next_seq, successor) = next_ledger_sequence_in(dbtx).await?;
         if let Some(rec) = build(None, next_seq) {
-            dbtx.raw_insert_bytes(&counter_key, &(next_seq + 1).to_be_bytes())
+            // An Agent ledger admission can be made by public paths that never touch the watch
+            // scheduler. Raise the durable occurrence floor in this SAME transaction.
+            note_ledger_insert_in(dbtx, &rec).await?;
+            dbtx.raw_insert_bytes(&ledger_counter_key(), &successor.to_be_bytes())
                 .await
                 .map_err(db_err)?;
             dbtx.raw_insert_bytes(&ledger_row_key(next_seq), &encode_row(&rec)?)
@@ -4249,7 +6092,7 @@ async fn reject_legacy_intent_backed_raw_writer(
                 key.0
             ))
         })?;
-    let row: OperationRecord = decode_row_result("ledger row", &row_key, &bytes)?;
+    let row = decode_canonical_ledger_row(&row_key, &bytes)?;
     if raw_row_parts(&row.kind).is_some() {
         return Err(ExecError::Permanent(format!(
             "journal: legacy {writer} cannot mutate intent-backed raw operation {}; \
@@ -4456,6 +6299,14 @@ fn watch_state_key() -> Vec<u8> {
 
 fn policy_key() -> Vec<u8> {
     vec![TAG_POLICY]
+}
+
+fn evacuation_supersession_key(key: &IdempotencyKey) -> Vec<u8> {
+    tagged(TAG_EVACUATION_SUPERSESSION, key.0.as_bytes())
+}
+
+fn evacuation_supersession_reverse_key(key: &IdempotencyKey) -> Vec<u8> {
+    tagged(TAG_EVACUATION_SUPERSESSION_REVERSE, key.0.as_bytes())
 }
 
 /// Whether `row` is an AGENT `join:` row that SUCCEEDED and created a NEW partition (§5.1.4):
@@ -4678,4 +6529,1965 @@ fn serde_err(e: serde_json::Error) -> ExecError {
 
 fn decode_err(kind: &str, key: &[u8], e: serde_json::Error) -> ExecError {
     ExecError::Permanent(format!("journal: failed to decode {kind} row {key:?}: {e}"))
+}
+
+#[cfg(test)]
+mod replacement_foundation_tests {
+    use super::*;
+    use crate::Invoice;
+    use fedimint_core::db::mem_impl::MemDatabase;
+    use fedimint_core::db::IRawDatabaseExt;
+    use wallet_core::{EvacuationQuoteSample, Journal, MovePhase};
+
+    const NOW: u64 = 1_700_000_000_000;
+
+    fn fed(n: u8) -> FederationId {
+        FederationId([n; 32])
+    }
+
+    fn cap(base: u64, bps: u16) -> wallet_core::EvacFeeCap {
+        wallet_core::EvacFeeCap {
+            base_msat: Msat(base),
+            bps,
+        }
+    }
+
+    fn evidence() -> EvacuationRefusalEvidence {
+        EvacuationRefusalEvidence {
+            cap_components: cap(10, 100),
+            requested_net: Msat(100),
+            source_spendable: Msat(200),
+            low: EvacuationQuoteSample {
+                delivered_net: Msat(10),
+                total_fee: Msat(20),
+                fee_cap: Msat(10),
+            },
+            high: EvacuationQuoteSample {
+                delivered_net: Msat(100),
+                total_fee: Msat(30),
+                fee_cap: Msat(11),
+            },
+            diagnostic: "two measured refusals".into(),
+            measured_at_ms: NOW,
+        }
+    }
+
+    fn decision(key: &str, occurrence: u64, fee: wallet_core::EvacFeeCap) -> AllocatorDecision {
+        AllocatorDecision {
+            action: Action::Evacuate {
+                from: fed(1),
+                to: fed(2),
+                amount: Msat(100),
+                fee_cap: fee.at(Msat(100)),
+                gateway: None,
+                fee_cap_components: Some(fee),
+            },
+            reason: wallet_core::ReasonCode::ShutdownNotice,
+            occurrence: Occurrence(occurrence),
+            idempotency_key: IdempotencyKey(key.into()),
+        }
+    }
+
+    async fn marked_parent(journal: &FedimintJournal, key: &str) -> Intent {
+        let parent = decision(key, 1, cap(10, 100));
+        let mut intent = Intent::from_decision(
+            &parent,
+            Actor::Agent {
+                occurrence: Occurrence(1),
+            },
+            NOW,
+        );
+        intent.evacuation_refusal = Some(evidence());
+        journal.upsert(&intent).await.expect("seed marked parent");
+        intent
+    }
+
+    fn make_journal() -> FedimintJournal {
+        FedimintJournal::with_clock(MemDatabase::new().into_database(), || NOW)
+    }
+
+    async fn seed_agent_refusal(journal: &FedimintJournal, occurrence: u64) {
+        let reason = ReasonCode::SpendingBelowTarget;
+        let decision = AllocatorDecision {
+            action: Action::RefuseInflow {
+                fed: fed(1),
+                reason,
+                diagnostics: Default::default(),
+            },
+            reason,
+            occurrence: Occurrence(occurrence),
+            idempotency_key: IdempotencyKey(format!("refuse:watch-floor:{occurrence}")),
+        };
+        journal
+            .record_refusals(&[decision], Occurrence(occurrence), NOW)
+            .await
+            .expect("seed non-Tick Agent ledger row");
+    }
+
+    /// A direct Agent ledger admission, which allocates a sequence through the validated
+    /// counter/tail check. Returns whether it was admitted.
+    async fn direct_agent_admission_succeeds(journal: &FedimintJournal, occurrence: u64) -> bool {
+        let reason = ReasonCode::SpendingBelowTarget;
+        let decision = AllocatorDecision {
+            action: Action::RefuseInflow {
+                fed: fed(1),
+                reason,
+                diagnostics: Default::default(),
+            },
+            reason,
+            occurrence: Occurrence(occurrence),
+            idempotency_key: IdempotencyKey(format!("refuse:tail-probe:{occurrence}")),
+        };
+        journal
+            .record_refusals(&[decision], Occurrence(occurrence), NOW)
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn counter_tail_mismatch_blocks_status_and_direct_agent_overwrite() {
+        let journal = make_journal();
+        seed_agent_refusal(&journal, 29).await;
+        let mut high = journal
+            .history(10, None)
+            .await
+            .expect("read valid Agent row")
+            .into_iter()
+            .next()
+            .expect("seed row exists");
+        high.seq = 5;
+        high.actor = Actor::Agent {
+            occurrence: Occurrence(80),
+        };
+        let high_key = ledger_row_key(5);
+        let high_bytes = encode_row(&high).expect("encode high Agent row");
+        let mut dbtx = journal.db.begin_transaction().await;
+        dbtx.raw_insert_bytes(&high_key, &high_bytes)
+            .await
+            .expect("seed out-of-counter high Agent row");
+        dbtx.raw_remove_entry(&ledger_counter_key())
+            .await
+            .expect("remove counter");
+        dbtx.commit_tx_result()
+            .await
+            .expect("commit missing-counter mismatch");
+        assert!(
+            !direct_agent_admission_succeeds(&journal, 82).await,
+            "a missing counter cannot hide the physical high Agent tail"
+        );
+
+        let mut dbtx = journal.db.begin_transaction().await;
+        dbtx.raw_insert_bytes(&ledger_counter_key(), &5_u64.to_be_bytes())
+            .await
+            .expect("seed low counter which would overwrite row five");
+        dbtx.commit_tx_result()
+            .await
+            .expect("commit low-counter mismatch");
+        let key = IdempotencyKey("refuse:watch-floor:tail-mismatch".to_owned());
+        let decision = AllocatorDecision {
+            action: Action::RefuseInflow {
+                fed: fed(1),
+                reason: ReasonCode::SpendingBelowTarget,
+                diagnostics: Default::default(),
+            },
+            reason: ReasonCode::SpendingBelowTarget,
+            occurrence: Occurrence(81),
+            idempotency_key: key.clone(),
+        };
+        assert!(
+            journal
+                .record_refusals(&[decision], Occurrence(81), NOW)
+                .await
+                .is_err(),
+            "direct Agent admission must not overwrite the physical tail at a low counter"
+        );
+        let mut dbtx = journal.db.begin_transaction_nc().await;
+        assert_eq!(
+            dbtx.raw_get_bytes(&high_key)
+                .await
+                .expect("read protected high row"),
+            Some(high_bytes)
+        );
+        assert!(dbtx
+            .raw_get_bytes(&ledger_key_index(&key))
+            .await
+            .expect("read rejected direct index")
+            .is_none());
+        assert_eq!(
+            dbtx.raw_get_bytes(&ledger_counter_key())
+                .await
+                .expect("read protected low counter"),
+            Some(5_u64.to_be_bytes().to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_counter_blocks_fresh_user_admission_without_overwriting_the_tail() {
+        let journal = make_journal();
+        seed_agent_refusal(&journal, 29).await;
+        let mut high = journal
+            .history(10, None)
+            .await
+            .expect("read valid row")
+            .into_iter()
+            .next()
+            .expect("seed row exists");
+        high.seq = 5;
+        high.actor = Actor::User;
+        let high_key = ledger_row_key(5);
+        let high_bytes = encode_row(&high).expect("encode physical user tail");
+        let mut dbtx = journal.db.begin_transaction().await;
+        dbtx.raw_insert_bytes(&high_key, &high_bytes)
+            .await
+            .expect("seed physical tail");
+        dbtx.raw_insert_bytes(&ledger_counter_key(), &5_u64.to_be_bytes())
+            .await
+            .expect("seed stale counter at occupied tail sequence");
+        dbtx.commit_tx_result().await.expect("commit stale counter");
+
+        let mut user = unmarked_parent("evac:fresh-user-stale-counter");
+        user.actor = Actor::User;
+        assert!(
+            journal.upsert(&user).await.is_err(),
+            "User admission must validate the physical tail before allocating a sequence"
+        );
+        let mut dbtx = journal.db.begin_transaction_nc().await;
+        assert_eq!(
+            dbtx.raw_get_bytes(&high_key)
+                .await
+                .expect("read protected tail"),
+            Some(high_bytes)
+        );
+        assert!(dbtx
+            .raw_get_bytes(&ledger_key_index(&user.idempotency_key))
+            .await
+            .expect("read absent fresh User index")
+            .is_none());
+        assert_eq!(
+            dbtx.raw_get_bytes(&ledger_counter_key())
+                .await
+                .expect("read protected stale counter"),
+            Some(5_u64.to_be_bytes().to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_counter_rolls_back_user_retry_intent_indexes_cache_and_ledger() {
+        let journal = make_journal();
+        let mut parent = unmarked_parent("evac:user-retry-stale-counter");
+        parent.actor = Actor::User;
+        let cache = pristine_record(&parent);
+        seed_parent_and_cache(&journal, &parent, &cache).await;
+        journal
+            .set_status(
+                &parent.idempotency_key,
+                parent.attempt,
+                IntentStatus::Failed,
+                Some("retry"),
+            )
+            .await
+            .expect("terminalize User parent");
+        let mut high = journal
+            .history(10, None)
+            .await
+            .expect("read User ledger template")
+            .into_iter()
+            .next()
+            .expect("parent row exists");
+        high.seq = 5;
+        let high_key = ledger_row_key(5);
+        let high_bytes = encode_row(&high).expect("encode physical tail");
+        let mut dbtx = journal.db.begin_transaction().await;
+        dbtx.raw_insert_bytes(&high_key, &high_bytes)
+            .await
+            .expect("seed physical tail");
+        dbtx.raw_insert_bytes(&ledger_counter_key(), &5_u64.to_be_bytes())
+            .await
+            .expect("seed stale retry counter");
+        dbtx.commit_tx_result()
+            .await
+            .expect("commit stale retry counter");
+
+        let snapshot_keys = vec![
+            intent_key(&parent.idempotency_key),
+            pending_index_key(IntentStatus::Failed, &parent.idempotency_key),
+            pending_index_key(IntentStatus::Pending, &parent.idempotency_key),
+            move_key(&parent.idempotency_key),
+            ledger_counter_key(),
+            ledger_key_index(&parent.idempotency_key),
+            ledger_row_key(0),
+            high_key.clone(),
+        ];
+        let mut dbtx = journal.db.begin_transaction_nc().await;
+        let mut before = Vec::new();
+        for key in &snapshot_keys {
+            before.push(
+                dbtx.raw_get_bytes(key)
+                    .await
+                    .expect("snapshot stale User retry input"),
+            );
+        }
+        drop(dbtx);
+
+        let mut retry = parent.clone();
+        retry.attempt += 1;
+        retry.status = IntentStatus::Pending;
+        assert!(
+            journal.retry_failed_intent(&retry).await.is_err(),
+            "User retry must validate tail before replacing its failed attempt"
+        );
+        let mut dbtx = journal.db.begin_transaction_nc().await;
+        let mut after = Vec::new();
+        for key in &snapshot_keys {
+            after.push(
+                dbtx.raw_get_bytes(key)
+                    .await
+                    .expect("snapshot rejected User retry input"),
+            );
+        }
+        assert_eq!(
+            after, before,
+            "rejected User retry must roll back intent/index/cache/counter/ledger bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_admission_at_ledger_sequence_max_rolls_back_without_overflow() {
+        let journal = make_journal();
+        seed_agent_refusal(&journal, 29).await;
+        let mut tail = journal
+            .history(10, None)
+            .await
+            .expect("read valid row")
+            .into_iter()
+            .next()
+            .expect("seed row exists");
+        tail.seq = u64::MAX - 1;
+        tail.actor = Actor::User;
+        let tail_key = ledger_row_key(u64::MAX - 1);
+        let tail_bytes = encode_row(&tail).expect("encode max-minus-one tail");
+        let mut dbtx = journal.db.begin_transaction().await;
+        dbtx.raw_insert_bytes(&tail_key, &tail_bytes)
+            .await
+            .expect("seed max-minus-one physical tail");
+        dbtx.raw_insert_bytes(&ledger_counter_key(), &u64::MAX.to_be_bytes())
+            .await
+            .expect("seed tail-consistent exhausted counter");
+        dbtx.commit_tx_result()
+            .await
+            .expect("commit exhausted counter");
+
+        let mut user = unmarked_parent("evac:user-ledger-sequence-max");
+        user.actor = Actor::User;
+        assert!(
+            journal.upsert(&user).await.is_err(),
+            "no actor may wrap the ledger counter at u64::MAX"
+        );
+        let mut dbtx = journal.db.begin_transaction_nc().await;
+        assert_eq!(
+            dbtx.raw_get_bytes(&tail_key)
+                .await
+                .expect("read protected exhausted tail"),
+            Some(tail_bytes)
+        );
+        assert!(dbtx
+            .raw_get_bytes(&ledger_row_key(u64::MAX))
+            .await
+            .expect("read impossible successor row")
+            .is_none());
+        assert!(dbtx
+            .raw_get_bytes(&ledger_key_index(&user.idempotency_key))
+            .await
+            .expect("read absent overflow User index")
+            .is_none());
+        assert_eq!(
+            dbtx.raw_get_bytes(&ledger_counter_key())
+                .await
+                .expect("read unwrapped exhausted counter"),
+            Some(u64::MAX.to_be_bytes().to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn counter_hole_fails_closed_until_the_physical_tail_is_restored() {
+        let journal = make_journal();
+        seed_agent_refusal(&journal, 29).await;
+        journal
+            .put_watch_state(&WatchState::default())
+            .await
+            .expect("seed legacy checkpoint");
+        let missing_key = ledger_row_key(1);
+        let mut dbtx = journal.db.begin_transaction().await;
+        dbtx.raw_insert_bytes(&ledger_counter_key(), &2_u64.to_be_bytes())
+            .await
+            .expect("create append-counter hole after the Agent row");
+        dbtx.commit_tx_result().await.expect("commit counter hole");
+
+        assert!(
+            !direct_agent_admission_succeeds(&journal, 44).await,
+            "a counter hole is inconsistent append state and cannot be appended past"
+        );
+
+        let mut restored = journal
+            .history(10, None)
+            .await
+            .expect("read valid row shape")
+            .into_iter()
+            .next()
+            .expect("Agent refusal exists");
+        restored.seq = 1;
+        restored.actor = Actor::Agent {
+            occurrence: Occurrence(43),
+        };
+        let mut dbtx = journal.db.begin_transaction().await;
+        dbtx.raw_insert_bytes(
+            &missing_key,
+            &encode_row(&restored).expect("encode restored Agent row"),
+        )
+        .await
+        .expect("restore the missing row from valid backup bytes");
+        dbtx.commit_tx_result()
+            .await
+            .expect("commit valid hole restoration");
+
+        assert!(
+            direct_agent_admission_succeeds(&journal, 44).await,
+            "a restored physical tail makes the append sequence knowable again"
+        );
+        assert_eq!(
+            journal
+                .get_watch_state()
+                .await
+                .expect("read the checkpoint raised by the admitted append")
+                .occurrence,
+            44,
+            "an Agent append raises the durable occurrence floor in its own transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonzero_counter_without_a_ledger_tail_fails_closed() {
+        let journal = make_journal();
+        let mut dbtx = journal.db.begin_transaction().await;
+        dbtx.raw_insert_bytes(&ledger_counter_key(), &u64::MAX.to_be_bytes())
+            .await
+            .expect("seed corrupt huge counter");
+        dbtx.commit_tx_result()
+            .await
+            .expect("commit corrupt huge counter");
+
+        assert!(
+            !direct_agent_admission_succeeds(&journal, 7).await,
+            "a nonzero counter with no ledger tail cannot name a safe append sequence"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_occurrence_exhaustion_refuses_max_without_saturating_or_rewriting_state() {
+        let journal = make_journal();
+        let initial = WatchState {
+            occurrence: u64::MAX - 1,
+            last_discover_ms: 17,
+            discover_cursor: Some(fed(9)),
+            discover_backlog: true,
+            discover_rotation: vec![fed(8)],
+        };
+        journal
+            .put_watch_state(&initial)
+            .await
+            .expect("seed near-max checkpoint");
+
+        let observe = journal
+            .observe_watch_occurrence(u64::MAX)
+            .await
+            .expect_err("a standalone MAX occurrence cannot poison the watch floor");
+        assert!(
+            matches!(observe, ExecError::Permanent(ref message) if message.contains("occurrence exhausted")),
+            "{observe:?}"
+        );
+        assert_eq!(
+            journal
+                .get_watch_state()
+                .await
+                .expect("read unmodified checkpoint"),
+            initial,
+            "MAX must be rejected before its standalone observation writes"
+        );
+
+        journal
+            .put_watch_state(&WatchState {
+                occurrence: u64::MAX,
+                ..initial.clone()
+            })
+            .await
+            .expect("seed corrupt/exhausted checkpoint");
+        let advance = journal
+            .advance_watch_occurrence()
+            .await
+            .expect_err("advance must fail closed rather than saturating at MAX");
+        assert!(
+            matches!(advance, ExecError::Permanent(ref message) if message.contains("watch scheduler occurrence exhausted")),
+            "{advance:?}"
+        );
+        assert_eq!(
+            journal
+                .get_watch_state()
+                .await
+                .expect("read exhausted checkpoint")
+                .occurrence,
+            u64::MAX,
+            "a failed advance must not rewrite the exhausted value"
+        );
+    }
+
+    fn unmarked_parent(key: &str) -> Intent {
+        let decision = decision(key, 1, cap(10, 100));
+        Intent::from_decision(
+            &decision,
+            Actor::Agent {
+                occurrence: Occurrence(1),
+            },
+            NOW,
+        )
+    }
+
+    async fn seed_parent_and_cache(journal: &FedimintJournal, intent: &Intent, cache: &MoveRecord) {
+        journal.put_move(cache).await.expect("seed prior cache");
+        journal.upsert(intent).await.expect("seed unmarked parent");
+    }
+
+    fn pristine_record(intent: &Intent) -> MoveRecord {
+        let Action::Evacuate {
+            from,
+            to,
+            amount,
+            fee_cap,
+            ..
+        } = intent.action
+        else {
+            panic!("test parent must be an evacuation");
+        };
+        MoveRecord {
+            key: intent.idempotency_key.clone(),
+            from: Some(from),
+            to,
+            amount,
+            fee_cap,
+            gateway: GatewayUrl("https://gw.example".into()),
+            send_required: true,
+            invoice: None,
+            recv_op: None,
+            send_op: None,
+            phase: MovePhase::Created,
+            outcome: None,
+            preimage: None,
+            receive_fee_quoted: None,
+            send_fee_quoted: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn postverify_marker_same_attempt_restores_prior_pristine_cache() {
+        let journal = make_journal();
+        let parent = unmarked_parent("evac:postverify-marker");
+        let prior = pristine_record(&parent);
+        seed_parent_and_cache(&journal, &parent, &prior).await;
+        let mut written = prior.clone();
+        written.receive_fee_quoted = Some(Msat(1));
+        let pause = journal.pause_after_next_move_write_for_test(parent.idempotency_key.clone());
+        let writer_journal = journal.clone();
+        let writer_key = parent.idempotency_key.clone();
+        let writer = tokio::spawn(async move {
+            writer_journal
+                .put_move_if_attempt(&writer_key, parent.attempt, &written)
+                .await
+        });
+
+        pause.wait_until_committed().await;
+        let mut marked = journal
+            .get(&parent.idempotency_key)
+            .await
+            .expect("read writer parent")
+            .expect("writer parent exists");
+        marked.evacuation_refusal = Some(evidence());
+        journal.upsert(&marked).await.expect("durably mark parent");
+        pause.release();
+
+        assert_eq!(
+            writer.await.expect("writer task"),
+            Ok(false),
+            "a postverify marker retires this writer"
+        );
+        assert_eq!(
+            journal
+                .get_move(&parent.idempotency_key)
+                .await
+                .expect("read restored cache"),
+            Some(prior),
+            "the same attempt's planner-owned marker preserves its prior pristine cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn postverify_terminal_same_attempt_restores_prior_artifact_row() {
+        let journal = make_journal();
+        let parent = unmarked_parent("evac:postverify-terminal");
+        let mut prior = pristine_record(&parent);
+        prior.phase = MovePhase::Invoiced;
+        prior.invoice = Some(Invoice("prior-artifact".into()));
+        seed_parent_and_cache(&journal, &parent, &prior).await;
+        let written = pristine_record(&parent);
+        let pause = journal.pause_after_next_move_write_for_test(parent.idempotency_key.clone());
+        let writer_journal = journal.clone();
+        let writer_key = parent.idempotency_key.clone();
+        let writer = tokio::spawn(async move {
+            writer_journal
+                .put_move_if_attempt(&writer_key, parent.attempt, &written)
+                .await
+        });
+
+        pause.wait_until_committed().await;
+        journal
+            .set_status(
+                &parent.idempotency_key,
+                parent.attempt,
+                IntentStatus::Done,
+                None,
+            )
+            .await
+            .expect("terminalize same attempt");
+        pause.release();
+
+        assert_eq!(writer.await.expect("writer task"), Ok(false));
+        assert_eq!(
+            journal
+                .get_move(&parent.idempotency_key)
+                .await
+                .expect("read restored artifact"),
+            Some(prior),
+            "a terminal same attempt preserves its prior artifact row"
+        );
+    }
+
+    #[tokio::test]
+    async fn postverify_newer_attempt_removes_byte_identical_prior_cache() {
+        // A newer attempt can write byte-identical cache data before the old writer postverifies.
+        // It is still Other: preserving the N cache would recreate stale state after the retry.
+        let journal = make_journal();
+        let parent = unmarked_parent("evac:postverify-n-plus-one");
+        let prior = pristine_record(&parent);
+        seed_parent_and_cache(&journal, &parent, &prior).await;
+        let pause = journal.pause_after_next_move_write_for_test(parent.idempotency_key.clone());
+        let writer_journal = journal.clone();
+        let writer_key = parent.idempotency_key.clone();
+        let written = prior.clone();
+        let writer = tokio::spawn(async move {
+            writer_journal
+                .put_move_if_attempt(&writer_key, parent.attempt, &written)
+                .await
+        });
+
+        pause.wait_until_committed().await;
+        journal
+            .set_status(
+                &parent.idempotency_key,
+                parent.attempt,
+                IntentStatus::Failed,
+                Some("manual retry"),
+            )
+            .await
+            .expect("fail old attempt");
+        let mut retry = parent.clone();
+        retry.attempt += 1;
+        retry.status = IntentStatus::Pending;
+        journal
+            .retry_failed_intent(&retry)
+            .await
+            .expect("install newer attempt");
+        assert!(journal
+            .put_move_if_attempt(&retry.idempotency_key, retry.attempt, &prior)
+            .await
+            .expect("newer writer succeeds"));
+        pause.release();
+        assert_eq!(writer.await.expect("old writer task"), Ok(false));
+        assert_eq!(
+            journal
+                .get_move(&parent.idempotency_key)
+                .await
+                .expect("read N+1 cache"),
+            None,
+            "Other cleanup removes byte-identical data rather than restoring N's prior cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn postverify_missing_attempt_removes_byte_identical_prior_cache() {
+        // Absence is also Other.  The old cache bytes match exactly, so this catches a cleanup
+        // exemption based on whether the old write changed bytes.
+        let journal = make_journal();
+        let parent = unmarked_parent("evac:postverify-missing");
+        let prior = pristine_record(&parent);
+        seed_parent_and_cache(&journal, &parent, &prior).await;
+        let pause = journal.pause_after_next_move_write_for_test(parent.idempotency_key.clone());
+        let writer_journal = journal.clone();
+        let writer_key = parent.idempotency_key.clone();
+        let written = prior.clone();
+        let writer = tokio::spawn(async move {
+            writer_journal
+                .put_move_if_attempt(&writer_key, parent.attempt, &written)
+                .await
+        });
+
+        pause.wait_until_committed().await;
+        let mut tx = journal.db.begin_transaction().await;
+        tx.raw_remove_entry(&intent_key(&parent.idempotency_key))
+            .await
+            .expect("remove current intent");
+        tx.raw_remove_entry(&pending_index_key(
+            IntentStatus::Pending,
+            &parent.idempotency_key,
+        ))
+        .await
+        .expect("remove pending index");
+        tx.commit_tx_result().await.expect("commit missing intent");
+        pause.release();
+        assert_eq!(writer.await.expect("missing writer task"), Ok(false));
+        assert_eq!(
+            journal
+                .get_move(&parent.idempotency_key)
+                .await
+                .expect("read missing-intent cache"),
+            None,
+            "a missing intent also never restores byte-identical prior bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn marked_precheck_rejects_direct_move_write() {
+        let journal = make_journal();
+        let parent = marked_parent(&journal, "evac:marked-direct-write").await;
+        assert_eq!(
+            journal
+                .put_move_if_attempt(
+                    &parent.idempotency_key,
+                    parent.attempt,
+                    &pristine_record(&parent),
+                )
+                .await,
+            Ok(false),
+            "a planner-owned structural marker rejects a direct writer before it writes a cache"
+        );
+        assert_eq!(
+            journal
+                .get_move(&parent.idempotency_key)
+                .await
+                .expect("read marker cache"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_same_attempt_rejects_direct_move_write() {
+        let journal = make_journal();
+        let parent = unmarked_parent("evac:terminal-direct-write");
+        journal.upsert(&parent).await.expect("seed parent");
+        journal
+            .set_status(
+                &parent.idempotency_key,
+                parent.attempt,
+                IntentStatus::Done,
+                None,
+            )
+            .await
+            .expect("terminalize same attempt");
+
+        assert_eq!(
+            journal
+                .put_move_if_attempt(
+                    &parent.idempotency_key,
+                    parent.attempt,
+                    &pristine_record(&parent),
+                )
+                .await,
+            Ok(false),
+            "a terminal intent rejects a direct cache write even at the same attempt"
+        );
+        assert_eq!(
+            journal
+                .get_move(&parent.idempotency_key)
+                .await
+                .expect("read terminal cache"),
+            None,
+            "the rejected direct write leaves no terminal cache artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_replay_validates_full_child_relation_and_fences_parent_retry() {
+        let journal = make_journal();
+        let parent = marked_parent(&journal, "evac:parent").await;
+        let child = decision("evac:child", 2, cap(10, 200));
+        assert!(journal
+            .replace_marked_evacuation(
+                &parent.idempotency_key,
+                parent.attempt,
+                &evidence(),
+                &child,
+                NOW,
+                &parent,
+            )
+            .await
+            .expect("exchange"));
+        assert!(journal
+            .replace_marked_evacuation(
+                &parent.idempotency_key,
+                parent.attempt,
+                &evidence(),
+                &child,
+                NOW + 1,
+                &parent,
+            )
+            .await
+            .expect("time-independent exact replay"));
+        Journal::set_status(
+            &journal,
+            &child.idempotency_key,
+            0,
+            IntentStatus::Executing,
+            None,
+        )
+        .await
+        .expect("claim child");
+        assert!(journal
+            .replace_marked_evacuation(
+                &parent.idempotency_key,
+                parent.attempt,
+                &evidence(),
+                &child,
+                NOW + 2,
+                &parent,
+            )
+            .await
+            .expect("replay accepts progressed child"));
+        assert_eq!(
+            journal.history(10, None).await.expect("history").len(),
+            2,
+            "replays must not append replacement rows"
+        );
+        let mut changed_action = child.clone();
+        let Action::Evacuate { fee_cap, .. } = &mut changed_action.action else {
+            unreachable!("fixture is an evacuation");
+        };
+        *fee_cap = Msat(999);
+        assert!(journal
+            .replace_marked_evacuation(
+                &parent.idempotency_key,
+                parent.attempt,
+                &evidence(),
+                &changed_action,
+                NOW + 3,
+                &parent,
+            )
+            .await
+            .is_err());
+        let mut changed_reason = child.clone();
+        changed_reason.reason = ReasonCode::Unhealthy;
+        assert!(journal
+            .replace_marked_evacuation(
+                &parent.idempotency_key,
+                parent.attempt,
+                &evidence(),
+                &changed_reason,
+                NOW + 3,
+                &parent,
+            )
+            .await
+            .is_err());
+        let mut retired = journal
+            .get(&parent.idempotency_key)
+            .await
+            .expect("read")
+            .expect("parent");
+        retired.status = IntentStatus::Pending;
+        retired.attempt += 1;
+        assert!(
+            journal.retry_failed_intent(&retired).await.is_err(),
+            "a canonical superseded parent cannot become a second live evacuation"
+        );
+        assert_eq!(journal.pending().await.expect("scan").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn supersession_neighbors_keep_both_links_for_a_replaced_replacement() {
+        let journal = make_journal();
+        let a = marked_parent(&journal, "evac:chain-a").await;
+        let b = decision("evac:chain-b", 2, cap(10, 200));
+        journal
+            .replace_marked_evacuation(&a.idempotency_key, a.attempt, &evidence(), &b, NOW, &a)
+            .await
+            .expect("A -> B exchange");
+
+        // B is now a qualifying, unstarted parent in a later planning epoch.
+        let mut b_parent = journal
+            .get(&b.idempotency_key)
+            .await
+            .expect("read B")
+            .expect("B exists");
+        let mut b_evidence = evidence();
+        b_evidence.cap_components = cap(10, 200);
+        b_evidence.low.fee_cap = b_evidence.cap_components.at(b_evidence.low.delivered_net);
+        b_evidence.high.fee_cap = b_evidence.cap_components.at(b_evidence.high.delivered_net);
+        b_evidence.high.total_fee = Msat(40);
+        b_parent.evacuation_refusal = Some(b_evidence.clone());
+        journal.upsert(&b_parent).await.expect("mark B");
+        let c = decision("evac:chain-c", 3, cap(10, 300));
+
+        // A pre-commit exchange fault must not let B's reverse predecessor (A -> B) masquerade as
+        // evidence that the attempted B -> C exchange committed.  This is the exact shape the
+        // actor and standalone confirmation paths must classify as uncommitted before they clear
+        // B's marker; a dual-key reader would return A -> B here.
+        journal.fail_before_next_evacuation_replacement_for_test();
+        assert!(matches!(
+            journal
+                .replace_marked_evacuation(
+                    &b.idempotency_key,
+                    b_parent.attempt,
+                    &b_evidence,
+                    &c,
+                    NOW + 1,
+                    &b_parent,
+                )
+                .await,
+            Err(ExecError::Retryable(_))
+        ));
+        assert!(
+            journal
+                .evacuation_canonical_successor(&b.idempotency_key)
+                .await
+                .expect("read absent B canonical successor")
+                .is_none(),
+            "an uncommitted B -> C has no canonical successor even though B has a predecessor"
+        );
+        let predecessor = journal
+            .evacuation_supersession(&b.idempotency_key)
+            .await
+            .expect("read B's predecessor through the dual-key API")
+            .expect("A -> B predecessor");
+        assert_eq!(predecessor.old_key, a.idempotency_key);
+        assert_eq!(predecessor.new_key, b.idempotency_key);
+        assert_eq!(predecessor.old_attempt, a.attempt);
+        assert_eq!(predecessor.new_attempt, 0);
+        assert_eq!(predecessor.occurrence, b.occurrence);
+        assert_eq!(predecessor.refusal, evidence());
+        assert_eq!(predecessor.superseded_at_ms, NOW);
+        assert_eq!(
+            journal
+                .get(&b.idempotency_key)
+                .await
+                .expect("read B after fault"),
+            Some(b_parent.clone()),
+            "the fault neither retires nor clears the attempted parent"
+        );
+        assert!(
+            journal
+                .get(&c.idempotency_key)
+                .await
+                .expect("read absent C after fault")
+                .is_none(),
+            "the fault does not create the attempted child"
+        );
+        journal
+            .replace_marked_evacuation(
+                &b.idempotency_key,
+                b_parent.attempt,
+                &b_evidence,
+                &c,
+                NOW + 1,
+                &b_parent,
+            )
+            .await
+            .expect("B -> C exchange");
+        assert_eq!(
+            journal
+                .evacuation_canonical_successor(&b.idempotency_key)
+                .await
+                .expect("read committed B canonical successor")
+                .expect("B -> C successor")
+                .new_key,
+            c.idempotency_key,
+            "a committed B -> C remains confirmable by the strict reader"
+        );
+
+        let a_links = journal
+            .evacuation_supersession_neighbors(&a.idempotency_key)
+            .await
+            .expect("read A links");
+        assert!(a_links.predecessor.is_none());
+        assert_eq!(
+            a_links.successor.expect("A successor").new_key,
+            b.idempotency_key
+        );
+        let b_links = journal
+            .evacuation_supersession_neighbors(&b.idempotency_key)
+            .await
+            .expect("read B links");
+        assert_eq!(
+            b_links.predecessor.expect("B predecessor").old_key,
+            a.idempotency_key
+        );
+        assert_eq!(
+            b_links.successor.expect("B successor").new_key,
+            c.idempotency_key
+        );
+        let c_links = journal
+            .evacuation_supersession_neighbors(&c.idempotency_key)
+            .await
+            .expect("read C links");
+        assert_eq!(
+            c_links.predecessor.expect("C predecessor").old_key,
+            b.idempotency_key
+        );
+        assert!(c_links.successor.is_none());
+
+        // Exact exchange confirmation for B -> C only needs B's canonical successor relation.
+        // Damage to the older A -> B relation must not turn an already committed B -> C exchange
+        // into an ambiguity that an actor/standalone caller cannot safely resolve.
+        let mut tx = journal.db.begin_transaction().await;
+        tx.raw_remove_entry(&evacuation_supersession_key(&a.idempotency_key))
+            .await
+            .expect("damage older canonical relation");
+        tx.commit_tx_result()
+            .await
+            .expect("commit older relation damage");
+        assert_eq!(
+            journal
+                .evacuation_supersession(&b.idempotency_key)
+                .await
+                .expect("B successor remains independently confirmable")
+                .expect("B -> C relation")
+                .new_key,
+            c.idempotency_key
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_replay_accepts_every_coherent_child_lifecycle_status() {
+        for status in [
+            IntentStatus::Pending,
+            IntentStatus::Executing,
+            IntentStatus::Awaiting,
+            IntentStatus::Done,
+            IntentStatus::Failed,
+        ] {
+            let journal = make_journal();
+            let parent = marked_parent(&journal, &format!("evac:parent-status-{status:?}")).await;
+            let child = decision(&format!("evac:child-status-{status:?}"), 2, cap(10, 200));
+            assert!(journal
+                .replace_marked_evacuation(
+                    &parent.idempotency_key,
+                    parent.attempt,
+                    &evidence(),
+                    &child,
+                    NOW,
+                    &parent,
+                )
+                .await
+                .expect("exchange"));
+            if status != IntentStatus::Pending {
+                Journal::set_status(&journal, &child.idempotency_key, 0, status, None)
+                    .await
+                    .expect("advance child");
+            }
+            assert!(journal
+                .replace_marked_evacuation(
+                    &parent.idempotency_key,
+                    parent.attempt,
+                    &evidence(),
+                    &child,
+                    NOW + 1,
+                    &parent,
+                )
+                .await
+                .expect("replay after coherent child progress"));
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_rejects_stale_child_namespace_third_holder_and_reverse_damage() {
+        let journal = make_journal();
+        let parent = marked_parent(&journal, "evac:parent-a").await;
+        let child = decision("evac:child-a", 2, cap(10, 200));
+        let stale = MoveRecord {
+            key: child.idempotency_key.clone(),
+            from: Some(fed(1)),
+            to: fed(2),
+            amount: Msat(100),
+            fee_cap: Msat(12),
+            gateway: GatewayUrl("https://gw.example".into()),
+            send_required: true,
+            invoice: None,
+            recv_op: None,
+            send_op: None,
+            phase: MovePhase::Created,
+            outcome: None,
+            preimage: None,
+            receive_fee_quoted: None,
+            send_fee_quoted: None,
+        };
+        let mut tx = journal.db.begin_transaction().await;
+        tx.raw_insert_bytes(
+            &move_key(&child.idempotency_key),
+            &encode_row(&stale).expect("row"),
+        )
+        .await
+        .expect("stale move");
+        tx.commit_tx_result().await.expect("commit stale move");
+        assert_eq!(
+            journal
+                .replacement_child_namespace(&child.idempotency_key)
+                .await
+                .expect("inspect stale child namespace"),
+            ReplacementChildNamespace::Contaminated,
+            "a stale MoveRecord is not an uncommitted replacement child"
+        );
+        assert!(
+            journal
+                .replace_marked_evacuation(
+                    &parent.idempotency_key,
+                    parent.attempt,
+                    &evidence(),
+                    &child,
+                    NOW,
+                    &parent,
+                )
+                .await
+                .is_err(),
+            "even an unstarted MoveRecord makes the fresh child namespace non-empty"
+        );
+
+        let journal = make_journal();
+        let parent = marked_parent(&journal, "evac:parent-b").await;
+        let blocker = Intent::from_decision(
+            &decision("evac:blocker", 9, cap(10, 200)),
+            Actor::Agent {
+                occurrence: Occurrence(9),
+            },
+            NOW,
+        );
+        journal.upsert(&blocker).await.expect("third holder");
+        assert!(
+            journal
+                .replace_marked_evacuation(
+                    &parent.idempotency_key,
+                    parent.attempt,
+                    &evidence(),
+                    &decision("evac:child-b", 2, cap(10, 200)),
+                    NOW,
+                    &parent,
+                )
+                .await
+                .is_err(),
+            "the transaction scans for another live Agent evacuation of the source"
+        );
+
+        let journal = make_journal();
+        let parent = marked_parent(&journal, "evac:parent-c").await;
+        let child = decision("evac:child-c", 2, cap(10, 200));
+        journal
+            .replace_marked_evacuation(
+                &parent.idempotency_key,
+                parent.attempt,
+                &evidence(),
+                &child,
+                NOW,
+                &parent,
+            )
+            .await
+            .expect("exchange");
+        let mut tx = journal.db.begin_transaction().await;
+        tx.raw_remove_entry(&evacuation_supersession_reverse_key(&child.idempotency_key))
+            .await
+            .expect("remove reverse");
+        tx.commit_tx_result().await.expect("commit reverse damage");
+        assert!(
+            journal
+                .evacuation_supersession(&parent.idempotency_key)
+                .await
+                .is_err(),
+            "canonical lookup validates its reverse half in the same snapshot"
+        );
+
+        for (label, status) in [
+            ("intent", None),
+            ("move", None),
+            ("ledger-index", None),
+            ("canonical", None),
+            ("reverse", None),
+            ("pending-index", Some(IntentStatus::Pending)),
+            ("executing-index", Some(IntentStatus::Executing)),
+            ("awaiting-index", Some(IntentStatus::Awaiting)),
+            ("done-index", Some(IntentStatus::Done)),
+            ("failed-index", Some(IntentStatus::Failed)),
+        ] {
+            let journal = make_journal();
+            let parent = marked_parent(&journal, &format!("evac:parent-stale-{label}")).await;
+            let child = decision(&format!("evac:child-stale-{label}"), 2, cap(10, 200));
+            let raw_key = match label {
+                "intent" => intent_key(&child.idempotency_key),
+                "move" => move_key(&child.idempotency_key),
+                "ledger-index" => ledger_key_index(&child.idempotency_key),
+                "canonical" => evacuation_supersession_key(&child.idempotency_key),
+                "reverse" => evacuation_supersession_reverse_key(&child.idempotency_key),
+                _ => pending_index_key(status.expect("status row"), &child.idempotency_key),
+            };
+            let mut tx = journal.db.begin_transaction().await;
+            tx.raw_insert_bytes(&raw_key, &[1])
+                .await
+                .expect("seed stale direct child namespace row");
+            tx.commit_tx_result().await.expect("commit stale row");
+            assert!(
+                journal
+                    .replace_marked_evacuation(
+                        &parent.idempotency_key,
+                        parent.attempt,
+                        &evidence(),
+                        &child,
+                        NOW,
+                        &parent,
+                    )
+                    .await
+                    .is_err(),
+                "{label} stale child row must fence exchange"
+            );
+        }
+
+        for (label, mutate_canonical) in [("canonical", true), ("reverse", false)] {
+            let journal = make_journal();
+            let parent = marked_parent(&journal, &format!("evac:parent-corrupt-{label}")).await;
+            let child = decision(&format!("evac:child-corrupt-{label}"), 2, cap(10, 200));
+            journal
+                .replace_marked_evacuation(
+                    &parent.idempotency_key,
+                    parent.attempt,
+                    &evidence(),
+                    &child,
+                    NOW,
+                    &parent,
+                )
+                .await
+                .expect("exchange");
+            let key = if mutate_canonical {
+                evacuation_supersession_key(&parent.idempotency_key)
+            } else {
+                evacuation_supersession_reverse_key(&child.idempotency_key)
+            };
+            let mut tx = journal.db.begin_transaction().await;
+            tx.raw_insert_bytes(&key, &[1])
+                .await
+                .expect("corrupt sidecar half");
+            tx.commit_tx_result().await.expect("commit corruption");
+            assert!(journal
+                .evacuation_supersession(&parent.idempotency_key)
+                .await
+                .is_err());
+            assert!(
+                journal
+                    .evacuation_supersession(&child.idempotency_key)
+                    .await
+                    .is_err(),
+                "{label} corruption must fail sidecar lookup from either endpoint"
+            );
+            let display = journal
+                .evacuation_supersession_neighbors_for_display_keys(&[
+                    parent.idempotency_key.clone(),
+                    child.idempotency_key.clone(),
+                ])
+                .await
+                .expect("corrupt sidecars do not poison the bounded display projection");
+            assert_eq!(
+                display.get(&parent.idempotency_key),
+                Some(&EvacuationSupersessionNeighbors::default()),
+                "{label} parent link degrades to absent for display"
+            );
+            assert_eq!(
+                display.get(&child.idempotency_key),
+                Some(&EvacuationSupersessionNeighbors::default()),
+                "{label} child link degrades to absent for display"
+            );
+        }
+    }
+
+    /// `show <key>` is the documented first step of a structural-refusal incident: it resolves the
+    /// ledger row and only THEN augments it with the linked intent's live status and marker. So a
+    /// corrupt intent row must degrade to absent rather than blank the row the operator asked for,
+    /// while a retryable storage fault — which says nothing about whether a marker exists — must
+    /// still fail loudly instead of displaying a false "no marker".
+    #[tokio::test]
+    async fn malformed_linked_intent_degrades_for_display_while_storage_faults_still_fail() {
+        let journal = make_journal();
+        let marked = marked_parent(&journal, "evac:display-marker").await;
+        assert_eq!(
+            journal
+                .intent_for_display(&marked.idempotency_key)
+                .await
+                .expect("a readable marker is read normally"),
+            Some(marked.clone()),
+            "the display projection returns the exact live marker while the row is readable"
+        );
+
+        let mut tx = journal.db.begin_transaction().await;
+        tx.raw_insert_bytes(&intent_key(&marked.idempotency_key), &[1])
+            .await
+            .expect("corrupt the linked intent row");
+        tx.commit_tx_result().await.expect("commit corruption");
+        let strict = journal
+            .get(&marked.idempotency_key)
+            .await
+            .expect_err("the money-path read still refuses a corrupt intent row");
+        assert!(
+            matches!(strict, ExecError::Permanent(_)),
+            "corruption is permanent, not retryable: {strict:?}"
+        );
+        assert_eq!(
+            journal
+                .intent_for_display(&marked.idempotency_key)
+                .await
+                .expect("a corrupt intent row must not blank the operation row show resolved"),
+            None,
+            "a malformed intent row degrades to absent for display"
+        );
+
+        journal.fail_next_intent_reads_for_test(1);
+        let faulted = journal
+            .intent_for_display(&IdempotencyKey("evac:display-fault".to_owned()))
+            .await
+            .expect_err("a storage fault is not permission to display absence");
+        assert!(
+            matches!(faulted, ExecError::Retryable(_)),
+            "the retryable class still propagates: {faulted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn marker_clear_requires_the_exact_pending_planner_owned_evacuation() {
+        let journal = make_journal();
+        let parent = marked_parent(&journal, "evac:clear-marker").await;
+        assert!(!journal
+            .clear_marked_evacuation_if_pending(&Intent {
+                attempt: parent.attempt + 1,
+                ..parent.clone()
+            },)
+            .await
+            .expect("wrong attempt is not clearable"));
+        assert!(journal
+            .get(&parent.idempotency_key)
+            .await
+            .expect("read retained marker")
+            .expect("parent exists")
+            .evacuation_refusal
+            .is_some());
+        let mut stale_parent = parent.clone();
+        stale_parent.reason = wallet_core::ReasonCode::Unhealthy;
+        assert!(!journal
+            .clear_marked_evacuation_if_pending(&stale_parent)
+            .await
+            .expect("changed full parent is not clearable"));
+        assert!(journal
+            .clear_marked_evacuation_if_pending(&parent,)
+            .await
+            .expect("exact marker clear"));
+        let cleared = journal
+            .get(&parent.idempotency_key)
+            .await
+            .expect("read cleared marker")
+            .expect("parent remains pending");
+        assert_eq!(cleared.status, IntentStatus::Pending);
+        assert_eq!(cleared.evacuation_refusal, None);
+        assert!(!journal
+            .clear_marked_evacuation_if_pending(&parent,)
+            .await
+            .expect("cleared marker cannot be cleared twice"));
+
+        let journal = make_journal();
+        let parent = marked_parent(&journal, "evac:clear-marker-with-holder").await;
+        let _other = marked_parent(&journal, "evac:other-live-holder").await;
+        assert!(
+            journal
+                .clear_marked_evacuation_if_pending(&parent)
+                .await
+                .is_err(),
+            "a second live agent evacuation from the same source is corruption/ambiguity, never a clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_requires_the_full_planned_parent_before_the_exchange() {
+        let journal = make_journal();
+        let parent = marked_parent(&journal, "evac:full-parent-cas").await;
+        let mut changed = parent.clone();
+        changed.reason = ReasonCode::Unhealthy;
+        journal
+            .upsert(&changed)
+            .await
+            .expect("persist a changed but still marker-bearing parent");
+        let child = decision("evac:full-parent-cas-child", 2, cap(10, 200));
+
+        assert!(
+            !journal
+                .replace_marked_evacuation(
+                    &parent.idempotency_key,
+                    parent.attempt,
+                    &evidence(),
+                    &child,
+                    NOW,
+                    &parent,
+                )
+                .await
+                .expect("a stale full-parent CAS is a benign refusal"),
+            "matching key/attempt/evidence alone must not replace a changed parent"
+        );
+        assert_eq!(
+            journal
+                .get(&parent.idempotency_key)
+                .await
+                .expect("read unchanged parent"),
+            Some(changed.clone())
+        );
+        assert!(journal
+            .get(&child.idempotency_key)
+            .await
+            .expect("read absent child")
+            .is_none());
+
+        assert!(journal
+            .replace_marked_evacuation(
+                &changed.idempotency_key,
+                changed.attempt,
+                changed
+                    .evacuation_refusal
+                    .as_ref()
+                    .expect("changed parent retains marker"),
+                &child,
+                NOW,
+                &changed,
+            )
+            .await
+            .expect("the current full parent is exchangeable"));
+    }
+
+    #[tokio::test]
+    async fn replacement_and_attempt_fenced_move_writer_have_exactly_one_winner() {
+        let journal = make_journal();
+        let parent = marked_parent(&journal, "evac:parent-race").await;
+        let child = decision("evac:child-race", 2, cap(10, 200));
+        let non_pristine = MoveRecord {
+            key: parent.idempotency_key.clone(),
+            from: Some(fed(1)),
+            to: fed(2),
+            amount: Msat(100),
+            fee_cap: Msat(11),
+            gateway: GatewayUrl("https://gw.example".into()),
+            send_required: true,
+            invoice: None,
+            recv_op: None,
+            send_op: None,
+            phase: MovePhase::Invoiced,
+            outcome: None,
+            preimage: None,
+            receive_fee_quoted: None,
+            send_fee_quoted: None,
+        };
+        let replacement_journal = journal.clone();
+        let writer_journal = journal.clone();
+        let parent_key = parent.idempotency_key.clone();
+        let writer_key = parent.idempotency_key.clone();
+        let replacement_evidence = evidence();
+        let (replacement, writer) = tokio::join!(
+            replacement_journal.replace_marked_evacuation(
+                &parent_key,
+                parent.attempt,
+                &replacement_evidence,
+                &child,
+                NOW,
+                &parent,
+            ),
+            writer_journal.put_move_if_attempt(&writer_key, parent.attempt, &non_pristine),
+        );
+        let replacement_won = replacement.as_ref().is_ok_and(|accepted| *accepted);
+        assert!(
+            replacement_won,
+            "the planner-owned marker replacement wins: {replacement:?}"
+        );
+        assert_eq!(
+            writer,
+            Ok(false),
+            "marked parents reject late cache writers"
+        );
+        let parent_after = journal
+            .get(&parent.idempotency_key)
+            .await
+            .expect("read raced parent")
+            .expect("parent remains auditable");
+        let child_after = journal
+            .get(&child.idempotency_key)
+            .await
+            .expect("read raced child");
+        if replacement_won {
+            assert_eq!(parent_after.status, IntentStatus::Failed);
+            assert_eq!(
+                child_after.map(|intent| intent.status),
+                Some(IntentStatus::Pending)
+            );
+            assert_eq!(
+                journal
+                    .get_move(&parent.idempotency_key)
+                    .await
+                    .expect("read raced artifact"),
+                None,
+                "the marker fence prevents a late writer from creating parent artifacts"
+            );
+            assert!(journal
+                .evacuation_supersession(&parent.idempotency_key)
+                .await
+                .expect("read replacement link")
+                .is_some());
+        } else {
+            assert_eq!(parent_after.status, IntentStatus::Pending);
+            assert!(child_after.is_none());
+            assert!(journal
+                .get_move(&parent.idempotency_key)
+                .await
+                .expect("read winning artifact")
+                .is_some());
+            assert!(journal
+                .evacuation_supersession(&parent.idempotency_key)
+                .await
+                .expect("read absent replacement link")
+                .is_none());
+        }
+    }
+
+    /// The two durable orderings at the actual CAS boundary are both safe.
+    /// This is intentionally expressed against `FedimintJournal`, rather than
+    /// a mock Journal: `set_status_if` clears the marker and moves the index
+    /// in the same transaction that decides the Pending -> Executing winner.
+    #[tokio::test]
+    async fn replacement_and_pending_claim_have_one_durable_executable_winner() {
+        for claim_first in [true, false] {
+            let journal = make_journal();
+            let parent = marked_parent(
+                &journal,
+                if claim_first {
+                    "evac:claim-first-parent"
+                } else {
+                    "evac:replacement-first-parent"
+                },
+            )
+            .await;
+            let child = decision(
+                if claim_first {
+                    "evac:claim-first-child"
+                } else {
+                    "evac:replacement-first-child"
+                },
+                2,
+                cap(10, 200),
+            );
+
+            if claim_first {
+                assert!(
+                    Journal::set_status_if(
+                        &journal,
+                        &parent.idempotency_key,
+                        parent.attempt,
+                        IntentStatus::Pending,
+                        IntentStatus::Executing,
+                    )
+                    .await
+                    .expect("claim"),
+                    "the claim wins its CAS"
+                );
+                assert!(
+                    !journal
+                        .replace_marked_evacuation(
+                            &parent.idempotency_key,
+                            parent.attempt,
+                            &evidence(),
+                            &child,
+                            NOW,
+                            &parent,
+                        )
+                        .await
+                        .expect("replacement loses claimed parent"),
+                    "the replacement observes the CAS winner"
+                );
+                let claimed = journal
+                    .get(&parent.idempotency_key)
+                    .await
+                    .expect("read claim winner")
+                    .expect("parent remains");
+                assert_eq!(claimed.status, IntentStatus::Executing);
+                assert_eq!(
+                    claimed.evacuation_refusal, None,
+                    "claim atomically consumes the marker"
+                );
+                assert_eq!(
+                    journal.pending().await.expect("live index"),
+                    vec![claimed.clone()],
+                    "the original is the only executable index row"
+                );
+                assert!(journal
+                    .get(&child.idempotency_key)
+                    .await
+                    .expect("child lookup")
+                    .is_none());
+                assert!(journal
+                    .get_move(&parent.idempotency_key)
+                    .await
+                    .expect("parent move lookup")
+                    .is_none());
+                assert_eq!(
+                    journal
+                        .evacuation_supersession_neighbors(&parent.idempotency_key)
+                        .await
+                        .expect("no sidecar"),
+                    EvacuationSupersessionNeighbors::default()
+                );
+            } else {
+                assert!(
+                    journal
+                        .replace_marked_evacuation(
+                            &parent.idempotency_key,
+                            parent.attempt,
+                            &evidence(),
+                            &child,
+                            NOW,
+                            &parent,
+                        )
+                        .await
+                        .expect("replacement"),
+                    "the atomic exchange wins before the claim"
+                );
+                assert!(
+                    !Journal::set_status_if(
+                        &journal,
+                        &parent.idempotency_key,
+                        parent.attempt,
+                        IntentStatus::Pending,
+                        IntentStatus::Executing,
+                    )
+                    .await
+                    .expect("stale claim"),
+                    "a claim cannot resurrect the retired parent"
+                );
+                let retired = journal
+                    .get(&parent.idempotency_key)
+                    .await
+                    .expect("read retired parent")
+                    .expect("parent remains auditable");
+                let executable = journal
+                    .get(&child.idempotency_key)
+                    .await
+                    .expect("read child")
+                    .expect("child exists");
+                assert_eq!(retired.status, IntentStatus::Failed);
+                assert_eq!(executable.status, IntentStatus::Pending);
+                assert_eq!(
+                    journal.pending().await.expect("live index"),
+                    vec![executable.clone()],
+                    "only the child is executable"
+                );
+                assert!(journal
+                    .get_move(&parent.idempotency_key)
+                    .await
+                    .expect("parent move lookup")
+                    .is_none());
+                assert_eq!(
+                    journal
+                        .evacuation_supersession_neighbors(&parent.idempotency_key)
+                        .await
+                        .expect("parent link")
+                        .successor
+                        .expect("forward link")
+                        .new_key,
+                    child.idempotency_key
+                );
+                assert!(
+                    journal
+                        .replace_marked_evacuation(
+                            &parent.idempotency_key,
+                            parent.attempt,
+                            &evidence(),
+                            &child,
+                            NOW,
+                            &parent,
+                        )
+                        .await
+                        .expect("exact replay"),
+                    "replay preserves the one linked child"
+                );
+            }
+        }
+    }
+
+    /// br-n8o: "Pin it with a CONCURRENT test that races replacement against a receive commit and
+    /// proves at most one intent remains executable. A sequential test cannot observe this: it
+    /// never interleaves the two steps, so it passes against the racy implementation."
+    ///
+    /// `set_status_if(Pending -> Executing)` is the receive commit's precursor: it is the step that
+    /// hands the parent to a driver, and it consumes the planner's marker in the same transaction.
+    /// The two are forced to genuinely overlap here.  The exchange is parked inside its own
+    /// uncommitted transaction at the point where it has already read the marked-Pending parent and
+    /// confirmed the parent owns no artifact -- precisely the "reads no artifact yet" window the
+    /// bead names -- and the claim is then driven to a durable commit underneath it before the
+    /// exchange is released to write.
+    ///
+    /// `MemDatabase` gives this real teeth: `begin_transaction` snapshots under a read lock and
+    /// `commit_tx` replays every op against the live map, so the exchange's stale parent write is
+    /// rejected with `WriteConflict` and `autocommit` retries the closure against the claim's
+    /// durable result.
+    #[tokio::test]
+    async fn a_claim_committing_inside_the_exchange_window_leaves_one_executable_intent() {
+        let journal = make_journal();
+        let parent = marked_parent(&journal, "evac:interleaved-parent").await;
+        let child = decision("evac:interleaved-child", 2, cap(10, 200));
+
+        let pause =
+            journal.arm_replacement_write_rendezvous_for_test(parent.idempotency_key.clone());
+
+        let exchange_journal = journal.clone();
+        let exchange_parent = parent.clone();
+        let exchange_child = child.clone();
+        let exchange = tokio::spawn(async move {
+            exchange_journal
+                .replace_marked_evacuation(
+                    &exchange_parent.idempotency_key,
+                    exchange_parent.attempt,
+                    &evidence(),
+                    &exchange_child,
+                    NOW,
+                    &exchange_parent,
+                )
+                .await
+        });
+
+        // Do not race the spawn: wait until the exchange has actually read the marked-Pending
+        // parent, confirmed it owns no artifact, and parked inside its still-open transaction.
+        pause.wait_until_parked().await;
+
+        // Commit the competing claim underneath that open transaction.
+        let claimed = Journal::set_status_if(
+            &journal,
+            &parent.idempotency_key,
+            parent.attempt,
+            IntentStatus::Pending,
+            IntentStatus::Executing,
+        )
+        .await
+        .expect("the claim runs while the exchange holds an open transaction");
+        assert!(claimed, "the claim commits durably inside the window");
+
+        // Release the parked exchange onto a parent that changed under it.
+        pause.release();
+        let exchanged = exchange
+            .await
+            .expect("the exchange task did not panic")
+            .expect("the exchange resolves rather than erroring");
+
+        assert!(
+            !exchanged,
+            "an exchange whose parent was claimed mid-transaction must lose, not overwrite it"
+        );
+
+        let parent_after = journal
+            .get(&parent.idempotency_key)
+            .await
+            .expect("read raced parent")
+            .expect("parent remains auditable");
+        assert_eq!(parent_after.status, IntentStatus::Executing);
+        assert_eq!(
+            parent_after.evacuation_refusal, None,
+            "the claim consumed the marker"
+        );
+        assert!(
+            journal
+                .get(&child.idempotency_key)
+                .await
+                .expect("child lookup")
+                .is_none(),
+            "the loser must not leave a second intent for the same money"
+        );
+        assert_eq!(
+            journal.pending().await.expect("live index"),
+            vec![parent_after.clone()],
+            "the claimed parent is the only executable intent"
+        );
+        assert_eq!(
+            journal
+                .evacuation_supersession_neighbors(&parent.idempotency_key)
+                .await
+                .expect("neighbor read"),
+            EvacuationSupersessionNeighbors::default(),
+            "a losing exchange records no supersession link"
+        );
+        assert!(journal
+            .get_move(&parent.idempotency_key)
+            .await
+            .expect("artifact read")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn replacement_rejects_incoherent_evidence_and_child_cap() {
+        for evidence in [
+            {
+                let mut e = evidence();
+                e.requested_net = Msat(101);
+                e
+            },
+            {
+                let mut e = evidence();
+                e.low.fee_cap = Msat(99);
+                e
+            },
+        ] {
+            let journal = make_journal();
+            let parent = marked_parent(&journal, "evac:evidence").await;
+            assert!(journal
+                .replace_marked_evacuation(
+                    &parent.idempotency_key,
+                    parent.attempt,
+                    &evidence,
+                    &decision("evac:evidence-child", 2, cap(10, 200)),
+                    NOW,
+                    &parent,
+                )
+                .await
+                .is_err());
+        }
+        let journal = make_journal();
+        let mut parent = marked_parent(&journal, "evac:rollback-evidence").await;
+        let mut rollback_evidence = evidence();
+        rollback_evidence.measured_at_ms = NOW.saturating_sub(1);
+        parent.evacuation_refusal = Some(rollback_evidence.clone());
+        journal
+            .upsert(&parent)
+            .await
+            .expect("seed rollback-clock evidence");
+        assert!(
+            journal
+                .replace_marked_evacuation(
+                    &parent.idempotency_key,
+                    parent.attempt,
+                    &rollback_evidence,
+                    &decision("evac:rollback-evidence-child", 2, cap(10, 200)),
+                    NOW,
+                    &parent,
+                )
+                .await
+                .expect("display-clock rollback is valid evidence"),
+            "evidence timestamp is display-only and does not order the parent"
+        );
+        let journal = make_journal();
+        let parent = marked_parent(&journal, "evac:bad-child-cap").await;
+        let mut child = decision("evac:bad-child-cap-child", 2, cap(10, 200));
+        let Action::Evacuate { fee_cap, .. } = &mut child.action else {
+            unreachable!("fixture is an evacuation");
+        };
+        *fee_cap = Msat(1);
+        assert!(
+            journal
+                .replace_marked_evacuation(
+                    &parent.idempotency_key,
+                    parent.attempt,
+                    &evidence(),
+                    &child,
+                    NOW,
+                    &parent,
+                )
+                .await
+                .is_err(),
+            "child cap must equal its components at the child amount"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_evidence_requires_affordable_structural_samples_not_requested_balance() {
+        let mut accepted = evidence();
+        accepted.requested_net = Msat(100);
+        accepted.source_spendable = Msat(95);
+        accepted.high.delivered_net = Msat(80);
+        accepted.high.total_fee = Msat(12);
+        accepted.high.fee_cap = cap(10, 100).at(Msat(80));
+        let journal = make_journal();
+        let parent = marked_parent(&journal, "evac:affordable").await;
+        let mut parent_row = journal
+            .get(&parent.idempotency_key)
+            .await
+            .expect("read parent")
+            .expect("parent");
+        parent_row.evacuation_refusal = Some(accepted.clone());
+        journal.upsert(&parent_row).await.expect("replace marker");
+        assert!(journal
+            .replace_marked_evacuation(
+                &parent.idempotency_key,
+                parent.attempt,
+                &accepted,
+                &decision("evac:affordable-child", 2, cap(10, 200)),
+                NOW,
+                &parent_row,
+            )
+            .await
+            .expect("requested net may exceed spendable when both samples are affordable"));
+
+        let mut unaffordable = accepted.clone();
+        unaffordable.high.total_fee = Msat(20); // 80 + 20 exceeds the 95-msat spendable balance.
+        let journal = make_journal();
+        let parent = marked_parent(&journal, "evac:unaffordable").await;
+        let mut parent_row = journal
+            .get(&parent.idempotency_key)
+            .await
+            .expect("read parent")
+            .expect("parent");
+        parent_row.evacuation_refusal = Some(unaffordable.clone());
+        journal.upsert(&parent_row).await.expect("replace marker");
+        assert!(journal
+            .replace_marked_evacuation(
+                &parent.idempotency_key,
+                parent.attempt,
+                &unaffordable,
+                &decision("evac:unaffordable-child", 2, cap(10, 200)),
+                NOW,
+                &parent_row,
+            )
+            .await
+            .is_err());
+
+        let mut non_structural = evidence();
+        non_structural.low.total_fee = Msat(11);
+        non_structural.high.total_fee = Msat(20);
+        let journal = make_journal();
+        let parent = marked_parent(&journal, "evac:non-structural").await;
+        let mut parent_row = journal
+            .get(&parent.idempotency_key)
+            .await
+            .expect("read parent")
+            .expect("parent");
+        parent_row.evacuation_refusal = Some(non_structural.clone());
+        journal.upsert(&parent_row).await.expect("replace marker");
+        assert!(
+            journal
+                .replace_marked_evacuation(
+                    &parent.idempotency_key,
+                    parent.attempt,
+                    &non_structural,
+                    &decision("evac:non-structural-child", 2, cap(10, 200)),
+                    NOW,
+                    &parent_row,
+                )
+                .await
+                .is_err(),
+            "two over-cap samples without either shared structural predicate are insufficient"
+        );
+    }
 }

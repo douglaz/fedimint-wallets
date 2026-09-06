@@ -51,7 +51,24 @@ federation's guardians), but without it recovery means hunting guardians down by
   processes spending the same notes; the federation will let exactly one win and the
   bookkeeping of both is garbage. One seed, one live `client.db`, one daemon.
 
-### 3a. Prefer WSS-transport federations
+### 3a. Ledger integrity alerts: preserve, repair, then retry
+
+`/v1/status` is money-dry (it admits no operation) but performs live probes, not an offline cached
+preview: it requires a live `Runtime` and returns `503` without one. Its successor arithmetic is
+checked — an occurrence floor of `u64::MAX - 1` previews the one legal `u64::MAX` daemon cycle; a
+floor already at `u64::MAX` returns `503` because no next occurrence exists.
+
+Before every ledger append, an O(1) descending tail check requires the ledger counter to be exactly
+one greater than the highest canonical ledger-row key (and both to be empty/zero together). A missing
+or low counter, a counter hole, or a malformed highest physical tail makes the next sequence
+unknowable, so it fences **all fresh ledger admissions**, User and Agent alike, rather than letting an
+append overwrite physical history at a falsely low sequence. Stop the daemon and restore both counter
+and ledger from one consistent trusted backup under exclusive stopped-wallet ownership. If no such
+backup exists, leave the wallet fail-closed and escalate. Reads and updates to an already-addressed
+row can remain available subject to their own integrity checks; do not infer from that that a new
+money operation is safe to admit.
+
+### 3b. Prefer WSS-transport federations
 
 Choose federations whose guardians speak the **WebSocket (WSS)** API transport. The iroh
 transport's long-poll can STALL on sustained waits — a cross-fed Move's receive-claim await
@@ -122,9 +139,11 @@ pilot, 75k sats per fed is what makes the enforced caps imply a ~150k sat total:
 #   bound evacuations — see the evac pair below.
 # 3% proportional cap on funding moves (top-up/standby)
 # 200 sats + 3% evacuation cap, computed from the net the DESTINATION IS CREDITED. These are
-#   the evacuation knobs; --max-fee is not. Raising them affects evacuations decided
-#   AFTERWARDS — a pending one carries the pair it was admitted with, so this is not a lever
-#   for releasing an evacuation that is already retrying.
+#   the evacuation knobs; --max-fee is not. Admitted evacuations are immutable generally.
+#   Only a pre-artifact agent evacuation with durable typed structural-refusal evidence can be
+#   atomically replaced, and only by a component-wise monotone effective cap increase at its
+#   measured sample; an empty bounded probe stays Retryable evidence, not route-unavailability
+#   proof. Do not treat ordinary policy edits as a release lever.
 wallet-cli policy set \
   --per-fed-cap 75000000 \
   --spending-target 50000000 \
@@ -151,6 +170,41 @@ bps value entered as if it were msat silently widens the cap by orders of magnit
 
 `--evac-fee-base-msat` is msat, like the rest. Raise any of them only after a clean first week.)
 
+### 4a. Structural evacuation-refusal incident
+
+A normal route or fee failure is **not** a release incident. First inspect the affected evacuation
+with `wallet-cli show <key>` and distinguish an ordinary retryable refusal from the durable typed
+**structural-refusal marker**: only the latter is the pre-artifact Agent-evacuation exception below.
+Do not infer the marker from a generic failed row, a no-op policy edit, or a crossed cap.
+
+For a marked structural refusal, preserve the diagnostic and increase the evacuation cap
+component-wise (`evac_fee_base_msat` and/or `evac_fee_bps`) so the **effective cap at the marker's
+measured delivered-net sample** is monotone higher. Store the policy change and verify it with
+`wallet-cli policy get`. On its next **healthy whole-view** scheduler tick, a daemon atomically
+retires the marked parent and creates a linked fresh replacement. A partial-view recovery-only
+cycle cannot create that sidecar: it may instead retry the
+already-admitted old work (which can finish without a replacement) or re-mark it for the later
+healthy planner tick. For an exclusive standalone
+`wallet-cli --standalone tick`, supply a fresh `--occurrence` strictly greater than the marked
+Agent occurrence; it must never reuse the marked occurrence. `wallet-cli --standalone status` is a
+diagnostic: with a stale/default occurrence it warns, returns the full scored/designation report, and
+shows **no** would-run decisions (neither impossible child nor ordinary work deferred by that child).
+It remains dry. Use a strictly newer occurrence before treating the preview as actionable or running
+`tick`; daemon status remains strict because the daemon owns allocation.
+
+Replacement-path errors do **not** release this marker. Validation, admission, fresh-blocker, stale
+parent/CAS-false, and confirmed-uncommitted exchange errors retain the exact Pending parent, create no
+child or sidecar, and require no manual `upsert`, re-mark, or reconcile. Correct the reported policy,
+balance, or blocker issue and retry `wallet-cli --standalone tick` with an occurrence strictly newer
+than the marked parent (the same valid N+1 is acceptable after a confirmed-uncommitted fault). Only a
+successful exchange—or a post-error exchange confirmed committed—retires the parent. This is separate
+from the planner's authoritative no-child marker disposition, which can intentionally clear its exact
+marker when no replacement is selected.
+
+Ordinary policy edits do not release the marker. Neither a no-op change nor an edit whose effective
+cap at the measured sample is unchanged or lower can create a replacement; nor can merely crossing
+some other cap. If the daemon's next tick does not create the linked child, retain the history and
+diagnostic and investigate rather than repeatedly re-running the old occurrence.
 ## Automated — page on what the glance cannot catch
 
 The daily glance below is a HUMAN check, and every outage this wallet has had survived precisely
@@ -249,6 +303,28 @@ systemctl --user show walletd -p NRestarts
 curl -s -H "Authorization: Bearer $(cat "$WALLETD_TOKEN_PATH")" \
   http://127.0.0.1:9736/v1/health \
   | jq -e '.scheduler_alive == true' >/dev/null && echo alive || echo "SCHEDULER DOWN"
+
+# 5. Watch checkpoint: a non-200 here is a storage or tail/counter fence, not a scheduler stall.
+watch_body=$(mktemp)
+# Bounded on purpose: /v1/watch/status is a durable checkpoint read, so a daemon that accepts
+# the connection but never answers is itself the finding. Without these an unresponsive walletd
+# hangs the operator's check forever instead of reporting a transport failure.
+if watch_http=$(curl -sS --connect-timeout 5 --max-time 15 -o "$watch_body" -w '%{http_code}' \
+  -H "Authorization: Bearer $(cat "$WALLETD_TOKEN_PATH")" \
+  http://127.0.0.1:9736/v1/watch/status); then
+  watch_curl=0
+else
+  watch_curl=$?
+fi
+if [ "$watch_curl" -ne 0 ]; then
+  echo "WATCH STATUS TRANSPORT FAILURE (curl exit $watch_curl)" >&2
+elif [ "$watch_http" != 200 ]; then
+  echo "WATCH STATUS NON-200 ($watch_http): possible tail/counter or storage fence" >&2
+  cat "$watch_body" >&2
+else
+  jq -r '"watch occurrence \(.occurrence), discover_backlog \(.discover_backlog)"' "$watch_body"
+fi
+rm -f "$watch_body"
 ```
 
 The `/v1/health` status-code-is-always-200 shape is deliberate (the API requires the bearer

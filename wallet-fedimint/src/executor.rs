@@ -49,8 +49,8 @@ use std::collections::BTreeMap;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use wallet_core::{
-    Action, Actor, AllocatorGoal, EvacFeeCap, ExecError, Executor, FederationId, Intent, Journal,
-    Msat, OperationId, PerformOutcome,
+    Action, Actor, AllocatorGoal, EvacFeeCap, EvacuationQuoteSample, EvacuationRefusalEvidence,
+    ExecError, Executor, FederationId, Intent, Journal, Msat, OperationId, PerformOutcome,
 };
 
 /// Pinned lnv2 requires the gateway-reduced incoming contract to be at least 5 sats
@@ -237,6 +237,7 @@ fn raw_pay_quote_error(lowest_quote: Option<u64>, fee_cap: Msat, from: Federatio
 fn pre_fund_reservation_error(error: ExecError) -> ExecError {
     let reason = match error {
         ExecError::Retryable(reason) | ExecError::Permanent(reason) => reason,
+        ExecError::StructuralEvacuationRefusal(evidence) => evidence.diagnostic,
         ExecError::Unsupported => "reservation journal read is unsupported".to_owned(),
     };
     ExecError::Retryable(format!(
@@ -895,6 +896,19 @@ impl FedimintExecutor {
                     desired.0, spendable.0, cap.base_msat.0, cap.bps
                 )));
             }
+            EvacuationSizing::StructuralRefused(evidence) => {
+                tracing::warn!(
+                    from = %from.to_hex(),
+                    to = %to.to_hex(),
+                    requested_msat = desired.0,
+                    spendable_msat = spendable.0,
+                    cap_base_msat = cap.base_msat.0,
+                    cap_bps = cap.bps,
+                    "executor: no evacuable amount fits — {}",
+                    evidence.diagnostic
+                );
+                return Err(ExecError::StructuralEvacuationRefusal(evidence));
+            }
         };
         if amount < desired {
             tracing::warn!(
@@ -1179,7 +1193,9 @@ impl FedimintExecutor {
                             "allocator pre-fund admission: corrupt derived record; retaining strict reservation"
                         );
                     }
-                    Err(error @ ExecError::Retryable(_)) | Err(error @ ExecError::Unsupported) => {
+                    Err(error @ ExecError::Retryable(_))
+                    | Err(error @ ExecError::StructuralEvacuationRefusal(_))
+                    | Err(error @ ExecError::Unsupported) => {
                         return Err(pre_fund_reservation_error(error));
                     }
                 }
@@ -2301,6 +2317,9 @@ enum EvacuationSizing {
     /// samples of a fee curve that is not monotone, so probe exhaustion is INCONCLUSIVE, never
     /// proof, and no branch that lacks two currently-affordable points recommends a fee change.
     Refused(String),
+    /// The same retryable refusal, with the measured two-point structural diagnostic retained in a
+    /// typed durable form rather than requiring the journal to parse prose.
+    StructuralRefused(EvacuationRefusalEvidence),
 }
 
 /// The result of the two-pass sizing search.
@@ -2577,9 +2596,7 @@ where
     let oscillation = oscillation_bound(spendable);
     let search = search_evacuation_net(desired, spendable, cap, oscillation, &mut quote).await?;
     let Some(sized) = search.sized else {
-        return Ok(EvacuationSizing::Refused(
-            no_fitting_amount_reason(cap, spendable, &search, &mut quote).await?,
-        ));
+        return no_fitting_amount_reason(desired, cap, spendable, &search, &mut quote).await;
     };
     evacuation_viability(sized, spendable, cap, oscillation, &mut quote).await
 }
@@ -2590,8 +2607,8 @@ where
 ///
 /// BOTH sample points are quoted HERE, back to back, and that is the point of this function's
 /// shape. The trend it measures is the operator's evidence that a refusal is structural rather
-/// than incidental — it does NOT recommend changing a knob, because a policy change cannot release
-/// an already-admitted evacuation (see the structural message, and `br-n8o`) — so it must not be
+/// than incidental — it does not itself recommend changing a knob. Only the separately
+/// policy-qualified `br-n8o` exchange can replace a marked pre-artifact evacuation — so it must not be
 /// computed from a cost cached earlier in the search: the execution path already refuses to act on anything but a fresh quote (the pass-1
 /// re-quote and the pass-2 revalidation exist because another intent can move the source's note
 /// inventory mid-search), and it would be incoherent to hold the operator-facing diagnosis to a
@@ -2608,11 +2625,12 @@ where
 /// version could emit a FALSE recommendation to move a money knob — a delayed true positive beats
 /// a false one that drives operator action.
 async fn no_fitting_amount_reason<F, Fut>(
+    desired: Msat,
     cap: EvacFeeCap,
     spendable: Msat,
     search: &EvacuationSearch,
     mut quote: F,
-) -> Result<String, ExecError>
+) -> Result<EvacuationSizing, ExecError>
 where
     F: FnMut(Msat) -> Fut,
     Fut: std::future::Future<Output = Result<CandidateQuote, ExecError>>,
@@ -2629,12 +2647,12 @@ where
         // when its fresh re-quote at the same amount is no longer affordable, so an earlier probe
         // may well have been affordable and then moved above budget. Saying otherwise sends an
         // operator looking for a balance that was never the problem.
-        return Ok(
+        return Ok(EvacuationSizing::Refused(
             "no affordable amount survived to the end of the search (one may have been \
              affordable earlier and then re-quoted above budget; the source may also have funds \
              in flight, and a later tick can succeed)"
                 .to_string(),
-        );
+        ));
     };
     // THE HIGH POINT FIRST, before anything is concluded from the floor. The search refused at
     // this amount, so it is the sample the refusal is actually about, and every question below is
@@ -2651,20 +2669,20 @@ where
             } => format!(", short by {shortfall} msat"),
             _ => String::new(),
         };
-        return Ok(format!(
+        return Ok(EvacuationSizing::Refused(format!(
             "the largest PROBED affordable amount {} msat no longer prices at all{gap} (a quote moved \
              mid-search; a later tick can succeed)",
             hint.0
-        ));
+        )));
     };
     if high_cost.source_debit() > spendable {
-        return Ok(format!(
+        return Ok(EvacuationSizing::Refused(format!(
             "the largest PROBED affordable amount {} msat is no longer fundable ({} msat needed against \
              {} msat spendable; a later tick can succeed)",
             hint.0,
             high_cost.source_debit().0,
             spendable.0
-        ));
+        )));
     }
     // The high point now FITS the cap: the refusal itself has gone stale, and a later tick will
     // simply succeed. Say exactly that — the sample DID hold up, it was the cap refusal that did
@@ -2673,11 +2691,11 @@ where
     // refusal path would be new money handling in the one place built on the assumption that
     // nothing is being committed.
     if fits_cap(high_cost, cap) {
-        return Ok(format!(
+        return Ok(EvacuationSizing::Refused(format!(
             "the cap no longer refuses {} msat — the quote eased after the search; a later tick \
              can succeed",
             hint.0
-        ));
+        )));
     }
     let floor = Msat(MINIMUM_INCOMING_CONTRACT_MSAT);
     let floor_quote = quote(floor).await?;
@@ -2691,11 +2709,11 @@ where
             } => format!(", short by {shortfall} msat"),
             _ => String::new(),
         };
-        return Ok(format!(
+        return Ok(EvacuationSizing::Refused(format!(
             "{} msat is affordable and over the cap, but the {} msat protocol minimum does not \
              price at all{gap}, so there is no second point to measure a trend from",
             hint.0, floor.0
-        ));
+        )));
     };
     // The slope needs two CURRENTLY affordable points, so an unfundable floor withholds it. What
     // this must NOT do is call that a balance condition rather than a fee-cap one: affordability
@@ -2705,7 +2723,7 @@ where
     // over-claim this diagnostic was just corrected for. Report both measured facts, recommend
     // nothing.
     if floor_cost.source_debit() > spendable {
-        return Ok(format!(
+        return Ok(EvacuationSizing::Refused(format!(
             "mixed state: the largest probed affordable {} msat is affordable and over the cap, \
              but the {} msat protocol \
              minimum is not currently fundable ({} msat needed against {} msat spendable), so \
@@ -2715,36 +2733,58 @@ where
             floor.0,
             floor_cost.source_debit().0,
             spendable.0
-        ));
+        )));
     }
     // Both sample points are DELIVERED nets, not asks. The cap is `base + bps*D/10_000`, so its
     // slope is exactly `bps/10_000` in D — and only in D. Sampling the asks and calling the rise
     // `bps * span` overstates the cap's trend by `bps * Δδ` (δ = ask − delivered), which can flip
     // condition (i) and assert a structural cause for an incidental miss. That is the
     // re-derivation this needed, not a substitution of one number.
-    match structural_refusal_cause(
-        cap,
-        (floor_cost.delivered_net(), floor_cost.total_fee()),
-        (high_cost.delivered_net(), high_cost.total_fee()),
-    ) {
-        Some(cause) => Ok(format!(
-            "structural refusal (measured, not proven) — {cause} (largest probed affordable ask {} msat \
+    let low_sample = EvacuationQuoteSample {
+        delivered_net: floor_cost.delivered_net(),
+        total_fee: floor_cost.total_fee(),
+        fee_cap: cap.at(floor_cost.delivered_net()),
+    };
+    let high_sample = EvacuationQuoteSample {
+        delivered_net: high_cost.delivered_net(),
+        total_fee: high_cost.total_fee(),
+        fee_cap: cap.at(high_cost.delivered_net()),
+    };
+    match structural_refusal_cause(cap, &low_sample, &high_sample) {
+        Some(cause) => {
+            let diagnostic = format!(
+                "structural refusal (measured, not proven) — {cause} (largest probed affordable ask {} msat \
              delivers {} msat and quotes {} msat of fees against a {} msat cap, both points \
-             re-quoted at diagnosis time). NOTE raising evac_fee_base_msat or evac_fee_bps will \
-             NOT release THIS evacuation: it carries the cap parameters `decide()` admitted it \
-             with, and a policy change only affects evacuations decided afterwards. While this \
-             one keeps retrying there is currently no supported way to replace it",
+             re-quoted at diagnosis time). NOTE a qualifying monotone increase of \
+             evac_fee_base_msat and/or evac_fee_bps can let walletd or standalone `tick` atomically \
+             create a linked fresh successor under the new cap; this two-point evidence is not proof \
+             that every amount remains unavailable",
             hint.0,
             high_cost.delivered_net().0,
             high_cost.total_fee().0,
-            cap.at(high_cost.delivered_net()).0
-        )),
+                cap.at(high_cost.delivered_net()).0
+            );
+            Ok(EvacuationSizing::StructuralRefused(
+                EvacuationRefusalEvidence {
+                    cap_components: cap,
+                    requested_net: desired,
+                    source_spendable: spendable,
+                    low: low_sample,
+                    high: high_sample,
+                    diagnostic,
+                    measured_at_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                },
+            ))
+        }
         // Every clause here is a CLAIM, and the search keeps no probe history to support most of
         // the ones prose invites. Four consecutive review rounds found an unsupported assertion in
         // this message, each introduced while correcting the previous one — so it now says only
         // what `sized == None` and the two diagnosis-time quotes establish, and nothing about how
         // individual probes failed. Shorten it before extending it.
-        None => Ok(format!(
+        None => Ok(EvacuationSizing::Refused(format!(
             "the bounded search produced no amount that still satisfied BOTH affordability and \
              the cap when re-quoted — pass 2 may have found one and lost it on revalidation — up \
              to the largest PROBED affordable {} msat, and the two points re-quoted at diagnosis \
@@ -2752,7 +2792,7 @@ where
              no trend indicating a structural cause — which is not the same as there being none, \
              on a fee curve that is not monotone. The refusal may clear on a later quote",
             hint.0
-        )),
+        ))),
     }
 }
 
@@ -2797,22 +2837,12 @@ where
 /// as measured, so the cause can never be reported off an extrapolation alone.
 fn structural_refusal_cause(
     cap: EvacFeeCap,
-    low: (Msat, Msat),
-    high: (Msat, Msat),
+    low: &EvacuationQuoteSample,
+    high: &EvacuationQuoteSample,
 ) -> Option<String> {
-    let (low_amount, low_fee) = (i128::from(low.0 .0), i128::from(low.1 .0));
-    let (high_amount, high_fee) = (i128::from(high.0 .0), i128::from(high.1 .0));
-    let span = high_amount - low_amount;
-    if span <= 0 {
-        // One point cannot establish a trend.
-        return None;
-    }
-    let rise = high_fee - low_fee;
-    let cap_rise = i128::from(cap.bps) * span;
-    let fee_rise = rise * 10_000;
-
+    let assessment = wallet_core::assess_evacuation_structural_refusal(cap, low, high)?;
     let mut causes = Vec::new();
-    if cap_rise >= fee_rise {
+    if assessment.fee_rises_no_faster_than_cap {
         // NEITHER condition is a proof, and an earlier revision of this comment claimed condition
         // (ii) was one — "with no sampling involved". That was wrong on its own terms: (ii)'s
         // intercept is EXTRAPOLATED from these very two samples (see the `intercept` line below),
@@ -2837,9 +2867,7 @@ fn structural_refusal_cause(
                 .to_string(),
         );
     }
-    // The fixed component of the measured line: `fee(a) − s_f*a` at the low point.
-    let intercept = low_fee - rise * low_amount / span;
-    if fee_rise >= cap_rise && intercept > i128::from(cap.base_msat.0) && low.1 > cap.at(low.0) {
+    if assessment.fixed_component_exceeds_cap_base {
         causes.push(format!(
             "the fixed component alone — both gateways' bases plus the fixed federation and \
              per-note mint fees, ~{intercept} msat — exceeds the cap base {} msat, and the fee \
@@ -2847,7 +2875,8 @@ fn structural_refusal_cause(
              size. NOTE this intercept is EXTRAPOLATED from the same two samples \
              on a fee curve that is NOT monotone — evidence, not proof, since a per-note fee drop \
              at an unprobed boundary can still let an intermediate amount serve",
-            cap.base_msat.0
+            cap.base_msat.0,
+            intercept = assessment.fixed_component_msat,
         ));
     }
     (!causes.is_empty()).then(|| causes.join("; "))
@@ -3143,10 +3172,9 @@ fn maybe_crash(_point: &str) {}
 
 /// Whether the `WALLET_CLI_CRASH_AT` value (`None` when unset) selects `point`. Split out from
 /// [`maybe_crash`] so the match logic is unit-tested WITHOUT touching process-global env or the
-/// uncatchable abort path. In a `--release` non-test build the hook above is elided and this
-/// predicate is unused; it stays defined (and tested) rather than gated so `cargo test --release`
-/// still compiles the unit test.
-#[cfg_attr(not(debug_assertions), allow(dead_code))]
+/// uncatchable abort path. The predicate is compiled for debug builds and tests, including
+/// `cargo test --release`, but not into a non-test release binary where the hook is absent.
+#[cfg(any(debug_assertions, test))]
 fn crash_point_matches(configured: Option<&str>, point: &str) -> bool {
     configured == Some(point)
 }
@@ -3501,6 +3529,7 @@ mod tests {
             created_at_ms: 0,
             operation_id: None,
             invoice: None,
+            evacuation_refusal: None,
         }
     }
 
@@ -5344,19 +5373,12 @@ mod tests {
         );
     }
 
-    /// A structural refusal must NOT promise that raising a fee knob releases THIS evacuation.
-    ///
-    /// It cannot. The pending `Action` carries the `(base, bps)` pair `decide()` admitted it with
-    /// and the executor recomputes from those, so a policy change only reaches evacuations decided
-    /// afterwards. Meanwhile the refusal stays `Retryable`, nothing terminalizes it, and it retries
-    /// the old cap indefinitely. br-p93 lets independent goals proceed, but conflict-suppresses a
-    /// recurring `Evacuate(A)` and allocator funding that touches A, so no fresh action for this
-    /// goal is created. An operator following the old advice would believe they had released
-    /// stranded funds.
-    ///
-    /// `br-n8o` owns terminalization/supersession; br-p93 is the conflict-suppression mechanism.
+    /// A structural refusal must describe the available policy remedy without turning two sampled
+    /// points into proof. A qualifying component-wise monotone cap increase is consumed by walletd
+    /// and standalone `tick` as an atomic, linked successor exchange; an equal/crossed/decreased
+    /// update is deliberately not a release.
     #[tokio::test]
-    async fn a_structural_refusal_says_a_policy_change_will_not_release_this_evacuation() {
+    async fn a_structural_refusal_names_the_qualified_successor_policy_remedy() {
         let route = TestRoute::new(gw(49_000, 2_500), gw(99_000, 2_500));
         let cap = EvacFeeCap {
             base_msat: Msat(100_000),
@@ -5369,12 +5391,20 @@ mod tests {
             "fixture must reach the structural diagnostic: {reason}"
         );
         assert!(
-            reason.contains("will NOT release THIS evacuation"),
-            "the recommendation must not promise an action that cannot work: {reason}"
+            reason.contains("qualifying monotone increase")
+                && reason.contains("evac_fee_base_msat")
+                && reason.contains("evac_fee_bps"),
+            "the diagnostic must name the qualified policy remedy: {reason}"
         );
         assert!(
-            reason.contains("no supported way to replace it"),
-            "and must say plainly that no replacement path exists yet: {reason}"
+            reason.contains(
+                "walletd or standalone `tick` atomically create a linked fresh successor"
+            ),
+            "the diagnostic must name the linked atomic replacement path: {reason}"
+        );
+        assert!(
+            reason.contains("not proof"),
+            "the remedy must retain the two-point evidence caveat: {reason}"
         );
     }
 
@@ -5631,7 +5661,11 @@ mod tests {
         fn expect_sized(&self) -> Msat {
             match self {
                 EvacuationSizing::Sized(net) => *net,
-                EvacuationSizing::Refused(reason) => {
+                EvacuationSizing::Refused(reason)
+                | EvacuationSizing::StructuralRefused(EvacuationRefusalEvidence {
+                    diagnostic: reason,
+                    ..
+                }) => {
                     panic!("expected a sized evacuation: {reason}")
                 }
             }
@@ -5641,6 +5675,7 @@ mod tests {
             match self {
                 EvacuationSizing::Sized(net) => panic!("expected a refusal, got {net:?}"),
                 EvacuationSizing::Refused(reason) => reason,
+                EvacuationSizing::StructuralRefused(evidence) => &evidence.diagnostic,
             }
         }
     }
@@ -5698,6 +5733,53 @@ mod tests {
             rec.fee_cap,
             Msat(2_450_000),
             "keeping the planned cap would authorise more than 10x the entitlement"
+        );
+    }
+
+    /// A supersession child carries B's components into the real executor
+    /// sizing/enforcement composition.  Do not substitute the parent's
+    /// absolute A cap here: that would make the replacement structurally
+    /// pointless and reject a payment B authorizes.
+    #[test]
+    fn replacement_child_b_is_the_executor_cap_rule_and_executed_net_cap() {
+        let cap_a = EvacFeeCap {
+            base_msat: Msat(10_000),
+            bps: 0,
+        };
+        let cap_b = EvacFeeCap {
+            base_msat: Msat(20_000),
+            bps: 200,
+        };
+        let planned = Msat(1_000_000);
+        let executed_net = Msat(500_000);
+        let child_b = Action::Evacuate {
+            from: FED_A,
+            to: FED_B,
+            amount: planned,
+            fee_cap: cap_b.at(planned),
+            gateway: None,
+            fee_cap_components: Some(cap_b),
+        };
+        let plan = MovePlan::from_action(&child_b).expect("replacement child is executable");
+        let rule = evacuation_cap_rule(plan.fee_cap_components, plan.fee_cap);
+        assert_eq!(rule, cap_b, "the production plan selects B, never A");
+        let mut rec = evacuation_record(plan.amount, plan.fee_cap);
+        apply_evacuation_sizing(&mut rec, rule, executed_net);
+        assert_eq!(rec.amount, executed_net);
+        assert_eq!(rec.fee_cap, cap_b.at(executed_net));
+
+        // The same actual fee is legal under B at what moved, but A's old
+        // absolute cap would refuse.  This is the cap passed into the real
+        // Pay-step predicate after `apply_evacuation_sizing`.
+        let actual_receive = Msat(20_000);
+        let actual_send = Msat(10_000);
+        assert!(
+            pay_step_cap_verdict(actual_receive, actual_send, rec.fee_cap).is_ok(),
+            "B permits the executed replacement"
+        );
+        assert!(
+            pay_step_cap_verdict(actual_receive, actual_send, cap_a.at(planned)).is_err(),
+            "using old A's absolute planned cap must refuse"
         );
     }
 
@@ -6274,7 +6356,108 @@ mod tests {
                      is what makes 'nothing smaller helps' follow: {reason}"
                 );
             }
+            EvacuationSizing::StructuralRefused(evidence) => {
+                let reason = evidence.diagnostic;
+                assert!(
+                    reason.contains("structural refusal"),
+                    "a structural refusal must carry the diagnostic: {reason}"
+                );
+            }
         }
+    }
+
+    /// br-n8o's load-bearing seam: evidence the REAL producer builds must be qualifiable.
+    ///
+    /// Every replacement test in `service::tests` hand-builds its `EvacuationRefusalEvidence`
+    /// (`ReplacementHandoffExecutor` picks `low.delivered_net = Msat(10)` and
+    /// `total_fee = cap.at(net) + 1`). That proves the exchange machinery, but it proves nothing
+    /// about the object production actually emits — the two are structurally disjoint, and
+    /// `evacuation_cap_qualifies_replacement` is the gate BOTH the journal and the planner apply
+    /// to the real one.
+    ///
+    /// So the whole br-n8o mechanism rests on a property nothing asserted: that a cap raise can
+    /// ever gain integer room at one of the samples `size_evacuation` chose. Qualification needs
+    /// `new_cap.at(net) > old.at(net)` at `low` or `high`; if the producer emitted a degenerate
+    /// pair the mechanism would ship dead on arrival with every other test green. This drives the
+    /// real search and hands its output to the real gate.
+    #[tokio::test]
+    async fn production_built_refusal_evidence_can_qualify_a_cap_raise() {
+        // The same shape the structural-refusal fixture above uses: a fat send base the cap
+        // cannot absorb at any affordable size.
+        let route = TestRoute::new(gw(3, 0), gw(99_999, 29_999));
+        let cap = EvacFeeCap {
+            base_msat: Msat(100_000),
+            bps: 300,
+        };
+        let spendable = Msat(1_130_002);
+
+        let EvacuationSizing::StructuralRefused(evidence) =
+            route.size(spendable, spendable, cap).await
+        else {
+            panic!("this fixture must produce a STRUCTURAL refusal to have evidence to test");
+        };
+
+        // The producer must record what it actually measured, not placeholders: a degenerate or
+        // zero sample is exactly what would silently break qualification.
+        assert_eq!(evidence.cap_components, cap);
+        assert!(
+            evidence.low.delivered_net.0 > 0 && evidence.high.delivered_net.0 > 0,
+            "both samples must be real amounts: {evidence:?}"
+        );
+        assert!(
+            evidence.low.delivered_net < evidence.high.delivered_net,
+            "the two samples must be DISTINCT, or a bps raise can never gain room at either:              {evidence:?}"
+        );
+        for sample in [&evidence.low, &evidence.high] {
+            assert!(
+                sample.total_fee > sample.fee_cap,
+                "each sample must actually miss its cap, or it was not a refusal: {sample:?}"
+            );
+            assert_eq!(
+                sample.fee_cap,
+                cap.at(sample.delivered_net),
+                "the recorded cap must be the cap AT that sample, since qualification recomputes                  exactly this: {sample:?}"
+            );
+        }
+
+        // A no-op edit must NOT qualify — otherwise any policy write would retire a live marker.
+        assert!(
+            !wallet_core::evacuation_cap_qualifies_replacement(&evidence, cap),
+            "an unchanged cap must never qualify a replacement"
+        );
+        // Nor may a component go backwards, even if the other rises enough to gain room.
+        assert!(
+            !wallet_core::evacuation_cap_qualifies_replacement(
+                &evidence,
+                EvacFeeCap {
+                    base_msat: Msat(cap.base_msat.0 * 4),
+                    bps: cap.bps - 1,
+                },
+            ),
+            "a lowered component must veto qualification regardless of the other"
+        );
+
+        // THE property: raising a component gains integer room at a sample the PRODUCER chose.
+        let raised_base = EvacFeeCap {
+            base_msat: Msat(cap.base_msat.0 * 4),
+            bps: cap.bps,
+        };
+        assert!(
+            wallet_core::evacuation_cap_qualifies_replacement(&evidence, raised_base),
+            "a base raise must qualify production-built evidence, or an operator following the              runbook can never retire a real structural marker: {evidence:?}"
+        );
+        let raised_bps = EvacFeeCap {
+            base_msat: cap.base_msat,
+            bps: cap.bps + 100,
+        };
+        assert!(
+            wallet_core::evacuation_cap_qualifies_replacement(&evidence, raised_bps),
+            "a bps raise must also qualify: at {} and {} msat a +100 bps step is worth {} and {}              msat of room, and integer FLOOR division must not round both away: {evidence:?}",
+            evidence.low.delivered_net.0,
+            evidence.high.delivered_net.0,
+            raised_bps.at(evidence.low.delivered_net).0 - cap.at(evidence.low.delivered_net).0,
+            raised_bps.at(evidence.high.delivered_net).0 - cap.at(evidence.high.delivered_net).0,
+        );
     }
 
     /// THE PPM WARNING FIRES, AND DOES NOT GATE. Both halves: the warning is produced for a send

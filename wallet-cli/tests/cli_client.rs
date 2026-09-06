@@ -309,6 +309,61 @@ async fn history_filters_before_limit_by_following_the_cursor() {
 }
 
 #[tokio::test]
+async fn show_client_mode_prints_supersession_links_and_missing_link_fallbacks() {
+    let dir = scratch();
+    let token = write_token(&dir);
+    let mut linked = succeeded_view("evac:child");
+    linked.kind = "evacuation".to_owned();
+    linked.supersedes = Some("evac:parent".to_owned());
+    linked.superseded_by = Some("evac:grandchild".to_owned());
+    assert!(
+        !json(&linked).contains("\"evacuation_refusal_active\""),
+        "a mock daemon response with no exact linked intent must omit the field"
+    );
+    let unlinked = succeeded_view("pay:ordinary");
+    let (url, log) = spawn_mock_responses(vec![
+        MockResponse {
+            status: 200,
+            body: json(&linked),
+            delay: Duration::ZERO,
+        },
+        MockResponse {
+            status: 200,
+            body: json(&unlinked),
+            delay: Duration::ZERO,
+        },
+    ])
+    .await;
+
+    let linked_out = run_client(&url, &token, &dir, &["show", "evac:child"]).await;
+    assert_eq!(linked_out.code, Some(0), "stderr: {}", linked_out.stderr);
+    assert!(
+        linked_out.stdout.contains("supersedes: evac:parent")
+            && linked_out.stdout.contains("superseded_by: evac:grandchild")
+            && linked_out.stdout.contains("evacuation_refusal_active: -"),
+        "stdout: {}",
+        linked_out.stdout
+    );
+
+    let unlinked_out = run_client(&url, &token, &dir, &["show", "pay:ordinary"]).await;
+    assert_eq!(
+        unlinked_out.code,
+        Some(0),
+        "stderr: {}",
+        unlinked_out.stderr
+    );
+    assert!(
+        unlinked_out.stdout.contains("supersedes: -")
+            && unlinked_out.stdout.contains("superseded_by: -"),
+        "stdout: {}",
+        unlinked_out.stdout
+    );
+    let log = log.lock().unwrap();
+    assert_eq!(log[0].path, "/v1/operations/evac:child");
+    assert_eq!(log[1].path, "/v1/operations/pay:ordinary");
+}
+
+#[tokio::test]
 async fn candidates_client_mode_sorted_newest_first() {
     let dir = scratch();
     let token = write_token(&dir);
@@ -1214,6 +1269,10 @@ fn succeeded_view(key: &str) -> OperationView {
         reason: "user_initiated".to_owned(),
         operation_key: key.to_owned(),
         error: None,
+        superseded_by: None,
+        supersedes: None,
         refusal: None,
+        evacuation_refusal: None,
+        evacuation_refusal_active: None,
     }
 }

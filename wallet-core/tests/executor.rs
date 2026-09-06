@@ -53,6 +53,239 @@ fn counts(performed: usize, skipped: usize, failed: usize) -> ExecutionSummary {
     }
 }
 
+fn structural_evacuation_evidence() -> EvacuationRefusalEvidence {
+    EvacuationRefusalEvidence {
+        cap_components: EvacFeeCap {
+            base_msat: Msat(10),
+            bps: 100,
+        },
+        requested_net: Msat(100),
+        source_spendable: Msat(200),
+        low: EvacuationQuoteSample {
+            delivered_net: Msat(10),
+            total_fee: Msat(20),
+            fee_cap: Msat(10),
+        },
+        high: EvacuationQuoteSample {
+            delivered_net: Msat(100),
+            total_fee: Msat(30),
+            fee_cap: Msat(11),
+        },
+        diagnostic: "structural refusal".into(),
+        measured_at_ms: 7,
+    }
+}
+
+/// Replacement eligibility is intentionally a pure, shared cap calculation:
+/// neither the planner nor the durable exchange gets to reinterpret a policy
+/// edit.  In particular, a larger bps value which rounds to the same cap at
+/// both observed quotes is not permission to release the old reservation.
+#[test]
+fn evacuation_replacement_cap_qualification_requires_monotone_effective_room() {
+    let evidence = structural_evacuation_evidence();
+    let old = evidence.cap_components;
+    let cases = [
+        ("equal components", old, false),
+        (
+            "unrelated policy decreases bps",
+            EvacFeeCap {
+                base_msat: Msat(11),
+                bps: 0,
+            },
+            false,
+        ),
+        (
+            "base decrease",
+            EvacFeeCap {
+                base_msat: Msat(9),
+                bps: 100,
+            },
+            false,
+        ),
+        (
+            "crossed component edit",
+            EvacFeeCap {
+                base_msat: Msat(11),
+                bps: 99,
+            },
+            false,
+        ),
+        (
+            "integer-effectively-equal bps increase",
+            EvacFeeCap {
+                base_msat: Msat(10),
+                bps: 101,
+            },
+            false,
+        ),
+        (
+            "effective base-only increase",
+            EvacFeeCap {
+                base_msat: Msat(11),
+                bps: 100,
+            },
+            true,
+        ),
+        (
+            "effective bps-only increase",
+            EvacFeeCap {
+                base_msat: Msat(10),
+                bps: 200,
+            },
+            true,
+        ),
+    ];
+
+    for (name, candidate, expected) in cases {
+        assert_eq!(
+            evacuation_cap_qualifies_replacement(&evidence, candidate),
+            expected,
+            "{name}: old={old:?}, candidate={candidate:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn retry_marker_is_typed_and_claim_consumes_it() {
+    let journal = MemJournal::new();
+    let decision = decision(
+        "evac:marker",
+        Action::Evacuate {
+            from: FederationId([1; 32]),
+            to: FederationId([2; 32]),
+            amount: Msat(100),
+            fee_cap: Msat(11),
+            gateway: None,
+            fee_cap_components: Some(EvacFeeCap {
+                base_msat: Msat(10),
+                bps: 100,
+            }),
+        },
+        ReasonCode::ShutdownNotice,
+    );
+    let mut intent = Intent::from_decision(
+        &decision,
+        Actor::Agent {
+            occurrence: decision.occurrence,
+        },
+        0,
+    );
+    intent.status = IntentStatus::Executing;
+    journal.upsert(&intent).await.expect("seed executing");
+    let evidence = structural_evacuation_evidence();
+    journal
+        .reset_retryable(&intent.idempotency_key, 0, Some(evidence.clone()))
+        .await
+        .expect("persist marker");
+    assert_eq!(
+        journal
+            .get(&intent.idempotency_key)
+            .await
+            .expect("read")
+            .expect("intent")
+            .evacuation_refusal,
+        Some(evidence)
+    );
+    assert!(journal
+        .set_status_if(
+            &intent.idempotency_key,
+            0,
+            IntentStatus::Pending,
+            IntentStatus::Executing,
+        )
+        .await
+        .expect("claim"));
+    assert_eq!(
+        journal
+            .get(&intent.idempotency_key)
+            .await
+            .expect("read")
+            .expect("intent")
+            .evacuation_refusal,
+        None
+    );
+}
+
+#[test]
+fn replaceable_evacuation_record_rejects_each_protocol_artifact_but_allows_quotes() {
+    let decision = decision(
+        "evac:pristine",
+        Action::Evacuate {
+            from: FederationId([1; 32]),
+            to: FederationId([2; 32]),
+            amount: Msat(100),
+            fee_cap: Msat(11),
+            gateway: None,
+            fee_cap_components: Some(EvacFeeCap {
+                base_msat: Msat(10),
+                bps: 100,
+            }),
+        },
+        ReasonCode::ShutdownNotice,
+    );
+    let intent = Intent::from_decision(
+        &decision,
+        Actor::Agent {
+            occurrence: Occurrence(1),
+        },
+        0,
+    );
+    let pristine = MoveRecord {
+        key: intent.idempotency_key.clone(),
+        from: Some(FederationId([1; 32])),
+        to: FederationId([2; 32]),
+        amount: Msat(100),
+        fee_cap: Msat(11),
+        gateway: GatewayUrl("https://gw.example".into()),
+        send_required: true,
+        invoice: None,
+        recv_op: None,
+        send_op: None,
+        phase: MovePhase::Created,
+        outcome: None,
+        preimage: None,
+        receive_fee_quoted: Some(Msat(3)),
+        send_fee_quoted: Some(Msat(4)),
+    };
+    assert!(
+        replaceable_evacuation_record_is_pristine(&intent, &pristine),
+        "quote-only draft remains replaceable"
+    );
+    let artifacts = [
+        ("invoice", {
+            let mut row = pristine.clone();
+            row.invoice = Some(Invoice("lnbc1artifact".into()));
+            row
+        }),
+        ("recv_op", {
+            let mut row = pristine.clone();
+            row.recv_op = Some(OperationId([3; 32]));
+            row
+        }),
+        ("send_op", {
+            let mut row = pristine.clone();
+            row.send_op = Some(OperationId([4; 32]));
+            row
+        }),
+        ("preimage", {
+            let mut row = pristine.clone();
+            row.preimage = Some(Preimage([5; 32]));
+            row
+        }),
+        ("outcome", {
+            let mut row = pristine.clone();
+            row.outcome = Some("anything happened".into());
+            row
+        }),
+    ];
+    for (name, row) in artifacts {
+        assert!(
+            !replaceable_evacuation_record_is_pristine(&intent, &row),
+            "{name} is protocol progress and must fence replacement"
+        );
+    }
+}
+
 /// Like [`counts`] but with the §15.11 `retryable` sub-count set (`retryable` is a subset of
 /// `failed`, so a purely-retryable pass is `counts_with_retryable(p, s, failed, failed)`).
 fn counts_with_retryable(

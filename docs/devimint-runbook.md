@@ -954,3 +954,12 @@ in the session scratchpad (`tv3.sh`, `lnv2swap.sh`).
   `wallet-cli/tests/smoke_*_devimint.sh` are the working references.
 - Crash-resume test: kill the client/process mid-operation, reopen the client, assert the
   operation completes (the executor self-resumes) and balances are exactly-once.
+
+## 7. Inspecting a structural evacuation marker
+
+Use `wallet-cli show <operation-key> --json` (or daemon `GET /v1/operations/<key>`) and require
+`"evacuation_refusal_active": true` before treating `evacuation_refusal` as a live replacement
+marker. A superseded Failed parent deliberately retains its historical `evacuation_refusal`
+evidence and reports `"evacuation_refusal_active": false`. The field is omitted when `show` cannot
+read an exact linked intent (including malformed/degraded rows), and history omits it because it
+does not perform intent reads. Only the literal value `true` is authority to replace it.

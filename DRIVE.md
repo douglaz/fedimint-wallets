@@ -15,13 +15,102 @@ Phase 7 seed encryption, the two-gateway evacuation fallback, Android, or the
 rest of the repository backlog. Those remain next-step recommendations, not
 silent scope expansion.
 
-**Phase:** HARDEN · **Bead:** `br-n8o`
-· **Branch:** `chore/close-br-p93`
-· **Pending:** land the merged `br-p93` closeout, then implement the serialized
-  pre-artifact evacuation replacement
+**Phase:** VERIFY/HARDEN · **Bead:** `br-n8o`
+· **Branch:** `fix/br-n8o-evacuation-supersession-review`
+· **Pending:** outer-driver PR / merge / bead closure
 **Gate:** `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
-· current final-fixes tree: EXIT=0, 953 passed / 0 failed (2026-08-17);
-  complete gate log: `/tmp/pr36-final-coderabbit-cleanup-full-gate.log`
+
+## 2026-08-23: scope carve-out — this branch is now supersession only
+
+Independent review of PR #39 found two subsystems riding the supersession fix that
+`br-n8o` never asked for. Both were removed from this branch; every gate figure recorded
+BELOW this section predates that removal and does not count the current tree.
+
+- **WatchState agent-floor migration — DELETED, not split.** Four serde-defaulted WatchState
+  fields, a chunked canonical-ledger rescan that wrote on read, a 16-chunk immediate drain, a
+  scheduler preflight, an allocation fence on every Agent admission, and a two-field
+  `/v1/watch/status` health surface. It was justified as compatibility for "old direct Agent
+  admissions" on a live production store, so that store was inspected on 2026-08-23.
+
+  **The live store is the production `walletd` deployment** (see the operator runbook for its
+  location; deliberately not named here — this repository is public). It runs the deployed
+  release, has never restarted, and holds a funded balance across two mainnet federations with
+  real `receive`/`pay`/`move`/`join` history. (A first pass mistakenly checked the local systemd
+  walletd at `~/.local/share/walletd`, which is an empty duplicate — 0 sats, no federations. That
+  was the wrong wallet; the conclusion below is from the right one.)
+
+  Checked against it, the stale-checkpoint condition the migration existed to repair **does not
+  exist**: `/v1/watch/status` reports occurrence 10551, and a full ledger scan (22 pages,
+  seq 0..10677) finds the highest `Actor::Agent` occurrence is also 10551. Exactly equal.
+
+  That same scan found something else: ledger seqs **611, 614, 615 are permanently undecodable**
+  (a "missing field: diagnostics" decode error, tens of thousands of log warnings — filed as
+  `br-yjg`, fixed in #42). The deleted
+  subsystem treats an unreadable canonical row as repair-only, so `agent_floor_reconciled` would
+  have stayed false and `advance_watch_occurrence`, `observe_watch_occurrence`, the scheduler
+  preflight, and every fresh Agent ledger admission would have failed closed until an operator
+  restored those exact bytes from backup — pinned by its own deleted test
+  `legacy_watch_floor_scan_skips_corrupt_rows_without_marking_reconciled`. Deploying it onto this
+  wallet would have permanently stopped the automated scheduler on a store holding real sats.
+
+  The invariant it protected is now held by `note_ledger_insert_in` (raises the floor in the same
+  transaction as any Agent ledger append) plus `max_agent_occurrence_in` (seeds an absent
+  checkpoint from `Actor::Agent` rows, not only `OperationKind::Tick`). The O(1) counter/tail
+  check is retained; it fences every fresh ledger append and is unrelated to the floor scan.
+- **Partial/corrupt federation world-view gates — SPLIT to `fix/corrupt-registry-partial-world-gates`,
+  stacked on this branch.** `/v1/status` 503s, the scheduler poison-row gate, and the standalone
+  `tick`/`status` refusal. Unchanged; stacked rather than rebased onto `main` because the
+  scheduler gate uses this branch's recovery-only cycle.
+- **The `HISTORY_PAGE_LIMIT_MAX = 500` cap stays here.** It is not scope creep: `history` now
+  batch-reads supersession sidecars for a whole page in one journal snapshot, so an unbounded
+  `limit` is an unbounded read this change introduced.
+
+· **gate at the 2026-08-23 carve-out** (superseded; PR HEAD is higher — see below):
+  `REAL_GATE_EXIT=0`, **1050 passed / 0 failed** across
+  24 result lines (2026-08-23); complete gate log:
+  `/tmp/claude-1000/-home-master-p-fedimint-wallets/700ceac2-65b9-4c36-887b-993fcccf8005/scratchpad/gate-r4.log`.
+  The stacked gates branch gates at `REAL_GATE_EXIT=0`, **1055 passed / 0 failed** across
+  24 result lines (`.../scratchpad/gate-rbranch.log`).
+
+· **PR HEAD (`fix/br-n8o-evacuation-supersession-review`, 2026-09-03):** `REAL_GATE_EXIT=0`,
+  **1063 passed / 0 failed**. Every figure above is labelled with the branch and date it was
+  measured on; read this one as the current release evidence and the others as history. The
+  delta over the carve-out figure is the merges of #41-#44 plus three tests added since: the
+  producer-evidence qualification test, the live supersession gate, and the watch-floor seeding
+  regression found in review.
+
+## Superseded evidence (pre-carve-out tree)
+
+· final release tree gate: `GATE_EXIT=0`, 1101 passed / 0 failed across 24 result lines
+  (2026-08-20);
+  complete gate log: `/tmp/br-n8o-coderabbit-full-workspace-gate.log`.
+· pre-history-pagination parked-handoff/real-corruption discrimination gate: `GATE_EXIT=0`,
+  1098 passed / 0 failed across 24 result lines (2026-08-20);
+  complete gate log: `/tmp/final-discrimination-expanded-full-workspace-gate.log`.
+  Focused `wallet-fedimint` fmt and strict clippy also exited 0
+  (`/tmp/final-discrimination-final-fmt.log`,
+  `/tmp/final-discrimination-final-clippy.log`), and the seven focused regressions exited 0
+  (`/tmp/final-discrimination-pass-*.log`).  Production-behavior mutations went red as intended:
+  removing plan-error tick terminalization left `Started`; removing token-failure cleanup left
+  `(1, true)`; removing the retained-marker error-arm consume made the following reconcile re-drive
+  the parent; and marking CommitTick invoked only on `Ok` abandoned the queue to `(0, false)`
+  (`/tmp/final-discrimination-*-red.log`).
+· pre-final-discrimination WatchState/replacement-liveness tree: `GATE_EXIT=0`, 1097 passed / 0 failed across
+  24 result lines (2026-08-18);
+  complete gate log: `/tmp/opus-dual-shape-full-workspace-gate.log`.
+· pre-partial-restored-state correction: `GATE_EXIT=0` (2026-08-18);
+  complete gate log: `/tmp/watchstate-final-full-gate.log`. It predates the correction below.
+· pre-WatchState-final-hardening baseline: `GATE_EXIT=0`, 1054 passed / 0 failed (2026-08-18);
+  complete gate log: `/tmp/br-n8o-final3-workspace-gate.log`. It predates the changes recorded
+  below and is not a gate claim for this working tree. Superseded 1044-test evidence
+  (`/tmp/br-n8o-ultimate2-workspace-gate.log`), 1029-test evidence
+  (`/tmp/br-n8o-final-workspace-gate.log`) and 1025-test evidence
+  (`/tmp/n8o-display-tristate-full-workspace-gate.log`) and earlier 1008-, 1011-, 1012- and
+  1013-test runs (`/tmp/rb-lite-p3-full-workspace-gate.log`,
+  `/tmp/n8o-r3-iter3-workspace-gate.log`, `/tmp/n8o-sf-r1-workspace-gate.log`,
+  `/tmp/n8o-i3-workspace-gate.log`) were accurate when written but predate
+  regressions added by the later review rounds below, so they no longer count
+  this tree.
 · landed baseline on `main` `410eb2f`: GitHub fmt/clippy/test and Nix package/image
   jobs succeeded in run 31822761409 (2026-08-14)
 · baseline on `main` `097e461`: EXIT=0, 792 passed / 0 failed (2026-08-12)
@@ -42,10 +131,630 @@ silent scope expansion.
 
 ## Done
 
+### Final accepted liveness dispositions (current working tree; uncommitted)
+
+- **Watch-floor liveness — accepted.** Agent ledger appends atomically advance the durable scan
+  high-water only when an initialized reconciled frontier exactly equals their sequence, and still
+  fence/reconcile and raise the occurrence floor. User appends deliberately avoid the WatchState hot
+  row; allocation later discovers them from the ledger counter and drains the suffix. Allocation and
+  standalone observation process a bounded, yielding series of valid 256-row chunks. Before any
+  planner-marker handoff, the daemon chains bounded valid-backlog batches rather than waiting for its
+   normal cadence; standalone reports the durable high-water and requires the explicit same-tick
+   retry. Unreadable rows remain repair-only fail-closed while durable intent recovery continues.
+- **Opus P1 floor authority, P2 standalone marker retention, and P3 status disposition — accepted.**
+  A legacy direct Agent admission can leave WatchState below its ledger, while an unreadable
+  canonical row can contain any `u64`; neither a high scalar nor `u64::MAX` is a safe override, so
+  advance, standalone observation, and fresh Agent admission remain fenced until exact-row restore.
+  Standalone replacement validation/admission/blocker/CAS-false/confirmed-uncommitted errors now
+  retain their exact Pending parent with no child or sidecar; a later strictly newer child exchanges
+  it directly, while the distinct authoritative no-child disposition still clears. Status has the
+  named private `StandaloneDiagnostic`/`DaemonStrict` mode: stale/default standalone status warns and
+  returns populated scored/designation diagnostics with no decisions, whereas daemon status remains
+  strict; standalone `u64::MAX` rejection is unchanged. Focused P1/P2/P3 regressions, including the
+  middle-chain retry without re-mark, marker-disposition clear, and daemon strict/MAX cases, exited
+  0 in `/tmp/opus-p1-p3-focused-green.log`; relevant fmt plus strict `wallet-fedimint`/`wallet-cli`
+  Clippy exited 0 in `/tmp/opus-p1-p3-focused-strict.log`. Deliberately clearing the
+  confirmed-uncommitted marker made the exact-marker assertion fail (EXIT=101,
+  `/tmp/opus-p2-marker-retention-mutation-red.log`); omitting stale standalone status's local
+  decision clear made its no-impossible-child assertion fail (EXIT=101,
+  `/tmp/opus-p3-stale-status-mutation-red.log`). Restored exact workspace gate:
+  `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
+  exited `GATE_EXIT=0`, 1089 passed / 0 failed across 24 result lines
+  (`/tmp/opus-p1-p3-full-workspace-gate.log`).
+- **Standalone dual marker-outcome guard — accepted.** A forged test-only TickPlan carrying both a
+  replacement and a separate no-child marker disposition now terminalizes its already-open Tick
+  audit row as Failed before any marker clear, child, sidecar, deferred audit, or executor action;
+  both exact parents remain repair evidence. Removing only that guard let the forged plan complete
+  and made the guard-diagnostic assertion fail (EXIT=101,
+  `/tmp/opus-dual-shape-guard-mutation-red.log`). Restored focused regression plus strict
+  `wallet-fedimint` Clippy exited 0 (`/tmp/opus-dual-shape-focused-green.log`); the final exact
+  workspace gate exited `GATE_EXIT=0`, 1097 passed / 0 failed across 24 result lines
+  (`/tmp/opus-dual-shape-full-workspace-gate.log`).
+- **Federation-registry poison is an unknown world — accepted.** The daemon status preview and
+  production scheduler use the federation-list report rather than silently accepting its
+  poison-tolerant healthy subset. `/v1/status` returns an actionable `503` before its dry-run when
+  any row was skipped. The scheduler logs the count, opens no federation and creates no fresh
+  Tick/probe/discovery work, retains default deadlines, and runs only durable recovery (including
+  RecoveryOnly marker redrive). Operators preserve the data directory and repair the exact row;
+  they never delete it or re-join around it. The deterministic raw-row regressions pin both the
+  dry-run fence and recovery-without-fresh-decision behavior. Reverting either report gate made
+  its focused regression fail at the handler `503` or default-deadline assertion (both `EXIT=101`,
+  `/tmp/codex-p2-mutation-handler-red.log` and
+  `/tmp/codex-p2-mutation-scheduler-red.log`); restored focused strict checks and the exact
+  workspace gate exited 0 (`/tmp/codex-p2-focused-strict-clippy.log` and
+  `/tmp/codex-p2-full-workspace-gate.log`). The final discrimination regressions now start daemon
+  status with an absent raw WatchState and prove its raw `0x0a` row remains absent after the `503`,
+  with no persisted probe/Tick; the scheduler pairs a healthy retry-open fixture and counting
+  discovery source with the corrupt row, proving recovery still completes while neither opens nor
+  discovery work begins. Removing each report gate made its focused assertion fail (`EXIT=101`,
+  `/tmp/corrupt-registry-daemon-gate-mutation-red.log` and
+  `/tmp/corrupt-registry-scheduler-gate-mutation-red.log`). The focused daemon/scheduler and exact
+  standalone warning regressions exited 0 (`/tmp/corrupt-registry-focused-green.log`); focused fmt
+  and strict Clippy for both affected packages exited 0
+  (`/tmp/corrupt-registry-focused-strict.log`). The final exact workspace gate exited
+  `GATE_EXIT=0` (`/tmp/corrupt-registry-full-workspace-gate.log`).
+- **Replacement pre-exchange storage faults — accepted.** Parent, pending/blocker, and reservation
+  projection read faults retain the exact structural marker in actor and standalone paths; no-child
+  authoritative/CAS-miss paths remain the only marker-clear paths. Confirmation retries a bounded
+  number of transient (`Retryable`) read failures and treats permanent/mixed confirmation as
+  ambiguous. A `Permanent` error returned directly by the replacement autocommit is a rolled-back
+  closure/validation result, so the actor retains the marker and consumes its parked handoff without
+  poisoning wallet-wide goal or balance authority. The next occurrence uses a distinct child key and
+  can self-heal. The scheduler-shaped regression and existing Retryable ambiguity checks passed in
+  `/tmp/opus-p2-replacement-regressions.log`; mutating the rolled-back Permanent classification back
+  to global ambiguity exited 101 at the no-poison assertion
+  (`/tmp/opus-p2-permanent-ambiguous-mutation.log`). The following exact workspace gate passed with
+  1086 tests (`/tmp/opus-p2p3-final-workspace-gate.log`).
+- **Evidence run in this pass:** `cargo test -p wallet-fedimint --test journal` exited 0 (60 tests)
+  in `/tmp/krsp-journal3.log`; `cargo test -p wallet-fedimint --lib` exited 0 (532 tests) in
+  `/tmp/krsp-lib2.log`; the repository gate exited 0 in `/tmp/krsp-full-gate.log`. The later
+  exact-budget/pure-retry, forced-autocommit-conflict, and poisoned-reconcile marker checks exited
+  0 in `/tmp/reviewer-followup-focused.log` and `/tmp/poison-regression2.log`; those focused
+  checks were followed by the full workspace gate exiting 0 in `/tmp/final-followup-gate.log`.
+  The scheduler's typed immediate-retry classifier and pure 16-chunk checkpoint inspection passed
+  focused checks in `/tmp/classifier-focused.log` and the subsequent workspace gate in
+  `/tmp/classifier-full-gate.log`. Forced migration/discovery WatchState autocommit conflicts and
+  standalone marker-clear parity passed in `/tmp/conflicts-expanded.log` and
+  `/tmp/standalone-parity.log`; the following workspace gate exited 0 in
+  `/tmp/expanded-full-gate.log`. The standalone parity red mutation exited 101 at its independent
+  work assertion in `/tmp/standalone-parity-red.log`. The final exact workspace gate exited 0 with
+  1084 passed / 0 failed across 24 result lines (`/tmp/br-n8o-release-final-gate.log`). The
+  exact-pin live two-federation smoke also exited 0: it funded A, performed one allocator-selected
+  A-to-B standby move (`performed=1 skipped=0 failed=0 retryable=0`), moved A from 2,999,950 to
+  1,982,862 msat and B from 0 to 999,998 msat, then refused terminal-occurrence replay without
+  moving funds (`/tmp/br-n8o-release-live-tick-final.log`).
+
+### Final formal findings disposition (current uncommitted hardening pass)
+
+- **Final-review correction, bounded WatchState floor migration — updated.**
+  `WatchState` serde-defaults the live-row reconciliation bit plus explicit migration initialization,
+  exclusive ledger high-water, and exact unreadable canonical-ledger keys. A legacy/absent-state access is
+  intentionally a migration **writer**: it performs one bounded (256-row) canonical sequence scan,
+  retains the highest readable `Actor::Agent` occurrence, persists the high-water and exact corrupt keys, and exposes
+  `agent_floor_reconciled` plus the unreadable-row count at `/v1/watch/status`. The bit covers
+  canonical counter-addressable sequence rows, not noncanonical poison rows; the latter retain
+  their separate history/budget handling. A persisted reconciled state whose high-water differs
+  from the validated counter is made unreconciled and progresses through bounded canonical chunks
+  before another Agent allocation. Later unreconciled accesses normally retry only those exact keys
+  and direct rows appended after the durable high-water; a valid repair clears its key and can raise
+  the floor. The restore-specific exception is a partial checkpoint whose high-water is ahead of the
+  validated ledger: its incompatible remembered keys are cleared, its scan restarts at zero, and its
+  occurrence is retained as a monotonic floor. An O(1) descending tail check requires the counter
+  to name exactly the successor of the highest canonical ledger key; a counter hole, low/missing
+  counter, or malformed tail fails closed until counter and ledger are restored from one consistent
+  backup. Initial and later tail-consistent counter-row reads are bounded
+  to 256 direct sequences per access: a large valid ledger persists truthful partial high-water
+  progress and remains unreconciled rather than looping, while a valid >256-row append backlog
+  converges over later accesses. Reconciled access is keyed O(1). Until reconciliation is true,
+  `advance_watch_occurrence`, `observe_watch_occurrence`, and every first Agent-ledger admission
+  (including the retry append path) fail closed; advance/observe drain at most 16 yielding,
+  separately committed chunks per call. The daemon preflights that drain before reconcile/open and
+  retries only valid zero-unreadable batches without revisiting those phases; unreadable, tail, or
+  storage preflight faults run durable-only reconcile/repair (never a parked-marker release)
+  before fresh allocation is fenced.
+  Standalone retries the same tick. User
+  appends deliberately leave the WatchState hot row untouched, trading immediate frontier updates
+  for a later bounded suffix drain. Once reconciled, an Agent
+  insertion atomically raises the floor and advances scan high-water. Operators must stop,
+  preserve, inspect, and restore a malformed ledger row or its backup — never delete it blindly —
+  then let the next watch access retry; see the real-sats runbook §8. Historical focused journal, marker-fault,
+  and daemon-status checks exited 0 (`/tmp/opus-review-relevant-green.log`); the high-water
+  and tracked-key mutations each exited 101 at their respective durable assertions
+  (`/tmp/opus-mut-watch-high-water-red.log`, `/tmp/opus-mut-watch-tracked-red.log`), the direct
+  Agent hook high-water mutation exited 101 (`/tmp/opus-review-mut-agent-hook-red.log`), and
+  mutating ordinary-fallback clear handling back to abort made the confirmed post-commit clear
+  test exit 101 (`/tmp/opus-review-mut-postcommit-red.log`), and removing bounded chunk progress
+  made the >256-valid-append convergence assertion fail (EXIT=101,
+  `/tmp/opus-chunk-mut-progress-red.log`). The historical corrected focused checks exited 0
+  (`/tmp/opus-chunk-relevant-final.log`) and the historical exact workspace gate exited 0
+  (`/tmp/opus-chunk-full-gate-final.log`, superseded by the pre-hardening 1054-test gate). The subsequent rolling-API/backlog-status focused
+  check (fmt, `wallet-api` strict Clippy, and both status tests) exited 0
+  (`/tmp/opus-backlog-observability-check.log`). The durable false-with-zero-key backlog and
+  partial-frontier Agent-insert regressions exited 0 (`/tmp/opus-final-backlog-focused.log`);
+  mutating that insert to unconditionally advance its high-water exited 101
+  (`/tmp/opus-final-backlog-mut-agent-frontier-red.log`). Those historical high-water mutations
+  predate the persisted-reconciled-state/counter mismatch guard and do not evidence it; neither
+  does the historical workspace-gate citation above. The prior pass first ran the new stale-restored
+  WatchState regression against the old allocation behavior; it exited 101 at the assertion that
+  the bounded rescan sees occurrence 7 (`/tmp/watch-stale-highwater-red.log`). Restored, all 55
+  journal tests and that prior exact workspace gate exited 0 (`/tmp/journal-tests.log` and
+  `/tmp/watchstate-final-full-gate.log`). The partial-state-ahead-of-restored-ledger regression
+  separately exited 101 under the old backward-cursor behavior
+  (`/tmp/watch-partial-restored-red.log`); restored, all 56 journal tests exited 0
+  (`/tmp/watch-partial-journal-tests.log`) and the current exact workspace gate passed as recorded
+  in the header. The final scheduler-preflight, User-hot-row, standalone-diagnostic, and daemon-MAX
+  focused command exited 0 in `/tmp/opus-final-focused-green.log`; strict relevant Clippy exited 0
+  in `/tmp/opus-final-relevant-clippy.log`; and the exact workspace gate exited 0 in
+  `/tmp/opus-final-full-gate.log`. Production-behavior mutations removing the early preflight,
+  rewriting WatchState on User append, and replacing the standalone retry instruction each exited
+  101 at their named assertions in `/tmp/opus-final-mutation-preflight-red.log`,
+  `/tmp/opus-final-mutation-user-hot-row-red.log`, and
+  `/tmp/opus-final-mutation-standalone-diagnostic-red.log`, respectively. The follow-up
+   unreadable/tail recovery regressions exited 0 in `/tmp/opus-recovery-focused.log`; mutating a
+   tail preflight back to short-circuit before recovery exited 101 at its post-reconcile hook in
+   `/tmp/opus-recovery-mutation-tail-preflight-red.log`. The current scheduler closure adds the
+   repeated partial joined/open-view marker hold, exact converged replacement parent/child/sidecar,
+   and abortable post-cycle raw floor-read regressions. The real `run_cycle` now owns the
+   converged replacement's occurrence, plan, commit, and successful Tick audit (rather than an
+   out-of-band test commit); all 23 scheduler tests exited 0 in
+   `/tmp/scheduler-forgery-fixed-focused.log`. Bypassing the production preflight ordering made
+   the exact >4096-backlog test fail at its bounded-preflight assertion (`EXIT=101`,
+   `/tmp/forgery-fixed-preflight-mutation-red.log`); it was restored before the focused run.
+   Current strict `wallet-fedimint` Clippy exited 0 (`/tmp/forge-final-clippy.log`) and the exact
+   workspace gate exited 0 (`/tmp/forge-final-workspace-gate.log`).
+- **Final-review correction, corrupt strict reservations — implemented, locally verified.**
+  Actor reconciliation and standalone `tick` no longer invoke a custom executor fallback.
+  Unreadable strict reservations retain the exact marked parent and fail closed until repair.
+  Focused actor/standalone regressions passed in `/tmp/final-review-focused2.log`.
+- **Final-review correction, structural-marker wake suppression — implemented and
+  verified.** A deliberate successful clear and the existing exact `Ok(false)` confirmation retain
+  their one-shot key/attempt suppression. A retryable marker-clear error remains conservatively
+  suppressed because it may have crossed the commit boundary, including when confirmation cannot
+  read; a permanent closure/validation error cannot have committed and installs no suppression.
+  Suppression is consumed only after a successful reset, a retryable post-commit-error reread
+  proving the exact pending attempt, or `DriverFinished` cleanup of an abandoned attempt; a successful
+  `PutPolicy` clears prior-generation entries.
+  The combined focused regression covers both the retryable ambiguous clear and a repaired
+  permanent refusal whose later qualifying wake must arrive
+  (`/tmp/br-n8o-final-relevant-checks.log`). Mutating permanent errors back into the suppression
+  class made `a permanent clear error must not suppress the later qualifying wake` fail
+  (EXIT=101, `/tmp/br-n8o-final-mut-suppression-red.log`), then was restored. The final exact
+  workspace gate exited 0 with 1,029 passed / 0 failed
+  (`/tmp/br-n8o-final-workspace-gate.log`). The exact-pin isolated two-federation live tick was
+  rerun after these production corrections and exited 0: it funded A, performed exactly one
+  1,000,000-msat A-to-B allocator move (`performed=1`, `failed=0`, `retryable=0`), left B at
+  999,998 msat, and rejected stale-occurrence replay without moving funds
+  (`/tmp/br-n8o-live-tick-final3-rerun.log`). This final live rerun followed the bounded migration,
+  canonical ledger-allocation, watch-observability, and independent CommitTick-continuation
+  corrections above. Its first unchanged launch failed during the pinned Fedimint build when Nix
+  removed an ephemeral `/tmp/nix-shell.*` rustc directory before any wallet assertion
+  (`/tmp/br-n8o-live-tick-final3.log`); the clean rerun is the cited pass.
+- **Prior final confirmation panel (superseded by the corrections above).** Codex reviewed the complete
+  `main` diff and reported no actionable correctness defect
+  (`/tmp/n8o-round1-final-codex-review.log`, exit 0). Claude independently verified strict
+  admission, no hot wake, exact-parent actor/standalone parity, canonical-successor confirmation,
+  MAX and parked-snapshot behavior. Its sole P2 (trust a present WatchState to avoid the ledger
+  scan) was rejected with the `main` upgrade evidence and four mutation-red stale-checkpoint tests
+  in `challenges-round-1.md` (`/tmp/n8o-round1-final-claude-review.log`, exit 0). Focused restored
+  coverage exited 0 (`/tmp/n8o-post-mutation-focused-green.log`); fmt plus workspace strict Clippy
+  exited 0 (`/tmp/n8o-round1-fmt-strict-clippy.log`). The exact final workspace gate exited 0 with
+  1025 passed / 0 failed (`/tmp/n8o-round1-final-workspace-gate.log`, superseded by the current
+  1054-test gate), and `git diff --check` exited 0.
+
+- **Strict-final run round 1, carried parked-snapshot hypothesis — verified ALREADY CLOSED, no code
+  change.** The `ReconcileDecide` -> stale replacement `CommitTick` -> `ReconcileDecide` release
+  defect is real and is already fixed in this tree: the pre-exchange stale-occurrence arm calls
+  `consume_parked_evacuation_marker` (`service/actor.rs:2372`), which drops only the in-memory
+  snapshot and the matching handoff, so the deliberately retained durable marker survives and the
+  next reconciliation recaptures instead of full-parent-CAS releasing it. Re-proved first-hand
+  rather than taken from the round-1..5 write-ups below: deleting only that call made
+  `stale_replacement_refusal_consumes_its_parked_snapshot_for_the_next_reconcile` exit 101 at
+  `a retained marker stays planner-owned instead of being released for ordinary redrive` with
+  `redriven: 1` (`/tmp/n8o-sf-r1-parked-mut-red.log`); restored, that regression plus the display,
+  neighbors and standalone-confirmation regressions exited 0 (`/tmp/n8o-sf-r1-focused-green.log`).
+  The separate MAX/`WatchState` defenses were re-read and left intact.
+- **Strict-final run round 1, "dirty child namespace confirms as uncommitted" — accepted (P3,
+  comment-only).** Two money-path comments claimed all three of `replace_marked_evacuation`'s
+  corruption guards leave the parent byte-identical and therefore confirm as uncommitted. Verified
+  against the code: the `Uncommitted` arm of `ServiceActor::replacement_exchange_outcome`
+  (`service/actor.rs:3109`) and `Runtime::confirm_standalone_replacement_exchange`
+  (`runtime.rs:4256`) both require `ReplacementChildNamespace::Pristine`, and a dirty child
+  namespace still reads `Contaminated` at confirmation, so it matches neither arm and stays
+  fail-closed post-exchange-ambiguous. The other two guards do confirm as uncommitted. Only the two
+  comments (and the round-3 entry below) were corrected; reclassifying the namespace case was
+  rejected in `challenges-round-1.md` as an unreachable-state behaviour change that would also be
+  strictly less safe.
+- **Round 1 verification:** the exact workspace gate
+  `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
+  recorded `GATE_EXIT=0` with 1012 passed / 0 failed (`/tmp/n8o-sf-r1-workspace-gate.log`), and
+  `git diff --check` exited 0. The pre-change baseline of the same gate on this tree was also
+  `GATE_EXIT=0` with 1012 passed (`/tmp/n8o-sf-r1-baseline-gate.log`), which is what makes the
+  comment-only round provably behaviour-neutral.
+- **Strict-final run round 1, iteration 2 — independent re-derivation, no code or test change.**
+  The whole `main`..worktree diff was re-read and the round-1 dispositions were re-checked against
+  the production source rather than against the write-ups above. The carried parked-snapshot
+  hypothesis was re-proved first-hand: deleting only `consume_parked_evacuation_marker`
+  (`service/actor.rs:2372`) made
+  `stale_replacement_refusal_consumes_its_parked_snapshot_for_the_next_reconcile` exit **101** at
+  `a retained marker stays planner-owned instead of being released for ordinary redrive`, reporting
+  `redriven: 1` (`/tmp/n8o-sf-r1-i2-mutA-red.log`); restored, the eight focused regressions
+  (parked-snapshot, unselected-parked, rotate-on-clear-fault, release-fault-vs-recovery,
+  newly-observed-marker shadow, standalone canonical-successor confirmation, display degrade,
+  neighbors chain) exited 0 (`/tmp/n8o-sf-r1-i2-focused-green.log`). The iteration-1
+  dirty-child-namespace comment correction was re-verified against
+  `ServiceActor::replacement_exchange_outcome` (its `Uncommitted` arm requires
+  `ReplacementChildNamespace::Pristine`) and `child_namespace_is_empty`, and the "a fresh claim
+  consumes the marker" premise against `set_status_if`'s `Pending -> Executing` arm
+  (`journal.rs:4993`). Four further hypotheses raised this iteration were rejected with evidence in
+  `challenges-round-1.md` (release-build `cfg` on the force/crash-point predicates; daemon-vs-CLI
+  `show` key choice; the behaviour-neutral `scheduler.rs` churn hunk; the `preferred` parent scan
+  dropping `pending()`'s status filter). The exact workspace gate recorded `GATE_EXIT=0` with
+  1012 passed / 0 failed three times: before the mutation (`/tmp/n8o-sf-r1-i2-baseline-gate.log`),
+  after it was restored (`/tmp/n8o-sf-r1-i2-workspace-gate.log`), and over the source tree left
+  behind (`/tmp/n8o-sf-r1-i2-final-gate.log`); only this citation sentence was edited afterwards,
+  and no gate step reads `DRIVE.md`. `git diff --check` exited 0.
+- **Strict-final run round 1, iteration 3 — actor-side confirmation regression added (P2,
+  test-only).** Instead of re-deriving the same dispositions a third time, this iteration mutated
+  every production behaviour this round changed and re-ran its regression, reverting each mutation
+  through the editor and proving the revert with `md5sum -c` against a pre-mutation manifest. Eight
+  of the nine mutations reddened at their own assertion (the full matrix, with per-mutation logs, is
+  in `challenges-round-1.md`). One did not: reverting
+  `ServiceActor::replacement_exchange_outcome` (`service/actor.rs:3117`) from the strict
+  `evacuation_canonical_successor` back to the dual-key `evacuation_supersession` left the whole
+  492-test `wallet-fedimint` lib suite green (`/tmp/n8o-i3-mutF2.log`, EXIT=0) — the discriminating
+  regression existed only on the standalone path. That gap matters on the daemon path: for a parent
+  that is itself a replacement, the dual-key reader returns the reverse `A -> B` predecessor, which
+  matches neither confirmation arm, so a definitely-uncommitted `B -> C` would be reported as
+  `PostExchangeAmbiguous` — retaining the marker and poisoning goal-admission and balance-fact
+  authority instead of raising the truthful `Conflict` refusal.
+  `service::tests::confirmed_uncommitted_exchange_ignores_a_middle_parents_predecessor` now pins the
+  daemon side of that parity: one `Conflict` refusal on the child key, `B` still `Pending` with its
+  consumed marker cleared, no `C` row, no canonical successor for `B`, the `A -> B` predecessor
+  still readable as audit history, and both authority tokens still issuable. Mutation-red proof:
+  the same revert made it exit **101** at `a middle parent's predecessor cannot make B -> C
+  ambiguous` (`/tmp/n8o-i3-newtest-mut.log`); restored, it exits 0 (`/tmp/n8o-i3-newtest.log`). No
+  production behaviour changed this iteration. Adding daemon/CLI-level tests for the `show` display
+  degrade was rejected with evidence in `challenges-round-1.md` — the row's DB key encoding is
+  private to `wallet-fedimint`, so it would require exporting a raw-write API from production code
+  to corrupt a row. The exact workspace gate recorded `GATE_EXIT=0` with 1013 passed / 0 failed
+  (`/tmp/n8o-i3-workspace-gate.log`), and `git diff --check` exited 0.
+- **Strict-final run round 1, iteration 4 — two unpinned behaviour CLAIMS closed (P2, tests + one
+  corrected comment).** The three iterations above re-derived the diff and mutated its production
+  behaviours; this one audited the *comments* on the changed money path, running each observable
+  claim instead of reading it. Two held up badly. (1) The `PostExchangeAmbiguous` arm claimed
+  "recovery is an explicit restart/operator action rather than an automatic drive of ambiguous
+  money". False: `reconcile_durable` (`service/actor.rs:4243`) skips only `marker_is_planner_owned`
+  rows, and a committed replacement child is `Pending`/`Agent`/`Evacuate` with NO marker, so the
+  next ownership-recovery pass rehydrates and drives it. That behaviour is also the correct one —
+  in the only ambiguity where a child exists the exchange committed, and ADR-0029 forbids stranding
+  a dying federation's balance — so the fix is the comment plus the missing regression, not the
+  code. `ambiguous_exchange_recovery_drives_the_committed_child_while_planning_stays_poisoned`
+  injects the ambiguity over an exchange that DID commit and asserts `redriven: 1`, the recovered
+  owner, and both authorities still refusing; one mutation per property reddened it at its own
+  assertion (`/tmp/n8o-i4-mutA-red.log`, `/tmp/n8o-i4-mutB-red.log`, both 101). (2) `reconcile`
+  selects the parked handoff *before* propagating a failed durable scan, with an explicit comment
+  that this is deliberate — and swapping those two lines left the whole 494-test `wallet-fedimint`
+  lib suite green (`/tmp/n8o-i4-mutC-order.log`, EXIT=0), i.e. iteration 3's matrix had missed it.
+  `a_marker_captured_by_a_failed_reconcile_is_released_by_the_next_one` now pins it, reddening at
+  `the marker captured by the failed pass got its bounded next-cycle release` under that swap
+  (`/tmp/n8o-i4-mutD-red.log`, 101). Every mutation was reverted through the editor and proved
+  byte-identical with `md5sum -c`. Six further hypotheses were rejected with evidence in
+  `challenges-round-1.md` (qualifying-marker wake cadence; duplicate parked snapshots for one key;
+  dirty-child-namespace vs the release CAS; the deliberate standalone `status` occurrence
+  authority; the documented public history page cap; the retired parent's inert pristine
+  `MoveRecord`). The exact workspace gate recorded `GATE_EXIT=0` with 1015 passed / 0 failed
+  (`/tmp/n8o-i4-final-gate.log`), and `git diff --check` exited 0.
+- **Final panel round 3, `show` display hard-fail — accepted (P2).** Both front ends had added an
+  unconditional strict intent read to the `show` projection, so ONE corrupt intent row took away a
+  ledger row `main` served — on the exact command runbook §4a and devimint §7 name for a
+  structural-evacuation incident. `FedimintJournal::intent_for_display` now applies this commit's
+  own adjacent sidecar policy: a MALFORMED row degrades to absent with a `warn!` (the intent read
+  only augments an already-resolved ledger row), while a RETRYABLE storage fault still fails,
+  because answering a transient fault with `evacuation_refusal_active: false` would be a false
+  display rather than a degraded one. Money paths keep the strict `Journal::get`; the now-unused
+  `Journal` import in both binaries is the mechanical proof that `show` was their only strict
+  intent read. `malformed_linked_intent_degrades_for_display_while_storage_faults_still_fail` pins
+  both properties, one independent mutation each: propagating the Permanent class reddened it at
+  `a corrupt intent row must not blank the operation row show resolved`
+  (EXIT=101, `/tmp/n8o-r3-display-mutA-red.log`); degrading every class reddened it at
+  `a storage fault is not permission to display absence`
+  (EXIT=101, `/tmp/n8o-r3-display-mutB-red.log`). Restored green:
+  `/tmp/n8o-r3-display-restored-green.log`.
+- **Final panel round 3, `/v1/status` vs the rotated marker queue — rejected (P2).** The premise is
+  real: after a clear fault with two parked markers the actor's handoff and the dry run's pending
+  rescan can name different qualifying parents. Nothing durable diverges — status is dry, both
+  parents are legitimate replacements, the queue stays bounded and starvation-free, and both
+  children still happen, just in the other order. The preview is inherently not the tick
+  (`Runtime::status` re-probes the world; the parked handoff is a full-row snapshot), and neither
+  proposed fix removes the divergence: an actor round-trip goes stale immediately, and routing
+  status through the actor would put a network probe sweep inside the serialized turn. Recorded
+  with evidence in `challenges-round-3.md`.
+- **Final panel round 3, dropped exchange-refusal reason — accepted (P3).**
+  `replace_marked_evacuation` reports corruption (incoherent parent move artifacts, a second live
+  agent evacuation on the source) through the same `Err` channel as a benign CAS miss, and both
+  confirm as uncommitted, so that money-path signal was being discarded behind
+  a generic conflict. The actor and standalone arms now `warn!` the typed error with the parent key;
+  control flow, refusal reasons, marker disposition and messages are unchanged, and the CLI's
+  default `warn`-on-stderr subscriber puts it beside the standalone bail.
+- **Final panel round 3, `Runtime::status` contract text — accepted (P3).** The pin claim was
+  verified still true and left intact; the doc now also records the two deliberate authority bails
+  (exhausted occurrence, stale marked-replacement occurrence), why they differ in kind, and that
+  both stay read-only. `tick.rs`'s echo was checked and correctly left alone — it is scoped to
+  pinned-input problems. No behaviour changed.
+- **Final panel round 3, deferred work in the pin gate's `admitted` slot — resolved, no change.**
+  The reviewer asked for an explicit decision. `first_move_route_problem` runs over the whole
+  planned round before `finish_replacement_round` moves non-child decisions into
+  `replacement_deferred`, so deferred work carries the same concrete route preflight the gate
+  already trusts, unlike never-preflighted `suppressed` work. A replacement round defers ordinary
+  pinned work regardless of probe colour and audits each `tick-drop:`, so including it removes an
+  inconsistency instead of manufacturing a false success; the next ordinary cycle still bails loudly
+  on a genuinely unusable pin.
+- **Round 3 verification:** the exact workspace gate
+  `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
+  recorded `GATE_EXIT=0` with 1011 passed / 0 failed (`/tmp/n8o-r3-workspace-gate.log`), and
+  `git diff --check` exited 0.
+- **Round 4 — no actionable finding left, re-verified from scratch, no code or test change.** The
+  panel's two P2s were re-checked against the production source rather than against the round-3
+  write-up: the accepted `show` degrade is in both front ends via
+  `FedimintJournal::intent_for_display`, and the rejected `/v1/status` ordering divergence is still
+  dry by construction (`Runtime::status` calls `plan_tick`, whose `qualifying_replacement_parent`
+  rescans pending rows; the daemon previews at `watch.occurrence + 1`). The three production
+  behaviours this pass depends on were re-mutated first-hand and each reddened at its own
+  assertion before restoration: dropping `consume_parked_evacuation_marker` failed
+  `stale_replacement_refusal_consumes_its_parked_snapshot_for_the_next_reconcile` at `a retained
+  marker stays planner-owned instead of being released for ordinary redrive` with `redriven: 1`
+  (EXIT=101, `/tmp/n8o-r4-parked-mutation-red.log`); propagating the malformed class from
+  `intent_for_display` failed at `a corrupt intent row must not blank the operation row show
+  resolved` (EXIT=101, `/tmp/n8o-r4-display-mutA-red.log`); degrading every error class failed at
+  `a storage fault is not permission to display absence` (EXIT=101,
+  `/tmp/n8o-r4-display-mutB-red.log`). Restored, both regressions exited 0
+  (`/tmp/n8o-r4-focused-restored-green.log`), the exact workspace gate recorded `GATE_EXIT=0` with
+  1011 passed / 0 failed (`/tmp/n8o-r4-workspace-gate.log`), and `git diff --check` exited 0.
+- **Round 5 — no code or test change; the stale gate line in this header was the only defect
+  found.** Both round-2 review files were re-read and their premises re-checked in the production
+  source: the `show` degrade is live in both front ends, the parked-queue/`/v1/status` ordering
+  divergence remains dry and bounded, and the `u64::MAX - 1` daemon preview is still an unreachable
+  P3. The parked-marker plumbing was re-derived independently and holds:
+  `finish_replacement_round` sets `marker_disposition` only when a parent was observed AND no
+  child was produced, so the childless-shadow fallback keys off the authoritative scan;
+  a preferred handoff is admitted only on full-row equality, so a changed or cleared parent falls
+  out instead of being replaced; and a marker that stops qualifying under an edited policy fails
+  `marker_is_planner_owned` and returns to ordinary redrive rather than stranding. The header's
+  "current implementation tree" line still cited the 1008-test rb-lite p3 run, which this tree
+  outgrew by three regressions across rounds 2-3; it now cites a first-hand run of the exact
+  workspace gate, `GATE_EXIT=0` with 1011 passed / 0 failed
+  (`/tmp/n8o-r3-iter3-workspace-gate.log`), with `git diff --check` at exit 0.
+- **Codex wall-clock finding — accepted.** `EvacuationRefusalEvidence.measured_at_ms` is display
+  material, not an ordering authority: replacement validation no longer compares it with the
+  parent creation clock, and the rollback-clock replacement regression is green.
+- **Claude scheduler-marker parking finding — accepted.** A tick-suppressed cycle captures full
+  marker rows and the next `ReconcileDecide` exact-CAS clears only those rows. Durable-only
+  reconciliation does not consume or overwrite that hand-off. This is deliberately no-wake; the
+  next normal scheduler interval, not a policy wake, retries ordinary work. The suggested global
+  delay of real `PutPolicy` wakes was rejected: marker clear emits no wake, while real policy
+  updates must retain prompt activation.
+- **Stale-occurrence marker retention finding — accepted.** The production cycle is
+  `ReconcileDecide` -> plan -> `CommitTick`, so the reconciliation that hands a parent to the
+  planner also parks its exact snapshot. The pre-exchange stale-occurrence refusal therefore
+  consumes that in-memory snapshot as well. It writes nothing durable: the deliberately retained
+  marker survives, and the next `ReconcileDecide` recaptures it instead of full-parent-CAS
+  releasing it into an ordinary redrive. Every snapshot no such refusal consumed still drains on
+  the next cycle, so the bounded handoff is unchanged, and the separate MAX/`WatchState` defenses
+  are untouched. The post-exchange ambiguous arm deliberately keeps its snapshot: there the drain's
+  CAS is itself the exact confirmation, since it clears only a parent that is still byte-identical,
+  sidecar-free, and the sole live agent evacuation holder for its source.
+  The new `stale_replacement_refusal_consumes_its_parked_snapshot_for_the_next_reconcile`
+  regression drives reconcile -> stale plan/commit -> reconcile -> strictly newer occurrence. It
+  failed against the unfixed tree and again with only the consumption removed (each EXIT=101 at
+  `a retained marker stays planner-owned instead of being released for ordinary redrive`;
+  `/tmp/n8o-parked-red-1.log` and `/tmp/n8o-parked-mutation-red.log`), and the restored production
+  behavior exited 0 (`/tmp/n8o-parked-restored-green.log`). The exact workspace gate
+  `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
+  then exited 0 with 1006 passed / 0 failed (`/tmp/n8o-round1-gate-1.log`).
+- **Replacement-parent scan race finding — accepted.** The authoritative inner planner scan may
+  observe a marker written after planning starts even when an earlier observation did not. The
+  childless-shadow fallback now keys off the returned exact `marker_disposition`, not a stale
+  pre-scan boolean, and the redundant pre-scan is gone. The deterministic
+  `newly_observed_marker_shadow_falls_back_to_unrelated_ordinary_work` regression publishes the
+  marker immediately before that authoritative scan and proves unrelated C -> D work survives.
+  Disabling only the fallback made it fail at the empty decision list (EXIT=101,
+  `/tmp/n8o-shadow-race-mutation-red.log`).
+- **Parked-marker recovery-order finding — accepted.** A failed exact-CAS release remains logged,
+  fail-closed, and parked, but it no longer returns before the strict durable scan can rehydrate
+  unrelated work. `parked_marker_release_failure_does_not_suppress_unrelated_durable_recovery`
+  uses a permanent same-source-holder refusal and proves the marker survives while both unrelated
+  live intents regain drivers. Restoring the early return made the test fail with that exact
+  permanent storage error (EXIT=101, `/tmp/n8o-parked-release-mutation-red.log`). This does not
+  weaken strict money-path validation or synthesize a wake; normal scheduler pacing remains.
+- **Round-1 restored evidence:** the three focused regressions above exited 0 together
+  (`/tmp/n8o-round1-focused-restored-green.log`); the actor service suite passed 160/160 and
+  strict `wallet-fedimint` clippy exited 0 (`/tmp/n8o-round1-service-clippy.log`). The exact
+  workspace gate exited 0 with 1008 passed / 0 failed
+  (`/tmp/n8o-round1-final-workspace-gate.log`).
+- **rb-lite two-round summary and round-2 P3 cleanup — accepted, not final formal delta-clean.**
+  The two rb-lite rounds left no P0–P2 finding; their round-2 P3 cleanup makes standalone
+  structural-replacement `status` require `--occurrence` strictly newer than the marked Agent
+  parent, just as standalone `tick` does. The stale case exits non-zero but remains dry: it writes
+  neither exchange nor child. The CLI help, real-sats runbook, Phase 6a plan, operation-history
+  contract, and ADR-0031 now state that operator requirement. The standalone replacement seam now
+  returns `Result<Reservations>` rather than an unreachable successful `None`: every definite
+  pre-admission/uncommitted outcome stays an error, so the caller records the failed tick and exits
+  non-zero; a successful exchange remains the one-child path. The existing same-N rejection,
+  dry-status, and N+1 exchange regression exited 0
+  (`/tmp/rb-lite-p3-runtime-focused.log`), as did the focused CLI test and rendered `status --help`
+  (`/tmp/rb-lite-p3-cli-focused.log`, `/tmp/rb-lite-p3-status-help.stdout`), relevant fmt/clippy
+  (`/tmp/rb-lite-p3-fmt-relevant-clippy.log`), and the exact workspace gate, 1008 passed / 0 failed
+  (`/tmp/rb-lite-p3-full-workspace-gate.log`). This records rb-lite's two-round cleanup only;
+  the final formal review panels and a final formal delta-clean conclusion remain pending.
+- **Independent re-verification of the parked-marker round — no further change needed.** The three
+  production behaviours that round changed were re-mutated from scratch rather than taken from the
+  earlier log set, and each reddened at its own assertion before being restored: dropping
+  `consume_parked_evacuation_marker` failed at `a retained marker stays planner-owned instead of
+  being released for ordinary redrive` with `redriven: 1`
+  (`/tmp/n8o-final-mut1.log`, EXIT=101); restoring `reconcile`'s early return on a parked-marker
+  release fault failed at `a marker-local permanent clear error does not abort durable recovery`
+  with the same-source-holder storage error (`/tmp/n8o-final-mut2.log`, EXIT=101); and regating the
+  childless-shadow fallback on the stale pre-scan boolean instead of the authoritative
+  `marker_disposition` failed at `the marker's childless shadow must not discard unrelated eligible
+  work` (`/tmp/n8o-final-mut3.log`, EXIT=101). With every mutation reverted, `git diff --check`
+  exited 0 and the exact workspace gate
+  `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
+  recorded `GATE_EXIT=0` with 1008 passed / 0 failed (`/tmp/n8o-final-run-gate-1.log`).
+- **Claude replacement exclusivity/pin finding — accepted.** Replacement-deferred decisions are
+  separate from conflict suppression, remain visible to pinned-input validation, are never
+  admitted/folded/reported accepted, and are written as replacement-exclusive audit rows in actor
+  and standalone paths. Executable siblings use the explicit `tick-drop:` audit identity;
+  deferred `RefuseInflow` advisories retain their original `refuse:` identity and every allocator
+  diagnostic, plus the replacement-exclusive note.
+- **Occurrence exhaustion hardening — accepted.** Standalone `Occurrence(u64::MAX)` is refused
+  before it can write the watch floor, a tick ledger row, or an intent. The watch checkpoint uses
+  checked advancement rather than saturation, and planner ownership/capture excludes a MAX Agent
+  parent: a direct/corrupt exhausted parent is ordinary retryable work, never a parked
+  impossible-successor marker.
+- **Daemon final-occurrence preview — resolved.** A daemon scheduler may allocate
+  `Occurrence(u64::MAX)` exactly once from a `u64::MAX - 1` watch floor. Its dedicated status
+  dry-run and tick path accept that final work, while standalone `status`/`tick` remain strict and
+  marked-replacement children still must be newer than their Agent parent. `/v1/status` refuses a
+  consumed final floor, a provisional reconciliation floor (inspect `/v1/watch/status`, then
+  retry/repair), and any joined-but-unopened membership view rather than previewing work the
+  scheduler will not allocate. The production `run_cycle` regression also records and terminalizes
+  the one final tick before checked exhaustion rejects its successor. Focused handler/scheduler
+  evidence and the handler-path mutation that fails at the HTTP-200 assertion are in
+  `/tmp/p3-daemon-status-followup-focused.log` and
+  `/tmp/p3-daemon-status-followup-handler-mutation-red.log`. The subsequent exact workspace gate
+  exited 0 in `/tmp/p3-daemon-status-followup-full-gate.log`.
+- **Occurrence/deferred-audit evidence:** focused `wallet-fedimint` runtime, journal, and service
+  regressions exited 0 in `/tmp/focused-occurrence-tests-final.log` and
+  `/tmp/near-max-scheduler-lifecycle.log`, including standalone MAX-before-write, checked watch
+  exhaustion, reconcile → stale near-MAX refusal → reconcile → strictly newer MAX-child commit,
+  MAX-parent ordinary redrive, and actor/standalone deferred-advisory diagnostic preservation.
+- **Dry-run replacement authority:** standalone `status` applies the same non-mutating strict
+  occurrence check as its tick exchange, so it returns an actionable error rather than advertising
+  a same-occurrence replacement; it also rejects a no-marker MAX occurrence before any watch or
+  tick write, while the existing N+1 dry-run remains valid. Changing the replacement check to
+  accept equality made its combined same-N/N+1 regression fail (test EXIT=101,
+  `/tmp/status-same-occurrence-mutation-red.log`), and removing the entry MAX check made
+  `standalone_status_refuses_max_without_writing_watch_state_or_tick` fail (test EXIT=101,
+  `/tmp/status-max-acceptance-mutation-red.log`); both mutations were restored.
+- **Occurrence discriminating mutations:** changing checked watch advance back to
+  `saturating_add` made
+  `watch_occurrence_exhaustion_refuses_max_without_saturating_or_rewriting_state` fail
+  (test EXIT=101, `/tmp/occurrence-saturating-mutation-red.log`). Independently accepting MAX
+  made `standalone_tick_refuses_max_before_writing_watch_state_or_tick` fail (test EXIT=101,
+  `/tmp/occurrence-max-acceptance-mutation-red.log`). Both production mutations were restored.
+- **Marker presentation finding — accepted.** `show` exposes retained historical evidence plus
+  `evacuation_refusal_active`; only a Pending Agent Evacuate marker is active. Bounded history
+  avoids intent N+1 reads.
+- **Final display tri-state hardening — accepted.** `OperationView` and standalone
+  `OperationRecordAuditView` now make `evacuation_refusal_active` an omitted-or-boolean
+  projection: `true` only for a readable exact Pending Agent Evacuate marker, `false` for a
+  readable exact inactive intent, and omitted (text `-`) for history or an absent/malformed
+  degraded intent. The API, daemon mapping, standalone/client JSON and text paths have focused
+  coverage in `/tmp/n8o-display-tristate-restored-focused.log` (EXIT=0). Mutating the daemon
+  unknown-intent mapping to `Some(false)` made its exact absence assertion fail with EXIT=101
+  (`/tmp/n8o-display-tristate-unknown-to-false-mutation-red.log`); the production mapping was
+  restored. The exact workspace gate exited 0 with 1025 passed
+  (`/tmp/n8o-display-tristate-full-workspace-gate.log`), and `git diff --check` exited 0.
+- **Current verification:** exact workspace gate
+  `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
+  exited 0 after the final lifecycle regressions below. Focused green evidence includes
+  `reconcile_decide_parks_exact_markers_across_durable_recovery_then_redrives_only_cas_match`,
+  `commit_tick_marker_clear_fault_terminalizes_an_already_started_tick`,
+  `policy_superseded_commit_clears_its_exact_marker_disposition_before_returning`, and
+  `replacement_round_audits_deferred_executable_and_advisory_without_admitting_siblings`, plus
+  `standalone_status_is_dry_and_tick_atomically_replaces_marked_evacuation` (all EXIT=0).
+- **Scheduler-marker discriminating mutations:** changing the production capture guard to `false`
+  and, independently, bypassing the production drain each made
+  `reconcile_decide_parks_exact_markers_across_durable_recovery_then_redrives_only_cas_match`
+  fail (each EXIT=101: expected `redriven == 1`, observed `0`); both mutations were restored.
+- **Wall-clock discriminating mutation:** restoring the rejected
+  `measured_at_ms < created_at_ms` production bound made
+  `replacement_rejects_incoherent_evidence_and_child_cap` fail at its rollback assertion
+  (EXIT=101, `/tmp/n8o-wallclock-mutation-red.log`); restoring display-only validation made the
+  focused test pass (EXIT=0, `/tmp/n8o-wallclock-green.log`).
+- **Replacement exchange-boundary hardening:** the actor now carries a typed
+  `ReplacementFailureDisposition`, rather than deriving cleanup authority from a public error
+  string. Parent reread, replacement pending scan, reservation projection, and admission failures
+  are definite-uncommitted: their exact child-namespace/full-parent cleanup runs before the
+  original truthful `Storage` or `Refused` outcome is returned, and a pre-opened tick is
+  terminalized. A post-exchange mixed reread remains ambiguous, retains its marker, and poisons
+  the existing goal/balance authorities.
+- **Replacement boundary evidence:** one-shot actor regressions independently fault the replacement
+  parent read, second pending scan, and second reservation projection; each observes no child, an
+  exact marker clear, and a Failed pre-opened tick. Focused
+  `cargo test -p wallet-fedimint service::tests::replacement --lib` plus
+  `ambiguous_exchange_confirmation_retains_marker_and_poisons_goal_and_balance_authority` exited
+  0 (`/tmp/replacement-focused-final.log`); wallet-fedimint clippy exited 0
+  (`/tmp/replacement-clippy-wallet-fedimint.log`).
+- **Replacement boundary discriminating mutations:** bypassing the definite-uncommitted marker
+  cleanup made `replacement_parent_read_storage_fault_clears_marker_and_terminalizes_tick` fail at
+  its exact-marker assertion (EXIT=101, `/tmp/replacement-preexchange-mutation-red.log`).
+  Independently, temporarily permitting a post-exchange branch to rewrite the failed parent without
+  its marker (and bypassing the status-transition fence required for that invalid rewrite) made
+  `ambiguous_exchange_confirmation_retains_marker_and_poisons_goal_and_balance_authority` fail at
+  its retained-marker assertion (EXIT=101, `/tmp/replacement-ambiguity-mutation-red.log`). Both
+  production mutations were restored.
+- **Final replacement verification:** exact workspace gate
+  `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
+  exited 0 (`/tmp/replacement-workspace-gate-exact.log`).
+
+- **`br-n8o` implementation is complete pending formal review.** A retryable
+  pre-artifact sizing refusal now carries typed
+  `EvacuationRefusalEvidence`: it is evidence from fresh structural samples, not proof that
+  a route is unavailable. Only the guarded actor/standalone commit seam may claim that durable
+  marker for a policy-qualified replacement; an effective cap increase must be component-wise
+  monotone at the recorded delivered-net sample.
+- The claim is one atomic journal exchange: a distinct fresh occurrence/key is inserted
+  `Pending`, its parent becomes `Failed`, and forward/reverse durable supersession sidecars
+  are written in the same transaction. The exchange refuses ambiguous authority, stale/equal/
+  decreased or crossed cap edits, terminal/non-pre-artifact parents, and any outcome that
+  would terminalize the parent without its child. Claiming consumes the marker
+  (`Pending -> Executing` cannot recreate it).
+- `CommitTick` owns the serialized actor exchange; the exclusive-DB standalone `tick` seam
+  performs the same exchange and requires `--occurrence` strictly advanced beyond the marked
+  agent occurrence. The daemon advances occurrence itself. `OperationView` and standalone
+  `show`/JSON history expose `supersedes` / `superseded_by` from the sidecars, preserving both
+  audit identities rather than rewriting a ledger row.
+- Deterministic evidence: actor race/atomic-child test
+  `/tmp/n8o-race.log`, restart/replay test `/tmp/n8o-restart.log`, standalone end-to-end
+  exchange `/tmp/n8o-focused-e2e.log`, and red mutations for same-occurrence admission
+  (`/tmp/n8o-occurrence-mutation.log`), cap qualification
+  (`/tmp/n8o-cap-mutation.log`), standalone exchange
+  (`/tmp/br-n8o-mutation-standalone-exchange-red.log`), and child-driver publication
+  (`/tmp/br-n8o-mutation-child-driver-red.log`). Each focused green passed; each listed
+  production-behaviour mutation failed at its corresponding assertion.
+- Follow-up service evidence: focused green runs for the shadow fallback
+  (`/tmp/n8o-shadow-green.log`), exactly-confirmed uncommitted exchange
+  (`/tmp/n8o-uncommitted-green.log`), mixed-confirmation poison
+  (`/tmp/n8o-ambiguous-green.log`), post-write verification branches
+  (`/tmp/n8o-postverify-green.log`), and the existing exchange/restart path
+  (`/tmp/n8o-replacement-green.log`) each exited 0. Independent production-behaviour
+  mutations exited 101 at the targeted assertions: no ordinary shadow fallback
+  (`/tmp/n8o-mutation-shadow-red.log`), no uncommitted-marker clear
+  (`/tmp/n8o-mutation-uncommitted-red.log`), ambiguous child recovery
+  (`/tmp/n8o-mutation-ambiguous-red.log`), and terminal, marker, N+1, and missing
+  postverify cache cleanup (`/tmp/n8o-mutation-postverify-terminal-red.log`,
+  `/tmp/n8o-mutation-postverify-marker-red.log`,
+  `/tmp/n8o-mutation-postverify-nplus-red.log`, and
+  `/tmp/n8o-mutation-postverify-missing-red.log`). `cargo fmt --all -- --check`,
+  `cargo clippy -p wallet-fedimint --all-targets -- -D warnings`, and
+  `git diff --check` each exited 0; no full workspace gate was run in this pass.
+- The exact-pin isolated two-federation live tick rebuilt the pinned/patched Fedimint
+  harness and the current wallet CLI from a clean `env -i` launch, joined both
+  federations, funded A to 2,999,950 msat, and performed one allocator-selected
+  A-to-B move. It exited 0 with
+  `performed=1 skipped=0 failed=0 retryable=0`; A ended at 1,982,862 msat,
+  B received 999,998 msat, and stale-occurrence replay was rejected without
+  moving funds. The unchanged exact-pin gate was rerun after the final marker/cache-race
+  fixes and again exited 0 with the same safety assertions; complete current-tree log:
+  `/tmp/br-n8o-live-tick-post-rblite-final.log`.
+
+### Historical `br-p93` closeout evidence
+
 - Merged the conflict-scoped scheduler/standalone gate as PR #36
   (`75802dfa898fcde45b8cf0102c30a7b1fc9fe281`), after the final 953-test
   workspace gate, exact-pin two-federation live tick, and GitHub devshell/package
-  jobs all exited 0. `br-p93` is closed; `br-n8o` is claimed as the next P1.
+  jobs all exited 0. `br-p93` closed; `br-n8o` was then the next P1.
 - Read the current project, canonical docs/ADRs, code architecture, current
   backlog and recent delivery evidence.
 - Two independent strategy reviews completed. Both found the re-canary unsafe
@@ -911,7 +1620,95 @@ occurrence without moving funds. It exited 0; the complete log is
   from 0 to 999,998 msat, and rejected terminal-occurrence replay without moving funds. It exited
   0; complete log: `/tmp/pr36-live-tick-join-supersession-final-rerun.log`.
 
-### Final CodeRabbit cleanup disposition (current working tree)
+### rb-lite final-review canonical-successor parser miss (current working tree)
+
+- The rb-lite final-review parser missed that `FedimintJournal::evacuation_supersession` is
+  intentionally dual-key: looking up chain-middle B can return its reverse A-to-B predecessor.
+  Exact replacement confirmation instead asks only whether attempted parent B gained canonical
+  successor C. `evacuation_canonical_successor` now returns `None` when B's canonical row is absent
+  regardless of that predecessor, while still validating canonical and reverse halves when it is
+  present. Actor and standalone exact-confirmation sites use this strict reader; neighbor and
+  presentation APIs remain dual-sided.
+- The new journal/runtime production seams build A-to-B, make B a coherent marked Pending parent,
+  and inject B-to-C pre-commit and post-commit faults. The pre-commit case proves no C child is
+  written and only B's marker is cleared as definitely uncommitted; the post-commit case proves
+  B-to-C remains confirmed. Focused green commands exited 0:
+  `nix develop -c cargo test -p wallet-fedimint
+  journal::replacement_foundation_tests::supersession_neighbors_keep_both_links_for_a_replaced_replacement
+  -- --exact`,
+  `nix develop -c cargo test -p wallet-fedimint
+  runtime::tests::standalone_replacement_confirmation_ignores_a_middle_parents_predecessor -- --exact`,
+  and `nix develop -c cargo test -p wallet-fedimint
+  service::tests::structural_evacuation_marker_is_atomically_replaced_by_one_fresh_planned_child
+  -- --exact`.
+- Mutation evidence: changing standalone confirmation back to the dual-key reader made the
+  standalone production test exit 101 at its exact uncommitted-outcome assertion, reporting that
+  confirmation was ambiguous after the injected pre-commit error. The strict reader was restored.
+  After restoration, the exact workspace gate `nix develop -c bash -c 'cargo fmt --check && cargo
+  clippy --workspace --all-targets -- -D warnings && cargo test --workspace'` exited 0; complete
+   output is `/tmp/rb-lite-canonical-successor-full-gate.log`. Final diffcheck follows this record.
+
+### Opus final P2/P3 recovery-only marker redrive and daemon-status runbook
+
+- Reconciliation now carries an internal typed marker disposition: public durable recovery preserves
+  planner-owned markers, a healthy scheduler pass captures one exact parent for its planner, and a
+  scheduler pass that has already committed not to plan uses recovery-only redrive. The latter drops
+  only its exact parked in-memory snapshot/handoff, claims the old Pending work through the normal
+  `Pending -> Executing` CAS (which consumes evidence atomically), and never directly clears durable
+  marker evidence. Ambiguous goal-admission poison instead preserves the exact marker and starts no
+  driver for it.
+- The recovery claim arms the existing one-shot marker-wake suppression before its driver can renew a
+  structural refusal. Thus a confirmed partial/open-view, unreadable-floor, or tail/storage-fenced
+  cycle cannot tight-loop on `policy_wake`; the next healthy pass captures the renewed marker for
+  normal replacement planning. A valid zero-unreadable bounded watch backlog is different: it returns
+  the immediate typed retry before any reconcile/driver, preserving the exact marker for its next
+  prompt healthy planner pass. Scheduler coverage includes partial joined views, the preserved
+  exhausted valid watch-floor batch followed by a whole-view replacement sidecar, and a prior parked
+  handoff behind an unreadable floor, all without an ineligible fresh Tick.
+- `/v1/status` documentation now states its operational prerequisites and side effect precisely:
+  live `Runtime` and `MultiClient`, every joined federation open, reconciled `get_watch_state`, checked
+  successor (`MAX-1` previews `MAX`; `MAX` is 503), and live probes. The real-sats runbook also calls
+  out that status is money-dry. (SUPERSEDED: `get_watch_state` was a bounded migration WRITER when
+  this was written — one status request could advance a batch and then 503. The WatchState
+  agent-floor migration subsystem was deleted in br-e29 for an O(1) counter/tail check, so status
+  now performs a plain read and never advances a batch.)
+- Focused green evidence: all 23 scheduler tests exited 0 in
+  `/tmp/opus-p2-scheduler-tests.log`; the recovery wake test and poisoned-marker recovery test exited
+  0 in `/tmp/opus-p2-recovery-test.log` and `/tmp/opus-p2-poison-test.log`. Mutation evidence:
+  preserving recovery-only marker work made the recovery assertion fail with EXIT=101 at
+  `left: 0 / right: 1` (`/tmp/opus-p2-mutation-recovery-skip-red.log`); removing its wake
+  suppression made the no-immediate-wake assertion fail with EXIT=101
+  (`/tmp/opus-p2-mutation-wake-suppression-red.log`). Reviewer follow-up mutations also proved that
+  redriving during a valid bounded backlog fails its no-reconcile assertion with EXIT=101
+  (`/tmp/opus-p2-review-mutation-valid-backlog-red.log`) and that removing the poisoned-marker guard
+  fails `recovery.redriven == 0` with EXIT=101
+  (`/tmp/opus-p2-review-mutation-poison-guard-red.log`). All mutations were restored.
+- The exact workspace gate `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace
+  --all-targets -- -D warnings && cargo test --workspace'` exited 0 with 1086 passed / 0 failed;
+  complete output is `/tmp/opus-p2-review-final-workspace-gate.log`.
+
+### History effective-cap cursor pagination P3 regression (current working tree)
+
+- The in-process daemon endpoint test seeds 501 typed `Tick` ledger rows, requests
+  `/v1/history?limit=507`, and proves that the first response contains precisely the newest 500
+  sequence values, that `next_before_seq` is its final sequence value, and that following the
+  cursor returns the remaining older values without a gap, duplicate, or ordering loss.
+- The focused daemon command `nix develop -c cargo test -p wallet-daemon
+  tests::history_cursor_uses_the_effective_capped_limit_without_losing_rows -- --exact` exited 0
+  (1 passed) in `/tmp/history-cap-focused-green.log`. The strict relevant command `nix develop -c
+  bash -c 'cargo test -p wallet-daemon
+  tests::history_cursor_uses_the_effective_capped_limit_without_losing_rows -- --exact && cargo
+  fmt --check && cargo clippy -p wallet-daemon --all-targets -- -D warnings'` exited 0 in
+  `/tmp/history-cap-focused-fmt-clippy-green.log`.
+- Mutation evidence: changing the cursor fullness condition from the effective capped `limit` to
+  the requested `query.limit.unwrap_or(50)` made that exact focused test exit 101 at `a full
+  effective page has a cursor`; the production condition was restored
+  (`/tmp/history-cap-cursor-requested-limit-mutation-red.log`).
+- The exact full workspace gate `nix develop -c bash -c 'cargo fmt --check && cargo clippy
+  --workspace --all-targets -- -D warnings && cargo test --workspace'` exited 0; complete output:
+  `/tmp/history-cap-full-workspace-gate.log`.
+
+### Historical final CodeRabbit cleanup disposition (before `br-n8o`)
 
 - Accepted: document `Awaiting` as subscription/external-payment work that reconcile does not
   re-perform; correct the route-outage distinction and current destination-list/both-end
@@ -929,8 +1726,7 @@ occurrence without moving funds. It exited 0; the complete log is
 
 ## Next
 
-1. `br-n8o`: serialized pre-artifact supersession, preserved and linked audit
-   identity, replay consistency, and a concurrent receive-commit race gate.
+1. Outer driver owns the PR, merge, and `br-n8o` closure; do not perform them in this run.
 2. `br-evac-cap-driven-basis-v07`: add `TestRoute::with_recv_fed_fee`; use
    separate driven fixtures for the literal delivered-vs-ask refusal band
    before `mc.receive` and for successful `MoveMeta.fee_cap == cap(delivered)`.

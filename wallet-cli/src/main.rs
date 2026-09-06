@@ -16,7 +16,7 @@ use fedimint_client::secret::RootSecretStrategy as _;
 use fedimint_client::Client;
 use fedimint_core::db::Database;
 use fedimint_core::invite_code::InviteCode;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -26,8 +26,8 @@ use tokio::time::Instant;
 use wallet_api::{AwaitTarget, OperationStatusDto, Policy, PolicyValidationError};
 use wallet_core::{
     Action, ActiveProbeVerdict, Actor, AllocatorDecision, DiscoveryPolicy, DiscoverySource,
-    ExecutionSummary, FederationId, IdempotencyKey, IntentStatus, Journal, Msat, Occurrence,
-    OperationKind, OperationRecord, OperationStatus, ProbePolicy, ReasonCode, RefusalDiagnostics,
+    ExecutionSummary, FederationId, IdempotencyKey, IntentStatus, Msat, Occurrence, OperationKind,
+    OperationRecord, OperationStatus, ProbePolicy, ReasonCode, RefusalDiagnostics,
 };
 use wallet_fedimint::{
     direct_inflow_nonce_key, join_intent_key, move_key, parse_invoice, raw_pay_key,
@@ -275,13 +275,19 @@ enum Command {
     /// decisions through the executor — the wallet actually rebalances/tops-up. Prints the
     /// decisions and execution counts to stdout. Recurring schedulers must advance
     /// `--occurrence` after a settled move; a terminal same-occurrence replay exits non-zero
-    /// instead of silently skipping the same edge forever.
+    /// instead of silently skipping the same edge forever. If WatchState floor reconciliation is
+    /// incomplete, fix unreadable rows from backup when reported, then re-run this same tick;
+    /// daemon operators instead retry GET /v1/watch/status until its bounded backlog converges.
     Tick {
         #[command(flatten)]
         policy: PolicyFlags,
     },
     /// DRY-RUN a tick (Phase 2 step 2.2): probe, score, and decide, but do NOT apply. Client mode
-    /// uses walletd's stored policy; the per-invocation flags below require `--standalone`.
+    /// uses walletd's stored policy; the per-invocation flags below require `--standalone`. For a
+    /// marked structural evacuation replacement, stale/default standalone `status` warns but returns
+    /// the scored/designation diagnostic with no would-run decisions; use an occurrence strictly newer
+    /// than the marked Agent parent before treating a replacement preview as actionable. It remains
+    /// dry and does not retire the parent or create a child.
     Status {
         #[command(flatten)]
         policy: PolicyFlags,
@@ -478,7 +484,10 @@ struct PolicyFlags {
     #[arg(long)]
     standby: Option<String>,
     /// Allocation epoch stamped into each decision's idempotency key. Keep it for retrying
-    /// Pending/Executing work; bump it after a settled tick to let the decision recur.
+    /// Pending/Executing work; bump it after a settled tick to let the decision recur. A standalone
+    /// tick for a marked structural evacuation replacement requires an occurrence strictly newer
+    /// than its marked Agent parent; standalone status instead shows a stale diagnostic with no
+    /// would-run decisions, and the daemon advances its occurrence itself.
     #[arg(long, default_value_t = 0)]
     occurrence: u64,
     /// §5.1.3 FUNDING-GATE probe policy: seconds the qualifying probe successes must span
@@ -800,6 +809,11 @@ async fn run_standalone(cli: Cli) -> Result<(), CliExit> {
         other => other,
     };
 
+    let joined = journal
+        .list_federations()
+        .await
+        .map_err(|e| CliExit::Usage(anyhow::anyhow!("reading federation registry: {e:?}")))?;
+
     // Recovery rebuilds a funded client from an EXISTING seed and must NEVER mint one: unlike every
     // other verb, `recover` on a seedless store must refuse (exit 2, nothing journaled) rather than
     // silently generate a random seed — that would recover the wrong (empty) wallet AND occupy the
@@ -823,10 +837,6 @@ async fn run_standalone(cli: Cli) -> Result<(), CliExit> {
     };
     let multi_client = Arc::new(MultiClient::new(db, journal_db, mnemonic).await);
 
-    let joined = journal
-        .list_federations()
-        .await
-        .map_err(|e| CliExit::Usage(anyhow::anyhow!("reading federation registry: {e:?}")))?;
     let joined_ids: Vec<_> = joined.iter().map(|(id, _)| *id).collect();
     let infos: Vec<_> = joined.iter().map(|(_, info)| info.clone()).collect();
     multi_client
@@ -2031,16 +2041,40 @@ async fn run_history(
     let rows = journal
         .history(usize::MAX, None)
         .await
-        .map_err(|e| anyhow::anyhow!("reading the operation ledger: {e:?}"))?;
-    for record in rows
+        .map_err(|e| anyhow::anyhow!("reading the operation ledger: {e:?}"))?
         .into_iter()
         .filter(|r| fed_filter.is_none_or(|f| record_involves_fed(r, f)))
         .filter(|r| actor.is_none_or(|a| a.matches(r.actor)))
         .filter(|r| status.is_none_or(|s| s.matches(r.status)))
         .take(limit)
-    {
+        .collect::<Vec<_>>();
+    // The frozen TSV has no link columns.  JSON gets one bulk snapshot for the selected page,
+    // never an N+1 sidecar lookup; ordinary text history remains the exact legacy ledger read.
+    let links = if json {
+        Some(
+            journal
+                .evacuation_supersession_neighbors_for_display_keys(
+                    &rows
+                        .iter()
+                        .map(|record| record.correlation_key.clone())
+                        .collect::<Vec<_>>(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("reading evacuation audit links: {e:?}"))?,
+        )
+    } else {
+        None
+    };
+    for record in rows {
         if json {
-            println!("{}", serde_json::to_string(&record)?);
+            let neighbors = links
+                .as_ref()
+                .map(|links| display_supersession_neighbors_for_key(links, &record.correlation_key))
+                .unwrap_or_default();
+            println!(
+                "{}",
+                serde_json::to_string(&OperationRecordAuditView::new(&record, &neighbors,))?
+            );
         } else {
             println!("{}", history_tsv(&record));
         }
@@ -2064,17 +2098,46 @@ async fn run_show(journal: &FedimintJournal, reference: String, json: bool) -> a
     else {
         anyhow::bail!("no operation found for {reference:?}");
     };
+    let links = journal
+        .evacuation_supersession_neighbors_for_display_keys(std::slice::from_ref(
+            &record.correlation_key,
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("reading evacuation audit links: {e:?}"))?;
+    let links = display_supersession_neighbors_for_key(&links, &record.correlation_key);
+    // `show` owns one exact key, so this live read is bounded.  History intentionally does not
+    // make this lookup per row.  A malformed intent row degrades to absent (with a `warn!`) like
+    // a malformed sidecar: the ledger row this command exists to print must still print.
+    let intent = journal
+        .intent_for_display(&record.correlation_key)
+        .await
+        .map_err(|e| anyhow::anyhow!("reading linked intent: {e:?}"))?;
     if json {
-        println!("{}", serde_json::to_string(&record)?);
+        println!(
+            "{}",
+            serde_json::to_string(&OperationRecordAuditView::with_evacuation_refusal(
+                &record,
+                &links,
+                intent
+                    .as_ref()
+                    .and_then(|intent| intent.evacuation_refusal.as_ref()),
+                evacuation_refusal_active(intent.as_ref()),
+            ))?
+        );
     } else {
         print_show_record(&record);
+        print_supersession_links(&links);
+        print_evacuation_refusal(
+            intent
+                .as_ref()
+                .and_then(|intent| intent.evacuation_refusal.as_ref()),
+        );
+        println!(
+            "evacuation_refusal_active: {}",
+            evacuation_refusal_active_text(evacuation_refusal_active(intent.as_ref()))
+        );
         // The linked intent status, read live (intent-keyed rows only; `-` otherwise).
-        let intent_status = journal
-            .get(&record.correlation_key)
-            .await
-            .ok()
-            .flatten()
-            .map(|i| i.status);
+        let intent_status = intent.as_ref().map(|i| i.status);
         println!(
             "linked_intent_status: {}",
             intent_status.map_or("-", intent_status_tag)
@@ -2435,7 +2498,9 @@ fn tick_apply_failure(summary: &ExecutionSummary) -> Option<String> {
             "tick: {} decision(s) did not apply (performed={} skipped={} failed={} \
              terminal_failed_skipped={} retryable={}); check stderr for per-intent reasons. \
              Retryable failures ({} of failed) can be re-driven with reconcile or the same \
-             --occurrence; terminal Failed intents require correcting the input/route and \
+             --occurrence; a structurally refused standalone evacuation instead requires \
+             --occurrence advanced beyond the old Agent occurrence (the daemon advances it \
+             automatically); terminal Failed intents require correcting the input/route and \
              starting a fresh --occurrence",
             summary.failed + summary.terminal_failed_skipped,
             summary.performed,
@@ -2980,6 +3045,68 @@ fn history_tsv(r: &OperationRecord) -> String {
     .join("\t")
 }
 
+/// Ephemeral offline-audit projection.  `OperationRecord` remains the persisted v1 ledger
+/// schema; JSON callers get every one of its fields flattened at the top level plus the immutable
+/// sidecar endpoints.  Do not add these fields to `OperationRecord`, since old durable rows must
+/// continue to decode as the unchanged ledger contract.
+#[derive(Serialize)]
+struct OperationRecordAuditView<'a> {
+    #[serde(flatten)]
+    record: &'a OperationRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supersedes: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<&'a str>,
+    /// Offline `show` supplies this from the exact intent; history intentionally leaves it absent
+    /// rather than doing one intent read per ledger row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evacuation_refusal: Option<&'a wallet_core::EvacuationRefusalEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evacuation_refusal_active: Option<bool>,
+}
+
+impl<'a> OperationRecordAuditView<'a> {
+    fn new(
+        record: &'a OperationRecord,
+        links: &'a wallet_fedimint::EvacuationSupersessionNeighbors,
+    ) -> Self {
+        Self::with_evacuation_refusal(record, links, None, None)
+    }
+
+    fn with_evacuation_refusal(
+        record: &'a OperationRecord,
+        links: &'a wallet_fedimint::EvacuationSupersessionNeighbors,
+        evacuation_refusal: Option<&'a wallet_core::EvacuationRefusalEvidence>,
+        evacuation_refusal_active: Option<bool>,
+    ) -> Self {
+        Self {
+            record,
+            supersedes: links
+                .predecessor
+                .as_ref()
+                .map(|link| link.old_key.0.as_str()),
+            superseded_by: links.successor.as_ref().map(|link| link.new_key.0.as_str()),
+            evacuation_refusal,
+            evacuation_refusal_active,
+        }
+    }
+}
+
+/// A readable exact intent answers this display field; an absent or malformed/degraded linked row
+/// does not. Only a marked Pending Agent evacuation is active.
+fn evacuation_refusal_active(intent: Option<&wallet_core::Intent>) -> Option<bool> {
+    intent.map(|intent| {
+        intent.evacuation_refusal.is_some()
+            && intent.status == wallet_core::IntentStatus::Pending
+            && matches!(intent.actor, Actor::Agent { .. })
+            && matches!(intent.action, Action::Evacuate { .. })
+    })
+}
+
+fn evacuation_refusal_active_text(active: Option<bool>) -> String {
+    active.map_or_else(|| "-".to_owned(), |active| active.to_string())
+}
+
 /// The multi-line `show` view (§11): the full record plus kind-specific op ids/gateway.
 fn print_show_record(r: &OperationRecord) {
     let (kind, amount) = kind_and_amount(&r.kind);
@@ -3001,6 +3128,51 @@ fn print_show_record(r: &OperationRecord) {
     println!("send_fee_quoted_msat: {}", opt_msat(r.fees.send_fee_quoted));
     print_kind_details(&r.kind);
     println!("error: {}", r.error.as_deref().unwrap_or("-"));
+}
+
+fn print_evacuation_refusal(evidence: Option<&wallet_core::EvacuationRefusalEvidence>) {
+    println!(
+        "evacuation_refusal: {}",
+        evidence.map_or_else(
+            || "-".to_owned(),
+            |evidence| {
+                serde_json::to_string(evidence).unwrap_or_else(|_| "<unserializable>".to_owned())
+            }
+        )
+    );
+}
+
+/// Sidecar links are intentionally outside the frozen TSV history row.  They are nevertheless
+/// first-class offline audit facts on `show`, including both sides of a replacement chain middle.
+fn print_supersession_links(links: &wallet_fedimint::EvacuationSupersessionNeighbors) {
+    let (supersedes, superseded_by) = supersession_link_values(links);
+    println!("supersedes: {supersedes}");
+    println!("superseded_by: {superseded_by}");
+}
+
+fn supersession_link_values(
+    links: &wallet_fedimint::EvacuationSupersessionNeighbors,
+) -> (&str, &str) {
+    (
+        links
+            .predecessor
+            .as_ref()
+            .map_or("-", |link| link.old_key.0.as_str()),
+        links
+            .successor
+            .as_ref()
+            .map_or("-", |link| link.new_key.0.as_str()),
+    )
+}
+
+/// Presentation sidecars must never hide a ledger row. The journal normally inserts an empty
+/// neighbor entry for every requested key, but a missing entry is equivalent to no display links.
+/// Strict replacement and confirmation paths deliberately use their strict journal readers instead.
+fn display_supersession_neighbors_for_key(
+    links: &BTreeMap<IdempotencyKey, wallet_fedimint::EvacuationSupersessionNeighbors>,
+    key: &IdempotencyKey,
+) -> wallet_fedimint::EvacuationSupersessionNeighbors {
+    links.get(key).cloned().unwrap_or_default()
 }
 
 /// Print the recorded refusal arithmetic (§9.3), one line per figure the deciding site
@@ -3342,8 +3514,10 @@ fn gate_policy_override(flags: &PolicyFlags) -> Option<wallet_core::ProbePolicy>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wallet_core::FeeBreakdown;
-    use wallet_fedimint::DiscoverPassProgress;
+    use wallet_core::{EvacFeeCap, EvacuationQuoteSample, EvacuationRefusalEvidence, FeeBreakdown};
+    use wallet_fedimint::{
+        DiscoverPassProgress, EvacuationSupersessionNeighbors, EvacuationSupersessionRecord,
+    };
 
     /// The two floors must read differently. They imply different operator actions: a protocol
     /// dust gap clears only when the gap itself grows, while a route floor also clears if the
@@ -3876,6 +4050,11 @@ mod tests {
         assert!(msg.contains("failed=1"), "{msg}");
         assert!(msg.contains("retryable=1"), "{msg}");
         assert!(msg.contains("Retryable failures"), "{msg}");
+        assert!(
+            msg.contains("structurally refused standalone evacuation")
+                && msg.contains("daemon advances it automatically"),
+            "{msg}"
+        );
 
         let terminal_skip = ExecutionSummary {
             performed: 0,
@@ -3990,6 +4169,42 @@ mod tests {
         }
     }
 
+    fn supersession(old: &str, new: &str) -> EvacuationSupersessionRecord {
+        let cap = EvacFeeCap {
+            base_msat: Msat(10),
+            bps: 100,
+        };
+        EvacuationSupersessionRecord {
+            old_key: IdempotencyKey(old.into()),
+            old_attempt: 0,
+            new_key: IdempotencyKey(new.into()),
+            new_attempt: 0,
+            old_occurrence: Occurrence(1),
+            occurrence: Occurrence(2),
+            source: fed(1),
+            old_cap_components: Some(cap),
+            new_cap_components: Some(cap),
+            refusal: EvacuationRefusalEvidence {
+                cap_components: cap,
+                requested_net: Msat(100),
+                source_spendable: Msat(100),
+                low: EvacuationQuoteSample {
+                    delivered_net: Msat(10),
+                    total_fee: Msat(20),
+                    fee_cap: cap.at(Msat(10)),
+                },
+                high: EvacuationQuoteSample {
+                    delivered_net: Msat(100),
+                    total_fee: Msat(30),
+                    fee_cap: cap.at(Msat(100)),
+                },
+                diagnostic: "test relation".into(),
+                measured_at_ms: 1,
+            },
+            superseded_at_ms: 1,
+        }
+    }
+
     #[test]
     fn rfc3339_from_millis_golden() {
         assert_eq!(rfc3339_from_millis(0), "1970-01-01T00:00:00.000Z");
@@ -4041,6 +4256,142 @@ mod tests {
         assert_eq!(cols[6], "-", "no send fee");
         assert_eq!(cols[7], "agent:9");
         assert_eq!(cols[8], "standing_instruction");
+    }
+
+    #[test]
+    fn offline_audit_json_and_show_links_cover_chain_ends_and_middle() {
+        let mut record = ledger_record(
+            OperationKind::Move {
+                from: fed(1),
+                to: fed(2),
+                amount: Msat(42),
+                send_op: None,
+                recv_op: None,
+                gateway: None,
+                evacuation: true,
+            },
+            Actor::Agent {
+                occurrence: Occurrence(2),
+            },
+            OperationStatus::Succeeded,
+        );
+        record.correlation_key = IdempotencyKey("evac:b".into());
+        let links = EvacuationSupersessionNeighbors {
+            predecessor: Some(supersession("evac:a", "evac:b")),
+            successor: Some(supersession("evac:b", "evac:c")),
+        };
+
+        let json = serde_json::to_value(OperationRecordAuditView::new(&record, &links))
+            .expect("serialize flattened audit view");
+        assert_eq!(
+            json["seq"], 7,
+            "all persisted OperationRecord fields remain"
+        );
+        assert_eq!(json["correlation_key"], "evac:b");
+        assert_eq!(json["supersedes"], "evac:a");
+        assert_eq!(json["superseded_by"], "evac:c");
+        assert!(
+            json.get("evacuation_refusal_active").is_none(),
+            "offline history omits live marker authority rather than asserting false"
+        );
+        assert_eq!(
+            supersession_link_values(&links),
+            ("evac:a", "evac:c"),
+            "text show prints predecessor and successor for B"
+        );
+
+        let no_predecessor = EvacuationSupersessionNeighbors {
+            predecessor: None,
+            successor: Some(supersession("evac:a", "evac:b")),
+        };
+        let no_successor = EvacuationSupersessionNeighbors {
+            predecessor: Some(supersession("evac:b", "evac:c")),
+            successor: None,
+        };
+        let a_json = serde_json::to_value(OperationRecordAuditView::new(&record, &no_predecessor))
+            .expect("serialize A audit view");
+        assert!(a_json.get("supersedes").is_none());
+        assert_eq!(a_json["superseded_by"], "evac:b");
+        assert_eq!(supersession_link_values(&no_predecessor), ("-", "evac:b"));
+        let c_json = serde_json::to_value(OperationRecordAuditView::new(&record, &no_successor))
+            .expect("serialize C audit view");
+        assert_eq!(c_json["supersedes"], "evac:b");
+        assert!(c_json.get("superseded_by").is_none());
+        assert_eq!(supersession_link_values(&no_successor), ("evac:b", "-"));
+
+        let active_evidence = supersession("evac:marked", "evac:child").refusal;
+        let active_json = serde_json::to_value(OperationRecordAuditView::with_evacuation_refusal(
+            &record,
+            &links,
+            Some(&active_evidence),
+            Some(true),
+        ))
+        .expect("serialize active standalone show view");
+        assert_eq!(active_json["evacuation_refusal_active"], true);
+        assert_eq!(
+            active_json["evacuation_refusal"]["diagnostic"],
+            "test relation"
+        );
+        let historical_json =
+            serde_json::to_value(OperationRecordAuditView::with_evacuation_refusal(
+                &record,
+                &links,
+                Some(&active_evidence),
+                Some(false),
+            ))
+            .expect("serialize historical standalone show view");
+        assert_eq!(
+            historical_json["evacuation_refusal_active"], false,
+            "a readable exact but inactive intent remains explicitly false"
+        );
+        let absent_json = serde_json::to_value(OperationRecordAuditView::with_evacuation_refusal(
+            &record, &links, None, None,
+        ))
+        .expect("serialize absent/degraded standalone show view");
+        assert!(
+            absent_json.get("evacuation_refusal_active").is_none(),
+            "an absent or degraded linked intent must not claim inactive"
+        );
+        assert_eq!(evacuation_refusal_active_text(Some(true)), "true");
+        assert_eq!(evacuation_refusal_active_text(Some(false)), "false");
+        assert_eq!(
+            evacuation_refusal_active_text(None),
+            "-",
+            "standalone text must not turn absent/degraded intent into false"
+        );
+    }
+
+    #[test]
+    fn missing_bulk_supersession_key_degrades_to_empty_display_links() {
+        let record = ledger_record(
+            OperationKind::Move {
+                from: fed(1),
+                to: fed(2),
+                amount: Msat(42),
+                send_op: None,
+                recv_op: None,
+                gateway: None,
+                evacuation: true,
+            },
+            Actor::Agent {
+                occurrence: Occurrence(2),
+            },
+            OperationStatus::Succeeded,
+        );
+        let links = BTreeMap::new();
+        let neighbors = display_supersession_neighbors_for_key(&links, &record.correlation_key);
+
+        let json = serde_json::to_value(OperationRecordAuditView::new(&record, &neighbors))
+            .expect("serialize audit view with missing display sidecar");
+        assert!(
+            json.get("supersedes").is_none(),
+            "a missing map entry is no predecessor link"
+        );
+        assert!(
+            json.get("superseded_by").is_none(),
+            "a missing map entry is no successor link"
+        );
+        assert_eq!(supersession_link_values(&neighbors), ("-", "-"));
     }
 
     #[test]

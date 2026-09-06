@@ -40,15 +40,15 @@ pub struct Policy {
     pub per_fed_cap: Msat,
     pub spending_target: Msat,
     pub standby_target: Msat,
-    /// ABSOLUTE fee cap. It bounds NO action the allocator emits: funding `Move`s use
+    /// ABSOLUTE fee cap. It bounds no allocator-emitted action: funding `Move`s use
     /// `max_fee_bps_of_move`, and `Evacuate` uses the `evac_fee_*` pair below.
     /// **In an evacuation incident this is not the knob to turn** — the evacuation cap is
-    /// `evac_fee_base_msat` + `evac_fee_bps`. But raising those affects only evacuations DECIDED
-    /// AFTERWARDS: a pending one carries the pair `decide()` admitted it with, and while it keeps
-    /// retrying there is no supported way to replace it (br-n8o). So neither knob releases an
-    /// evacuation already in flight. `max_fee` remains load-bearing elsewhere, as the default
-    /// `fee_cap` for user-initiated pay/move/receive and as the probe leg cap, so it is not
-    /// dead.
+    /// `evac_fee_base_msat` + `evac_fee_bps`. An admitted action's cap is generally immutable.
+    /// The narrow exception is a pre-artifact Agent `Evacuate` with durable typed
+    /// structural-refusal evidence: a component-wise monotone effective increase at its measured
+    /// delivered-net sample wakes the scheduler and atomically replaces that marked parent with a
+    /// linked fresh successor. `max_fee` remains load-bearing elsewhere, as the default `fee_cap`
+    /// for user-initiated pay/move/receive and as the probe leg cap, so it is not dead.
     pub max_fee: Msat,
     /// PROPORTIONAL fee cap for funding `Move`s, in basis points of the amount moved
     /// (1..=10000; Policy rejects 0). Replaces the absolute `max_fee` for funding so sizing
@@ -397,11 +397,26 @@ pub struct OperationView {
     /// The ledger row's failure diagnostic (audit-honest: cleared on success). Without it a
     /// caller directed to `/v1/operations/{key}` after a failure learns only THAT it failed.
     pub error: Option<String>,
+    /// For a structurally superseded evacuation, the fresh child operation key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    /// For a replacement evacuation, the retired parent operation key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
     /// For a `refusal` row, the balance/threshold figures the refusal was decided from, so
     /// "why didn't the wallet act?" is answerable from a LIVE daemon (`history`/`show`), not
     /// only from a stopped-wallet journal read. `None` for every other kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<RefusalDiagnostics>,
+    /// Exact structural-refusal evidence carried by a still-pending marked evacuation. History
+    /// deliberately omits this per-row lookup; `show` projects it for the requested operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evacuation_refusal: Option<wallet_core::EvacuationRefusalEvidence>,
+    /// Whether the exact linked intent is an active Pending agent-evacuation marker. `None` means
+    /// the display did not resolve a readable exact intent (including history and degraded reads);
+    /// `Some(false)` means the exact intent is present but historical or inactive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evacuation_refusal_active: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -841,6 +856,8 @@ mod tests {
             reason: "spending_below_target".to_owned(),
             operation_key: "refuse:spending_below_target:0101:0".to_owned(),
             error: None,
+            superseded_by: None,
+            supersedes: None,
             refusal: Some(RefusalDiagnostics {
                 source: Some(fed(2)),
                 want: Some(Msat(50_000)),
@@ -853,6 +870,8 @@ mod tests {
                 conflict_suppressed: true,
                 min_move: Some(Msat(5_000)),
             }),
+            evacuation_refusal: None,
+            evacuation_refusal_active: None,
         };
         let json = serde_json::to_string(&view).expect("serialize");
         assert!(
@@ -876,6 +895,29 @@ mod tests {
         assert_eq!(d.cap_room, Some(Msat(96_000)));
         assert_eq!(d.amount, Some(Msat(0)));
         assert_eq!(d.min_move, Some(Msat(5_000)));
+        assert_eq!(
+            back.evacuation_refusal_active, None,
+            "a legacy/missing wire field remains an unknown display projection"
+        );
+
+        let active = OperationView {
+            evacuation_refusal_active: Some(true),
+            ..view.clone()
+        };
+        assert_eq!(
+            serde_json::to_value(active).expect("serialize active projection")
+                ["evacuation_refusal_active"],
+            true
+        );
+        let historical = OperationView {
+            evacuation_refusal_active: Some(false),
+            ..view.clone()
+        };
+        assert_eq!(
+            serde_json::to_value(historical).expect("serialize inactive projection")
+                ["evacuation_refusal_active"],
+            false
+        );
 
         // A non-refusal view omits the `refusal` field entirely. Use a `move` view so the
         // string "refusal" cannot appear via `kind`/`operation_key`.
@@ -891,12 +933,20 @@ mod tests {
             reason: "user_initiated".to_owned(),
             operation_key: "move:example".to_owned(),
             error: None,
+            superseded_by: None,
+            supersedes: None,
             refusal: None,
+            evacuation_refusal: None,
+            evacuation_refusal_active: None,
         };
         let move_json = serde_json::to_string(&move_view).expect("serialize non-refusal");
         assert!(
-            !move_json.contains("refusal"),
+            !move_json.contains("\"refusal\":"),
             "refusal omitted when None: {move_json}"
+        );
+        assert!(
+            !move_json.contains("\"evacuation_refusal_active\":"),
+            "unknown marker authority omitted rather than asserted by history: {move_json}"
         );
     }
 
@@ -914,7 +964,11 @@ mod tests {
             reason: "user_initiated".to_owned(),
             operation_key: "move:example".to_owned(),
             error: Some("gateway route rejected".to_owned()),
+            superseded_by: None,
+            supersedes: None,
             refusal: None,
+            evacuation_refusal: None,
+            evacuation_refusal_active: None,
         };
         assert_json_roundtrip(OperationAccepted {
             operation_key: "pay:example".to_owned(),
