@@ -15,6 +15,9 @@ either outcome (the ledger, hardening, UI, and recovery serve a single-fed walle
 
 ## Where we are
 
+The description of the system as built now lives in [docs/spec/](./spec/README.md); this section
+is the phase-by-phase record of how it got there.
+
 - **Phase 1 — money engine: COMPLETE.** Join/receive/pay/DirectInflow/cross-fed Move,
   crash/reconcile gate live-validated ([phase1-implementation-spec.md](./archive/phase1-implementation-spec.md)).
 - **Phase 2 — sense + decide: COMPLETE.** probe → score → snapshot → decide → apply via

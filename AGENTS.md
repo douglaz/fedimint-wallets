@@ -3,7 +3,8 @@
 Instructions for coding agents working in this repository.
 
 This is a **multi-federation Bitcoin wallet running in production and holding real
-sats**. Read [README.md](./README.md) for what is built, and
+sats**. Read [docs/spec/](./docs/spec/README.md) for what is built (the as-built specification;
+start at its executive summary) and
 [docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md) for what is next. The ADRs under
 [docs/adr/](./docs/adr/) are canonical wherever they conflict with older text.
 
@@ -110,6 +111,8 @@ or not at all: a deliberately broken build can perform the harmful operation bef
 any assertion notices.
 
 Gate for this repo: `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
+
+A change under `docs/spec/` also runs `bash docs/spec/tools/check-all.sh` (CI does too).
 <!-- end-agent-discipline -->
 
 ## Project-specific notes
