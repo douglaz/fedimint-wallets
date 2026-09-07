@@ -2,7 +2,7 @@
 
 *A single-file orientation to the as-built specification, for a reader who has never seen the
 code. Written 2026-09-07 against `main` `1e44487` plus PR #40: six Rust crates, about 80,000
-lines of which roughly 40% is test code, 1,071 tests, 18 live smoke gates, 31 ADRs.*
+lines of which roughly 40% is test code, 1,071 tests, 16 live smoke gates, 31 ADRs.*
 
 ---
 
@@ -38,8 +38,10 @@ per-operation driver tasks do the waiting. A pay issued while a probe is stuck r
 external call in under 250 ms, measured (`ADR-0024`, `CNF-21`).
 
 **The ledger is the user's record, and it is append-only.** Every operation — including every
-failure and every refusal, with the figures that produced it — is one row in a sequence-numbered
-ledger written in the same transaction as the intent it describes. Nothing deletes a row. A
+failure and every refusal — is one row in a sequence-numbered ledger; an intent-backed row is
+written in the same transaction as the intent transition it describes, while tick, refusal and
+discovery rows are best-effort and a few refusal paths carry empty diagnostics (`OVR-4`,
+`ALC-5`). Nothing deletes a row. A
 terminal row is immutable. A retry is a new row. `wallet-cli history` reconstructs a whole
 session (`05-persistence.md`, `CNF-15`).
 
@@ -52,7 +54,8 @@ federation the user joined by hand is trusted as the user's own decision (`ADR-0
 ## 3. What is built, in one paragraph each
 
 **Money.** Join a federation; receive (fee deducted from the invoice) and direct-inflow (invoice
-grossed up so the destination is credited exactly the requested amount); pay a BOLT11 invoice
+grossed up so the destination is credited the requested amount, never over and at most one
+receive-fee step under); pay a BOLT11 invoice
 choosing the cheapest gateway that fits a fee cap; move between federations as an internal swap
 through a gateway both ends validate; recover ecash from the twelve-word seed plus the
 federation's invite, into a fresh partition, never wiping anything (`ADR-0025`).
@@ -69,8 +72,9 @@ destination is actually credited (`ADR-0029`).
 that is uneconomic at any size blocks funding and says so in the ledger. One federation's stuck
 operation no longer suppresses decisions for the others. An evacuation that cannot fit its cap at
 any amount is marked with durable evidence, and a qualifying cap increase atomically retires it
-and admits a linked successor. A corrupt registry row or an unopened federation fences all
-planning and reports why on `/v1/health`.
+and admits a linked successor. An unopened federation fences all planning and reports why on
+`/v1/health`; a corrupt registry row does the same once PR #40 lands, and on `main` is still
+silently dropped (`F2`).
 
 **Host.** The daemon owns both RocksDB stores under one lock, serves eighteen routes behind a
 bearer token, runs the scheduler with adaptive sleep, wakes early for a federation's announced
@@ -94,13 +98,14 @@ The CLI's `--standalone` mode drives the same engine one-shot under the same loc
 
 ## 5. What has been validated, and against what
 
-The unit suite is the floor and is green. Fifteen live smokes against a two-federation devimint
+The unit suite is the floor and is green. Sixteen live smokes against a two-federation devimint
 harness cover the money path, the crash gate, the tick, evacuation, discovery, the probe,
 history, recovery, the daemon path, the autonomous chain, responsiveness, a 24-hour soak, and
-supersession; each records its last green run in its header. **None runs in CI**, by explicit
+supersession. Only the supersession smoke records its last green run in its header; the others
+carry launch blocks, and their last runs live in issue close notes. **None runs in CI**, by explicit
 policy.
 
-One daemon has run continuously since 2026-07-26 on two mainnet federations with a small real
+One daemon has been running the 2026-07-26 build on two mainnet federations with a small real
 balance. It is a **test deployment**, not a pilot, and it runs a build 220 commits behind `main`.
 It has demonstrated restart survival, a cross-federation move, and an external Lightning send and
 receive with fees reconciling exactly. It has never evacuated, never stranded a move, and has sat

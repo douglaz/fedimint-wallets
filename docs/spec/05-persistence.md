@@ -18,8 +18,9 @@ under `0x00` or the journal never sees it (`DEF-24`). *The split exists because 
 write churn flushed the fedimint client's small no-history memtable and failed its long-held
 lnv2 transactions during a 24-hour soak.*
 
-**STO-2** One process owns both stores. The lock is RocksDB's own on `client.db`, opened first
-as the exclusivity anchor; a second opener blocks (the daemon) or refuses after a non-blocking
+**STO-2** One process owns both stores. The lock is fedimint's advisory lock **file**
+`client.db.lock`, beside the `client.db` directory (not RocksDB's internal `LOCK` inside it),
+taken when `client.db` is opened first as the exclusivity anchor; a second opener blocks (the daemon) or refuses after a non-blocking
 probe (the standalone CLI). `init`, `mnemonic` and `restore-mnemonic` are therefore
 while-stopped operations.
 
@@ -125,10 +126,12 @@ its own write if it lost. `MovePhase` ∈ `Created, Invoiced, Sending, Settled, 
 Stranded`.
 
 **STO-12** `WatchState` (`0x0a`): `occurrence`, `last_discover_ms`, `discover_cursor?`,
-`discover_backlog`, `discover_rotation`. `advance_watch_occurrence` does a checked `+1` and
-`observe_watch_occurrence` a `max`; both reject `u64::MAX`, which is the fail-closed value.
+`discover_backlog`, `discover_rotation`. `advance_watch_occurrence` does a checked `+1` on the
+stored value and fails only when that value is already `u64::MAX`, so it can write `u64::MAX`
+once; `observe_watch_occurrence` does a `max` and rejects an **input** of `u64::MAX` before
+writing. `u64::MAX` is the fail-closed value (`ALC-33`).
 
-**STO-13** `Policy` (`0x0b`): thirty fields (`API-27`), seeded insert-if-absent by `walletd
+**STO-13** `Policy` (`0x0b`): twenty-eight fields (`API-27`), seeded insert-if-absent by `walletd
 init` and again at actor start, which then validates the stored row and refuses to start on an
 invalid one. `put_policy` is a plain overwrite; **the journal does not validate** — the actor
 does, and the HTTP handler rejects unknown keys (`API-20`). The stored type is permissive
@@ -138,8 +141,9 @@ defaults because rows written before them exist.
 **STO-14** The federation registry (`0x03`) is written by a plain overwrite after the client
 partition exists and before the in-memory client is inserted. `get_federation` fails closed on
 a corrupt row; `list_federations_report` skips a malformed key or undecodable value, counts it
-in `skipped_rows`, and warns. Three planning surfaces MUST treat `skipped_rows > 0` as "the
-world is unknown" rather than plan from the healthy subset (`ALC-46`).
+in `skipped_rows`, and warns. On `main` nothing outside `list_federations` reads the report, so a
+poison row is dropped and planning proceeds from the healthy subset; PR #40 makes three planning
+surfaces treat `skipped_rows > 0` as "the world is unknown" instead (`ALC-46`, `F2`).
 
 ## The operation ledger
 
@@ -222,8 +226,10 @@ old_key`. A superseded parent can never be retried; a child's namespace must be 
 Agent evacuation per source may exist at exchange time; the replay path validates that both
 sidecars exist and agree before returning success without writing (`OPS-30`).
 
-**STO-26** `ProbeRecord` (`0x08`): `attempts` (pruned to the newest 256 while keeping every
-attempt within the 7-day TTL, the newest attempt, and per-source newest success) and one
+**STO-26** `ProbeRecord` (`0x08`): `attempts`, pruned in two steps — first keep every attempt
+within the 7-day TTL, the newest attempt, and per source the newest success and the newest
+default-qualifying success; then truncate to the newest 256, which **overrides** the keep rules
+when more than 256 survive them — and one
 `in_flight` session whose nonce is exclusive; an outcome with a stale nonce is ignored.
 `CandidateRecord` (`0x09`): `id` (must equal the key), `invite`, `source`, `discovered_at_ms`,
 `structural`, `structural_checked_at_ms`, `state ∈ {Rejected, Discovered, AutoJoined,
@@ -255,8 +261,11 @@ bare default yields zero (`DEF-10`; a zero evacuation cap is a livelock). As bui
 carrying it are `Intent.evacuation_refusal`, `Action::Move.gateway`,
 `Action::Evacuate.{gateway, fee_cap_components}`, `OperationKind::Refusal.diagnostics`,
 `RefusalDiagnostics.{max_fee_bps, conflict_suppressed}`, and the three `Policy` fields in
-`STO-13`. Each MUST be pinned by a test that strips the key from a persisted row and re-reads it
-(`CNF-18`).
+`STO-13` — ten in the journal — plus `MoveMeta.fee_cap` and `MoveMeta.from`, which ride the
+SDK op-log's `custom_meta` in `client.db` (`OPS-25`): twelve. Each SHOULD be pinned by a test that strips the key from the serialized type and re-reads it.
+Ten are: `Refusal.diagnostics`, `Move.gateway`, `Intent.evacuation_refusal`, both
+`RefusalDiagnostics` fields, the three `Policy` fields, and both `MoveMeta` fields. Two are not:
+the `Evacuate` defaults, which one bare-`Action` fixture omits both at once (`CNF-18`, `F41`).
 
 **STO-31** No type on that list may carry `#[serde(deny_unknown_fields)]` (`DEF-11`): a row
 written by a newer build must stay readable by the previous build or a rollback cannot start.

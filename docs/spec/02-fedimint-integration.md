@@ -71,12 +71,14 @@ place a gateway in the list; the wallet applies no threshold of its own (`F6`, `
 devimint harness does not auto-register its gateway, so the list can be empty while a usable
 gateway exists.
 
-**FMI-11** `validate_gateway(fed, gw)` is a direct `POST {gateway}/routing_info` with the
-federation id as body, on a pooled HTTP client with a 5-second connect and 10-second total
-timeout, bypassing the SDK's gateway API because the SDK's connection check is hard-coded false
-at the pin and adds 550–730 ms of backoff per quote. `Some(routing_info)` means the gateway
-serves that federation; `None` means it answered and does not; a transport, HTTP or decode
-failure is an error.
+**FMI-11** Gateway validation is a direct `POST {gateway}/routing_info` with the federation id
+as body, on a pooled HTTP client with a 5-second connect and 10-second total timeout, bypassing
+the SDK's gateway API because the SDK's connection check is hard-coded false at the pin and adds
+550–730 ms of backoff per quote. The private `maybe_routing_info_for` is tri-state:
+`Some(routing_info)` means the gateway serves that federation, `None` means it answered and does
+not, and a transport, HTTP or decode failure is an error. The public `validate_gateway(fed, gw)`
+collapses that to `Result<()>`: "does not serve" and a transport fault both arrive as `Err`, so a
+caller cannot tell them apart through it.
 
 **FMI-12** Automated selection MUST choose the **cheapest** validated candidate (`DEF-5`): for a
 raw pay, the cheapest gateway whose gateway-plus-federation send quote fits the cap; for a raw
@@ -93,15 +95,21 @@ behaviour (`F6`).
 
 **FMI-14** Gateway precedence for a move or evacuation: (1) the daemon's configured pin,
 returned **unvalidated**; (2) the action's route hint, if it still `gateway_serves_route`; (3)
-if the amount is final, the fallback resolver (`FMI-12`); (4) the first registered gateway that
-validates both ends; (5) none → `Retryable`, never `Permanent`, so the intent stays `Pending` and
+if the amount is final, the fallback resolver (`FMI-12`) — and if it priced every candidate and
+none fits the cap it returns `Retryable` **without** trying (4), so a tight cap keeps a move
+`Pending` even when a validating gateway exists; only a budget-truncated or nothing-priced scan
+falls through to (4) the first registered gateway that validates both ends; (5) none → `Retryable`, never `Permanent`, so the intent stays `Pending` and
 a later run with a break-glass override can resume it. A fresh evacuation, whose amount is not
 yet final, takes (4) directly. `ADR-0030`'s rule that automated routing is never pinned is
 target state (`F4`).
 
 **FMI-15** A **direct inflow** is a receive-only move whose invoice is grossed up so the
-destination is credited exactly `amount` after gateway and federation receive fees; the external
-payer pays the invoice amount. A raw **receive** invoices `amount` and the recipient nets `amount`
+destination is credited `amount` after gateway and federation receive fees — **never more, and
+possibly less by a bounded shortfall**: the gross-up returns a verified never-over invoice and,
+when the federation's step fee prevents an exact solution, the best verified under-netting
+candidate, so the shortfall is bounded by one receive-fee step of that federation, not by a
+fixed figure. On the tested route it is tens of msat (lnv2's own receive quote omits the
+note-selection-dependent mint output fee) and the live gate tolerates 1,000 msat. The external payer pays the invoice amount. A raw **receive** invoices `amount` and the recipient nets `amount`
 minus fees. The two are different verbs with different ledger semantics (`STO-15`).
 
 ## The Lightning legs
@@ -187,7 +195,8 @@ collection command exists.
 ## Signals a federation emits, and what the wallet does with them
 
 **FMI-24** From the authenticated `ClientConfig`: `guardian_count = api_endpoints.len()`,
-`threshold` = the SDK's `2f+1` for that count, module kinds, `has_lnv2`, wallet-module presence,
+`threshold` = the SDK's `NumPeers::threshold()`, which is `n − (n−1)/3` (equal to `2f+1` only
+when `n ≡ 1 mod 3`; the `probe.rs` comment saying `2f+1` is stale), module kinds, `has_lnv2`, wallet-module presence,
 `is_mainnet`. The scorer rejects a threshold below the BFT bound (`ALC-14`).
 
 **FMI-25** Liveness is one `session_count` threshold read: success is `quorum_live`, wall-clock

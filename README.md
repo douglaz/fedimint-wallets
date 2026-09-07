@@ -186,6 +186,10 @@ gateway pinning details, and known gotchas.
 
 ## Design docs
 
+- [docs/spec/](./docs/spec/README.md) - the as-built specification: what the code does today, with
+  stable requirement identifiers, known defects, conformance evidence, and open findings. Start at
+  its executive summary. It supersedes the status list above and the plans below as the
+  description of the system.
 - [CONTEXT.md](./CONTEXT.md) - canonical product language and domain definitions.
 - [docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md) - current build sequence and
   definition of "fully featured v1".

@@ -1,8 +1,9 @@
 # 10 — Conformance checklist
 
 What has been demonstrated, by which gate, and what has not. A checked box names a gate that
-exists in the repository and was last observed green; the smokes record that observation in
-their own headers. An unchecked box is a claim nobody has earned. Treat it as such.
+exists in the repository and was last observed green. For the unit gates that observation is
+CI; for the live smokes it is the run recorded in the closing issue's notes (and, for one smoke,
+in its header — `CNF-39`). An unchecked box is a claim nobody has earned. Treat it as such.
 
 The unit and integration suite runs in CI on every push. **No live gate does**, by the
 workflow's explicit policy: the smokes need a two-federation devimint harness, take minutes to
@@ -23,45 +24,61 @@ by `docs/devimint-runbook.md` §1.
       (`DEF-25`, unchecked below).
 - [x] **CNF-40** A runbook claim about what a procedure does is re-run from a clean shell before
       it is called correct (`DEF-15`, `DEF-19`). The failure signature is recorded verbatim.
-- [x] **CNF-39** Every smoke header records its complete launch block and its last green run with
-      the figures observed, so the evidence outlives the shell that produced it.
+- [ ] **CNF-39** Every smoke header records its complete launch block and its last green run with
+      the figures observed. As built only `smoke_evacuate_supersede_devimint.sh` does; the other
+      fifteen carry a launch block and no run record, and their last green runs live in issue
+      close notes and `DRIVE.md`, not beside the script.
 
 ## Build and unit gates
 
 - [x] **CNF-4** `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings`
-      clean, in the devshell, on every push (`HST-16`).
-- [x] **CNF-5** 1,071 tests pass under the gate at `main` `1e44487` plus PR #40: 188 in
-      `wallet-core`, 10 in `wallet-api`, 720 in `wallet-fedimint`, 54 in `wallet-daemon`, 75 in
-      `wallet-cli`, 25 in `wallet-web`, plus integration suites under `wallet-core/tests/` and
-      `wallet-fedimint/tests/`.
-- [x] **CNF-6** CI asserts `Cargo.lock` is unchanged by the build.
+      clean, in the devshell, on every push, and (from this change) `docs/spec/tools/check-all.sh`
+      exit 0 in the same job (`HST-16`).
+- [x] **CNF-5** 1,071 tests pass under the gate at commit `ab52094` (PR #40's head, which
+      contains `main` `1e44487`), run as `nix develop -c bash -c 'cargo fmt --all --check && cargo
+      clippy --workspace --all-targets -- -D warnings && cargo test --workspace'` with
+      `REAL_GATE_EXIT=0` on 2026-09-06. `main` alone is a few fewer. The suite spans all six
+      crates plus the integration suites under `wallet-core/tests/` and `wallet-fedimint/tests/`.
+- [x] **CNF-6** CI asserts `Cargo.lock` is unchanged **before** any cargo step runs, guarding
+      against the cache action rewriting it; build-time drift is guarded by `--locked` on the clippy
+      and test steps.
 - [x] **CNF-7** `nix build` produces `walletd`, `wallet-cli` and a non-empty OCI image, and both
       binaries answer `--help` (`HST-16`).
-- [x] **CNF-18** Every persisted field that carries `serde(default)` (`STO-30`) is pinned by a
-      test that strips the key from a persisted row and re-reads it. Added for
-      `OperationKind::Refusal.diagnostics` in PR #42 with the verbatim production error.
+- [ ] **CNF-18** Every persisted field that carries `serde(default)` (`STO-30`) is pinned by a
+      test that strips the key from the serialized type and re-reads it. Ten of twelve are:
+      `Refusal.diagnostics` (PR #42, with the verbatim production error), `Move.gateway`,
+      `Intent.evacuation_refusal`, `RefusalDiagnostics.{max_fee_bps, conflict_suppressed}`, and
+      the three `Policy` fields, and `MoveMeta.fee_cap` / `MoveMeta.from`
+      (`wallet-fedimint/tests/move_meta.rs`). Two are not: the `Evacuate` defaults share one
+      bare-`Action` fixture that omits both keys at once (`F41`).
 - [x] **CNF-33** The **downgrade** direction is pinned for `Policy`: a row written by the
       current shape decodes under the previous shape's rules, and the handler rejects an unknown
       key (`DEF-11`, PR #43, both red-first).
-- [x] **CNF-32** A single-guardian threshold-decryption regression gate exists because the
-      four-guardian devimint harness cannot catch the class (`DEF-16`).
+- [ ] **CNF-32** A single-guardian threshold-decryption regression gate exists **in this
+      repository**. It does not: the gate that closed `DEF-16` is a unit test in the fork's
+      `crypto/tpe`, which `cargo test --workspace` here never runs; this repository's only
+      single-guardian test checks scorer rejection. A repoint that dropped the fix would pass
+      every gate here (`FMI-2`).
 - [x] **CNF-34** A claim committing inside the supersession exchange window leaves one executable
       intent: the parent `Executing`, no child, no sidecar, `pending()` equal to the parent alone.
       Red against both guards it pins (`DEF-23`, commit `beba9ab`).
-- [x] **CNF-35** A malformed value under a well-formed registry key fences the scheduler with
-      `corrupt_federation_registry` and writes no probe, tick or watch row; a joined-but-unopened
-      federation fences it with `partial_federation_view`. Planted under the `0x00` partition
-      (`DEF-24`).
+- [x] **CNF-35** A joined-but-unopened federation fences the scheduler with
+      `partial_federation_view` and writes no probe, tick or watch row
+      (`a_partial_federation_view_reports_why_automation_is_blocked`).
 - [x] **CNF-36** Allocator behaviour is pinned by golden fixtures (`wallet-core/tests/allocator_golden.rs`)
       whose evacuation cases stamp cap components that disagree with `max_fee`, so an accidental
       return to the flat cap breaks every evacuation golden.
-- [x] **CNF-37** `min_viable_amount` is an upper bound by construction, pinned by a property test
-      over its rounding (`ALC-12`).
+- [x] **CNF-37** `min_viable_amount` never under-estimates the true break-even, pinned by
+      `floor_never_under_estimates_the_true_break_even` over four fee tuples at three amounts each
+      — fixture coverage, not a generated property test (`ALC-12`).
 - [x] **CNF-38** The daemon runs exactly one `u64::MAX` occurrence cycle and then fails closed
       every later one (`ALC-33`).
-- [x] **CNF-26** Every CLI verb's request shape, stdout contract and exit-code mapping is pinned
-      against a mock daemon (`wallet-cli/tests/cli_client.rs`), so the wire contract does not
-      drift with the handlers.
+- [x] **CNF-26** The exit-code mapping (`API-28`) and the client-mode request shape and stdout
+      contract of `balance`, `history`, `show`, `candidates`, `status`, `pay`, `receive`, the
+      await verbs, `policy get`/`set`, `reconcile` and `health` are pinned against a mock daemon
+      (`wallet-cli/tests/cli_client.rs`). `join`, `recover`, `move`, `direct-inflow`,
+      `approve` and `list-feds` have no mock-server test; their wire shapes are covered only by
+      the live daemon smokes (`CNF-19`, `CNF-20`).
 
 ## Live gates — the harness
 
@@ -88,8 +105,9 @@ by `docs/devimint-runbook.md` §1.
 - [x] **CNF-8** `smoke_devimint.sh`: join and balance against one federation (Phase 1 step 3).
 - [x] **CNF-9** `smoke_money_devimint.sh`: receive and pay over lnv2 through the direct-swap path,
       single federation, one gateway.
-- [x] **CNF-10** `smoke_directinflow_devimint.sh`: a direct inflow nets **exactly** the target
-      amount (the gross-up fixed point, `FMI-15`).
+- [x] **CNF-10** `smoke_directinflow_devimint.sh`: a direct inflow nets the target amount, never
+      more and at most 1,000 msat less (the gross-up fixed point plus lnv2's unquoted mint output
+      fee, `FMI-15`).
 - [x] **CNF-11** `smoke_move_devimint.sh`: a two-leg move A→B through a shared gateway's internal
       swap; B rises by the amount, A falls by amount plus fees.
 - [x] **CNF-12** `smoke_crash_move_devimint.sh`: the move survives an uncatchable abort at each of
@@ -146,7 +164,7 @@ by `docs/devimint-runbook.md` §1.
       Unit-tested in the fork only; needs a fault hook that does not exist (`F24`).
 - [ ] **CNF-42** A crash at `after-receive-commit` on a supersession **child**, then restart and
       reconcile. The supersession smoke covers restart-and-reconcile but not a mid-flight kill
-      (`F25`).
+      (`F25`, `br-supersession-child-killpoint-gate-7c9`).
 - [ ] **CNF-43** The evacuation smoke discriminating the cap **basis**: its flat cap is far above
       the fee it asserts, so a return to sizing off `max_fee` would pass; and the delivered-net
       basis is unpinned at the pre-mint gate and the post-receive recompute because the test route
@@ -162,3 +180,6 @@ by `docs/devimint-runbook.md` §1.
       explained (`F12`).
 - [ ] **CNF-49** The readiness poller running from a schedule and paging on a transition (`F14`).
 - [ ] **CNF-50** A failed `ReconcileDecide` reported as `automation_blocked` (`F32`).
+- [ ] **CNF-51** A malformed value under a well-formed registry key fences the scheduler with
+      `corrupt_federation_registry` and writes no probe, tick or watch row, planted under the
+      `0x00` partition (`DEF-24`). The test exists in PR #40 and is not on `main` (`F2`).

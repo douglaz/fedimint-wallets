@@ -26,12 +26,15 @@ rather than rotating underneath it.
 
 ## Error envelope
 
-**API-5** Every non-2xx response is
+**API-5** Every non-2xx response **produced by a handler** is
 
 ```json
 { "kind": "refused|failed|unauthorized|not_found|timeout",
   "refuse_reason": "<optional>", "operation_key": "<optional>", "message": "<text>" }
 ```
+
+The router has no fallback, so an authenticated request to an unknown path or with an unsupported
+method gets axum's default non-JSON 404 or 405 body, not this envelope.
 
 `refuse_reason` ∈ `insufficient_after_reservations | fed_held_by_probe | over_cap |
 budget_exhausted | sizing_conflict{field} | amount_required | storage_error | policy_invalid |
@@ -46,7 +49,7 @@ policy_superseded | conflict`.
 | 422 | refused | `policy_invalid`, `amount_required`, `sizing_conflict`; and every daemon-side request validation failure with no reason (bad invoice, `from == to`, unjoined federation, bad nonce, malformed JSON, bad query or path, unknown policy field) |
 | 409 | refused | `insufficient_after_reservations`, `fed_held_by_probe`, `over_cap`, `budget_exhausted`, `storage_error`, `policy_superseded`, `conflict` |
 | 409 | failed | a journaled terminal failure surfaced synchronously; carries `operation_key` |
-| 503 | failed | shutting down, actor stopped, destination federation joined but not open, or a `/v1/status` precondition (`API-15`) |
+| 503 | failed | shutting down, actor stopped, destination federation joined but not open (fresh key), a balance read failing on an open source federation during money-verb admission, or a `/v1/status` precondition (`API-15`) |
 | 504 | timeout | a long-poll or invoice deadline elapsed; carries `operation_key` when the operation was admitted |
 | 500 | failed | storage error |
 
@@ -105,8 +108,8 @@ receive, pay, direct-inflow, move, evacuation, refusal, probe, tick, discover, a
 approve`. `actor` is `"user"` or `"agent:<occurrence>"`. **The enforced fee cap is not on the
 view** (`F9`), nor is a federation id.
 
-**API-13** A recovery whose intent is `Succeeded` but whose client handle is not yet installed
-is reported as `started`, so a caller never observes "succeeded" alongside a zero balance
+**API-13** A recovery whose ledger row is `succeeded` (intent `Done`) but whose client handle is
+not yet installed is reported as `started`, so a caller never observes "succeeded" alongside a zero balance
 (`DEF-18`'s visibility window).
 
 **API-14** `GET /v1/watch/status` is a pure journal read of `WatchState` (`STO-12`).
@@ -126,7 +129,8 @@ client mode cannot see a withheld funding goal. Only the raw endpoint and the po
 `{actor_queue_depth, inflight_drivers, scheduler_alive, automation_ready, automation_blocked?}`.
 `scheduler_alive` is the scheduler loop's liveness flag. `automation_ready` is
 `automation_blocked.is_none()`. `automation_blocked` is `{reason, detail}` with `reason` ∈
-`cycle_failed | partial_federation_view | corrupt_federation_registry` (`ALC-45`). Liveness and
+`cycle_failed | partial_federation_view` on `main`, plus `corrupt_federation_registry` once PR #40
+lands (`ALC-45`). Liveness and
 readiness are different answers, and a supervisor that reads only the status code learns
 neither. The CLI's `health` verb prints the first three fields and **omits both readiness
 fields**.
@@ -145,7 +149,8 @@ The response discards whether the admission was fresh or attached to an in-fligh
 the same key; a caller cannot distinguish the two from the status code.
 
 **API-18** `POST /v1/pay {invoice, amount?, fee_cap?, fed?}` (unknown fields rejected). An
-amountless invoice without `amount` is `422 amount_required`; a stated amount that disagrees
+amountless BOLT11 invoice is `422 amount_required` **whether or not** `amount` is supplied (the
+lnv2 send API cannot supply an amount); a stated amount that disagrees
 with the invoice is `422 sizing_conflict{amount}`. `fee_cap` defaults to the policy's `max_fee`;
 `fed` defaults to the policy's spending federation, else the sole joined federation, else 422.
 The operation key is derived from the payment hash, so paying the same invoice twice attaches
@@ -155,7 +160,8 @@ to the same operation (`OPS-8`). There is no gateway field on the wire (`ADR-003
 and, with the resolved `fee_cap`, is part of the operation key. A client that omits `fee_cap`
 and retries after a policy edit therefore derives a *different* key and admits a second move;
 the web plan's money forms exist to pin these values at render time (`F27`). `from == to` is
-422. A destination that is joined but not open is 503.
+422. A destination that is joined but not open is 503 **for a fresh key**; a replay of an
+existing key attaches before that check runs and succeeds.
 
 **API-20** `PUT /v1/policy` accepts a JSON object and rejects any key not in the set derived at
 runtime from `Policy::default()`'s serialization, with `422 unknown policy field(s): …`. A
@@ -169,8 +175,8 @@ shape). `nonce` is non-empty RFC 3986 unreserved characters and is part of the k
 admits the intent and then **blocks up to 30 seconds** for the invoice artifact: terminal
 without an invoice is `409 failed` with the key; the deadline is `504 timeout` with the key.
 Re-submitting the same key re-yields the same invoice (`OPS-8`). `receive` deducts fees from the
-invoice; `direct-inflow` grosses the invoice up so the destination is credited exactly `amount`
-(`FMI-15`).
+invoice; `direct-inflow` grosses the invoice up so the destination is credited `amount`, never
+more and possibly less by a bounded receive-fee step (`FMI-15`).
 
 **API-22** `POST /v1/join {invite}` and `POST /v1/recover {invite}` are 202 and asynchronous;
 await them with `GET /v1/operations/{key}?wait=true`. A recovery of an already-registered
@@ -198,9 +204,11 @@ receive, pay, await-receive, await-send, direct-inflow, await-move, move, probe,
 tick, status, health, policy get, policy set, history, show`. Exactly four initiate movement on
 the user's behalf: `pay`, `receive`, `move`, `direct-inflow` (`CONTEXT.md` **Money verb**).
 
-**API-27** Every one of the thirty `Policy` fields is settable through `policy set` flags, which
-GETs the whole policy, applies the flags, and PUTs the whole struct back (read-modify-write, so
-a field the client does not know survives). `--clear-spending-fed` and `--clear-standby-fed`
+**API-27** Every one of the twenty-eight `Policy` fields is settable through `policy set` flags,
+which GETs the whole policy, applies the flags, and PUTs the whole struct back. The round trip
+goes through the CLI's **typed** `Policy`, so a field the CLI's build does not know is dropped on
+GET, omitted on PUT, and reset to its default by the daemon. Within one version this is a correct
+read-modify-write; across a version skew it silently resets a newer field (`F40`). `--clear-spending-fed` and `--clear-standby-fed`
 conflict with their pin flags.
 
 **API-28** Exit codes:
@@ -208,7 +216,7 @@ conflict with their pin flags.
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 1 | usage, not found, any non-JSON 4xx, argument parse error |
+| 1 | usage, not found, any non-JSON 4xx other than 401, argument parse error |
 | 2 | refused at decision time; nothing journaled |
 | 3 | failed; a journaled terminal failure, message carries the key |
 | 4 | transport: connection refused, timeout, any 5xx, missing pointer or token, await deadline |

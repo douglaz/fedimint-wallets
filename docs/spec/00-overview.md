@@ -12,8 +12,9 @@ The system described here spreads a small spending balance across federations an
 automatically on the user's standing instruction, so that one federation degrading never leaves
 the user with nothing to spend. It does this as an **on-device agent** with no operator, no
 curated list and no service in the fund path (`ADR-0014`, `ADR-0015`), and it records every
-action it takes, and every action it declined, durably enough that the user can reconstruct what
-happened, why, and what it cost.
+action it takes and every operation it refuses durably enough that the user can reconstruct what
+happened, why, and what it cost. Two declines are not recorded: a funding shortfall deferred
+below the route floor, and a duplicate-key drop (`ALC-5`, `F1`).
 
 ## What is built
 
@@ -31,8 +32,11 @@ protects.
 **OVR-3** No money operation's network IO blocks another's start. The actor that owns admission
 does millisecond bookkeeping only; drivers wait (`ADR-0024`, `OPS-13`).
 
-**OVR-4** Every operation, failure and refusal is an append-only ledger row written in the same
-transaction as the intent it describes (`STO-16`). History without failures is not history.
+**OVR-4** Every operation, failure and refusal is an append-only ledger row. An intent-backed
+row is written in the same transaction as the intent transition it describes (`STO-16`); the rows
+that describe no intent — tick, refusal, discovery, auto-join — are written best-effort
+(`approve` is the exception: its row shares the candidate promotion's transaction, `STO-26`)
+and a failed write is logged, not fatal (`ALC-34`). History without failures is not history.
 
 **OVR-5** The allocator funds only what a probe has proven. A discovered federation is fundable
 after a sustained window of real sats-spending round trips passes, never on discovery alone
@@ -42,9 +46,11 @@ after a sustained window of real sats-spending round trips passes, never on disc
 tested against golden fixtures. Everything it needs — balances, probes, reservations, route
 prices — is gathered by the tick and placed in the snapshot (`ALC-1`).
 
-**OVR-7** Every fee cap that is enforced is computed from what the destination is actually
-credited, never from the amount asked for (`ALC-21`). A cap computed on an amount nobody received
-bounds nothing.
+**OVR-7** An **evacuation's** enforced fee cap is recomputed from what the destination is
+actually credited, never from the amount asked for (`ALC-21`); a cap computed on an amount nobody
+received bounds nothing. A funding `Move` keeps the proportional cap the allocator stamped on
+the planned amount even when delivery settles a hair under — the executor updates the amount and
+not the cap, which errs conservatively by a few msat (`OPS-22`).
 
 **OVR-8** The user holds the standing instruction's parameters as one stored `Policy`, edited at
 runtime through the wallet's own surfaces and never through a host config file (`STO-13`,

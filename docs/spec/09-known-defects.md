@@ -1,7 +1,9 @@
 # 09 — Known defects
 
-Every entry is a defect this system actually shipped and later fixed, written as a prohibition
-so the fix cannot be undone by a later change that looks like cleanup. The provenance for each is
+Every entry is a defect found in this system, written as a prohibition so the fix cannot be
+undone by a later change that looks like cleanup. Most shipped and were fixed; `DEF-12` was
+deleted before it merged, `DEF-23` and `DEF-24` were caught in review of the change that carried
+them, and `DEF-25` is still open (`F22`). Each entry says which. The provenance for each is
 the issue that recorded it (`br-…`, the repository's `.beads/issues.jsonl`) and the pull request
 that closed it. Where a defect was only ever observed in review rather than in a running wallet,
 the entry says so.
@@ -127,7 +129,8 @@ way: correct to refuse, and invisible.
 **Prohibition** — every path that skips planning MUST set `automation_blocked` with a reason
 and a detail (`ALC-45`). Liveness is not readiness.
 
-*Provenance: `br-rky` item 3; PR #40 commit `ab52094`.*
+*Provenance: `br-rky` item 3; PR #40 commit `ab52094`. The fence and its reason tag are in PR
+#40, not on `main` (`F2`).*
 
 ## Persistence and compatibility
 
@@ -190,8 +193,10 @@ the running daemon writes it, not because someone remembered to add it.
 `complete_recovery`'s commit lacked the autocommit retry the rest of the journal uses, so a
 transient write conflict at the one moment a recovery becomes durable would have failed it.
 
-**Prohibition** — every journal commit that can conflict MUST go through the retrying
-autocommit (`STO-8`).
+**Prohibition** — a compare-and-swap writer whose guard is read inside its own transaction MUST
+go through the retrying autocommit; `STO-8` lists the six that do. Plain writers (`STO-7`) map a
+conflict to `Retryable` and leave the retry to the caller — `advance_watch_occurrence` is one,
+and a conflict there fails the cycle as `cycle_failed` rather than retrying.
 
 *Provenance: `br-recovery-commit-retry-syv`.*
 

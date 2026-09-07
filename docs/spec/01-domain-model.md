@@ -43,7 +43,7 @@ names (`CONTEXT.md` **Intent**).
 
 | Variant | Who builds it | Note |
 |---|---|---|
-| `DirectInflow {to, amount, fee_cap}` | user | invoice grossed up so `to` nets exactly `amount` |
+| `DirectInflow {to, amount, fee_cap}` | user | invoice grossed up so `to` nets `amount`: never over, possibly under by a bounded receive-fee step (`FMI-15`) |
 | `Move {from, to, amount, fee_cap, gateway?}` | allocator (funding), user, probe legs | `gateway` is a route hint |
 | `Evacuate {from, to, amount, fee_cap, gateway?, fee_cap_components?}` | allocator only | `fee_cap` is the planning cap; the components recompute it |
 | `Pay {from, invoice, amount, fee_cap, payment_hash, gateway?}` | user | |
@@ -102,7 +102,7 @@ about 20 sats twice — mint on the candidate, redeem back — to prove redeemab
 
 ## Policy, occurrence, watch state
 
-**DOM-15** `Policy` is the standing instruction's thirty parameters, stored as one row
+**DOM-15** `Policy` is the standing instruction's twenty-eight parameters, stored as one row
 (`STO-13`), validated in the actor, and never in a host config file. Balance knobs
 (`per_fed_cap`, `spending_target`, `standby_target`, the two pins); three fee caps of three
 shapes (`max_fee` absolute, for user verbs and probe legs; `max_fee_bps_of_move` proportional,
@@ -113,7 +113,8 @@ budget; scheduler cadence; discovery caps; `auto_join`; `require_mainnet`.
 The daemon allocates one per cycle by a checked increment of `WatchState.occurrence`; the
 standalone tick takes it from `--occurrence` and records it as a floor; probe legs derive theirs
 from the session nonce. The floor never decreases, is raised in the same transaction as any
-agent ledger append, and is fail-closed at `u64::MAX` (`ALC-33`, `STO-21`).
+agent ledger append, and is fail-closed once it reaches `u64::MAX`: the daemon runs that one
+cycle and then fails every later one (`ALC-33`, `STO-12`, `STO-21`).
 
 **DOM-17** An **allocator goal** is the identity a live intent holds against re-issue:
 `FundInto(dest)` for an agent funding move, `Evacuate(source)` for an agent evacuation. Goals

@@ -25,8 +25,9 @@ overrides.
 | `log_level` | `info` (`RUST_LOG` overrides) |
 | `gateway` | none; pins one lnv2 gateway URL for every route (`F4`) |
 
-Paths must be absolute (`~` expanded). The only other environment knob is
-`WALLETD_PERFORM_TIMEOUT_SECS` (default 600, `0` disables, garbage falls back to the default).
+Paths must be absolute (`~` expanded). Two other environment knobs exist:
+`WALLETD_PERFORM_TIMEOUT_SECS` (default 600, `0` disables, garbage falls back to the default) and
+`WALLETD_SETTLEMENT_STALL_SECS` (default 300, the watchdog deadline, `ALC-40`).
 
 **HST-4** `walletd init`: read-or-default the config and write every key back canonicalized;
 create the data directory `0700`; open `client.db` (blocking on the lock if the daemon is
@@ -86,10 +87,10 @@ store. `04-api-contract.md` `API-25`–`API-31` own its behaviour.
 **HST-26** `wallet-web` exists as a crate with config, `init`, password hashing, and a
 fail-closed startup, and serves **zero routes**. Specifically:
 
-- `wallet-web init` prompts for a password twice on the TTY (never stdin), enforces 12–1024
-  characters, hashes with Argon2id (m = 19456 KiB, t = 2, p = 1), and writes
+- `wallet-web init` prompts for a password twice on the TTY (never stdin), enforces at least 12
+  characters and at most 1,024 **bytes**, hashes with Argon2id (m = 19456 KiB, t = 2, p = 1), and writes
   `~/.config/wallet-web/wallet-web.toml` `0600` atomically into a directory it creates `0700`
-  or verifies is owner-only.
+  or verifies is owned by the running uid and not group- or other-writable (a `0755` directory passes).
 - The config has exactly `port, daemon_url, token_path, password_hash, session_idle_timeout,
   session_absolute_timeout, public_origin`; there is no bind-address key (the bind is hardcoded
   `127.0.0.1`) and no log-level key (`RUST_LOG`).
@@ -122,16 +123,19 @@ output.
 **HST-16** CI (`.github/workflows/ci.yml`) runs two jobs on push to `main` and on pull
 requests, both in the devshell with SHA-pinned actions:
 
-- **gate**: `Cargo.lock` unchanged, `cargo fmt --check`, `cargo clippy --workspace --all-targets
-  --locked -- -D warnings`, `cargo test --workspace --locked`.
+- **gate**: `Cargo.lock` unchanged (checked before any cargo step, against the cache action), `cargo fmt --check`, `cargo clippy --workspace --all-targets
+  --locked -- -D warnings`, `cargo test --workspace --locked`, and (from this change)
+  `bash docs/spec/tools/check-all.sh`.
 - **nix-build**: build `walletd`, `wallet-cli` and the image; assert the image archive is
   non-empty; run both binaries with `--help`.
 
 **HST-17** No live devimint smoke runs in CI, by explicit policy in the workflow: live
 federations are too slow, and a job that silently skips is worse than none. The smokes are
-manual gates with their last-green evidence recorded in their headers (`10-conformance-checklist.md`).
+manual gates; their last-green evidence lives in the closing issue's notes, and for one smoke in
+its header (`CNF-39`).
 
-**HST-18** The unit and integration suite at `main` `1e44487` plus PR #40 is 1,071 tests
+**HST-18** The unit and integration suite at `ab52094` (PR #40's head, containing `main`
+`1e44487`) is 1,071 tests
 passing under the gate. About 60% of `wallet-fedimint`'s lines are test code.
 
 ## How the daemon is run
@@ -163,12 +167,13 @@ the only tracked unit has that environment line commented out at the default 600
 unreachable or without a token. It alerts on `scheduler_alive == false`, on
 `automation_ready == false` (with the reason and detail), and on every deferred funding goal
 whose floor is the route floor rather than the protocol minimum. An absent `automation_ready`
-(an older daemon) is a note, not an alert. `--state` deduplicates so a standing problem pages
-on transition. **Nothing runs it** (`F14`).
+(an older daemon) is a note, not an alert. `--state` suppresses output only when there is no
+alert and nothing changed; a **standing alert is printed, exits 1, and is posted to the webhook on
+every pass**, so the script's own docstring ("pages on transition") overstates it. **Nothing runs it** (`F14`).
 
 ## The long-running deployment
 
-**HST-23** One instance of `walletd` has run continuously since 2026-07-26 at build `b5f46de`,
+**HST-23** One instance of `walletd` has been running the 2026-07-26 build `b5f46de`,
 holding a small real-sats balance across two mainnet federations, with real receive, pay, move
 and join history. It is a **test deployment**, not production; the operator has said so, and
 this set describes it accordingly. Its location, namespace, image digest and balance are

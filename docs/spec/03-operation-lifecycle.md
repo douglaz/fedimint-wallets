@@ -43,8 +43,9 @@ does **not** bump the attempt counter.
 **OPS-5** Every user verb — in the daemon and in the CLI's standalone mode alike — builds one
 `AllocatorDecision` (`reason: UserInitiated`, `actor: User`), samples the source federation's
 balance off the actor, and submits one `OpRequest` to the actor. The CLI's standalone money verbs
-run the same actor without a scheduler; the `Runtime::pay/receive/do_move/join/await_move`
-functions have no production caller. Only `Runtime::tick` bypasses the actor (`OPS-12`).
+run the same actor without a scheduler; `Runtime::pay/receive/join/await_move` have no
+production caller. Two paths bypass the actor: `Runtime::tick` (`OPS-12`) and the standalone
+`probe` verb, whose two money legs go through `Runtime::do_move` with no service client (`F42`).
 
 **OPS-6** The actor's fresh-key admission, in order: journal read error → `StorageError`; a
 goal-bearing agent decision re-scans `pending()` and a conflicting live holder → `Conflict`
@@ -61,16 +62,28 @@ balance[from] − reservations.outbound(from)`; for `Move`, `Evacuate`, `DirectI
 `Receive`, `balance[to] + reservations.inbound(to) + amount ≤ per_fed_cap`. **`Evacuate` has no
 source-balance check and no pre-fund admission at perform time**; its money safety rests
 entirely on perform-time sizing (`OPS-21`). With `balances == None` the function checks nothing;
-the actor always passes balances, so this hole is reachable only from the unused standalone
-runtime verbs.
+the actor always passes balances. `Runtime::do_move` passes `None` when the key already exists
+or either client is unopened, and the standalone `probe` verb reaches it (`F42`) — but a fresh
+probe first runs `probe_local_faults`, which requires the source to hold `amount + leg cap` and
+the candidate to be under the cap, and the executor's pre-fund admission re-samples balances
+before any new move IO, so what is skipped there is the **actor's** admission, not every money
+check.
 
-**OPS-8** Idempotency. A request whose key already exists attaches: `Done` or `Awaiting` → skip
-with the existing outcome; `Failed` → the retry path (`OPS-10`); `Pending` or `Executing` →
-drive the existing intent. Attach validates shape: `Pay` must match `from, amount, fee_cap,
-payment_hash`; `Receive` `to, amount, fee_cap, nonce`; `Join`/`Recover` federation and invite;
-`Move`/`Evacuate` `from, to, amount, fee_cap` ignoring the gateway hint; `DirectInflow` `to,
-amount, fee_cap`. A mismatch is `Permanent` "conflicts with the existing request's sizing
-fields". The 202 response does not say whether the admission was fresh (`API-18`).
+**OPS-8** Idempotency. A request whose key already exists attaches: `Done` → deduplicated with
+the existing outcome; `Awaiting`, `Pending` or `Executing` → the existing intent is driven or
+re-awaited; `Failed` → the retry path (`OPS-10`). What attach validates depends on the state. For a
+**terminal** key the actor checks only the idempotency **anchor** (`Pay`: `payment_hash`;
+`Receive`: `to, amount, nonce`; `DirectInflow`: `to, amount` — the action carries no nonce, the
+key does; `Join`: federation and invite; every other action: full equality) and refuses a change
+with `409 conflict` "same-key
+request changed the completed operation's idempotency anchor"; a re-submitted completed pay with a
+different `fee_cap` is therefore a 202 deduplication, not a refusal. For a **live** key the actor
+checks the sizing fields (`Pay`: `from, amount, fee_cap, payment_hash`; `Receive`: `to, amount,
+fee_cap, nonce`; `Move`/`Evacuate`: `from, to, amount, fee_cap`, ignoring the gateway hint;
+`DirectInflow`: `to, amount, fee_cap`; `Join`/`Recover`: federation and invite) and refuses a
+mismatch with `422 sizing_conflict`. The core's own `validate_attach` runs only after those actor
+checks and only for `Pending`/`Executing`/`Awaiting`. The 202 response does not say whether the
+admission was fresh (`API-18`).
 
 **OPS-9** Reservations are projected from `reservation_intents()` (`Pending`, `Executing`,
 `Awaiting`; fails closed on a corrupt row). The **strict** projection reserves every non-terminal
@@ -99,7 +112,10 @@ through `OPS-6`.
 
 **OPS-12** The documented admission exception (`ADR-0031`): `wallet-cli --standalone tick`
 holds the exclusive lock, plans, re-scans `pending()` for blockers itself, and applies through
-`apply_with_allocator_admission` without the actor. The core functions that make this possible
+`apply_with_allocator_admission` without the actor. An undocumented second one is
+`wallet-cli --standalone probe`, whose legs are admitted by `Runtime::do_move` without the
+actor's conflict, goal, driver-cap and probe-hold checks; source funds and the destination cap are
+still checked by the probe preflight and the executor's pre-fund admission (`OPS-5`, `F42`). The core functions that make this possible
 are `pub`, so "the actor is the sole writer of agent intents" is convention, not enforcement
 (`F16`).
 
@@ -296,8 +312,10 @@ diagnostics with no would-run decisions.
 
 ## Reconcile
 
-**OPS-34** Core `reconcile` drives every intent in `pending()` (`Pending | Executing`) to
-terminal. It never touches `Awaiting`, `Done` or `Failed`. Re-performing an `Executing` intent
+**OPS-34** Core `reconcile` performs **one** `drive_intent_step` on every intent in `pending()`
+(`Pending | Executing`) per pass; despite its name, `drive_to_terminal` does not loop. A step that
+returns `Retryable` or a structural refusal leaves the intent `Pending` for a later pass. It never
+touches `Awaiting`, `Done` or `Failed`. Re-performing an `Executing` intent
 relies on the executor's idempotency (`OPS-17`–`OPS-27`).
 
 **OPS-35** The daemon's `reconcile_durable`, per pass: scan `pending()` (a scan fault fails the

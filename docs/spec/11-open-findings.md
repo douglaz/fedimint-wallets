@@ -1,8 +1,8 @@
 # 11 — Open findings
 
 What the code does not yet do that a document, an ADR, or a review said it should. Each finding
-names the issue that tracks it (`br-…` in `.beads/issues.jsonl`) so the two cannot drift apart
-silently; when an issue closes, its finding here is marked closed with the pull request, not
+names the issue that tracks it (`br-…` in `.beads/issues.jsonl`), or says why none exists, so the
+two cannot drift apart silently; when an issue closes, its finding here is marked closed with the pull request, not
 deleted.
 
 Written 2026-09-07 against `main` at `1e44487` plus the open pull request #40. Items are
@@ -13,8 +13,8 @@ grouped by what they cost if left alone, not by the order they were found.
 These are not findings against the code. They are decisions nobody has taken, and the code is
 built so that either answer remains possible.
 
-1. **Is the long-running deployment a test or a pilot?** The daemon has run continuously since
-   2026-07-26 at build `b5f46de` on two mainnet federations with a small real-sats balance. The
+1. **Is the long-running deployment a test or a pilot?** The daemon has been running the
+   2026-07-26 build `b5f46de` on two mainnet federations with a small real-sats balance. The
    repository's `AGENTS.md`, its release issues (`br-prod-canary-nab`, `br-recanary-y2j-ujs`) and
    its alerting issue (`br-rky`) all treat it as production; the operator has since said it is a
    test rig. Every P1 release/ops item in the backlog inherits its priority from the first
@@ -100,7 +100,8 @@ what was in flight — the precondition for a double-pay on an in-flight send (`
 `br-appstate-backup-7o2`.
 
 **F13. Federation consensus and module upgrades are unhandled.** `ADR-0027` accepted this for a
-short pilot. The deployment is now six weeks old.
+short pilot. The deployment is now six weeks old. No issue: `ADR-0027` owns the decision, and
+reopening it is a decision, not a task.
 
 ## Observability
 
@@ -129,8 +130,8 @@ across every admission path. Open — `br-e29`.
 
 ## The SDK dependency
 
-**F19. The workspace pins a fork carrying four patches.** iroh long-poll, recovery
-complete-or-fail, the single-share TPE fix, and (proposed) lnv2 claim-retry. Repointing to
+**F19. The workspace pins a fork carrying three patches**, with a fourth proposed. iroh long-poll,
+recovery complete-or-fail, the single-share TPE fix (`FMI-1`); lnv2 claim-retry is proposed in `F20`. Repointing to
 upstream requires every one of them to have landed there (`FMI-2`). Open — `br-jga`.
 
 **F20. A move that reaches `Stranded` has no recovery procedure.** The pinned lnv2 client parks a
@@ -160,7 +161,7 @@ inducing a module-recovery failure live needs a fault hook that does not exist. 
 
 **F25. The live supersession gate omits the after-receive-commit killpoint.** The gate is green
 twice on two federations and covers restart-and-reconcile; a mid-flight crash on the replacement
-child is not in it. Recorded as a deviation in `br-0fi`'s notes.
+child is not in it. Recorded as a deviation in `br-0fi`'s notes, which is closed. Open — `br-supersession-child-killpoint-gate-7c9`.
 
 **F26. Four money-path boundaries of the supersession exchange have not been read by a human.**
 `replace_marked_evacuation`, `commit_evacuation_replacement`,
@@ -175,7 +176,8 @@ startup exist (`HST-26`); it serves no routes. Eight issues cover the rest and n
 since 2026-07-30. Open — `br-2aa`, `br-nfz`, `br-5om`, `br-pfc`, `br-t8f`, `br-ucq`, `br-4yz`,
 `br-web-ops-exe`.
 
-**F28. The Android frontend does not exist.** Phase 6b in `docs/roadmap-to-v1.md`.
+**F28. The Android frontend does not exist.** Phase 6b in `docs/roadmap-to-v1.md`. No issue: a
+phase, not a task; beads get cut when it is planned.
 
 ## Hygiene
 
@@ -233,6 +235,25 @@ listing seven of thirteen tags and describing one database; `Policy`'s "no seed-
 wired yet"; a test comment claiming `Policy` is `deny_unknown_fields`; `fedimint-mechanics.md`'s
 "hard fee cap"; the runbook's "shipped k8s config". Each is a one-line fix; none is a behaviour
 gap. Open — `br-stale-doc-comments-sweep-zjx`.
+
+**F40. `policy set` from an older CLI silently resets a field a newer daemon added.** The CLI
+round-trips a typed `Policy`, so an unknown key is dropped on GET, omitted on PUT, and defaulted by
+the daemon — a money cap included. Correct within one version; a silent reset across a version skew
+(`API-27`). Open — `br-policy-set-drops-unknown-fields-3e1`.
+
+**F41. Two of twelve `serde(default)` persisted fields have no strip-key test.** Ten are pinned
+by a strip-or-absent-key decode test on the serialized type; the two `Evacuate` defaults share
+one bare-`Action` fixture that omits both keys at once (`CNF-18`, `STO-30`). Two earlier drafts
+of this finding under-counted the tests that exist; the bead was corrected each time.
+Open — `br-strip-key-tests-missing-2za`.
+
+**F42. `wallet-cli --standalone probe` admits its money legs without the actor.** `active_probe`
+runs with no service client, so both legs go through `Runtime::do_move`, which journals and
+drives directly: the actor's conflict, goal, driver-cap and probe-hold checks do not run. Source
+funds and the destination cap are still checked, by the probe preflight and by the executor's
+pre-fund admission (`OPS-5`, `OPS-7`, `OPS-12`). `ADR-0031` documents one exception (`tick`);
+this is a second, architectural rather than a money hole.
+Open — `br-standalone-probe-bypasses-actor-253`.
 
 ## Closed since this document was first written
 

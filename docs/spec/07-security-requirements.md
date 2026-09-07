@@ -49,7 +49,8 @@ learns nothing (`API-16`).
 
 **SEC-5** `walletd.toml` holds no secrets, only paths. The CLI's pointer file holds the token's
 **path**, not the token. `wallet-web.toml` holds an Argon2id password hash and is `0600` in a
-`0700` directory whose ownership is checked at start (`HST-26`).
+directory that `init` creates `0700` and that startup requires to be owned by the running uid and
+not group- or other-writable (or sticky); a `0755` directory passes (`HST-26`).
 
 **SEC-6** Nothing in the daemon, server or handler code logs the token, the seed, a full invoice,
 or a password. The one deliberate exception is `walletd mnemonic`, which prints the seed to stdout

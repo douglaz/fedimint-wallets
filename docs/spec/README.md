@@ -24,7 +24,7 @@ the documents keep the function names so a reader can go and look.
 | [`06-allocator-and-automation.md`](./06-allocator-and-automation.md) | The pure decision core, route economics, scoring, probes, discovery, evacuation, the tick, the scheduler cycle, and the readiness signal |
 | [`07-security-requirements.md`](./07-security-requirements.md) | The threat model and what is actually enforced — including what is not |
 | [`08-hosts-and-deployment.md`](./08-hosts-and-deployment.md) | The daemon, the standalone mode, the browser sidecar as built, the build, CI, and the one long-running deployment |
-| [`09-known-defects.md`](./09-known-defects.md) | Twenty-five defects this system shipped and fixed, written as prohibitions |
+| [`09-known-defects.md`](./09-known-defects.md) | Twenty-five defects found in this system — most shipped and fixed, one still open — written as prohibitions |
 | [`10-conformance-checklist.md`](./10-conformance-checklist.md) | What has been demonstrated, by which gate, and what has not |
 | [`11-open-findings.md`](./11-open-findings.md) | **Read before planning.** The gaps between documents and code, each tied to the issue that tracks it |
 | [`../../CONTEXT.md`](../../CONTEXT.md) | The glossary. Several entries there describe intent rather than behaviour and say so; `F6` and `F7` list them |
@@ -39,8 +39,10 @@ at any of four named points without double-paying, and everything else is built 
 Every requirement wears the same costume — a MUST, a stable identifier — and the confidence
 behind them is not uniform.
 
-- **Every requirement describes code that exists**, was read on 2026-09-07, and is exercised by
-  the unit suite (1,071 tests). That is the floor.
+- **Every requirement describes code that exists** and was read on 2026-09-07. The unit suite
+  (1,071 tests) is green on that code, but a requirement is not a test: `10-conformance-checklist.md`
+  says which behaviour a gate actually exercises, and `HST-23`–`HST-25` and the unchecked `CNF`
+  items describe facts no suite touches.
 - **Most money paths have also been exercised live** against a two-federation devimint harness
   by the smokes in `10-conformance-checklist.md`. That document says which, and which not.
 - **Nothing after build `b5f46de` (2026-07-26) has run against a real federation.** The one
@@ -80,9 +82,10 @@ stable identifier:
 
 An identifier is never reused and never renumbered. Deleting a requirement is permitted — the
 gap in the sequence is the tombstone — but a withdrawn id must be listed in the index below so an
-old citation still resolves. `tools/check_ids.py` enforces this: duplicate ids, dangling
+old citation still resolves. `tools/check_ids.py` enforces most of this: duplicate ids, dangling
 citations, sequence gaps not listed as withdrawn, and references to ADRs that do not exist all
-fail the gate.
+fail the gate. It cannot see a deleted **highest** id in a namespace — the range simply shrinks —
+so that one case rests on the convention and on review, not on the gate.
 
 ### A decision gets its identifier when it is accepted
 
@@ -112,7 +115,9 @@ bash docs/spec/tools/check-all.sh
 ```
 
 runs the identifier gate. It exits non-zero on any failure and captures each gate's own exit
-code rather than the last command's in a pipe. Run it before and after editing this set.
+code rather than the last command's in a pipe. Run it before and after editing this set. CI runs
+it in the `gate` job alongside the Rust gate, and a withdrawn identifier that is defined again
+fails it.
 
 ## Relationship to the rest of `docs/`
 
