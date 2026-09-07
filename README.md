@@ -46,6 +46,9 @@ live and devimint-validated:
   pricing and all network IO run OFF the actor so a mid-flight (hours-long LN) payment
   never blocks another operation (ADR-0024); the responsiveness gate holds
   `POST /v1/pay` to its first external call in <250 ms.
+  Standalone `tick` and dry-run `status` refuse a corrupt joined-federation registry rather
+  than plan from its healthy subset; preserve the data directory and repair the exact row from
+  a consistent backup before retrying.
 - **Seed recovery: complete.** A wallet restores each federation's ecash balance from
   the 12-word seed **plus the joined federation IDs/invites** — the backup unit settled by
   [ADR-0025](./docs/adr/0025-recovery-fresh-partition-seed-is-the-backup-unit.md), not the

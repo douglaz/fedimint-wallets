@@ -260,6 +260,38 @@ pub async fn status(State(state): State<AppState>) -> Result<impl IntoResponse, 
             "status dry-run requires a live runtime (covered by the daemon gate)",
         ));
     };
+    let Some(mc) = state.mc.as_ref() else {
+        return Err(HttpError::unavailable(
+            "status dry-run requires the live federation membership view; retry after walletd opens every joined federation",
+        ));
+    };
+    let joined_report = state
+        .journal
+        .list_federations_report()
+        .await
+        .map_err(storage)?;
+    if joined_report.skipped_rows > 0 {
+        return Err(HttpError::unavailable(format!(
+            "status dry-run refuses an incomplete federation registry: {} corrupt row(s) were skipped. \
+             Stop walletd, preserve the wallet data directory, and repair the corrupt federation \
+             registry row(s) before retrying; no scheduler planning was performed",
+            joined_report.skipped_rows
+        )));
+    }
+    let joined = joined_report.federations;
+    let open = mc.federations();
+    let unopened: Vec<_> = joined
+        .iter()
+        .filter(|(id, _)| !open.contains(id))
+        .map(|(id, _)| id.to_hex())
+        .collect();
+    if !unopened.is_empty() {
+        return Err(HttpError::unavailable(format!(
+            "status dry-run requires every joined federation to be open; unopened: {}. \
+             Retry after walletd opens them",
+            unopened.join(", ")
+        )));
+    }
     let policy = state.client.get_policy().await?;
     let mut tick_policy = TickPolicy::from(&policy);
     // The dry-run describes what the NEXT scheduler tick would do. That tick advances the

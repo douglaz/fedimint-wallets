@@ -963,3 +963,9 @@ marker. A superseded Failed parent deliberately retains its historical `evacuati
 evidence and reports `"evacuation_refusal_active": false`. The field is omitted when `show` cannot
 read an exact linked intent (including malformed/degraded rows), and history omits it because it
 does not perform intent reads. Only the literal value `true` is authority to replace it.
+
+## 8. Recovering from a corrupt federation registry
+
+If standalone `tick` or dry-run `status` reports a corrupt federation registry, repair that registry
+from a consistent backup before retrying — those world-complete commands do not open or plan only
+the healthy subset.
