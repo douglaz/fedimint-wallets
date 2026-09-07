@@ -282,6 +282,7 @@ async fn run_serve(config_path: &std::path::Path) -> Result<()> {
         mc: Some(multi_client),
         runtime: Some(read_runtime),
         scheduler_alive: service.scheduler_liveness(),
+        automation_blocker: service.automation_blocker(),
         token: Arc::from(token.as_str()),
         invoice_deadline: handlers::INVOICE_MINT_DEADLINE,
         await_deadline: handlers::AWAIT_LONGPOLL_DEADLINE,

@@ -3945,6 +3945,33 @@ impl Runtime {
         for problem in Self::pinned_input_problems(policy, &plan, &plan.blockers) {
             tracing::warn!("status: {problem}");
         }
+        // A structural marker whose evidence the CURRENT cap does not qualify is the one case where
+        // the operator has already acted -- they raised the cap -- and still nothing will happen.
+        // `plan.replacement` is `None` for exactly this parent, so every other status line looks
+        // identical to a healthy idle wallet. br-n8o exists because that silence is
+        // indistinguishable from the livelock it was filed to fix; say so rather than let a
+        // non-qualifying edit read as a successful one.
+        let current_cap = wallet_core::EvacFeeCap {
+            base_msat: policy.evac_fee_base_msat,
+            bps: policy.evac_fee_bps,
+        };
+        let live = self.journal.pending().await.map_err(exec_err)?;
+        for (key, evidence) in structural_markers_the_current_cap_cannot_replace(&live, current_cap)
+        {
+            tracing::warn!(
+                key = %key.0,
+                admitted_base_msat = evidence.cap_components.base_msat.0,
+                admitted_bps = evidence.cap_components.bps,
+                current_base_msat = current_cap.base_msat.0,
+                current_bps = current_cap.bps,
+                low_delivered_net_msat = evidence.low.delivered_net.0,
+                high_delivered_net_msat = evidence.high.delivered_net.0,
+                "status: a structurally refused evacuation is held by a fee cap the current \
+                 policy does not qualify to replace; no child will be planned until BOTH \
+                 components are at or above the admitted pair AND the raise buys whole \
+                 millisatoshis of cap room at one of the measured amounts"
+            );
+        }
         match self
             .terminal_replayed_executable_decisions(&status_decisions)
             .await
@@ -5746,6 +5773,25 @@ fn exec_err(e: ExecError) -> anyhow::Error {
     anyhow::anyhow!("{e:?}")
 }
 
+/// The live structural evacuation markers that `current_cap` is not entitled to replace.
+///
+/// Deliberately split out of the status warning that consumes it: the repo has no tracing capture,
+/// so leaving this adjudication inline would make the operator's only signal for a non-qualifying
+/// cap edit the one thing no test can observe.  It must agree exactly with the gate both
+/// replacement paths apply, so it calls that gate rather than restating it.
+fn structural_markers_the_current_cap_cannot_replace(
+    live: &[Intent],
+    current_cap: wallet_core::EvacFeeCap,
+) -> Vec<(&IdempotencyKey, &wallet_core::EvacuationRefusalEvidence)> {
+    live.iter()
+        .filter_map(|intent| {
+            let evidence = intent.evacuation_refusal.as_ref()?;
+            (!wallet_core::evacuation_cap_qualifies_replacement(evidence, current_cap))
+                .then_some((&intent.idempotency_key, evidence))
+        })
+        .collect()
+}
+
 fn budget_counted_probe_cost_msat(row: &OperationRecord) -> Option<u64> {
     if !matches!(row.actor, Actor::Agent { .. }) {
         return None;
@@ -6140,6 +6186,90 @@ mod tests {
             diagnostic: "measured, not proven".to_owned(),
             measured_at_ms: 1,
         }
+    }
+
+    /// The operator raised the knob and nothing happened -- the exact condition br-n8o was filed
+    /// about -- must be something status can name.  Every cap here is one an operator could
+    /// plausibly type after reading the refusal diagnostic.
+    #[test]
+    fn status_names_the_markers_a_cap_edit_did_not_actually_qualify() {
+        let sloped = wallet_core::EvacFeeCap {
+            base_msat: Msat(10_000),
+            bps: 200,
+        };
+        let evidence = wallet_core::EvacuationRefusalEvidence {
+            cap_components: sloped,
+            // Small enough that a one-bps bump rounds away at BOTH measured amounts: 1_000 * 201
+            // / 10_000 truncates to the same 20 msat that 200 bps already bought.
+            low: wallet_core::EvacuationQuoteSample {
+                delivered_net: Msat(1_000),
+                total_fee: Msat(15_000),
+                fee_cap: sloped.at(Msat(1_000)),
+            },
+            high: wallet_core::EvacuationQuoteSample {
+                delivered_net: Msat(2_000),
+                total_fee: Msat(25_000),
+                fee_cap: sloped.at(Msat(2_000)),
+            },
+            ..marked_evacuation_evidence()
+        };
+        let mut marked = Intent::from_decision(
+            &tick_evacuate_decision("evac:cap-edit-parent", FED_A, FED_B),
+            Actor::Agent {
+                occurrence: Occurrence(8),
+            },
+            1,
+        );
+        marked.evacuation_refusal = Some(evidence.clone());
+        let unmarked = Intent::from_decision(
+            &tick_evacuate_decision("evac:unmarked", FED_A, FED_B),
+            Actor::Agent {
+                occurrence: Occurrence(9),
+            },
+            1,
+        );
+        let live = vec![marked.clone(), unmarked];
+
+        let held = |cap: wallet_core::EvacFeeCap| {
+            structural_markers_the_current_cap_cannot_replace(&live, cap)
+                .into_iter()
+                .map(|(key, _)| key.0.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // The edit that motivated the finding: the base rises, the slope is trimmed to pay for it.
+        assert_eq!(
+            held(wallet_core::EvacFeeCap {
+                base_msat: Msat(50_000),
+                bps: 100,
+            }),
+            vec!["evac:cap-edit-parent".to_owned()],
+            "a base-up/bps-down edit buys no replacement and must be named"
+        );
+        // Retyping the admitted pair reads like a change and is not one.
+        assert_eq!(
+            held(sloped),
+            vec!["evac:cap-edit-parent".to_owned()],
+            "a no-op edit buys no replacement and must be named"
+        );
+        // A raise too small to clear integer rounding at either measured amount.
+        assert_eq!(
+            held(wallet_core::EvacFeeCap {
+                base_msat: Msat(10_000),
+                bps: 201,
+            }),
+            vec!["evac:cap-edit-parent".to_owned()],
+            "a raise that buys no whole millisatoshi of room must be named"
+        );
+        // A raise that genuinely qualifies is silent, and an unmarked intent never appears at all.
+        assert!(
+            held(wallet_core::EvacFeeCap {
+                base_msat: Msat(50_000),
+                bps: 200,
+            })
+            .is_empty(),
+            "a qualifying raise must not warn: the replacement will happen"
+        );
     }
 
     async fn seed_standalone_replacement(

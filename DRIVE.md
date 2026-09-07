@@ -20,7 +20,7 @@ silent scope expansion.
 · **Pending:** outer-driver PR / merge / bead closure
 **Gate:** `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
 
-### 2026-08-23: scope carve-out — this branch is now supersession only
+## 2026-08-23: scope carve-out — this branch is now supersession only
 
 Independent review of PR #39 found two subsystems riding the supersession fix that
 `br-n8o` never asked for. Both were removed from this branch; every gate figure recorded
@@ -32,9 +32,10 @@ BELOW this section predates that removal and does not count the current tree.
   `/v1/watch/status` health surface. It was justified as compatibility for "old direct Agent
   admissions" on a live production store, so that store was inspected on 2026-08-23.
 
-  **The live store is the hetzner k3s `walletd`** (namespace `walletd`, image `walletd:b5f46de`,
-  27d uptime, 0 restarts), holding **5,760,084 msat across two mainnet federations** with real
-  `receive`/`pay`/`move`/`join` history. (A first pass mistakenly checked the local systemd
+  **The live store is the production `walletd` deployment** (see the operator runbook for its
+  location; deliberately not named here — this repository is public). It runs the deployed
+  release, has never restarted, and holds a funded balance across two mainnet federations with
+  real `receive`/`pay`/`move`/`join` history. (A first pass mistakenly checked the local systemd
   walletd at `~/.local/share/walletd`, which is an empty duplicate — 0 sats, no federations. That
   was the wrong wallet; the conclusion below is from the right one.)
 
@@ -43,7 +44,8 @@ BELOW this section predates that removal and does not count the current tree.
   seq 0..10677) finds the highest `Actor::Agent` occurrence is also 10551. Exactly equal.
 
   That same scan found something else: ledger seqs **611, 614, 615 are permanently undecodable**
-  (`missing field \`diagnostics\``, 21,843 log warnings — filed as `br-yjg`). The deleted
+  (a "missing field: diagnostics" decode error, tens of thousands of log warnings — filed as
+  `br-yjg`, fixed in #42). The deleted
   subsystem treats an unreadable canonical row as repair-only, so `agent_floor_reconciled` would
   have stayed false and `advance_watch_occurrence`, `observe_watch_occurrence`, the scheduler
   preflight, and every fresh Agent ledger admission would have failed closed until an operator
@@ -63,13 +65,21 @@ BELOW this section predates that removal and does not count the current tree.
   batch-reads supersession sidecars for a whole page in one journal snapshot, so an unbounded
   `limit` is an unbounded read this change introduced.
 
-· **current tree gate (post-carve-out):** `REAL_GATE_EXIT=0`, **1050 passed / 0 failed** across
+· **gate at the 2026-08-23 carve-out** (superseded; PR HEAD is higher — see below):
+  `REAL_GATE_EXIT=0`, **1050 passed / 0 failed** across
   24 result lines (2026-08-23); complete gate log:
   `/tmp/claude-1000/-home-master-p-fedimint-wallets/700ceac2-65b9-4c36-887b-993fcccf8005/scratchpad/gate-r4.log`.
   The stacked gates branch gates at `REAL_GATE_EXIT=0`, **1055 passed / 0 failed** across
   24 result lines (`.../scratchpad/gate-rbranch.log`).
 
-### Superseded evidence (pre-carve-out tree)
+· **PR HEAD (`fix/br-n8o-evacuation-supersession-review`, 2026-09-03):** `REAL_GATE_EXIT=0`,
+  **1063 passed / 0 failed**. Every figure above is labelled with the branch and date it was
+  measured on; read this one as the current release evidence and the others as history. The
+  delta over the carve-out figure is the merges of #41-#44 plus three tests added since: the
+  producer-evidence qualification test, the live supersession gate, and the watch-floor seeding
+  regression found in review.
+
+## Superseded evidence (pre-carve-out tree)
 
 · final release tree gate: `GATE_EXIT=0`, 1101 passed / 0 failed across 24 result lines
   (2026-08-20);

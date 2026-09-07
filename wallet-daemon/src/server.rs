@@ -27,6 +27,8 @@ pub struct AppState {
     pub mc: Option<Arc<MultiClient>>,
     pub runtime: Option<Arc<Runtime>>,
     pub scheduler_alive: Arc<AtomicBool>,
+    /// Why the scheduler is refusing to plan, when it is. See `wallet_api::HealthView`.
+    pub automation_blocker: Arc<std::sync::Mutex<Option<wallet_api::AutomationBlocked>>>,
     /// The bearer token every route requires (spec P3). A local, same-user secret.
     pub token: Arc<str>,
     /// Invoice-mint hard deadline (spec §6a.6, default 30 s). A field so tests can shorten it.
