@@ -801,6 +801,18 @@ async fn run_cycle(
         return Ok(CycleResult {
             deadlines: wallet_core::AdaptiveSleepDeadlines::default(),
             noop: false,
+            // This fence outlasts the other two: a poison registry row does not clear on retry the
+            // way a pending open does, so the cycle re-fences every pass until someone repairs the
+            // row. That is exactly the shape an operator can watch a wallet sit in for weeks while
+            // `/v1/health` reports it alive, so it carries its own tag rather than none.
+            automation_blocked: Some(wallet_api::AutomationBlocked {
+                reason: "corrupt_federation_registry".to_owned(),
+                detail: format!(
+                    "{} federation registry row(s) failed to decode; membership is unknown, so \
+                     tick, probes, discovery, and federation opening are all skipped",
+                    joined_report.skipped_rows
+                ),
+            }),
         });
     }
     let joined = joined_report.federations;
@@ -2505,6 +2517,64 @@ mod tests {
         assert!(
             blocked.detail.contains(&unopenable.to_hex()),
             "the detail must name the offending federation so an operator can act on the page              without reading logs: {}",
+            blocked.detail
+        );
+        service.shutdown().await.expect("shutdown");
+    }
+
+    /// The corrupt-registry fence is the one an operator can sit in longest.
+    ///
+    /// A pending open resolves the moment the network cooperates, so `partial_federation_view`
+    /// clears itself. A poison registry row does not: every cycle re-reads the same undecodable
+    /// bytes and re-fences, forever, until a human repairs the row. That is precisely the shape
+    /// this wallet has already lost weeks to, so it must be visible as its own reason and not be
+    /// left as the one fence that skips without a tag.
+    #[tokio::test]
+    async fn a_corrupt_federation_registry_reports_why_automation_is_blocked() {
+        let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
+        let mnemonic = Mnemonic::from_entropy(&[0x52; 16]).expect("valid test mnemonic");
+        let multi_client = Arc::new(MultiClient::new(db, journal_db.clone(), mnemonic).await);
+        let journal = Arc::new(FedimintJournal::new(journal_db.clone()));
+        let runtime = Runtime::new(multi_client.clone(), journal.clone(), None, None, None);
+        let service = super::super::WalletService::start_parts(
+            None,
+            journal.clone(),
+            Arc::new(runtime.service_executor(None)),
+            Policy::default(),
+            None,
+        )
+        .await
+        .expect("start actor-only service");
+        let client = service.client();
+
+        // A federation registry row whose bytes do not decode. Membership is now UNKNOWN: the
+        // healthy subset is not a safe planning view, because this row's federation may hold funds
+        // the allocator would otherwise score. The journal namespaces its own rows under 0x00, so
+        // the row has to be planted inside that prefix to be a registry row at all.
+        let app_db = journal_db.with_prefix(vec![0x00]);
+        let mut dbtx = app_db.begin_transaction().await;
+        let mut key = vec![0x03];
+        key.extend_from_slice(&[0xC3; 32]);
+        dbtx.raw_insert_bytes(&key, b"not valid json")
+            .await
+            .expect("insert corrupt federation registry row");
+        dbtx.commit_tx_result()
+            .await
+            .expect("commit corrupt federation registry row");
+
+        let sources: Vec<Box<dyn CandidateSource>> = Vec::new();
+        let cycle = run_cycle(&runtime, &client, &sources)
+            .await
+            .expect("the fence skips the cycle; it does not abort the scheduler");
+
+        let blocked = cycle
+            .automation_blocked
+            .expect("a fenced cycle must report WHY, not just skip silently");
+        assert_eq!(blocked.reason, "corrupt_federation_registry");
+        assert!(
+            blocked.detail.contains('1'),
+            "the detail must say how many rows are unreadable: {}",
             blocked.detail
         );
         service.shutdown().await.expect("shutdown");

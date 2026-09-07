@@ -136,6 +136,7 @@ async fn fixture_with_corrupt_federation_registry_row() -> (
     let state = AppState {
         client: service.client(),
         journal: journal.clone(),
+        automation_blocker: service.automation_blocker(),
         mc: None,
         runtime: None,
         scheduler_alive: service.scheduler_liveness(),
