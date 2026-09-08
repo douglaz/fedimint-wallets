@@ -90,8 +90,8 @@ that fits.
 **FMI-13** `gateway_serves_route(to, from, gw)` checks `routing_info` liveness at each end and
 **nothing else**. Vetted-list membership is not re-tested, so a pinned or hinted URL that is on
 neither federation's list still passes, and a gateway the source federation has revoked can
-still carry an automated move. `CONTEXT.md`'s **Serves** entry says this is intent, not
-behaviour (`F6`).
+still carry an automated move. `ADR-0029` defines **serves** with source-side membership as
+the target; `CONTEXT.md` **Serves** points at the gap (`F6`).
 
 **FMI-14** Gateway precedence for a move or evacuation: (1) the daemon's configured pin,
 returned **unvalidated**; (2) the action's route hint, if it still `gateway_serves_route`; (3)
@@ -160,8 +160,8 @@ which the wallet retries through another gateway: an invoice minted and never fu
 after 3,600 seconds (a direct inflow stays `Awaiting` until then); a send funded and never
 completed is refunded by the SDK's send state machine on gateway forfeit or expiry, and the move
 terminalizes `Refunded`; a send that succeeds while the receive reaches a terminal non-claim is
-`Stranded` (`OPS-27`). The perform-level record of gateway misbehaviour that `CONTEXT.md`'s
-**Serves** entry calls for does not exist.
+`Stranded` (`OPS-27`). The perform-level record of gateway misbehaviour that `ADR-0029`'s
+**serves** definition (performs clause) requires does not exist.
 
 ## Recovery
 

@@ -34,11 +34,16 @@ with a membership re-check for `Move` as well as `Evacuate`.
 Both statements above turn on a gateway "serving" a route, which the original text used as if it
 were self-evident. It is not, and the loose reading is the one that livelocks.
 
-**A gateway SERVES when it is on the relevant vetted list, VALIDATES, and a viable amount can
-actually be sized over it.** Registry presence is not the test: a gateway that is listed but dead,
+**A gateway SERVES when it is on the relevant vetted list, VALIDATES, a viable amount can
+actually be sized over it, and it PERFORMS — completes every leg it quoted, both on a shared route.** Registry
+presence is not the test: a gateway that is listed but dead,
 or that cannot price the route, does not serve it, and treating it as though it did leaves a dying
 federation with a listed-but-useless gateway and no way out — precisely the incident the second
-route exists for.
+route exists for. Quoting is not serving either (clause added 2026-09-08): a gateway that answers
+`routing_info` and fee quotes but then hangs or rejects the actual `receive`/`pay` does not
+serve, since otherwise strict swap-first reselects it every tick and a viable hop is never
+reached. The bounded per-gateway record of recent perform-level failures that makes this
+decidable is br-s0e's implementation work, not part of the definition.
 
 *Which* vetted list depends on what is being served, and the shared route and the hop need
 different predicates: a **shared route** wants a gateway vetted by BOTH federations, while a **hop

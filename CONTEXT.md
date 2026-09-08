@@ -132,46 +132,16 @@ net** to another, and that ambiguity is exactly how the same defect reached five
 call sites. Say which one you mean.
 
 **Serves** (of a gateway, with respect to a route or a leg):
-A gateway **serves** when it is on the relevant **vetted list**, validates, and an
-ECONOMICALLY viable amount can be sized over it — one whose total fee does not exceed
-what it actually delivers. A route that can only carry chunks costing more than they
-move does not serve, however many times it would settle. Presence in the registry is NOT the
-test: a gateway that is listed but dead, or that cannot price the route, does not
-serve it.
-
-Which vetted list depends on what is being served, and the two are different
-predicates:
-- **A shared route** — one gateway carrying both ends — should be served only by a gateway
-  vetted by **both** federations. NOTE this is the INTENT, not today's behaviour: automated
-  selection starts from the destination's list (`mc.gateways(&to)`) and validates the source end
-  only by fetching `routing_info` (`route_econ::pair_economics`,
-  `FedimintExecutor::gateway_serves_route`, `MultiClient::validate_gateway`), so a responsive
-  gateway vetted only by the destination — or since revoked by the source — can still carry an
-  automated move. Closing that gap is work, not vocabulary; until it is closed, do not cite this
-  entry as though the invariant holds.
-- **A hop leg** is served by a gateway vetted by the **one** federation at that end.
-  A hop's source leg and destination leg are judged separately, each against its own
-  federation's list; neither gateway need be known to the other federation.
-
-Two things are NOT failures to serve, and conflating either with one is how a healthy
-gateway gets abandoned for a dearer route:
-- Being unable to fund the *full* ask. That is an ordinary instruction to move less.
-- Any single over-cap quote at one amount. Only "no amount fits" is a failure.
-Genuine failures are: not vetted, does not validate, its quote errors or times out, no amount
-can be sized over it at all, or the best amount it CAN carry costs more in fees than it
-delivers, or it QUOTES BUT DOES NOT PERFORM — answering `routing_info` and fee quotes while
-then hanging or rejecting the actual `receive`/`pay`. ADR-0030 requires a request-level
-misbehaving double for that future gate; the current `hang_gateway.py` smoke double never answers
-at all and therefore proves only the broader timeout boundary. Quoting is not serving: without that term, strict
-swap-first reselects such a gateway every tick, or replays it once the receive has committed, and
-a viable hop is never reached. An implementation needs a bounded record of recent perform-level
-failures per gateway so a repeat offender stops counting as serving.
-On that third one: the only sizing oracle is a BOUNDED search, so it means a PROVEN
-structural refusal — an empty bounded result is inconclusive and is retried, not a failure to
-serve.
-_Avoid_: "supports", "is available for" — both get read as registry presence, which
-is the reading that leaves a dying federation with a listed-but-useless gateway and
-no way out.
+A gateway **serves** when it is on the relevant **vetted list**, validates, an economically
+viable amount can be sized over it (total fee never exceeding what it delivers), and it
+**performs** — completes every leg it quoted, both legs on a **shared route**. A **shared route** is served only by a
+gateway on **both** federations' lists; each **hop** leg is served by a gateway on the list of the
+one federation at its end. Registry presence is not the test, and neither is a single miss:
+being unable to fund the full ask is an instruction to move less, one over-cap quote is not
+"no amount fits", and an empty bounded sizing result is inconclusive, not a refusal.
+Target per [ADR-0029](docs/adr/0029-evacuation-must-be-executable.md); the source-list and
+performs clauses are not built yet (open finding F6, `br-s0e`).
+_Avoid_: "supports", "is available for" — both get read as registry presence.
 
 **Break-glass gateway override**:
 An operator's explicit, single-invocation instruction to route through a named gateway
@@ -194,59 +164,42 @@ not by this glossary. `direct-inflow` is the one an implementer is most likely t
 smokes fund through it, so classifying it as rejected or ignored breaks the funding step.
 
 **Vetted list**:
-The gateways a federation's guardians have admitted for lnv2. It is the ONLY input to
-automated route selection — the scheduler, allocator, probes and evacuation choose from
-it and nothing else; an operator's **break-glass gateway override** deliberately steps
-outside it, but that is never automated. Two cautions, both from ADR-0030: this rule is
-NOT yet implemented (today's daemon still honours a pinned gateway), and membership is a
-UNION of what each responding guardian returned, so it is not a threshold property. Adding to it is a guardian action, per guardian, not a wallet one:
-an operator with no guardian cooperation cannot change it, which is precisely why the
-break-glass exists.
+The gateways a federation's guardians have admitted for lnv2, and the only input to automated
+route selection; an operator's **break-glass gateway override** deliberately steps outside it,
+and nothing automated ever does. Adding to it is a per-guardian action, not a wallet one, which
+is why the break-glass exists.
+Target per [ADR-0030](docs/adr/0030-automated-routing-is-never-pinned.md); today's daemon still
+honours a pin (F4, `br-remove-gateway-pin-yjw`) and the list is a union of guardian answers
+(F6, `br-gw-threshold-membership-k4t`).
 _Avoid_: "registered gateways" when you mean routable ones — presence in the list is not
-the same as **serving** a route.
+**serving** a route.
 
 **Route hint**:
-What an action was PRICED against, carried on the action. Explicitly a hint and not a
-constraint: for a `Move` it is used only while it still **holds**, and otherwise the route is
-re-resolved under the same fee cap. "Holds" is a membership-and-validation test, so a hint can
-hold while its fee has risen above the cap; the re-resolution promised here must then actually
-happen BEFORE the route is used, not be discovered at the receive step (permanent) or the pay
-step (which retries the persisted route). Price the held hint against the cap first. For an `Evacuate` a holding hint is not automatically kept either: it is a
-starting point, and br-s0e re-selects WITHIN the same route class by largest **delivered net**.
-It does not change which class is tried — strict swap-first ordering is unaffected. The cap, never gateway identity, is the money
-backstop.
+The route an action was priced against, carried on the action as a hint, never a constraint:
+kept only while it **holds**, otherwise re-resolved under the same fee cap before the route is
+used. A hint names a whole route in the shape of its kind — one gateway for a **shared route**,
+two gateway identities for a **hop** — and stops holding if it no longer holds in that shape.
+For an `Evacuate` a holding hint is only a starting point within its route class. The cap, never
+gateway identity, is the money backstop.
+A hint **holds** when it is still on the relevant **vetted list**, still validates, and has no
+recorded failure to **perform** — deliberately one clause weaker than **serves**, the
+affordability sizing, so a holding hint can still prove unaffordable and be re-resolved, but a
+gateway that quoted and then did not perform never keeps its hint.
+Target per [ADR-0029](docs/adr/0029-evacuation-must-be-executable.md); the membership and
+perform-record halves of "holds" are not checked yet (F6, `br-s0e`).
+_Avoid_: "pin" — a hint is the opposite of one; "serves" for "holds" — it would silently demand
+a sizing pass the hint path does not run.
 
-A hint **holds** when it is still on the relevant **vetted list** and still validates. That is
-deliberately WEAKER than **serving** — by exactly one term, the affordability sizing — which is
-why it needs its own word: a hint that holds may still turn out unaffordable, and is then
-re-resolved. Do not substitute "serves" here; the canonical predicate includes affordability and
-using it would silently demand a sizing pass the hint path does not run.
-As with **Serves**, the membership half is the INTENT, not today's behaviour — the current check
-validates endpoints without re-testing the source federation's list — and it becomes true when
-the evacuation-hop work closes that gap. Until then, do not cite this entry as though the
-membership half holds.
-Sizing decides the amount; the hint check decides whether to keep the route it was priced
-against. Reading "still holds" as "re-run the affordability search" would price every candidate
-twice — but dropping the membership half is worse: a hint priced before the source federation
-revoked that gateway would keep routing money outside the vetted list, which is exactly what
-ADR-0030 forbids.
-
-A hint names a whole route, not a gateway — so its shape follows the **route kind**.
-For a **shared route** that is one gateway, judged against the two-federation
-predicate. For a **hop** it is two gateway identities plus the kind, each leg judged
-against its own end. A hint is only usable if the route it names still **holds** in the same
-shape it was priced in: a shared hint whose gateway is now vetted-and-valid for one end only has
-not become a hop hint — it has stopped holding.
-
-**Once an operation has committed, the route should stop being a hint** — a recorded route
-replayed as persisted, without re-resolution, since otherwise a restart can pay through a
-different gateway than the one the invoice was sized and recorded for. As with **Serves**,
-this is the INTENT and not today's behaviour: after cache loss the op artifact carries no
-gateway, so reassembly falls back to resolving afresh. The evacuation-hop work is what makes
-it true, by persisting the route with the operation. Until then, do not cite this entry as
-though the invariant holds.
-_Avoid_: calling this a "pin" — it is the opposite, and conflating the two is what
-makes route-selection rules contradict each other.
+**Committed route**:
+The route recorded with an **Operation** once any leg has committed; from then on it is
+replayed as recorded and never re-resolved, so a restart cannot pay through a different gateway
+than the one the invoice was sized for. What commits is the route actually RESOLVED for the
+operation — equal to the **route hint** only when the hint was retained, never a hint that was
+re-resolved; a **break-glass gateway override** chooses a route but never travels on the intent,
+so a committed break-glass route replays without the flag.
+Target per [ADR-0030](docs/adr/0030-automated-routing-is-never-pinned.md); after cache loss the
+operation artifact carries no gateway yet (F7, `br-s0e`).
+_Avoid_: "pin"; "persisted route" (ADR-0030's earlier wording for the same thing).
 
 **Shared route** / **Hop**:
 A **shared route** is one gateway serving both ends (an internal swap). A **hop** is

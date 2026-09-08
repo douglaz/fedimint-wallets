@@ -27,7 +27,7 @@ the documents keep the function names so a reader can go and look.
 | [`09-known-defects.md`](./09-known-defects.md) | Twenty-five defects found in this system — most shipped and fixed, one still open — written as prohibitions |
 | [`10-conformance-checklist.md`](./10-conformance-checklist.md) | What has been demonstrated, by which gate, and what has not |
 | [`11-open-findings.md`](./11-open-findings.md) | **Read before planning.** The gaps between documents and code, each tied to the issue that tracks it |
-| [`../../CONTEXT.md`](../../CONTEXT.md) | The glossary. Several entries there describe intent rather than behaviour and say so; `F6` and `F7` list them |
+| [`../../CONTEXT.md`](../../CONTEXT.md) | The glossary. Entries define the ADR-accepted target and carry a one-line pointer to the gap where the code lags; `F6` and `F7` list them |
 | [`../adr/`](../adr/) | The thirty-one decisions and what was rejected to reach them. Canonical where they conflict with older prose; **not** canonical where they describe unbuilt behaviour (`ADR-0029` half, `ADR-0030`, `ADR-0031` items 2–3) |
 
 Read `00`, `01` and `03` first. `03` is the part that distinguishes this wallet from a thin
