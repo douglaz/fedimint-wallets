@@ -71,7 +71,7 @@ that are validated but never persisted (`ALC-3`).
 
 **HST-11** Standalone `tick` and `status` refuse an incomplete federation registry before
 opening or planning; explicit user and admin verbs keep their poison-tolerant behaviour
-(`ALC-46`; lands with PR #40).
+(`ALC-46`).
 
 **HST-12** Standalone is not a second resident engine and is not the model for a future host.
 `Runtime::watch_once` is a dev/test harness (`ADR-0031`); no production scheduler is built on

@@ -1,7 +1,7 @@
 # fedimint-wallets — Executive summary
 
 *A single-file orientation to the as-built specification, for a reader who has never seen the
-code. Written 2026-09-07 against `main` `1e44487` plus PR #40: six Rust crates, about 80,000
+code. Written 2026-09-07 against `main` `1e44487` plus PR #40, both now merged as `ee4ba1c`: six Rust crates, about 80,000
 lines of which roughly 40% is test code, 1,071 tests, 16 live smoke gates, 31 ADRs.*
 
 ---
@@ -73,8 +73,7 @@ that is uneconomic at any size blocks funding and says so in the ledger. One fed
 operation no longer suppresses decisions for the others. An evacuation that cannot fit its cap at
 any amount is marked with durable evidence, and a qualifying cap increase atomically retires it
 and admits a linked successor. An unopened federation fences all planning and reports why on
-`/v1/health`; a corrupt registry row does the same once PR #40 lands, and on `main` is still
-silently dropped (`F2`).
+`/v1/health`; so does a corrupt registry row (PR #40, merged 2026-09-08).
 
 **Host.** The daemon owns both RocksDB stores under one lock, serves eighteen routes behind a
 bearer token, runs the scheduler with adaptive sleep, wakes early for a federation's announced

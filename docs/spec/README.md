@@ -1,7 +1,7 @@
 # fedimint-wallets — as-built specification
 
 A description of the wallet **as it exists in this repository on 2026-09-07**, at `main`
-`1e44487` plus the open pull request #40. Not a plan, not a roadmap, and not a record of what was
+`ee4ba1c` (which contains PR #40 and PR #45). Not a plan, not a roadmap, and not a record of what was
 intended: where a plan document, an ADR, a code comment or the glossary says one thing and the
 code does another, this set records what the code does and files the difference in
 [`11-open-findings.md`](./11-open-findings.md).
