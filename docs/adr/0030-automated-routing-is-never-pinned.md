@@ -330,14 +330,14 @@ check the implementing bead owns, not a fact this ADR may assume.
   "durable break-glass" story true.
   SCOPE THE NON-DURABILITY TO PRE-COMMIT SELECTION. "An operator repeating the operation must
   repeat the flag" is right about CHOOSING a route and wrong once an operation has committed:
-  from that point the PERSISTED ROUTE is authoritative and replays over it
-  (CONTEXT.md's "Once an operation has committed" entry, br-s0e requirement 5). If a committed
+  from that point the COMMITTED ROUTE is authoritative and replays over it
+  (CONTEXT.md's **Committed route** entry, br-s0e requirement 5). If a committed
   break-glass `Move` had to re-derive its route from a flag, a restart would either re-resolve
   under an already-committed invoice or stall because the unvetted gateway is not on any list.
-  So: no flag, no route selection; but a recorded route replays without one.
+  So: no flag, no route selection; but a committed route replays without one.
   ORDERING CAVEAT: `br-remove-gateway-pin-yjw` lands BEFORE `br-s0e`, and today's backfill retains
   neither the source gateway nor the route kind. So between those two beads a break-glass `Move`
-  that commits its receive and then crashes has no recorded route to replay — it re-resolves from
+  that commits its receive and then crashes has no committed route to replay — it re-resolves from
   the vetted list or stalls. Either the route persistence lands with the pin-removal work, or that
   bead states this window explicitly rather than inheriting a guarantee that is not yet true.
 - **This does not make routing reliable**, and no document should say so. A federation whose

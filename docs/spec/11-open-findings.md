@@ -56,13 +56,13 @@ Selection starts from the destination federation's list and validates the source
 fetching `routing_info`; a gateway vetted by the destination alone, or revoked by the source
 since, can still carry an automated move. Separately the SDK's gateway list flattens every URL
 any responding guardian returned, so one misconfigured or malicious guardian can place a gateway
-in the automated candidate set. `CONTEXT.md`'s **Serves**, **Vetted list** and **Route hint**
-entries each say "this is the INTENT, not today's behaviour". Open — `br-gw-threshold-membership-k4t`,
+in the automated candidate set. `ADR-0029` and `ADR-0030` record the target; `CONTEXT.md`'s
+**Serves**, **Vetted list** and **Route hint** entries each point here as the gap. Open — `br-gw-threshold-membership-k4t`,
 `br-s0e`.
 
 **F7. The route is not persisted with a committed operation.** After cache loss the operation
 artifact carries no gateway, so reassembly resolves afresh and a restart can pay through a
-different gateway than the one the invoice was sized for. `CONTEXT.md` records this as intent.
+different gateway than the one the invoice was sized for. `ADR-0030` records the rule; `CONTEXT.md` **Committed route** points here as the gap.
 Open — part of `br-s0e`.
 
 **F8. A receive refused after commit leaves the ledger row on the planned pair.** When the
