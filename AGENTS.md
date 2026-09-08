@@ -2,8 +2,9 @@
 
 Instructions for coding agents working in this repository.
 
-This is a **multi-federation Bitcoin wallet running in production and holding real
-sats**. Read [docs/spec/](./docs/spec/README.md) for what is built (the as-built specification;
+This is a **multi-federation Bitcoin wallet**. Its one long-running deployment is a test rig
+holding a small real-sats balance on two mainnet federations — not production, but the money is
+real, so money-path changes are still reviewed and live-gated (below). Read [docs/spec/](./docs/spec/README.md) for what is built (the as-built specification;
 start at its executive summary) and
 [docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md) for what is next. The ADRs under
 [docs/adr/](./docs/adr/) are canonical wherever they conflict with older text.

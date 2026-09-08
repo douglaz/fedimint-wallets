@@ -121,12 +121,11 @@ fails it.
 
 ## Relationship to the rest of `docs/`
 
-This set supersedes, as the description of the system: the "Current status" section of
-`README.md`, the "Where we are" section of `docs/roadmap-to-v1.md`, `docs/phase6a-plan.md` and
-`docs/phase4-implementation-spec.md` as field-level authority, and the shape sketches in
-`docs/operation-history-spec.md` §2. Those documents remain useful as the record of *why* the
-code is the way it is; they are not the record of *what* it is. Retiring or archiving them is a
-separate decision this set does not make.
+This set is the description of the system. On 2026-09-08 the documents that used to carry
+that role were retired: `README.md`'s status section and the roadmap's "Where we are" now point
+here; `phase6a-plan.md`, `phase4-implementation-spec.md` and the `DRIVE.md` working journal moved
+to `docs/archive/`; `docs/operation-history-spec.md` §2 names `STO-15`–`STO-17` for the as-built
+shapes. The archived documents remain the record of *why* the code is the way it is.
 
 The runbooks (`docs/real-sats-pilot-runbook.md`, `docs/devimint-runbook.md`) are operator
 procedures and remain authoritative for procedure. `CONTEXT.md` remains the glossary. The ADRs

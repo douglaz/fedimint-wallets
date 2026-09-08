@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # devimint smoke test for the OPERATION LEDGER — the Phase 4.C exit gate
-# (docs/phase4-implementation-spec.md §13, docs/operation-history-spec.md §6): a full
+# (docs/archive/phase4-implementation-spec.md §13, docs/operation-history-spec.md §6): a full
 # two-fed session — join A+B → direct-inflow (fund) → raw receive (--key round trip) →
 # cross-fed move → a FORCED fee-cap failure → an agent tick with induced OverCap refusals —
 # must be fully reconstructible from `wallet-cli history`/`show`: kinds, actors, reasons,

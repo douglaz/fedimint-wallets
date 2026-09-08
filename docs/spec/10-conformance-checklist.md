@@ -27,7 +27,7 @@ by `docs/devimint-runbook.md` §1.
 - [ ] **CNF-39** Every smoke header records its complete launch block and its last green run with
       the figures observed. As built only `smoke_evacuate_supersede_devimint.sh` does; the other
       fifteen carry a launch block and no run record, and their last green runs live in issue
-      close notes and `DRIVE.md`, not beside the script.
+      close notes and `docs/archive/drive-br-n8o-2026-08.md`, not beside the script.
 
 ## Build and unit gates
 

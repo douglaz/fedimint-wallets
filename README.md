@@ -9,78 +9,13 @@ The Android Slint app is still planned, not built.
 
 ## Current status
 
-As of 2026-07-26, the engine, the `walletd` daemon, discovery, and seed recovery are
-live and devimint-validated:
+The system as built is described in [docs/spec/](./docs/spec/README.md); start at its
+[executive summary](./docs/spec/executive-summary.md). In one line: the headless engine, the
+`walletd` daemon, discovery, seed recovery and route economics are built and devimint-validated;
+the web sidecar is a skeleton; there is no phone app; the seed is plaintext on disk. What is next
+is in [docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md).
 
-- **Phase 1 money engine: complete.** Join, receive, pay, exact-net direct inflow,
-  cross-federation move, crash/reconcile recovery, and idempotent replay were
-  live-validated on devimint.
-- **Phase 2 sense + decide: complete.** Real federation probing feeds scoring,
-  snapshot building, allocation decisions, and executor application through
-  `wallet-cli tick` / `wallet-cli status`.
-- **Phase 3.A evacuation: executable at real fee shapes.**
-  Shutdown/degradation signals can trigger an LN-only evacuation from a dying
-  federation into an eligible healthy federation, and that path is devimint-validated.
-  The evacuation is bounded by a BASE + PROPORTIONAL cap (ADR-0029) —
-  `--evac-fee-base-msat` + `--evac-fee-bps`, default 200 sats + 3% — computed from the net
-  the destination is actually credited, not the flat absolute `--max-fee`, which at real
-  gateway prices could fall below the cost of draining a full balance and stall the drain.
-   One limit to know before an incident: admitted evacuations are immutable generally. The
-   narrow exception is a pre-artifact agent evacuation with durable typed structural-refusal
-   evidence: a component-wise monotone effective cap increase at its recorded sample atomically
-   creates a linked fresh occurrence. An empty bounded probe is still `Retryable` evidence, not
-   proof that a route is unavailable; ordinary policy edits do not release an evacuation.
-- **Phase 4 hardening + ledger: complete.** Review P1s are closed, per-federation
-  caps are enforced, terminal stranded moves are explicit, and the append-only
-  operation ledger is exposed through `wallet-cli history` / `wallet-cli show`.
-- **Phase 5.0 active probe: complete.** The wallet can spend a small amount through
-  a candidate federation and redeem it back, producing a sustained-window
-  redeemability verdict for discovery-driven funding decisions.
-- **Phase 5.1 discovery + triggers: complete.** Source-agnostic candidate discovery
-  (Observer HTTP + manual), the candidate registry, and probe-gated funding: a
-  discovered/auto-joined federation is fundable only after a sustained active-probe
-  pass, never on discovery alone.
-- **Phase 6a `walletd` daemon + local API: complete.** A 24/7 single-owner daemon
-  (axum on 127.0.0.1 + bearer token) owns the DB and runs the watch scheduler;
-  `wallet-cli` is a thin client (client mode default, `--standalone` explicit). Route
-  pricing and all network IO run OFF the actor so a mid-flight (hours-long LN) payment
-  never blocks another operation (ADR-0024); the responsiveness gate holds
-  `POST /v1/pay` to its first external call in <250 ms.
-  Standalone `tick` and dry-run `status` refuse a corrupt joined-federation registry rather
-  than plan from its healthy subset; preserve the data directory and repair the exact row from
-  a consistent backup before retrying.
-- **Seed recovery: complete.** A wallet restores each federation's ecash balance from
-  the 12-word seed **plus the joined federation IDs/invites** — the backup unit settled by
-  [ADR-0025](./docs/adr/0025-recovery-fresh-partition-seed-is-the-backup-unit.md), not the
-  seed alone (fedimint recovery) — the SUCCESS path is live-validated on
-  devimint (both the daemon and standalone front ends, including journal-only loss over an
-  orphan partition). Complete-or-fail semantics (a failed module recovery terminalizes
-  rather than hanging forever) are covered by unit tests, NOT by a live gate: faithfully
-  injecting a module-recovery failure needs a fault hook in the fedimint fork, so the live
-  failure gate is deferred (`docs/recovery-failure-gate-analysis.md`).
-- **Route economics: complete.** Before each committable tick, unless live allocator work
-  conflict-blocks the designated funding pair, the allocator attempts to price it. Absent an
-  explicit gateway override, it starts from the destination federation's vetted list; an
-  override is the sole candidate. It validates each candidate's `routing_info` at both ends and
-  chooses the cheapest validated candidate. A pair priced `Routable` floors moves at that route's
-  economic break-even, never below the protocol `min_move` floor;
-  `Unroutable`/`UneconomicAtAnySize` blocks funding. An absent candidate
-  list, bounded-scan miss, quote error, or indeterminate floor can instead leave the pair
-  unpriced, which permissively falls back to the protocol `min_move` floor. Requiring
-  destination-list candidates to appear on the **source** federation's vetted list remains
-  follow-up work (`br-s0e`).
-
-Recovery of ECASH from the seed is done; the remaining durability work — encryption of
-the seed at rest (decided in [ADR-0026](./docs/adr/0026-seed-at-rest-encryption-headless.md),
-build now tracked rather than merely deferred) and an encrypted app-state/history
-snapshot with a restore drill — is Phase 7. **The seed is still plaintext on disk**, so
-anyone who can read the data directory owns the funds; host full-disk encryption, strict
-single-user isolation, and the runbook's balance ceiling are the only controls in force,
-and they are interim by design. This is also the stated precondition in
-[ADR-0028](./docs/adr/0028-web-frontend-localhost-sidecar-session-auth.md) for exposing the
-web sidecar anywhere beyond loopback or a trusted overlay. The Android
-frontend (Phase 6b) and release hardening (Phase 8) are next. See
-[docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md).
+The one long-running deployment is a test rig holding a small real-sats balance, not a pilot.
 
 ## What is in this repo
 
@@ -196,8 +131,6 @@ gateway pinning details, and known gotchas.
 - [CONTEXT.md](./CONTEXT.md) - canonical product language and domain definitions.
 - [docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md) - current build sequence and
   definition of "fully featured v1".
-- [docs/phase6a-plan.md](./docs/phase6a-plan.md) - the 24/7 daemon and local API: the
-  field-level authority for the runtime in production today.
 - [docs/phase6c-web-frontend-plan.md](./docs/phase6c-web-frontend-plan.md) - the browser
   frontend, specced and next to build.
 - [docs/operation-history-spec.md](./docs/operation-history-spec.md) - append-only
