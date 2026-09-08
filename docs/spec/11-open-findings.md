@@ -5,7 +5,7 @@ names the issue that tracks it (`br-…` in `.beads/issues.jsonl`), or says why 
 two cannot drift apart silently; when an issue closes, its finding here is marked closed with the pull request, not
 deleted.
 
-Written 2026-09-07 against `main` at `1e44487` plus the open pull request #40. Items are
+Written 2026-09-07 against `main` at `1e44487` plus PR #40, both merged as `ee4ba1c` on 2026-09-08. Items are
 grouped by what they cost if left alone, not by the order they were found.
 
 ## The questions still open at the product level
@@ -34,12 +34,6 @@ route whose economic floor is ≥ 450,102 msat. The floor is correct (`ALC-10`);
 any refusal row, decision, or log line when it binds. PR #41 (2026-08-30) added observability for
 the deferred-funding case; the issue remains open pending confirmation that the signal is
 emitted on the live path. Open — `br-0vg`.
-
-**F2. The partial/corrupt federation world-view fences are implemented but unmerged.**
-`GET /v1/status` 503s, the scheduler's recovery-only cycle with `automation_blocked` set, and the
-standalone `tick`/`status` refusal are all in PR #40, green against `main`, not merged. Until it
-lands, a poison registry row lets three planning surfaces plan from the healthy subset. Open —
-`br-19g`; closes on merge of #40.
 
 **F3. The evacuation fallback in `ADR-0029` is half built.** The proportional cap exists
 (`ALC-20`). The second route — a real Lightning hop through two gateways when none serves both
@@ -257,4 +251,7 @@ Open — `br-standalone-probe-bypasses-actor-253`.
 
 ## Closed since this document was first written
 
-*(none yet)*
+**F2. The partial/corrupt federation world-view fences were implemented but unmerged.** Closed
+2026-09-08: PR #40 merged as `ee4ba1c`; `GET /v1/status` 503s, the scheduler's recovery-only
+cycle tagged `corrupt_federation_registry`, and the standalone `tick`/`status` refusal are on
+`main` (`ALC-46`, `CNF-51`). `br-19g` closed.

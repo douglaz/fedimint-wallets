@@ -129,8 +129,7 @@ way: correct to refuse, and invisible.
 **Prohibition** — every path that skips planning MUST set `automation_blocked` with a reason
 and a detail (`ALC-45`). Liveness is not readiness.
 
-*Provenance: `br-rky` item 3; PR #40 commit `ab52094`. The fence and its reason tag are in PR
-#40, not on `main` (`F2`).*
+*Provenance: `br-rky` item 3; PR #40 commit `ab52094`, merged 2026-09-08.*
 
 ## Persistence and compatibility
 

@@ -141,9 +141,9 @@ defaults because rows written before them exist.
 **STO-14** The federation registry (`0x03`) is written by a plain overwrite after the client
 partition exists and before the in-memory client is inserted. `get_federation` fails closed on
 a corrupt row; `list_federations_report` skips a malformed key or undecodable value, counts it
-in `skipped_rows`, and warns. On `main` nothing outside `list_federations` reads the report, so a
-poison row is dropped and planning proceeds from the healthy subset; PR #40 makes three planning
-surfaces treat `skipped_rows > 0` as "the world is unknown" instead (`ALC-46`, `F2`).
+in `skipped_rows`, and warns. Three planning surfaces MUST treat `skipped_rows > 0` as "the
+world is unknown" rather than plan from the healthy subset (`ALC-46`); explicit user and admin
+verbs keep the poison-tolerant list.
 
 ## The operation ledger
 

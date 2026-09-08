@@ -120,8 +120,7 @@ action}], scored:[{id, gated_eligible}], deferred:[{dest, source, reason, want_m
 floor_source}]}`. `action` is the Debug rendering of the action, not a stable wire shape. It
 returns **503** before the dry run when the runtime is absent, the federation registry reports a
 skipped corrupt row, any joined federation is unopened, the watch occurrence is at its
-fail-closed maximum, or probing errors (the fences of `ALC-46`; the corrupt-row and unopened
-cases land with PR #40). This response shape is daemon-private, mirrored by hand in the CLI
+fail-closed maximum, or probing errors (the fences of `ALC-46`). This response shape is daemon-private, mirrored by hand in the CLI
 client, and the CLI's mirror **drops `deferred`**: an operator using `wallet-cli status` in
 client mode cannot see a withheld funding goal. Only the raw endpoint and the poller show it.
 
@@ -129,8 +128,7 @@ client mode cannot see a withheld funding goal. Only the raw endpoint and the po
 `{actor_queue_depth, inflight_drivers, scheduler_alive, automation_ready, automation_blocked?}`.
 `scheduler_alive` is the scheduler loop's liveness flag. `automation_ready` is
 `automation_blocked.is_none()`. `automation_blocked` is `{reason, detail}` with `reason` ∈
-`cycle_failed | partial_federation_view` on `main`, plus `corrupt_federation_registry` once PR #40
-lands (`ALC-45`). Liveness and
+`cycle_failed | partial_federation_view | corrupt_federation_registry` (`ALC-45`). Liveness and
 readiness are different answers, and a supervisor that reads only the status code learns
 neither. The CLI's `health` verb prints the first three fields and **omits both readiness
 fields**.

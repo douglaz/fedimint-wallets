@@ -180,6 +180,8 @@ by `docs/devimint-runbook.md` §1.
       explained (`F12`).
 - [ ] **CNF-49** The readiness poller running from a schedule and paging on a transition (`F14`).
 - [ ] **CNF-50** A failed `ReconcileDecide` reported as `automation_blocked` (`F32`).
-- [ ] **CNF-51** A malformed value under a well-formed registry key fences the scheduler with
+- [x] **CNF-51** A malformed value under a well-formed registry key fences the scheduler with
       `corrupt_federation_registry` and writes no probe, tick or watch row, planted under the
-      `0x00` partition (`DEF-24`). The test exists in PR #40 and is not on `main` (`F2`).
+      `0x00` partition (`DEF-24`;
+      `a_corrupt_federation_registry_reports_why_automation_is_blocked`). On `main` since
+      `ee4ba1c`; green in PR #40's CI at `ab52094`.

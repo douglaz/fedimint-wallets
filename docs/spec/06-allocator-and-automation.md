@@ -272,8 +272,7 @@ is a dev/test harness with no production caller (`ADR-0031`).
 ## The scheduler cycle
 
 **ALC-38** `run_cycle`, in order: (1) `reconcile_durable` (`OPS-35`); (2) ledger repair through
-the actor; (3) `list_federations_report` — **fence A (lands with PR #40; on `main` the
-report has no scheduler caller and a poison row is silently dropped)**: `skipped_rows > 0` → recovery-only
+the actor; (3) `list_federations_report` — **fence A**: `skipped_rows > 0` → recovery-only
 redrive, return blocked `corrupt_federation_registry`; (4) open missing federations under a
 membership lease — **fence B**: any still unopened → recovery-only redrive, return blocked
 `partial_federation_view`; (5) `ReconcileDecide`: release the previous parked handoff, capture
@@ -322,16 +321,16 @@ decision, and per deferred funding goal; it returns `scored` with `gated_eligibl
 `deferred`. It is the only surface for a floor-deferred shortfall.
 
 **ALC-45** Every path that skips planning MUST set `automation_blocked {reason, detail}` before
-the cycle sleeps (`DEF-9`). Reasons on `main`: `cycle_failed` (any cycle error, including
-occurrence overflow and discovery or deadline storage faults) and `partial_federation_view`.
-A third, `corrupt_federation_registry` (with the skipped-row count), lands with PR #40 (`F2`).
-`automation_ready` on `/v1/health` is its negation (`API-16`).
+the cycle sleeps (`DEF-9`). Reasons as built: `cycle_failed` (any cycle error, including
+occurrence overflow and discovery or deadline storage faults), `partial_federation_view`, and
+`corrupt_federation_registry` (with the skipped-row count). `automation_ready` on `/v1/health`
+is its negation (`API-16`).
 
 **ALC-46** Three planning surfaces MUST refuse a partial or corrupt world rather than plan from
 the healthy subset: the scheduler (fences A and B, `ALC-38`), `GET /v1/status` (503 before the
 dry run), and standalone `tick`/`status` (refuse before opening). Explicit user and admin verbs
 keep their poison-tolerant behaviour. A poison registry row is not an absent federation: its
-funds may be part of the world the allocator would score. Lands with PR #40 (`F2`).
+funds may be part of the world the allocator would score. Landed with PR #40 (`ee4ba1c`).
 
 **ALC-47** One planning skip is **not** reported: a failed `ReconcileDecide` (step 5 — a
 poisoned tick authority, or a lease live at the wrong moment) skips the tick row, route pricing,
