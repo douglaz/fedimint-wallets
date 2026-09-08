@@ -25,8 +25,9 @@ rebuildable by design, refusals and raw `receive`/`pay` leave no durable trace a
 
 All types in `wallet-core` (pure, serde). Storage in `wallet-fedimint` next to the journal.
 **Authority split:** this spec is normative for the MODEL (structure separation, write
-discipline, correlation-key rules); the exact field-level Rust shapes are authoritative in
-[phase4-implementation-spec.md](./phase4-implementation-spec.md) §7, which refines the
+discipline, correlation-key rules); the exact field-level shapes as built are in
+[docs/spec/05-persistence.md](./spec/05-persistence.md) (`STO-15`–`STO-17`); the historical
+derivation is [phase4-implementation-spec.md](./archive/phase4-implementation-spec.md) §7, which refines the
 sketch below (notably: `reason` is mandatory — user verbs carry `ReasonCode::UserInitiated`
 — and gateways are `Option`), **and its §7/§10 REFINE this spec's write discipline and
 repair rules**: terminal immutability gains exactly one principled exception (a

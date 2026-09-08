@@ -33,7 +33,7 @@ evacuation is just a send racing a shutdown window; it is the *last* thing that 
 
 The Phase 1-5 money-safety validation (~500 tests, 5 live devimint gates incl. the
 four-killpoint crash gate) assumed serialized execution. Under this ADR those guarantees
-rest instead on explicit, decide-time mechanisms (spec: `docs/phase6a-plan.md`):
+rest instead on explicit, decide-time mechanisms (spec: `docs/archive/phase6a-plan.md`):
 
 - **Dual reservation views** — fresh user admission reads a strict nonterminal intent projection.
   Tokenized allocator planning/commit reads a validated artifact/phase projection, so a send debit

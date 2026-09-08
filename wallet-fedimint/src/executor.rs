@@ -216,7 +216,7 @@ fn raw_pay_quote_error(lowest_quote: Option<u64>, fee_cap: Msat, from: Federatio
     // pre-6a CLI returned the error and was done, and leaving the intent Pending would
     // let a background reconcile settle it hours later, after the user already paid the
     // bill another way ("thought it failed, later succeeded"). A deliberate retry is a
-    // new operation (docs/phase6a-plan.md §6a.6; ADR-0024). Matches raw receive
+    // new operation (docs/archive/phase6a-plan.md §6a.6; ADR-0024). Matches raw receive
     // (`raw_fee_cap_error`), which already terminalizes its over-cap quote.
     match lowest_quote {
         Some(quote) => {

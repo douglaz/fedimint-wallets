@@ -33,7 +33,7 @@ layers anywhere in this phase.
 2. **Send-leg fee quote on the contract amount** — **the quote-base fix LANDED with the 3.A
    merge (`5315df3`)**: `send_fee_quote_for_amount` quotes on an explicit amount and the Pay
    arm computes the full outgoing contract (see
-   [phase4-implementation-spec.md](../phase4-implementation-spec.md) §2). Remaining work:
+   [phase4-implementation-spec.md](./phase4-implementation-spec.md) §2). Remaining work:
    persist the final quotes on the `MoveRecord` (feeds 4.B). Devimint check: a cap set just
    under the true cost refuses.
 3. **Strand handling** (`executor.rs`): persist the send preimage on the `MoveRecord`; on
@@ -55,7 +55,7 @@ layers anywhere in this phase.
    enforcement, evacuation-destination scorer eligibility, deterministic-send-rejection
    classification (the expired-invoice wedge), never-over TOCTOU verification, plus the
    gateway-scan / partial-open / tick-deadline P2s. Buildable specs:
-   [phase4-implementation-spec.md](../phase4-implementation-spec.md) §15.
+   [phase4-implementation-spec.md](./phase4-implementation-spec.md) §15.
 
 ## 4.B — The operation ledger
 

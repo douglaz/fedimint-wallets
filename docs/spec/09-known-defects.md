@@ -175,7 +175,7 @@ not exist: the checkpoint and the ledger's highest Agent occurrence were exactly
 invariant is held instead by raising the checkpoint in the same transaction as any Agent ledger
 append (`STO-21`) and seeding an absent checkpoint from the ledger (`STO-23`).
 
-*Provenance: `DRIVE.md` 2026-08-23 carve-out; `br-e29` carries the remaining proof obligation.*
+*Provenance: `docs/archive/drive-br-n8o-2026-08.md` 2026-08-23 carve-out; `br-e29` carries the remaining proof obligation.*
 
 ### DEF-13 — A persisted-type compatibility rule that named the wrong list of types
 
