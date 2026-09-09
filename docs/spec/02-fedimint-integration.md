@@ -67,7 +67,9 @@ recovery (`DEF-18`).
 **FMI-10** The **vetted list** for a federation is the SDK's `list_gateways` on that federation's
 client — the guardians' lnv2 gateway registrations. The SDK returns a **union** of what each
 responding guardian returned after thresholding only the response count, so one guardian can
-place a gateway in the list; the wallet applies no threshold of its own (`F6`, `SEC-17`). The
+place a gateway in the list; the wallet applies no threshold of its own (`F6`, `SEC-17`; the
+decided target is a per-guardian read admitting only URLs at least `NumPeers::threshold()`
+guardians return). The
 devimint harness does not auto-register its gateway, so the list can be empty while a usable
 gateway exists.
 
