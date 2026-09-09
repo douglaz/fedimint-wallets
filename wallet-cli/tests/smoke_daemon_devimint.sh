@@ -108,6 +108,10 @@ command -v jq >/dev/null || { echo "FAIL: jq not on PATH (it is in the fedimint 
 command -v curl >/dev/null || { echo "FAIL: lock-pinned curl not on PATH (use run_exact_nix_develop)" >&2; exit 1; }
 
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
+# devimint never vets its LDK gateway; register it on every guardian so walletd routes from the
+# vetted list (a daemon cannot express a gateway pin, ADR-0030). See devimint_lib.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/devimint_lib.sh"
+register_lnv2_gateway "$GW" "$FM_INVITE_CODE"
 RECEIVE_MSAT=500000   # our wallet receives 500 sat...
 PAY_MSAT=100000       # ...then pays 100 sat back, leaving headroom for fees
 PORT=19736            # off the default 9736 so a real walletd on this box is never hit
@@ -144,7 +148,6 @@ echo "== walletd init (sandboxed XDG at $SANDBOX) =="
 mkdir -p "$XDG_CONFIG_HOME/walletd"
 cat > "$XDG_CONFIG_HOME/walletd/walletd.toml" <<EOF
 port = $PORT
-gateway = "$GW"
 EOF
 "$WALLETD" init
 
@@ -174,7 +177,7 @@ STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer wrong"
 [[ "$STATUS" == "401" ]] || { echo "FAIL: wrong bearer got $STATUS, expected 401" >&2; exit 1; }
 
 # CLIENT MODE from here on: no --standalone, no --data-dir, no --gateway — the pointer file
-# and the daemon's host-config pin carry everything.
+# carries everything; the daemon routes from the vetted list registered above.
 wcli() { "$WALLET_CLI" "$@"; }
 balance_msat_for_fed() {
   local fed_id="$1"

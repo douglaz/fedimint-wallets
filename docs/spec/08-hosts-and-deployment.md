@@ -14,7 +14,8 @@ lock (`STO-2`); every other process is a client of its HTTP API (`04-api-contrac
 `$XDG_CONFIG_HOME/walletd/walletd.toml`, else `~/.config/walletd/walletd.toml`; `--config`
 overrides.
 
-**HST-3** `walletd.toml` has six keys and rejects any other:
+**HST-3** `walletd.toml` has five keys and rejects any other — including the retired `gateway`
+pin, so a file from the pinned era fails startup loudly (`ADR-0030`):
 
 | key | default |
 |---|---|
@@ -23,7 +24,6 @@ overrides.
 | `port` | `9736` |
 | `token_path` | env `WALLETD_TOKEN_PATH`, else the key, else `<data_dir>/token` |
 | `log_level` | `info` (`RUST_LOG` overrides) |
-| `gateway` | none; pins one lnv2 gateway URL for every route (`F4`) |
 
 Paths must be absolute (`~` expanded). Two other environment knobs exist:
 `WALLETD_PERFORM_TIMEOUT_SECS` (default 600, `0` disables, garbage falls back to the default) and
@@ -61,11 +61,13 @@ restarts it.
 **HST-9** `wallet-cli --standalone` is the documented admission exception in `ADR-0031`: a
 one-shot process that takes the exclusive lock, opens both stores, and drives `Runtime`
 directly. It refuses to start if the lock is held ("another process owns the wallet store").
-It resolves `data_dir` from `--data-dir`, else `walletd.toml`, else the default; it does **not**
-inherit the daemon's `gateway` key.
+It resolves `data_dir` from `--data-dir`, else `walletd.toml`, else the default.
 
 **HST-10** Standalone-only verbs: `discover`, `probe`, `tick`, `status` (the richer rendering),
-`history --fed`, and the `--gateway` break-glass on money and await verbs. Standalone `tick` and
+`history --fed`, and the `--gateway` break-glass. The break-glass is accepted on `pay`,
+`receive`, `move`, `direct-inflow` and the three await verbs, where it is armed for that ONE
+operation's key; it is a usage error on `tick`, `probe`, `discover`, `status` and `reconcile`;
+it is ignored on verbs that resolve no route (`ADR-0030`). Standalone `tick` and
 `status` accept ephemeral policy overrides (`--per-fed-cap`, `--evac-fee-*`, `--occurrence`, …)
 that are validated but never persisted (`ALC-3`).
 

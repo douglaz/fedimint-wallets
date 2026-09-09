@@ -84,9 +84,8 @@ The CLI's `--standalone` mode drives the same engine one-shot under the same loc
 
 - **The seed is plaintext on disk.** Anyone who reads the data directory owns the funds. Decided
   and deferred in `ADR-0026`; not started (`F11`).
-- **Automated routing still honours a pinned gateway**, and the vetted-list membership check
-  that would make "one gateway validates at both ends" a real invariant is not enforced.
-  `ADR-0030` describes a target state (`F4`, `F6`).
+- **The vetted-list membership check** that would make "one gateway validates at both ends" a
+  real invariant is not enforced, and the list is a union of guardian answers (`F6`).
 - **A dying federation with no gateway shared with any other cannot be evacuated.** The second
   route `ADR-0029` decided — a real Lightning hop through two gateways — is unbuilt (`F3`).
 - **A funding shortfall below the route floor is withheld with no operator signal.** Correct, and

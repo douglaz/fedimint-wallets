@@ -1141,7 +1141,7 @@ impl Drop for CriticalTaskGuard {
 impl WalletService {
     /// Production daemon constructor: actor + drivers + the watch scheduler.
     pub async fn start(runtime: Runtime) -> ServiceResult<Self> {
-        Self::start_from_runtime(runtime, true).await
+        Self::start_from_runtime(Arc::new(runtime), true).await
     }
 
     /// Standalone constructor (spec §6a.7): the CLI's one-shot `--standalone` mode spins up the
@@ -1149,16 +1149,16 @@ impl WalletService {
     /// not fire the background rebalancer — running the scheduler with no HTTP surface is exactly
     /// the "daemon-without-an-API in standalone mode" the deleted `watch` verb was; the scheduler's
     /// only home is now the daemon. The actor still owns admission/holds/driving, so the money
-    /// verbs run the one true `WalletClient` command path.
-    pub async fn start_without_scheduler(runtime: Runtime) -> ServiceResult<Self> {
+    /// verbs run the one true `WalletClient` command path. Takes the runtime SHARED so the CLI
+    /// can still arm a break-glass on it once the verb knows its operation key (ADR-0030).
+    pub async fn start_without_scheduler(runtime: Arc<Runtime>) -> ServiceResult<Self> {
         Self::start_from_runtime(runtime, false).await
     }
 
     /// Shared bring-up from a live [`Runtime`]. `run_scheduler` gates the background watch task:
     /// the daemon runs it; the one-shot standalone CLI does not.
-    async fn start_from_runtime(runtime: Runtime, run_scheduler: bool) -> ServiceResult<Self> {
+    async fn start_from_runtime(runtime: Arc<Runtime>, run_scheduler: bool) -> ServiceResult<Self> {
         let policy = Policy::default();
-        let runtime = Arc::new(runtime);
         let journal = runtime.service_journal();
         let executor: Arc<dyn Executor> =
             Arc::new(runtime.service_executor(Some(policy.per_fed_cap)));

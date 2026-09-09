@@ -278,11 +278,9 @@ pub fn missing_pinned_feds(policy: &TickPolicy, snapshot: &AllocatorSnapshot) ->
 }
 
 /// Operator-pinned feds that PROBED this tick but failed the lnv2/probe gate the allocator needs
-/// before it can route money through them. The probe already reflects the CLI-pinned gateway when
-/// one was supplied (it validates that exact gateway for the fed) and otherwise the
-/// registered-gateway set, so this is the usable-route/liveness check for BOTH the
-/// pinned-`--gateway` path AND the default gateway-selection path — a pin the operator relies on
-/// default selection for is honored or failed just like one behind an explicit `--gateway`.
+/// before it can route money through them. The probe scans the fed's VETTED gateway set (automated
+/// routing is never pinned, ADR-0030), so this is the usable-route/liveness check for the route
+/// the allocator would actually take.
 ///
 /// The check is intentionally limited to explicit spending/standby pins. Auto-designation already
 /// excludes failed probes through the scorer gate, while an explicit pin is a request to use that

@@ -48,7 +48,12 @@ fi
 WCLI_DIR=$(mktemp -d)
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
 FED_B_INV="${FED_B_INVITE:-${FM_INVITE_CODE_B:?two-fed harness did not export FED_B_INVITE}}"
-wcli() { "$WALLET_CLI" --standalone --data-dir "$WCLI_DIR" --gateway "$GW" "$@"; }
+# devimint never vets its LDK gateway; register it on every guardian of BOTH feds so the wallet
+# routes unpinned from the vetted lists (ADR-0030). See devimint_lib.sh for the verified command.
+source "$(dirname "${BASH_SOURCE[0]}")/devimint_lib.sh"
+register_lnv2_gateway "$GW" "$FM_INVITE_CODE"
+register_lnv2_gateway "$GW" "$FED_B_INV"
+wcli() { "$WALLET_CLI" --standalone --data-dir "$WCLI_DIR" "$@"; }
 join_fed() {
   local started key state
   started=$(wcli join "$1") || return
@@ -153,7 +158,7 @@ echo "verdict OK: the probe verb reads 'passed' after 3 successes spanning its s
 ST_OUT=$(mktemp)
 wcli status --spending "$FED_A" --standby "$FED_B" \
   --spending-target 0 --standby-target 0 --per-fed-cap 400000 --max-fee 1000000 \
-  --gateway "$GW" --occurrence 0 >"$ST_OUT" 2>/dev/null || fail "status exited non-zero"
+  --occurrence 0 >"$ST_OUT" 2>/dev/null || fail "status exited non-zero"
 if ! grep -E "^${FED_B} .*active_probe=insufficient" "$ST_OUT" >/dev/null; then
   echo "  --- status ---" >&2; cat "$ST_OUT" >&2
   fail "status (default policy) should report B active_probe=insufficient, not a pass"

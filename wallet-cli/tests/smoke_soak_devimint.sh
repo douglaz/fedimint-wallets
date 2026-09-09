@@ -119,6 +119,11 @@ done
 command -v curl >/dev/null || { echo "FAIL: lock-pinned curl not on PATH (use run_exact_nix_develop)" >&2; exit 1; }
 
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
+# devimint never vets its LDK gateway; register it on every guardian of BOTH feds so walletd and
+# the standalone seed route from the vetted lists (no daemon pin exists, ADR-0030). See devimint_lib.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/devimint_lib.sh"
+register_lnv2_gateway "$GW" "$FM_INVITE_CODE"
+register_lnv2_gateway "$GW" "$FED_B_INVITE"
 PORT=19739
 FUND_MSAT=2000000
 RECEIVE_MSAT=50000
@@ -158,9 +163,8 @@ echo "== soak seed: join A, fund A ${FUND_MSAT}, auto-join B, policy =="
 mkdir -p "$XDG_CONFIG_HOME/walletd"
 cat > "$XDG_CONFIG_HOME/walletd/walletd.toml" <<EOF
 port = $PORT
-gateway = "$GW"
 EOF
-wsa() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" --gateway "$GW" "$@"; }
+wsa() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" "$@"; }
 
 JOIN_OUT=$(wsa join "$FM_INVITE_CODE")
 JOIN_KEY=${JOIN_OUT#* }

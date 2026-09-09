@@ -112,6 +112,11 @@ done
 command -v fedimint-cli >/dev/null || { echo "FAIL: fedimint-cli not on PATH" >&2; exit 1; }
 
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
+# devimint never vets its LDK gateway; register it on every guardian of BOTH feds so walletd and
+# the standalone seed route from the vetted lists (no daemon pin exists, ADR-0030). See devimint_lib.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/devimint_lib.sh"
+register_lnv2_gateway "$GW" "$FM_INVITE_CODE"
+register_lnv2_gateway "$GW" "$FED_B_INVITE"
 PORT=19738
 FUND_MSAT=3000000          # A's 3,000-sat working balance
 SPENDING_TARGET=1000000    # A keeps 1,000 sat
@@ -147,10 +152,9 @@ echo "== seed: join A, fund A, auto-join candidate B, policy =="
 mkdir -p "$XDG_CONFIG_HOME/walletd"
 cat > "$XDG_CONFIG_HOME/walletd/walletd.toml" <<EOF
 port = $PORT
-gateway = "$GW"
 EOF
 
-wsa() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" --gateway "$GW" "$@"; }
+wsa() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" "$@"; }
 SEED_ERR="$SANDBOX/seed.stderr"
 
 JOIN_OUT=$(wsa join "$FM_INVITE_CODE")
@@ -209,7 +213,7 @@ stop_walletd() {
 }
 
 # ---- phase 1: autonomous probe -> gate opens -> autonomous fund -------------------------------
-echo "== phase 1: walletd (real gateway) — scheduler probes gated B, then funds it =="
+echo "== phase 1: walletd (vetted-list routing) — scheduler probes gated B, then funds it =="
 "$WALLETD" > "$WALLETD_LOG" 2>&1 &
 WALLETD_PID=$!
 wait_healthy

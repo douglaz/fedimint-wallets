@@ -38,13 +38,8 @@ emitted on the live path. Open — `br-0vg`.
 **F3. The evacuation fallback in `ADR-0029` is half built.** The proportional cap exists
 (`ALC-20`). The second route — a real Lightning hop through two gateways when none serves both
 federations — does not. A dying federation with no shared gateway cannot be drained. Its
-specification (`br-s0e`) is 39,000 characters long and blocked on `F4` and `F5`. Open —
+specification (`br-s0e`) is 39,000 characters long and blocked on `F5`. Open —
 `br-s0e`.
-
-**F4. Automated routing still honours a pinned gateway.** `ADR-0030` decided automated routing
-is never pinned; the daemon's configured pin still overrides route economics at the executor
-boundary. The break-glass `--gateway` override on standalone money verbs is the part that is
-correct. Open — `br-remove-gateway-pin-yjw`.
 
 **F5. The sizing API cannot distinguish a proven structural refusal from an inconclusive
 bounded miss.** Both are `EvacuationSizing::Refused(String)`. The code is explicit that it
@@ -250,6 +245,13 @@ this is a second, architectural rather than a money hole.
 Open — `br-standalone-probe-bypasses-actor-253`.
 
 ## Closed since this document was first written
+
+**F4. Automated routing still honours a pinned gateway.** Closed 2026-09-09: the `walletd.toml`
+`gateway` key is gone and rejected, the daemon constructs its runtime unarmed, and the standalone
+`--gateway` break-glass is bound to the one operation key the invocation names
+(`FedimintExecutor::override_for`), rejected on `tick`/`probe`/`discover`/`status`/`reconcile`
+(`HST-3`, `HST-10`, `FMI-14`, `ADR-0030` rewritten). The devimint smokes register the LDK gateway
+on every guardian instead of pinning. `br-remove-gateway-pin-yjw` closed.
 
 **F2. The partial/corrupt federation world-view fences were implemented but unmerged.** Closed
 2026-09-08: PR #40 merged as `ee4ba1c`; `GET /v1/status` 503s, the scheduler's recovery-only

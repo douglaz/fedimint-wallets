@@ -479,13 +479,28 @@ scheduler-dead daemon as healthy.
   attempt per invoice: the wallet refuses a retry of that same invoice by design
   ("already consumed its single payment attempt"). Get a fresh invoice from the payee.
 - **No validating Lightning route (`Unroutable`).** For a priced `Unroutable` pair, no candidate
-  has `routing_info` that validates at both ends. Absent an explicit override, the implementation
-  scans the destination federation's vetted list; an override is the sole candidate. Source-
-  federation vetted-list membership is not yet required (`br-s0e`). The two-gateway Lightning-hop
-  fallback for `Evacuate` remains planned and unshipped; routine `Move` has no such fallback.
-  Inspect history and reconcile any work that had already started before treating the outage as a
-  fresh refusal. Wait for a validating route to return; if none will, moving funds is a manual
-  operation.
+  has `routing_info` that validates at both ends. Automated routing scans the destination
+  federation's vetted list and nothing else. Source-federation vetted-list membership is not yet
+  required (`br-s0e`). The two-gateway Lightning-hop fallback for `Evacuate` remains planned and
+  unshipped; routine `Move` has no such fallback. Inspect history and reconcile any work that
+  had already started before treating the outage as a fresh refusal. Wait for a validating route
+  to return; if none will, moving funds is a manual operation — the break-glass (ADR-0030):
+  stop walletd, then run the ONE operation through a gateway you name, outside the vetted list:
+
+  ```bash
+  # a stuck automated evacuation/fund: name its key from `history`
+  wallet-cli --standalone await-move <key> --gateway http://<gateway>/
+  # or move it yourself
+  wallet-cli --standalone move --from <dying> --to <healthy> --amount <msat> --gateway http://<gateway>/
+  ```
+
+  The flag applies to that one operation only; `tick`/`probe`/`reconcile` refuse it. The named
+  gateway must still answer `routing_info` for the source federation and the fee cap still
+  applies, but nothing vets it — you accept that residual. A route that had already committed a
+  leg replays as recorded and ignores the flag. If `walletd.toml` still carries a `gateway = ...`
+  line from the pinned era, both walletd and `--standalone` refuse to parse it: delete the line
+  (or pass `--data-dir` explicitly). Restoring AUTOMATED movement is guardian-side: have the
+  guardians `gateways add` a live gateway on every reachable peer.
 - **A validated route is too expensive (`UneconomicAtAnySize`).** Live quotes proved that no move
   size fits the proportional fee cap. This is not a gateway outage: change the cap or route before
   expecting fresh automated movement to resume.

@@ -113,8 +113,9 @@
 #
 # Inside `dev-fed --exec` devimint sets FM_INVITE_CODE (fed-0's invite) and FM_PORT_GW_LDK (the
 # LDK lnv2 gateway's API port), and puts the funded internal client `fedimint-cli` on PATH. That
-# gateway is NOT in the federation's vetted list (runbook §4), so every lnv2 route on both sides
-# pins it explicitly — `--gateway "$GW"` standalone, `gateway = "$GW"` in walletd.toml.
+# gateway is NOT in the federation's vetted list (runbook §4), so this smoke registers it on every
+# guardian first (`register_lnv2_gateway`, devimint_lib.sh); wallet-cli and walletd then route
+# unpinned from the vetted list (ADR-0030). Only `fedimint-cli module lnv2` still passes `--gateway`.
 set -euo pipefail
 
 : "${FM_INVITE_CODE:?FM_INVITE_CODE not set — run inside \`devimint dev-fed --exec\`}"
@@ -144,6 +145,8 @@ for c in fedimint-cli jq awk; do
 done
 
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
+source "$(dirname "${BASH_SOURCE[0]}")/devimint_lib.sh"
+register_lnv2_gateway "$GW" "$FM_INVITE_CODE"
 PORT=19741               # walletd's bind port for phase A (sandboxed, one process at a time)
 FUND_MSAT=500000         # what store 1 receives before it is lost
 SPEND_MSAT=50000         # the post-recovery spendability probe (well under the restored balance)
@@ -216,16 +219,15 @@ write_host_config() { # $1 = walletd.toml path, $2 = data dir
   cat > "$1" <<EOF
 data_dir = "$2"
 port = $PORT
-gateway = "$GW"
 EOF
 }
 write_host_config "$CFG_1" "$DATA_DIR_1"
 write_host_config "$CFG_2" "$DATA_DIR_2"
 
-wsa1() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR_1" --gateway "$GW" "$@"; }
-wsa2() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR_2" --gateway "$GW" "$@"; }
+wsa1() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR_1" "$@"; }
+wsa2() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR_2" "$@"; }
 # Client mode against the running walletd. Fully explicit (--url + --token-path), so it can never
-# read a stale pointer; client mode REJECTS --gateway (walletd's pin is host config, §6a.6).
+# read a stale pointer; client mode REJECTS --gateway (walletd never routes outside the vetted list).
 wcli2() { "$WALLET_CLI" --url "$BASE" --token-path "$DATA_DIR_2/token" "$@"; }
 # `balance` prints "<fed hex>: <msat> msat" rows plus a "total (N/M federations): <msat> msat"
 # line, identically in both modes. Read the report ONCE (so a failed read is a loud error, not a

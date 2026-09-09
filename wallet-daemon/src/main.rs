@@ -244,9 +244,8 @@ async fn run_serve(config_path: &std::path::Path) -> Result<()> {
     let listener = server::bind(&config.bind()).await?;
 
     // hard_cap is None ON PURPOSE — the actor reads per_fed_cap from the stored Policy per
-    // decide (step 4); no constructor cap. The gateway pin is host config (walletd.toml):
-    // required against devimint, whose LDK gateway is never registered into the lnv2 set.
-    let pinned_gateway = config.gateway.clone().map(wallet_fedimint::GatewayUrl);
+    // decide (step 4); no constructor cap. No break-glass either, ever: automated routing
+    // resolves from each federation's vetted list and nothing else (ADR-0030).
     // Per-`perform` wall-clock deadline (§15.9). The daemon MUST bound this: an unbounded
     // `perform` lets a stalled settlement long-poll (e.g. a `Move`'s receive-claim await over
     // a flaky transport) park its driver forever — the driver never yields, so reconcile can
@@ -258,7 +257,7 @@ async fn run_serve(config_path: &std::path::Path) -> Result<()> {
     let service_runtime = Runtime::new(
         multi_client.clone(),
         journal.clone(),
-        pinned_gateway.clone(),
+        None,
         None,
         perform_timeout,
     );
@@ -271,7 +270,7 @@ async fn run_serve(config_path: &std::path::Path) -> Result<()> {
     let read_runtime = Arc::new(Runtime::new(
         multi_client.clone(),
         journal.clone(),
-        pinned_gateway,
+        None,
         None,
         None,
     ));

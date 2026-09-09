@@ -53,7 +53,7 @@ pub use discovery::{
     DiscoverPassProgress, DiscoverReport, DiscoverSourceReport, ManualSource, ObserverSource,
     SourceResult,
 };
-pub use executor::FedimintExecutor;
+pub use executor::{BreakGlass, FedimintExecutor};
 pub use fee::{gross_up, predicted_net, total_within_cap, GatewayFee, GrossUp};
 pub use journal::{
     prune_probe_attempts, raw_operation_row_matches, CandidateListReport, CandidateRecord,

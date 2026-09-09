@@ -24,7 +24,6 @@
 //! (`douglaz/fedimint` @ `b108ec6`).
 
 use crate::multi_client::MultiClient;
-use crate::types::GatewayUrl;
 use fedimint_api_client::api::{FederationApiExt as _, StatusResponse};
 use fedimint_client::db::ChronologicalOperationLogKey;
 use fedimint_client::ClientHandleArc;
@@ -163,9 +162,8 @@ pub fn assemble_status(p: &ProbeResult, id: FederationId) -> FederationStatus {
             // not sensed from the federation — a fresh probe reserves nothing.
             reserved_fee: Msat(0),
         },
-        // `probed_ok` = BOTH liveness (quorum answered) AND a usable route (the
-        // pinned gateway, if supplied, or the executor-default first registered
-        // gateway answers `routing_info`): the two no-sats empirical signals the allocator's
+        // `probed_ok` = BOTH liveness (quorum answered) AND a usable route (some gateway on
+        // the federation's vetted list answers `routing_info`): the two no-sats empirical signals the allocator's
         // receive-gating reads before it directs an inflow into a federation.
         probed_ok: p.quorum_live && p.gateway_available,
         // Reputation comes from the Phase-3 Observer; the sense layer is neutral.
@@ -280,7 +278,6 @@ fn forced_shutdown_matches(configured: Option<&str>, id: &FederationId) -> bool 
 /// I/O — validated live on devimint, NOT in the rb-lite gate.
 pub struct FedimintProbeRunner {
     mc: Arc<MultiClient>,
-    pinned_gateway: Option<GatewayUrl>,
 }
 
 /// Op-log page size for the pending-balance scan. Paging runs to exhaustion, so this
@@ -289,11 +286,7 @@ const PROBE_OPLOG_PAGE_SIZE: usize = 100;
 
 impl FedimintProbeRunner {
     pub fn new(mc: Arc<MultiClient>) -> Self {
-        Self::with_pinned_gateway(mc, None)
-    }
-
-    pub fn with_pinned_gateway(mc: Arc<MultiClient>, pinned_gateway: Option<GatewayUrl>) -> Self {
-        Self { mc, pinned_gateway }
+        Self { mc }
     }
 
     /// Probe one open federation. LIGHT — NO sats spent: structural facts from the
@@ -350,12 +343,11 @@ impl FedimintProbeRunner {
         let quorum_live = client.api().session_count().await.is_ok();
         let latency_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
 
-        // `gateway_available`: a pinned lnv2 gateway, if supplied, must answer
-        // `routing_info` for this federation; otherwise the executor-default first registered
-        // lnv2 gateway must answer. NOTE (runbook §4): devimint does NOT auto-register its
-        // LDK gateway, so the live tick passes that gateway URL directly. As the
+        // `gateway_available`: some lnv2 gateway on the federation's VETTED list must answer
+        // `routing_info` for this federation. NOTE (runbook §4): devimint does NOT auto-register
+        // its LDK gateway, so the live smokes register it on every guardian first. As the
         // `round_trip_ok` proxy this fails CLOSED: a missing lnv2 module, empty list,
-        // stale/unreachable gateway, invalid pinned gateway, or unreachable gateway
+        // stale/unreachable gateway, or unreachable gateway
         // registry all read as not-routable, producing a scorable `ProbeResult`
         // instead of hiding a dead federation behind `Err`.
         let gateway_available = self.gateway_available(id, has_lnv2).await;
@@ -460,21 +452,8 @@ impl FedimintProbeRunner {
             return false;
         }
 
-        if let Some(gateway) = &self.pinned_gateway {
-            return match self.mc.validate_gateway(id, gateway).await {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::warn!(
-                        federation = %id.to_hex(),
-                        gateway = %gateway.0,
-                        error = ?e,
-                        "probe: pinned gateway failed routing-info validation"
-                    );
-                    false
-                }
-            };
-        }
-
+        // Automated routing is never pinned (ADR-0030): a probe scans the federation's vetted
+        // list and nothing else, so its verdict is about routes the allocator can actually use.
         match self.mc.gateways(id).await {
             Ok(gateways) => {
                 // §15.6: ANY registered gateway that validates makes the fed routable — a stale

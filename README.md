@@ -74,9 +74,9 @@ the two fee caps are deliberately different shapes:
 
 A `--max-fee-bps-of-move` of `0` (every funding move would get a zero cap and fail) or above
 `10000` is rejected by policy validation. Before each committable tick, if live allocator work has
-not conflict-blocked the designated funding pair, the allocator attempts to price it. Absent an
-explicit gateway override, candidates come from the destination federation's vetted list; an
-override is the sole candidate. Pricing validates `routing_info` at both ends and picks the
+not conflict-blocked the designated funding pair, the allocator attempts to price it. Candidates
+come from the destination federation's vetted list and nothing else — automated routing is never
+pinned (ADR-0030). Pricing validates `routing_info` at both ends and picks the
 cheapest validated candidate, but source-side vetted-list membership is not yet enforced
 (`br-s0e`). A pair priced `Routable` waits until its shortfall clears that route's economic
 floor or the protocol `min_move` floor, whichever is greater. `Unroutable` blocks the move;
@@ -120,7 +120,7 @@ reuse of binaries from an ambiently overridden build or mutable Cargo Git source
 Live money-path validation uses devimint and the smoke scripts under
 [wallet-cli/tests/](./wallet-cli/tests/). Start with
 [docs/devimint-runbook.md](./docs/devimint-runbook.md) for the two-federation setup,
-gateway pinning details, and known gotchas.
+registering the LDK gateway with the guardians, and known gotchas.
 
 ## Design docs
 

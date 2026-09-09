@@ -33,11 +33,6 @@ pub struct WalletdConfig {
     pub port: u16,
     pub token_path: PathBuf,
     pub log_level: String,
-    /// Optional lnv2 gateway URL pinning EVERY route the daemon resolves. Host config — which
-    /// gateway is reachable is a deployment fact, not user policy. Required for the devimint
-    /// gates (its LDK gateway is never registered into the lnv2 set, runbook §4); production
-    /// deployments normally omit it and routes resolve from each federation's registered list.
-    pub gateway: Option<String>,
 }
 
 /// The on-disk `walletd.toml` shape. Every field optional so an operator writes only what they
@@ -55,8 +50,8 @@ struct RawConfig {
     token_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     log_level: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    gateway: Option<String>,
+    // There is deliberately NO `gateway` key (ADR-0030): a daemon cannot express a gateway
+    // pin, and `deny_unknown_fields` makes a stale one fail startup loudly.
 }
 
 impl WalletdConfig {
@@ -102,7 +97,6 @@ impl WalletdConfig {
             log_level: raw
                 .log_level
                 .unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_owned()),
-            gateway: raw.gateway,
         })
     }
 
@@ -115,7 +109,6 @@ impl WalletdConfig {
             port: Some(self.port),
             token_path: Some(self.token_path.display().to_string()),
             log_level: Some(self.log_level.clone()),
-            gateway: self.gateway.clone(),
         }
     }
 }
@@ -400,7 +393,6 @@ mod tests {
             port: DEFAULT_PORT,
             token_path: PathBuf::from("/tmp/walletd/token"),
             log_level: "info".to_owned(),
-            gateway: None,
         };
 
         assert_eq!(config.bind(), "[::1]:9736");
@@ -439,6 +431,21 @@ mod tests {
         std::fs::write(&config_path, "port = 9736\nmystery = true\n").unwrap();
         let error = load(&config_path).expect_err("unknown field accepted");
         assert!(error.to_string().contains("parsing host config"));
+    }
+
+    /// ADR-0030: the daemon cannot express a gateway pin. A `walletd.toml` left over from the
+    /// pinned era must fail startup loudly rather than silently run unpinned.
+    #[test]
+    fn the_retired_gateway_pin_key_is_rejected() {
+        let dir = scratch();
+        let config_path = dir.join("walletd.toml");
+        std::fs::write(
+            &config_path,
+            "port = 9736\ngateway = \"http://127.0.0.1:18790/\"\n",
+        )
+        .unwrap();
+        let error = load(&config_path).expect_err("the retired `gateway` key was accepted");
+        assert!(error.to_string().contains("parsing host config"), "{error}");
     }
 
     #[tokio::test]

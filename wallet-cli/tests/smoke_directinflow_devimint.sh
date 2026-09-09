@@ -80,8 +80,9 @@
 # it is a distinct client; the inflow flows from the funded client through the shared LDK gateway.
 #
 # IMPORTANT: the lnv2 gateway is NOT auto-registered into the federation's vetted list (runbook
-# §4), so the external `fedimint-cli` payment pins `--gateway "$GW"`; wallet-cli's operational
-# verbs use the engine's gateway selection and no longer expose a per-call gateway flag.
+# §4). This smoke registers it on every guardian first (`register_lnv2_gateway`, devimint_lib.sh)
+# so wallet-cli routes unpinned from the vetted list (ADR-0030); the external `fedimint-cli`
+# payment still passes `--gateway "$GW"` (fedimint's own CLI).
 #
 # The EXACT-net gate: devimint zeroes only the gateway's LIGHTNING routing fee
 # (FM_DEFAULT_ROUTING_FEES=0,0), NOT its TRANSACTION fee — so the gateway's lnv2 receive_fee is
@@ -121,6 +122,8 @@ fi
 command -v fedimint-cli >/dev/null || { echo "FAIL: fedimint-cli not on PATH (run inside dev-fed --exec)" >&2; exit 1; }
 
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
+source "$(dirname "${BASH_SOURCE[0]}")/devimint_lib.sh"
+register_lnv2_gateway "$GW" "$FM_INVITE_CODE"
 INFLOW_MSAT=100000   # route a 100-sat inflow; the wallet must net EXACTLY this
 
 DATA_DIR="$(mktemp -d)"
@@ -128,7 +131,7 @@ DI_ERR="$(mktemp)"
 DI2_ERR="$(mktemp)"
 trap 'rm -rf "$DATA_DIR" "$DI_ERR" "$DI2_ERR"' EXIT
 
-wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" --gateway "$GW" "$@"; }
+wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" "$@"; }
 join_fed() {
   local started key state
   started=$(wcli join "$1") || return

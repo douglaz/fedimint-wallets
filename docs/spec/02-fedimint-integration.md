@@ -93,15 +93,17 @@ neither federation's list still passes, and a gateway the source federation has 
 still carry an automated move. `ADR-0029` defines **serves** with source-side membership as
 the target; `CONTEXT.md` **Serves** points at the gap (`F6`).
 
-**FMI-14** Gateway precedence for a move or evacuation: (1) the daemon's configured pin,
-returned **unvalidated**; (2) the action's route hint, if it still `gateway_serves_route`; (3)
+**FMI-14** Gateway precedence for a move or evacuation: (1) the operator's break-glass, when
+this invocation armed one for THIS intent's key, returned **unvalidated** (`ADR-0030`; the
+daemon never arms one, and an uncommitted cached `MoveRecord` route yields to it while a
+committed one replays); (2) the action's route hint, if it is still on the destination's vetted
+list and still `gateway_serves_route`; (3)
 if the amount is final, the fallback resolver (`FMI-12`) — and if it priced every candidate and
 none fits the cap it returns `Retryable` **without** trying (4), so a tight cap keeps a move
 `Pending` even when a validating gateway exists; only a budget-truncated or nothing-priced scan
 falls through to (4) the first registered gateway that validates both ends; (5) none → `Retryable`, never `Permanent`, so the intent stays `Pending` and
 a later run with a break-glass override can resume it. A fresh evacuation, whose amount is not
-yet final, takes (4) directly. `ADR-0030`'s rule that automated routing is never pinned is
-target state (`F4`).
+yet final, takes (4) directly. Probes and route economics consult (4)'s vetted list only.
 
 **FMI-15** A **direct inflow** is a receive-only move whose invoice is grossed up so the
 destination is credited `amount` after gateway and federation receive fees — **never more, and

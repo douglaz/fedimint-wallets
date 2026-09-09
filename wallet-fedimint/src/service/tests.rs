@@ -377,7 +377,7 @@ async fn awaiter_runtime_fixture_with_await_operation_errors(
     runtime.set_post_observation_awaiter_test_fixture(terminal_states, post_observation_faults);
     runtime.set_awaiter_test_operation_errors(await_operation_errors);
     let hold = hold_retry.then(|| runtime.hold_next_awaiter_retry_for_test());
-    let service = WalletService::start_without_scheduler(runtime)
+    let service = WalletService::start_without_scheduler(Arc::new(runtime))
         .await
         .expect("start runtime-backed service");
     (service, journal, hold)
