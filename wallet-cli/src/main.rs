@@ -31,7 +31,7 @@ use wallet_core::{
 };
 use wallet_fedimint::{
     direct_inflow_nonce_key, join_intent_key, move_key, parse_invoice, raw_pay_key,
-    raw_receive_key, recover_intent_key, AutoJoinReport, AwaitOutcome, CandidateSource,
+    raw_receive_key, recover_intent_key, AutoJoinReport, AwaitOutcome, BreakGlass, CandidateSource,
     CandidateState, DiscoverReport, DiscoverSourceReport, FederationInfo, FedimintJournal,
     GatewayUrl, Invoice, ManualSource, MultiClient, ObserverSource, OpRequest, OperationId,
     OperationRef, ProbeOutcome, Runtime, ScoredFed, ServiceError, Snapshot, SnapshotScope,
@@ -68,11 +68,14 @@ struct Cli {
     #[arg(long)]
     perform_timeout: Option<u64>,
 
-    /// `--standalone` only: pin the shared lnv2 gateway URL for EVERY route this invocation
-    /// resolves (money verbs, probes, ticks). Required against devimint, whose LDK gateway is
-    /// not registered into any federation's lnv2 set (runbook §4); omitted, routes resolve from
-    /// each federation's registered gateway list. Client mode rejects it — walletd's pin is host
-    /// config (`walletd.toml`), and the wire has no gateway field (§6a.6).
+    /// `--standalone` only: the operator's BREAK-GLASS gateway (ADR-0030). Routes the ONE
+    /// operation this invocation creates or awaits through this lnv2 gateway URL, outside the
+    /// federation's vetted list — for a federation whose vetted gateways are all dead, or to
+    /// exercise one named gateway while debugging. Accepted on pay, receive, move,
+    /// direct-inflow and the await verbs; rejected on tick, probe, discover, status and
+    /// reconcile (automated routing is never pinned); ignored on verbs that resolve no route.
+    /// Client mode rejects it: walletd cannot express a gateway pin, and the wire has no gateway
+    /// field (§6a.6).
     #[arg(long, global = true)]
     gateway: Option<String>,
 
@@ -587,8 +590,9 @@ async fn run_client(cli: Cli) -> Result<(), CliExit> {
         )));
     }
     // Same fail-loud rule for the other standalone-only globals: silently discarding a MONEY
-    // deadline (--perform-timeout) or a route pin (--gateway) would give the caller different
-    // money behavior than the flag they typed — the daemon keeps its own deadline and pin.
+    // deadline (--perform-timeout) or a break-glass gateway (--gateway) would give the caller
+    // different money behavior than the flag they typed — the daemon keeps its own deadline and
+    // never routes outside the vetted list.
     if cli.perform_timeout.is_some() {
         return Err(CliExit::Usage(anyhow::anyhow!(
             "--perform-timeout bounds the standalone in-process executor and has no effect in \
@@ -597,8 +601,9 @@ async fn run_client(cli: Cli) -> Result<(), CliExit> {
     }
     if cli.gateway.is_some() {
         return Err(CliExit::Usage(anyhow::anyhow!(
-            "--gateway pins the standalone route and has no effect in client mode (walletd's pin \
-             is host config in walletd.toml; the wire has no gateway field); rerun with --standalone"
+            "--gateway is the standalone break-glass and has no effect in client mode (walletd \
+             never routes outside the vetted list; the wire has no gateway field); rerun with \
+             --standalone"
         )));
     }
     match &cli.command {
@@ -736,6 +741,19 @@ async fn run_standalone(cli: Cli) -> Result<(), CliExit> {
     let perform_timeout =
         (perform_timeout_secs > 0).then(|| Duration::from_secs(perform_timeout_secs));
     let gateway = cli.gateway.clone().map(GatewayUrl);
+    // ADR-0030: the break-glass is REJECTED, loudly, on the verbs that route automatically.
+    // `tick` runs the same allocator walletd runs, `probe`/`discover`/`status` write or read the
+    // health signals it trusts, and `reconcile` re-drives every pending intent — a gateway on
+    // any of them is the daemon pin under another name. Silently ignoring it there is the
+    // failure this rule exists to prevent. Route-less verbs (join, balance, ...) ignore it.
+    if gateway.is_some() && is_automated_routing_verb(&cli.command) {
+        return Err(CliExit::Usage(anyhow::anyhow!(
+            "--gateway is a break-glass for ONE operator-directed money operation (pay, receive, \
+             move, direct-inflow, await-*); automated routing is never pinned, so `{}` refuses it \
+             (ADR-0030). Register the gateway with the federation's guardians instead",
+            automated_verb_name(&cli.command)
+        )));
+    }
     let data_dir = resolve_standalone_data_dir(cli.data_dir)?;
 
     // 0700 like the daemon (`wallet-daemon::config::ensure_private_data_dir`): the mnemonic and
@@ -874,11 +892,56 @@ async fn run_standalone(cli: Cli) -> Result<(), CliExit> {
         joined,
         joined_ids,
         open_ids,
-        gateway,
         perform_timeout,
     )
     .await
     .map_err(CliExit::from)
+}
+
+/// The standalone verbs that route AUTOMATICALLY (ADR-0030's "rejected" bucket): the scheduler,
+/// allocator, probe and recovery machinery, wherever a human happens to start it from.
+fn is_automated_routing_verb(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Tick { .. }
+            | Command::Probe { .. }
+            | Command::Discover { .. }
+            | Command::Status { .. }
+            | Command::Reconcile
+    )
+}
+
+fn automated_verb_name(command: &Command) -> &'static str {
+    match command {
+        Command::Tick { .. } => "tick",
+        Command::Probe { .. } => "probe",
+        Command::Discover { .. } => "discover",
+        Command::Status { .. } => "status",
+        Command::Reconcile => "reconcile",
+        _ => unreachable!("only automated-routing verbs are named in the --gateway refusal"),
+    }
+}
+
+/// Arm the break-glass for the ONE operation this invocation names (ADR-0030): the money verb's
+/// own key, or the key an await verb was given. Nothing else in the process can observe it.
+fn arm_break_glass(
+    runtime: &Runtime,
+    gateway: &Option<GatewayUrl>,
+    key: &IdempotencyKey,
+) -> Result<(), CliExit> {
+    if let Some(gateway) = gateway {
+        runtime
+            .arm_break_glass(BreakGlass {
+                key: key.clone(),
+                gateway: gateway.clone(),
+            })
+            .map_err(|_| {
+                CliExit::Usage(anyhow::anyhow!(
+                    "--gateway is already armed for another operation in this invocation"
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 /// `tick` and its dry-run `status` reason about the entire joined-federation world. A skipped
@@ -925,11 +988,8 @@ struct WalletdHostConfig {
     _token_path: Option<String>,
     #[serde(rename = "log_level")]
     _log_level: Option<String>,
-    // The daemon's route pin is NOT inherited by standalone (route pinning stays the explicit
-    // `--gateway` flag — money routing must never change based on a file the user didn't name);
-    // parsed only so a pinned host config doesn't fail `deny_unknown_fields` here.
-    #[serde(rename = "gateway")]
-    _gateway: Option<String>,
+    // No `gateway` key, mirroring walletd (ADR-0030): a host config left over from the pinned
+    // era fails here exactly as it fails the daemon, rather than silently selecting a store.
 }
 
 /// Resolve the store selected by `walletd`: an explicit CLI override wins; otherwise read
@@ -1050,7 +1110,6 @@ async fn run_standalone_direct(
     joined: Vec<(FederationId, FederationInfo)>,
     joined_ids: Vec<FederationId>,
     open_ids: Vec<FederationId>,
-    gateway: Option<GatewayUrl>,
     perform_timeout: Option<Duration>,
 ) -> anyhow::Result<()> {
     match command {
@@ -1079,7 +1138,7 @@ async fn run_standalone_direct(
             let runtime = Runtime::new(
                 multi_client.clone(),
                 journal.clone(),
-                gateway,
+                None,
                 operator_hard_cap(false),
                 perform_timeout,
             );
@@ -1157,15 +1216,14 @@ async fn run_standalone_direct(
             reject_conflicting_probe_money_flags(&journal, candidate, amount, fee_cap).await?;
             let policy =
                 build_probe_policy(amount, fee_cap, min_successes, min_span_secs, ttl_secs)?;
-            // Probes ride the ordinary move machinery: an explicit --gateway pins the
-            // shared route (required against devimint, whose LDK gateway is not registered
-            // into the lnv2 set), else the route resolves from each fed's registered
-            // gateways. The ADR-0018 hard cap is enforced verbatim — probe legs never
-            // bypass it (§5.0.5).
+            // Probes ride the ordinary move machinery and resolve their route from each fed's
+            // VETTED gateways — never a break-glass (ADR-0030: a probe verdict must be about a
+            // route the allocator can use). The ADR-0018 hard cap is enforced verbatim — probe
+            // legs never bypass it (§5.0.5).
             let runtime = Runtime::new(
                 multi_client.clone(),
                 journal.clone(),
-                gateway,
+                None,
                 operator_hard_cap(false),
                 perform_timeout,
             );
@@ -1215,7 +1273,7 @@ async fn run_standalone_direct(
             let runtime = Runtime::new(
                 multi_client.clone(),
                 journal.clone(),
-                gateway.clone(),
+                None,
                 Some(tick_policy.per_fed_cap),
                 perform_timeout,
             );
@@ -1248,7 +1306,7 @@ async fn run_standalone_direct(
             let runtime = Runtime::new(
                 multi_client.clone(),
                 journal.clone(),
-                gateway.clone(),
+                None,
                 Some(tick_policy.per_fed_cap),
                 perform_timeout,
             );
@@ -1361,18 +1419,16 @@ async fn run_standalone_actor(
     perform_timeout: Option<Duration>,
 ) -> Result<(), CliExit> {
     // No hard cap: the actor reads the DB `Policy` per decide (§6a.6), exactly like the daemon's
-    // service runtime. The gateway pin comes from the standalone-only `--gateway` — REQUIRED
-    // against devimint, whose LDK gateway is never registered into the lnv2 set (runbook §4);
-    // without a pin the driver's registered-gateway scan finds nothing and the operation sits
-    // Pending until the mint deadline.
-    let runtime = Runtime::new(
+    // service runtime. The break-glass `--gateway` is armed by the verb itself once it knows
+    // the ONE operation key it applies to (ADR-0030); the runtime starts unarmed.
+    let runtime = Arc::new(Runtime::new(
         multi_client.clone(),
         journal.clone(),
-        gateway,
+        None,
         None,
         perform_timeout,
-    );
-    let service = WalletService::start_without_scheduler(runtime)
+    ));
+    let service = WalletService::start_without_scheduler(runtime.clone())
         .await
         .map_err(service_err_to_exit)?;
     let client = service.client();
@@ -1383,6 +1439,8 @@ async fn run_standalone_actor(
         &multi_client,
         &joined_ids,
         &service,
+        &runtime,
+        gateway,
     )
     .await;
     let shutdown = service.shutdown().await;
@@ -1404,6 +1462,7 @@ async fn run_standalone_actor(
 /// handlers (parse → build `Action` → `decide_op`/`resolve_await`/`reconcile`/policy), then render
 /// the frozen contract. This is the "one code path" the spec demands — no legacy `Runtime::pay`
 /// fork; the actor owns admission, reservations, holds, and (async) driving.
+#[allow(clippy::too_many_arguments)]
 async fn actor_command(
     command: Command,
     client: &WalletClient,
@@ -1411,6 +1470,8 @@ async fn actor_command(
     multi_client: &MultiClient,
     joined_ids: &[FederationId],
     service: &WalletService,
+    runtime: &Runtime,
+    break_glass: Option<GatewayUrl>,
 ) -> Result<(), CliExit> {
     match command {
         Command::Join { invite } => {
@@ -1519,6 +1580,7 @@ async fn actor_command(
                 joined_ids,
             )?;
             let key = raw_pay_key(details.payment_hash);
+            arm_break_glass(runtime, &break_glass, &key)?;
             let action = Action::Pay {
                 from,
                 invoice: Invoice(invoice),
@@ -1562,6 +1624,7 @@ async fn actor_command(
             let policy = client.get_policy().await.map_err(service_err_to_exit)?;
             let fee_cap = fee_cap.map(Msat).unwrap_or(policy.max_fee);
             let key = move_key(&from, &to, Msat(amount), fee_cap, Occurrence(occurrence));
+            arm_break_glass(runtime, &break_glass, &key)?;
             let action = Action::Move {
                 from,
                 to,
@@ -1605,6 +1668,7 @@ async fn actor_command(
             )?;
             let fee_cap = fee_cap.map(Msat).unwrap_or(policy.max_fee);
             let key = raw_receive_key(to, Msat(amount), &nonce);
+            arm_break_glass(runtime, &break_glass, &key)?;
             let action = Action::Receive {
                 to,
                 amount: Msat(amount),
@@ -1630,6 +1694,7 @@ async fn actor_command(
             )?;
             let fee_cap = fee_cap.map(Msat).unwrap_or(policy.max_fee);
             let key = direct_inflow_nonce_key(to, Msat(amount), &nonce);
+            arm_break_glass(runtime, &break_glass, &key)?;
             let action = Action::DirectInflow {
                 to,
                 amount: Msat(amount),
@@ -1643,6 +1708,8 @@ async fn actor_command(
                 client,
                 journal,
                 multi_client,
+                runtime,
+                break_glass,
                 AwaitVerb::Receive,
                 key,
                 timeout,
@@ -1650,10 +1717,30 @@ async fn actor_command(
             .await
         }
         Command::AwaitSend { key, timeout } => {
-            await_standalone(client, journal, multi_client, AwaitVerb::Send, key, timeout).await
+            await_standalone(
+                client,
+                journal,
+                multi_client,
+                runtime,
+                break_glass,
+                AwaitVerb::Send,
+                key,
+                timeout,
+            )
+            .await
         }
         Command::AwaitMove { key, timeout } => {
-            await_standalone(client, journal, multi_client, AwaitVerb::Move, key, timeout).await
+            await_standalone(
+                client,
+                journal,
+                multi_client,
+                runtime,
+                break_glass,
+                AwaitVerb::Move,
+                key,
+                timeout,
+            )
+            .await
         }
         Command::Reconcile => {
             // Mirror the daemon's `/v1/reconcile` handler exactly: actor-side intent re-drive
@@ -1778,15 +1865,23 @@ async fn block_for_invoice_standalone(
 /// Mirror the daemon's `GET /v1/operations/{key}?wait=true`: park until the operation is terminal
 /// (or `--timeout`), then render its terminal state from the ledger row. In a one-shot standalone
 /// process the pending intent has no live driver, so re-drive it first (abandon-and-resume, §6a.8).
+///
+/// The recovery pass re-drives EVERY pending intent, but a `--gateway` break-glass is armed for
+/// the awaited key alone (ADR-0030): every other intent resolves from its vetted list and, when
+/// nothing serves it, stays `Pending` exactly as the daemon would leave it.
+#[allow(clippy::too_many_arguments)]
 async fn await_standalone(
     client: &WalletClient,
     journal: &FedimintJournal,
     multi_client: &MultiClient,
+    runtime: &Runtime,
+    break_glass: Option<GatewayUrl>,
     verb: AwaitVerb,
     key: String,
     timeout: u64,
 ) -> Result<(), CliExit> {
     let key = IdempotencyKey(key);
+    arm_break_glass(runtime, &break_glass, &key)?;
     client
         .reconcile_durable()
         .await

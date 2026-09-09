@@ -258,7 +258,6 @@ fn no_serving_route(candidate_count: usize) -> Option<RouteEconomics> {
 
 pub(crate) async fn price_missing_pairs(
     mc: &MultiClient,
-    pinned_gateway: Option<&GatewayUrl>,
     snapshot: &AllocatorSnapshot,
     budget: &mut RouteQuoteBudget,
     priced: &mut BTreeMap<(FederationId, FederationId), RouteEconomics>,
@@ -268,9 +267,7 @@ pub(crate) async fn price_missing_pairs(
         if priced.contains_key(&(from, to)) {
             continue;
         }
-        if let Some(economics) =
-            pair_economics(mc, pinned_gateway, snapshot, from, to, budget).await
-        {
+        if let Some(economics) = pair_economics(mc, snapshot, from, to, budget).await {
             if economics.status == RouteStatus::UneconomicAtAnySize {
                 tracing::warn!(
                     from = %from.to_hex(),
@@ -291,7 +288,6 @@ pub(crate) async fn price_missing_pairs(
 
 async fn pair_economics(
     mc: &MultiClient,
-    pinned_gateway: Option<&GatewayUrl>,
     snapshot: &AllocatorSnapshot,
     from: FederationId,
     to: FederationId,
@@ -301,21 +297,16 @@ async fn pair_economics(
     if maximum.0 == 0 {
         return None;
     }
-    let candidates = match pinned_gateway {
-        Some(gateway) => vec![gateway.clone()],
-        None => {
-            let gateways = budget.run(mc.gateways(&to)).await?.ok()?;
-            if gateways.len() > MAX_ROUTE_GATEWAYS {
-                tracing::debug!(
-                    federation = %to.to_hex(),
-                    gateways = gateways.len(),
-                    "route economics: gateway list exceeds the per-tick quote cap; leaving pair unpriced"
-                );
-                return None;
-            }
-            gateways
-        }
-    };
+    // Automated routing prices the destination's VETTED list only (ADR-0030).
+    let candidates = budget.run(mc.gateways(&to)).await?.ok()?;
+    if candidates.len() > MAX_ROUTE_GATEWAYS {
+        tracing::debug!(
+            federation = %to.to_hex(),
+            gateways = candidates.len(),
+            "route economics: gateway list exceeds the per-tick quote cap; leaving pair unpriced"
+        );
+        return None;
+    }
     let candidate_count = candidates.len();
 
     let mut serving = Vec::new();
@@ -670,7 +661,6 @@ mod tests {
         let mut priced = BTreeMap::new();
         price_missing_pairs(
             &mc,
-            None,
             &snapshot,
             &mut budget,
             &mut priced,
@@ -687,7 +677,6 @@ mod tests {
         let mut priced = BTreeMap::new();
         price_missing_pairs(
             &mc,
-            None,
             &snapshot,
             &mut budget,
             &mut priced,
@@ -704,7 +693,6 @@ mod tests {
         let mut priced = BTreeMap::new();
         price_missing_pairs(
             &mc,
-            None,
             &snapshot,
             &mut budget,
             &mut priced,

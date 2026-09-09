@@ -127,6 +127,11 @@ command -v fedimint-cli >/dev/null || { echo "FAIL: fedimint-cli not on PATH" >&
 command -v gateway-ldk  >/dev/null || { echo "FAIL: gateway-ldk not on PATH (needed to set gateway fees)" >&2; exit 1; }
 
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
+# devimint never vets its LDK gateway; register it on every guardian of BOTH feds so walletd and
+# the standalone seed route from the vetted lists (no daemon pin exists, ADR-0030). See devimint_lib.sh.
+source "$(dirname "${BASH_SOURCE[0]}")/devimint_lib.sh"
+register_lnv2_gateway "$GW" "$FM_INVITE_CODE"
+register_lnv2_gateway "$GW" "$FED_B_INVITE"
 PORT="${WALLETD_PORT:-9789}"
 
 FUND_MSAT=2000000        # 2000 sat into A — the balance the evacuation will drain
@@ -165,7 +170,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-wsa() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" --gateway "$GW" "$@"; }
+wsa() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" "$@"; }
 wcli_balance_line() {
   { "$WALLET_CLI" balance 2>/dev/null || true; } \
     | awk -v id="$1" '$1 == id ":" && $3 == "msat" { print $2; exit }'
@@ -188,7 +193,6 @@ stop_walletd() {
 mkdir -p "$XDG_CONFIG_HOME/walletd"
 cat > "$XDG_CONFIG_HOME/walletd/walletd.toml" <<EOF
 port = $PORT
-gateway = "$GW"
 EOF
 
 # JSON assertion helpers as files: `python3 - <<'"'"'PY'"'"' <<<"$JSON"` silently feeds the JSON to

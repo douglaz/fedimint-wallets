@@ -156,6 +156,11 @@ fi
 command -v fedimint-cli >/dev/null || { echo "FAIL: fedimint-cli not on PATH (run inside dev-fed --exec)" >&2; exit 1; }
 
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
+# devimint never vets its LDK gateway; register it on every guardian of BOTH feds so the wallet
+# routes unpinned from the vetted lists (ADR-0030). See devimint_lib.sh for the verified command.
+source "$(dirname "${BASH_SOURCE[0]}")/devimint_lib.sh"
+register_lnv2_gateway "$GW" "$FM_INVITE_CODE"
+register_lnv2_gateway "$GW" "$FED_B_INVITE"
 FUND_MSAT=500000    # fund fed A with 500 sat via direct-inflow (must exceed MOVE + fees)
 MOVE_MSAT=100000    # move 100 sat A->B; B must net EXACTLY this (within slack, never over)
 RECV_SLACK=1000     # 1 sat — bounds lnv2 receive-fee-quote under-estimate on B (per direct-inflow smoke)
@@ -166,7 +171,7 @@ DI_ERR="$(mktemp)"
 MOVE_ERR="$(mktemp)"
 trap 'rm -rf "$DATA_DIR" "$DI_ERR" "$MOVE_ERR"' EXIT
 
-wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" --gateway "$GW" "$@"; }
+wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" "$@"; }
 join_fed() {
   local started key state
   started=$(wcli join "$1") || return

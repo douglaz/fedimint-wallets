@@ -27,7 +27,7 @@ use crate::discovery::{
     AutoJoinAttempt, AutoJoinCounts, CandidateSource, DiscoverPassResume, DiscoverReport,
     DiscoveryBackend, PreviewedCandidate, DISCOVERY_REASON,
 };
-use crate::executor::FedimintExecutor;
+use crate::executor::{BreakGlass, FedimintExecutor};
 use crate::journal::{
     CandidateListReport, CandidateState, FedimintJournal, OperationRef, ProbeRecord, ProbeSession,
     RawOperationRole, WatchState,
@@ -551,7 +551,12 @@ impl<E: Executor> Executor for TimeoutExecutor<E> {
 pub struct Runtime {
     mc: Arc<MultiClient>,
     journal: Arc<FedimintJournal>,
-    pinned_gateway: Option<GatewayUrl>,
+    /// The operator's break-glass gateway override for ONE named operation (ADR-0030). Armed at
+    /// most once per process: either at construction or, for a standalone money/await verb that
+    /// only learns its key after the service is up, via [`Self::arm_break_glass`]. Every executor
+    /// this runtime builds carries it; the executor applies it to the named key alone. The
+    /// daemon never arms one.
+    break_glass: std::sync::OnceLock<BreakGlass>,
     /// The hard per-fed balance cap enforced at perform time (§15.2), threaded into the executor.
     /// `None` disables it (the operator's `--allow-over-cap`). For a tick this is the policy's
     /// `per_fed_cap`; for an operator verb it is the ADR-0018 default unless overridden.
@@ -614,14 +619,18 @@ impl Runtime {
     pub fn new(
         mc: Arc<MultiClient>,
         journal: Arc<FedimintJournal>,
-        pinned_gateway: Option<GatewayUrl>,
+        break_glass: Option<BreakGlass>,
         hard_cap: Option<Msat>,
         perform_timeout: Option<Duration>,
     ) -> Self {
+        let armed = std::sync::OnceLock::new();
+        if let Some(break_glass) = break_glass {
+            let _ = armed.set(break_glass);
+        }
         Self {
             mc,
             journal,
-            pinned_gateway,
+            break_glass: armed,
             hard_cap,
             perform_timeout,
             #[cfg(test)]
@@ -927,12 +936,21 @@ impl Runtime {
         Ok((if resuming { resumed } else { fresh }, resuming))
     }
 
+    /// Arm the break-glass override for one named operation. A standalone money verb computes
+    /// its idempotency key only after the service is up (the key folds in policy defaults), so
+    /// it arms here before admitting the op; an await verb arms the key it was given before its
+    /// recovery pass. Executors built afterwards carry it. Returns the rejected value when one
+    /// is already armed — a one-shot standalone process names exactly one operation.
+    pub fn arm_break_glass(&self, break_glass: BreakGlass) -> Result<(), BreakGlass> {
+        self.break_glass.set(break_glass)
+    }
+
     /// Fresh step-2 executor for a detached service driver.
     pub(crate) fn service_executor(&self, hard_cap: Option<Msat>) -> FedimintExecutor {
         FedimintExecutor::new(
             self.mc.clone(),
             self.journal.clone(),
-            self.pinned_gateway.clone(),
+            self.break_glass.get().cloned(),
             hard_cap,
         )
     }
@@ -1357,7 +1375,7 @@ impl Runtime {
         end
     }
 
-    /// A fresh executor sharing this runtime's clients + journal + pinned gateway + hard cap.
+    /// A fresh executor sharing this runtime's clients + journal + break-glass + hard cap.
     /// Cheap (`Arc` clones); made per call so each standalone verb gets a `&self`-only executor.
     /// Standalone helper calls (`backfill_move_record` / `validate_direct_inflow_amount`) use it
     /// directly under the exclusive DB lock; service helpers instead use
@@ -1367,7 +1385,7 @@ impl Runtime {
         FedimintExecutor::new(
             self.mc.clone(),
             self.journal.clone(),
-            self.pinned_gateway.clone(),
+            self.break_glass.get().cloned(),
             self.hard_cap,
         )
     }
@@ -1639,7 +1657,6 @@ impl Runtime {
         amount: Msat,
         fee_cap: Msat,
         payment_hash: [u8; 32],
-        gateway: Option<GatewayUrl>,
     ) -> anyhow::Result<RawPayOutcome> {
         let details = parse_invoice(&invoice)?;
         anyhow::ensure!(
@@ -1664,7 +1681,7 @@ impl Runtime {
                 amount,
                 fee_cap,
                 payment_hash,
-                gateway,
+                gateway: None,
             },
             reason: ReasonCode::UserInitiated,
             occurrence: Occurrence(0),
@@ -1720,7 +1737,6 @@ impl Runtime {
         amount: Msat,
         fee_cap: Msat,
         nonce: String,
-        gateway: Option<GatewayUrl>,
     ) -> anyhow::Result<RawReceiveOutcome> {
         let key = raw_receive_key(to, amount, &nonce);
         let attached = self.journal.get(&key).await.map_err(exec_err)?.is_some();
@@ -1730,7 +1746,7 @@ impl Runtime {
                 amount,
                 fee_cap,
                 nonce,
-                gateway,
+                gateway: None,
             },
             reason: ReasonCode::UserInitiated,
             occurrence: Occurrence(0),
@@ -3521,9 +3537,9 @@ impl Runtime {
     ///
     /// The scorer runs at [`ScorerPolicy::default`] (the v1 structural floor); the money policy
     /// (caps/targets/fees + designation) comes from `policy`. A `Move` needs a routable shared
-    /// gateway — supply it as this runtime's pinned gateway (devimint does not auto-register its
-    /// LDK gateway; §4), exactly as `do_move` does. The probe route gate validates that same
-    /// pinned gateway when present, so decisions match the route the executor will use.
+    /// gateway on both federations' VETTED lists — automated routing is never pinned
+    /// (ADR-0030; devimint smokes register the LDK gateway on every guardian first, §4). The
+    /// probe route gate scans the same lists, so decisions match the route the executor will use.
     pub async fn tick(&self, policy: &TickPolicy) -> anyhow::Result<TickReport> {
         // A standalone MAX occurrence has no possible strictly newer daemon
         // successor. Refuse before touching the watch checkpoint, tick ledger, or
@@ -3872,8 +3888,8 @@ impl Runtime {
     /// terminal-replaying occurrence: its whole job is to SHOW the operator why a tick would
     /// fail, so hard-failing before assembling the scored view would blank out exactly the
     /// diagnostic they ran it for. It surfaces each such problem as a `warn!` (to stderr) and
-    /// still returns the full scored view + would-run decisions. The route check reflects the
-    /// pinned gateway when one was supplied, same as `tick`.
+    /// still returns the full scored view + would-run decisions. The route check scans the
+    /// vetted lists, same as `tick`.
     ///
     /// The exhausted standalone occurrence is a deliberate hard error: it has no successor. A stale
     /// marked replacement is different. Standalone returns the scored/designation diagnostic, but
@@ -4443,8 +4459,8 @@ impl Runtime {
 
     /// Price the funding pairs of `snapshot` that `priced` does not already cover, in place
     /// (`route_econ::price_missing_pairs`). `None` budget = no route I/O at all, which the
-    /// allocator reads as the permissive `min_move` fallback. The pinned gateway is threaded
-    /// through so an operator pin OVERRIDES route selection (§Q4). `blocked` drops the pairs
+    /// allocator reads as the permissive `min_move` fallback. Only the destination's vetted list
+    /// is priced — automated routing is never pinned (ADR-0030). `blocked` drops the pairs
     /// that conflict with allocator work already in flight, so quotes are never spent on work
     /// this tick cannot emit anyway (br-p93). A held funding goal leaves its REVERSE pair and
     /// every other independent pair priceable; a live evacuation owns either direction touching
@@ -4456,15 +4472,8 @@ impl Runtime {
         priced: &mut BTreeMap<(FederationId, FederationId), wallet_core::RouteEconomics>,
         blocked: &GoalBlockers,
     ) {
-        crate::route_econ::price_missing_pairs(
-            self.mc.as_ref(),
-            self.pinned_gateway.as_ref(),
-            snapshot,
-            budget,
-            priced,
-            blocked,
-        )
-        .await
+        crate::route_econ::price_missing_pairs(self.mc.as_ref(), snapshot, budget, priced, blocked)
+            .await
     }
 
     pub(crate) async fn designated_spending_from_probes(
@@ -4714,13 +4723,11 @@ impl Runtime {
         }
     }
 
-    /// The gateway candidates the executor would SCAN for a move into `to` (§15.6): the single
-    /// pinned gateway, or the destination's registered lnv2 set. `Err` (empty / unreadable) is a
+    /// The gateway candidates the executor would SCAN for a move into `to` (§15.6): the
+    /// destination's vetted lnv2 set. Automated routing is never pinned (ADR-0030), so the
+    /// break-glass is deliberately NOT consulted here. `Err` (empty / unreadable) is a
     /// destination-route problem the caller reports against `to`.
     async fn route_gateway_candidates(&self, to: &FederationId) -> Result<Vec<GatewayUrl>, String> {
-        if let Some(gateway) = &self.pinned_gateway {
-            return Ok(vec![gateway.clone()]);
-        }
         let gateways = self
             .mc
             .gateways(to)
@@ -4750,8 +4757,7 @@ impl Runtime {
         {
             return probes;
         }
-        let runner =
-            FedimintProbeRunner::with_pinned_gateway(self.mc.clone(), self.pinned_gateway.clone());
+        let runner = FedimintProbeRunner::new(self.mc.clone());
         let mut probes = Vec::new();
         for id in self.mc.federations() {
             match runner.probe(&id).await {
@@ -5954,13 +5960,7 @@ mod tests {
             .expect("terminalize intent");
 
         let error = runtime
-            .receive(
-                FED_A,
-                Msat(50_000),
-                Msat(1_000),
-                "terminal-retry".into(),
-                None,
-            )
+            .receive(FED_A, Msat(50_000), Msat(1_000), "terminal-retry".into())
             .await
             .expect_err("terminal attach returns its failure");
         assert!(

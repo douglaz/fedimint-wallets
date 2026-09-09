@@ -81,9 +81,9 @@
 # between the two through the shared LDK gateway's internal swap.
 #
 # IMPORTANT: the lnv2 gateway is NOT auto-registered into the federation's vetted list
-# (runbook §4), so EVERY lnv2 call — on both `wallet-cli` and `fedimint-cli` — passes
-# `--gateway "$GW"` explicitly. wallet-cli pins it once via the global standalone-only
-# `--gateway` flag (in `wcli()` below) — the engine resolves routes from it.
+# (runbook §4). This smoke registers it on every guardian first (`register_lnv2_gateway`,
+# devimint_lib.sh) and wallet-cli then routes UNPINNED from the vetted list (ADR-0030); only the
+# `fedimint-cli module lnv2` calls still pass `--gateway "$GW"` (fedimint's own CLI).
 #
 # Flow:
 #   RECEIVE (devimint default-0 -> our wallet):
@@ -120,6 +120,8 @@ command -v fedimint-cli >/dev/null || { echo "FAIL: fedimint-cli not on PATH (ru
 command -v jq >/dev/null || { echo "FAIL: jq not on PATH (it is in the fedimint nix devshell)" >&2; exit 1; }
 
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
+source "$(dirname "${BASH_SOURCE[0]}")/devimint_lib.sh"
+register_lnv2_gateway "$GW" "$FM_INVITE_CODE"
 RECEIVE_MSAT=500000   # our wallet receives 500 sat...
 PAY_MSAT=100000       # ...then pays 100 sat back, leaving headroom for fees
 
@@ -127,7 +129,7 @@ DATA_DIR="$(mktemp -d)"
 RECV_ERR="$(mktemp)"
 trap 'rm -rf "$DATA_DIR" "$RECV_ERR"' EXIT
 
-wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" --gateway "$GW" "$@"; }
+wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" "$@"; }
 join_fed() {
   local started key state
   started=$(wcli join "$1") || return

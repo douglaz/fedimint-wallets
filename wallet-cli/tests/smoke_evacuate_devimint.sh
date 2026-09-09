@@ -167,6 +167,11 @@ fi
 command -v fedimint-cli >/dev/null || { echo "FAIL: fedimint-cli not on PATH (run inside dev-fed --exec)" >&2; exit 1; }
 
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
+# devimint never vets its LDK gateway; register it on every guardian of BOTH feds so the wallet
+# routes unpinned from the vetted lists (ADR-0030). See devimint_lib.sh for the verified command.
+source "$(dirname "${BASH_SOURCE[0]}")/devimint_lib.sh"
+register_lnv2_gateway "$GW" "$FM_INVITE_CODE"
+register_lnv2_gateway "$GW" "$FED_B_INVITE"
 FUND_MSAT=500000       # fund fed A with 500 sat via direct-inflow (the dying fed's balance)
 CAP_HEADROOM=50000     # 50 sat left UNCAPPED in A so it can pay the move's fees. The allocator's
                        # evacuate amount = min(A.spendable, cap_room(B)); we bound it just BELOW
@@ -187,7 +192,7 @@ TICK_OUT="$(mktemp)"
 TICK_ERR="$(mktemp)"
 trap 'rm -rf "$DATA_DIR" "$DI_ERR" "$STATUS_OUT" "$STATUS_ERR" "$TICK_OUT" "$TICK_ERR"' EXIT
 
-wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" --gateway "$GW" "$@"; }
+wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" "$@"; }
 join_fed() {
   local started key state
   started=$(wcli join "$1") || return
@@ -274,7 +279,7 @@ echo "== SENSE check: a HEALTHY fed (no force) must NOT decide an evacuate =="
 if ! wcli status \
       --spending "$FED_A" --standby "$FED_B" \
       --spending-target 0 --standby-target 0 \
-      --per-fed-cap "$PER_FED_CAP" --max-fee "$MAX_FEE" --gateway "$GW" --occurrence 0 >"$STATUS_OUT" 2>"$STATUS_ERR"; then
+      --per-fed-cap "$PER_FED_CAP" --max-fee "$MAX_FEE" --occurrence 0 >"$STATUS_OUT" 2>"$STATUS_ERR"; then
   echo "FAIL: wallet-cli status (sense dry-run) exited non-zero" >&2
   echo "  --- status stdout ---" >&2; cat "$STATUS_OUT" >&2
   echo "  --- status stderr ---" >&2; cat "$STATUS_ERR" >&2
@@ -296,7 +301,7 @@ echo "== TICK: force A shutting-down -> decide Evacuate A->B -> apply drains A i
 if ! WALLET_CLI_FORCE_SHUTDOWN="$FED_A" wcli tick \
       --spending "$FED_A" --standby "$FED_B" \
       --spending-target 0 --standby-target 0 \
-      --per-fed-cap "$PER_FED_CAP" --max-fee "$MAX_FEE" --gateway "$GW" --occurrence 0 >"$TICK_OUT" 2>"$TICK_ERR"; then
+      --per-fed-cap "$PER_FED_CAP" --max-fee "$MAX_FEE" --occurrence 0 >"$TICK_OUT" 2>"$TICK_ERR"; then
   echo "FAIL: wallet-cli evacuate tick exited non-zero" >&2
   echo "  --- tick stdout ---" >&2; cat "$TICK_OUT" >&2
   echo "  --- tick stderr ---" >&2; cat "$TICK_ERR" >&2

@@ -45,7 +45,12 @@ fi
 WCLI_DIR=$(mktemp -d)
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
 FED_B_INV="${FED_B_INVITE:-${FM_INVITE_CODE_B:?two-fed harness did not export FED_B_INVITE}}"
-wcli() { "$WALLET_CLI" --standalone --data-dir "$WCLI_DIR" --gateway "$GW" "$@"; }
+# devimint never vets its LDK gateway; register it on every guardian of BOTH feds so the wallet
+# routes unpinned from the vetted lists (ADR-0030). See devimint_lib.sh for the verified command.
+source "$(dirname "${BASH_SOURCE[0]}")/devimint_lib.sh"
+register_lnv2_gateway "$GW" "$FM_INVITE_CODE"
+register_lnv2_gateway "$GW" "$FED_B_INV"
+wcli() { "$WALLET_CLI" --standalone --data-dir "$WCLI_DIR" "$@"; }
 join_fed() {
   local started key state
   started=$(wcli join "$1") || return
@@ -119,7 +124,7 @@ echo "== AGENT tick: tiny per-fed cap induces OverCap refusal rows =="
 if ! wcli tick \
       --spending "$FED_A" --standby "$FED_B" \
       --spending-target 0 --standby-target 0 \
-      --per-fed-cap 10000 --max-fee 1000000 --gateway "$GW" --occurrence 0 >/dev/null 2>&1; then
+      --per-fed-cap 10000 --max-fee 1000000 --occurrence 0 >/dev/null 2>&1; then
   fail "advisory-only tick exited non-zero"
 fi
 

@@ -117,6 +117,16 @@ command -v curl >/dev/null || { echo "FAIL: lock-pinned curl not on PATH (use ru
 GW_REAL="http://127.0.0.1:${FM_PORT_GW_LDK}/"
 PORT=19737           # walletd, off the default
 DOUBLE_PORT=18790    # the misbehaving gateway
+GW_DOUBLE="http://127.0.0.1:$DOUBLE_PORT/"
+# ROUTING CHOICE (ADR-0030): walletd cannot be pinned, so the double must reach the wallet
+# through the lnv2 VETTED lists. The real LDK gateway is NEVER registered: the standalone seed
+# below funds A through the break-glass (`--gateway "$GW_REAL"` on the one receive it creates and
+# on its await), which is the only seeding step that needs a route (join/discover/policy are
+# route-less), and the measured invoices are minted by fedimint-cli's own `--gateway`. The double
+# is then registered on EVERY guardian of BOTH feds (registration does no liveness check), so it
+# is the ONLY vetted gateway: the scheduled probe of B and every pay on A hit it exactly as the
+# old pin did, and nothing has to be `gateways remove`d first.
+source "$(dirname "${BASH_SOURCE[0]}")/devimint_lib.sh"
 FUND_MSAT=800000     # A's working balance (covers 32 pay reservations + the probe's)
 PAY_MSAT=10000       # each measured pay
 PAY_FEE_CAP=2000     # explicit, so 32 reservations fit A's balance (policy default is 200k)
@@ -157,10 +167,9 @@ echo "== seed: join A, fund A, auto-join candidate B (standalone, real gateway) 
 mkdir -p "$XDG_CONFIG_HOME/walletd"
 cat > "$XDG_CONFIG_HOME/walletd/walletd.toml" <<EOF
 port = $PORT
-gateway = "http://127.0.0.1:$DOUBLE_PORT/"
 EOF
 
-wsa() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" --gateway "$GW_REAL" "$@"; }
+wsa() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" "$@"; }
 SEED_ERR="$SANDBOX/seed.stderr"
 
 JOIN_OUT=$(wsa join "$FM_INVITE_CODE")
@@ -169,11 +178,12 @@ JOIN_KEY=${JOIN_OUT#* }
 FED_A=$(cut -d: -f2 <<<"$JOIN_KEY")
 echo "joined A: $FED_A"
 
-INV_FUND=$(wsa receive --amount "$FUND_MSAT" 2>"$SEED_ERR")
+# Break-glass on the ONE seeding operation (and its await): A's vetted list is empty on purpose.
+INV_FUND=$(wsa receive --amount "$FUND_MSAT" --gateway "$GW_REAL" 2>"$SEED_ERR")
 KEY_FUND=$(sed -n 's/^key: //p' "$SEED_ERR")
 SEND_FUND=$(fedimint-cli module lnv2 send "$INV_FUND" --gateway "$GW_REAL" 2>/dev/null | tr -d '"[:space:]')
 fedimint-cli module lnv2 await-send "$SEND_FUND" >/dev/null 2>&1 || true
-[[ "$(wsa await-receive "$KEY_FUND")" == "claimed" ]] || { echo "FAIL: funding A did not claim" >&2; exit 1; }
+[[ "$(wsa await-receive "$KEY_FUND" --gateway "$GW_REAL")" == "claimed" ]] || { echo "FAIL: funding A did not claim" >&2; exit 1; }
 echo "A funded (~${FUND_MSAT} msat)"
 
 wsa discover --source manual --invite "$FED_B_INVITE" --auto-join --scorer-allow-regtest >/dev/null
@@ -201,8 +211,12 @@ for i in $(seq 0 "$TOTAL_PAYS"); do
 done
 echo "minted ${#INVOICES[@]} invoices"
 
-# ---- phase 2: the double + walletd (pinned to the double) -------------------------------------
-echo "== start the misbehaving gateway + walletd (pin = double) =="
+# ---- phase 2: the double + walletd (the double is the ONLY vetted gateway) --------------------
+echo "== register the double as the sole vetted lnv2 gateway on BOTH feds =="
+register_lnv2_gateway "$GW_DOUBLE" "$FM_INVITE_CODE"
+register_lnv2_gateway "$GW_DOUBLE" "$FED_B_INVITE"
+
+echo "== start the misbehaving gateway + walletd (vetted list = double) =="
 python3 "$DOUBLE_PY" "$DOUBLE_PORT" "$DOUBLE_LOG" >"$SANDBOX/double.stdout" 2>&1 &
 DOUBLE_PID=$!
 sleep 0.3

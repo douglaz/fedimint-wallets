@@ -147,8 +147,12 @@ _Avoid_: "supports", "is available for" — both get read as registry presence.
 An operator's explicit, single-invocation instruction to route through a named gateway
 **outside the federation's vetted list**. It exists for one incident: a federation whose
 vetted gateways are dead, empty, or unreachable from this host, where consensus still
-redeems the ecash but no route to it can be selected. Reaching for it is an incident
-action, not configuration — it applies to that invocation and nothing else.
+redeems the ecash but no route to it can be selected — and for an operator deliberately
+exercising one named gateway while debugging a route. Reaching for it is an incident or
+debugging action, not configuration — it applies to the ONE **Operation** the invocation
+names (the one it creates, or the one it awaits by **operation key**) and to nothing else.
+Naming the operation is the authorization: an operator may name an Allocator-created
+operation (a stuck **Evacuation**), and nothing that does not name it can observe it.
 _Avoid_: "gateway preference" and "the operator's chosen gateway" — both frame it as a
 policy about which counterparty to trust, when the actual question is whether ANY route
 exists. Also avoid "pin": automated routing is never pinned, and calling this a pin is
@@ -168,9 +172,8 @@ The gateways a federation's guardians have admitted for lnv2, and the only input
 route selection; an operator's **break-glass gateway override** deliberately steps outside it,
 and nothing automated ever does. Adding to it is a per-guardian action, not a wallet one, which
 is why the break-glass exists.
-Target per [ADR-0030](docs/adr/0030-automated-routing-is-never-pinned.md); today's daemon still
-honours a pin (F4, `br-remove-gateway-pin-yjw`) and the list is a union of guardian answers
-(F6, `br-gw-threshold-membership-k4t`).
+Per [ADR-0030](docs/adr/0030-automated-routing-is-never-pinned.md). The list is still a union
+of guardian answers (F6, `br-gw-threshold-membership-k4t`).
 _Avoid_: "registered gateways" when you mean routable ones — presence in the list is not
 **serving** a route.
 
@@ -185,8 +188,9 @@ A hint **holds** when it is still on the relevant **vetted list**, still validat
 recorded failure to **perform** — deliberately one clause weaker than **serves**, the
 affordability sizing, so a holding hint can still prove unaffordable and be re-resolved, but a
 gateway that quoted and then did not perform never keeps its hint.
-Target per [ADR-0029](docs/adr/0029-evacuation-must-be-executable.md); the membership and
-perform-record halves of "holds" are not checked yet (F6, `br-s0e`).
+Target per [ADR-0029](docs/adr/0029-evacuation-must-be-executable.md); destination-list
+membership is checked, the source-list and perform-record halves of "holds" are not yet (F6,
+`br-s0e`).
 _Avoid_: "pin" — a hint is the opposite of one; "serves" for "holds" — it would silently demand
 a sizing pass the hint path does not run.
 

@@ -921,8 +921,21 @@ fedimint-cli module lnv2 await-receive <op_id>                  # -> "Claimed"
 ## 4. Gotchas (each cost a bring-up to learn)
 - **lnv2 gateway list is empty by default.** The LDK gateway connects to the fed
   (`fed_count: 1`) but devimint does NOT auto-register it into the federation's vetted lnv2
-  `gateways list`. So `module lnv2 receive/send` with auto-select fail with "No gateways are
-  available". **Fix: pass `--gateway "http://127.0.0.1:$FM_PORT_GW_LDK/"` explicitly** — the
+  `gateways list`, and the wallet's automated routing resolves from that list and nothing else
+  (ADR-0030 — there is no daemon pin; standalone `--gateway` is a one-operation break-glass).
+  **Fix: REGISTER the gateway on every guardian at bring-up**, which is what
+  `wallet-cli/tests/devimint_lib.sh`'s `register_lnv2_gateway "$GW" "$FM_INVITE_CODE"` does
+  (a two-fed smoke also registers it for `$FED_B_INVITE`). Per guardian `<peer>` in
+  `0..FM_FED_SIZE-1`, against a client joined to that federation:
+  ```bash
+  fedimint-cli --data-dir "$CLIENT_DIR" --our-id "$peer" --password "$FM_PASSWORD_API" \
+    module lnv2 gateways add "http://127.0.0.1:$FM_PORT_GW_LDK/"
+  fedimint-cli --data-dir "$CLIENT_DIR" module lnv2 gateways list      # evidence: the URL is vetted
+  ```
+  `gateways add` is an admin write to the ONE peer named by `--our-id` (`fedimint-lnv2-client/src/cli.rs`
+  → `request_admin`), hence the loop; the password is devimint's `FM_PASSWORD_API` (`pass`).
+  For `fedimint-cli module lnv2 receive/send` on fedimint's OWN client, keep passing
+  `--gateway "http://127.0.0.1:$FM_PORT_GW_LDK/"` explicitly as the §3 cheatsheet shows — the
   client uses it directly (this is what devimint's own tests do: `lnv2_send(&c, &gw.address(), inv)`).
 - **Deprecated top-level `ln-invoice`/`ln-pay` warn on stderr** ("Use `module ln ...`"); the
   JSON is on stdout. Use `2>/dev/null`. Note `module ln invoice` has DIFFERENT (positional)

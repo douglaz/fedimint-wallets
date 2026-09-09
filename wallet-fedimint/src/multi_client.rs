@@ -2925,7 +2925,7 @@ mod tests {
             None,
             None,
         );
-        let service = crate::service::WalletService::start_without_scheduler(runtime)
+        let service = crate::service::WalletService::start_without_scheduler(Arc::new(runtime))
             .await
             .expect("start actor-only service");
         let actor_client = service.client();

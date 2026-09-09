@@ -71,6 +71,11 @@ fi
 command -v fedimint-cli >/dev/null || { echo "FAIL: fedimint-cli not on PATH (run inside dev-fed --exec)" >&2; exit 1; }
 
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
+# devimint never vets its LDK gateway; register it on every guardian of BOTH feds so the wallet
+# routes unpinned from the vetted lists (ADR-0030). See devimint_lib.sh for the verified command.
+source "$(dirname "${BASH_SOURCE[0]}")/devimint_lib.sh"
+register_lnv2_gateway "$GW" "$FM_INVITE_CODE"
+register_lnv2_gateway "$GW" "$FED_B_INVITE"
 FUND_MSAT=800000        # fund fed A. Must exceed spending target, standby funding, and probe costs.
 SPENDING_TARGET=100000  # keep >=100 sat on A; its surplus funds the candidate once B passes.
 STANDBY_TARGET=100000   # fund the (probed) candidate B toward 100 sat -> the fund-standby move size.
@@ -84,7 +89,7 @@ DI_ERR="$(mktemp)"; DISC_OUT="$(mktemp)"; DISC_ERR="$(mktemp)"
 TICK_OUT="$(mktemp)"; TICK_ERR="$(mktemp)"; P_OUT="$(mktemp)"; P_ERR="$(mktemp)"
 trap 'rm -rf "$DATA_DIR" "$DI_ERR" "$DISC_OUT" "$DISC_ERR" "$TICK_OUT" "$TICK_ERR" "$P_OUT" "$P_ERR"' EXIT
 
-wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" --gateway "$GW" "$@"; }
+wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" "$@"; }
 join_fed() {
   local started key state
   started=$(wcli join "$1") || return
@@ -114,10 +119,10 @@ if command -v gateway-ldk >/dev/null; then
 fi
 
 # DISCOVER B from a MANUAL source (the offline/live-gate source) and AUTO-JOIN it. --scorer-allow-regtest
-# relaxes the network floor (devimint feds are regtest); --gateway pins the shared route for the join's
-# route checks. B becomes AutoJoined (agent-owned, probe-GATED) — NEVER user-joined.
+# relaxes the network floor (devimint feds are regtest); discovery resolves routes from the vetted
+# lists (it refuses --gateway, ADR-0030). B becomes AutoJoined (agent-owned, probe-GATED) — NEVER user-joined.
 if ! wcli discover --source manual --invite "$FED_B_INVITE" --auto-join \
-      --gateway "$GW" --scorer-allow-regtest >"$DISC_OUT" 2>"$DISC_ERR"; then
+      --scorer-allow-regtest >"$DISC_OUT" 2>"$DISC_ERR"; then
   echo "  --- discover stdout ---" >&2; cat "$DISC_OUT" >&2
   echo "  --- discover stderr ---" >&2; cat "$DISC_ERR" >&2
   fail "discover --auto-join exited non-zero"
@@ -163,7 +168,7 @@ echo "== GATED TICK: an unproven AutoJoined standby must NOT be funded (tick BAI
 # (The gated tick bails anyway: B is NeverProbed then. Default gate span is 24h, unreachable live.)
 tick() { wcli tick --spending "$FED_A" --standby "$FED_B" \
   --spending-target "$SPENDING_TARGET" --standby-target "$STANDBY_TARGET" \
-  --max-fee "$MAX_FEE" --gateway "$GW" --probe-min-span-secs 1 --occurrence "$1"; }
+  --max-fee "$MAX_FEE" --probe-min-span-secs 1 --occurrence "$1"; }
 if tick 0 >"$TICK_OUT" 2>"$TICK_ERR"; then
   echo "  --- tick stdout ---" >&2; cat "$TICK_OUT" >&2
   echo "  --- tick stderr ---" >&2; cat "$TICK_ERR" >&2

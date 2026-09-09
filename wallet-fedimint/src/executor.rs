@@ -278,17 +278,26 @@ struct FreshSendRequiredGatewayFees {
     send: fee::GatewayFee,
 }
 
+/// The operator's break-glass gateway override (ADR-0030): ONE operation, named by its
+/// idempotency key, routes through `gateway` instead of the federation's vetted list. Naming the
+/// key is the authorization — an automated intent (tick, probe, scheduler) has a key nobody
+/// named, so it can never observe the override even when the executor carries one. Non-durable
+/// by design: it lives in this process only and is never journaled into the intent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BreakGlass {
+    pub key: wallet_core::IdempotencyKey,
+    pub gateway: GatewayUrl,
+}
+
 /// The production [`Executor`]: shared, `Send + Sync`, holds `Arc`s to the fedimint I/O
 /// (`MultiClient`) and the durable journal (spec §2, `&self` + interior mutability).
 pub struct FedimintExecutor {
     mc: Arc<MultiClient>,
     journal: Arc<FedimintJournal>,
-    /// An explicitly pinned lnv2 gateway (Phase 1 pins the gateway, ⟦D4⟧). When set,
-    /// fresh operations use it instead of the federation's registered list — devimint does NOT
-    /// auto-register its LDK gateway into that list, so `mc.gateways` is empty there (runbook §4)
-    /// and the CLI must supply the URL directly. A RESUMED move ignores this and reuses the
-    /// gateway already pinned in its `MoveRecord`.
-    pinned_gateway: Option<GatewayUrl>,
+    /// The break-glass override, if this invocation armed one. Consulted only through
+    /// [`Self::override_for`], which applies it to the named key alone. A move whose route has
+    /// COMMITTED replays its `MoveRecord` gateway regardless; an uncommitted cached route yields.
+    break_glass: Option<BreakGlass>,
     /// The hard per-fed balance cap (ADR-0018) enforced at PERFORM time (§15.2): a non-evacuation
     /// inflow that would push its destination over the cap is refused pre-mint, and a fresh
     /// evacuation is downsized to the destination's remaining cap room. `None` disables the check
@@ -307,16 +316,26 @@ impl FedimintExecutor {
     pub fn new(
         mc: Arc<MultiClient>,
         journal: Arc<FedimintJournal>,
-        pinned_gateway: Option<GatewayUrl>,
+        break_glass: Option<BreakGlass>,
         hard_cap: Option<Msat>,
     ) -> Self {
         Self {
             mc,
             journal,
-            pinned_gateway,
+            break_glass,
             hard_cap,
             service_client: None,
         }
+    }
+
+    /// The break-glass gateway for `key`, if this invocation armed one FOR THAT KEY. Every route
+    /// resolution funnels through here, so the property "an intent nobody named never sees the
+    /// override" holds at the executor boundary rather than per entry point.
+    fn override_for(&self, key: &wallet_core::IdempotencyKey) -> Option<&GatewayUrl> {
+        self.break_glass
+            .as_ref()
+            .filter(|break_glass| break_glass.key == *key)
+            .map(|break_glass| &break_glass.gateway)
     }
 
     pub(crate) fn with_service_client(mut self, service_client: WalletClient) -> Self {
@@ -439,8 +458,12 @@ impl FedimintExecutor {
         // crash never reselects a different or non-shared gateway; a fresh move resolves one
         // now (persisted at the first `put_move`). If the cache was lost but the receive-only
         // op already exists, finalization/replay no longer needs the gateway at all: use a
-        // local sentinel instead of failing on an empty gateway list.
+        // local sentinel instead of failing on an empty gateway list. The break-glass override
+        // (ADR-0030) beats a cached route only while NOTHING has committed — see
+        // `gateway_from_cache_or_recovered`.
+        let override_gateway = self.override_for(&intent.idempotency_key);
         let gateway = match gateway_from_cache_or_recovered(
+            override_gateway,
             cached.as_ref(),
             plan,
             &operation_key,
@@ -458,6 +481,7 @@ impl FedimintExecutor {
             None => {
                 self.resolve_move_gateway(
                     plan,
+                    override_gateway,
                     action_gateway(&intent.action),
                     move_amount_is_final(&intent.action),
                 )
@@ -481,9 +505,9 @@ impl FedimintExecutor {
 
     /// The gateway a move should actually use (spec §7, §15.6), in precedence order:
     ///
-    /// 1. the explicitly PINNED gateway (⟦D4⟧; devimint's LDK gateway is not auto-registered, so
-    ///    the CLI passes it directly — runbook §4). An operator pin overrides route selection
-    ///    entirely, planning included;
+    /// 1. the operator's BREAK-GLASS gateway, when this invocation armed one FOR THIS intent's
+    ///    key (ADR-0030). It overrides route selection entirely, planning included — that is
+    ///    the incident capability, and it is unreachable for any intent nobody named;
     /// 2. the route `decide()` preselected on the action — but only while it still SERVES both
     ///    ends. It is a HINT, not a constraint: `perform` can run long after planning (retries,
     ///    restarts), and failing terminally on a gateway that has since gone away would strand
@@ -502,24 +526,39 @@ impl FedimintExecutor {
     async fn resolve_move_gateway(
         &self,
         plan: &MovePlan,
+        override_gateway: Option<&GatewayUrl>,
         preselected: Option<&GatewayUrl>,
         amount_is_final: bool,
     ) -> Result<GatewayUrl, ExecError> {
-        if let Some(gateway) = &self.pinned_gateway {
+        // The break-glass skips vetted-list membership and the two-end preselection on purpose
+        // (ADR-0030); the operation's own liveness checks and fee cap still apply downstream.
+        if let Some(gateway) = override_gateway {
             return Ok(gateway.clone());
         }
         if let Some(preselected) = preselected {
-            if self
-                .gateway_serves_route(&plan.to, plan.from.as_ref(), preselected)
+            // A hint HOLDS only while it is still on the destination's vetted list AND still
+            // serves both ends (ADR-0030 rule 1 binds the hint too: an automated re-drive must
+            // never route through a gateway the guardians have since de-vetted). Source-side
+            // membership is still unchecked (F6, `br-s0e`).
+            let still_vetted = self
+                .mc
+                .gateways(&plan.to)
                 .await
+                .map_err(retryable)?
+                .contains(preselected);
+            if still_vetted
+                && self
+                    .gateway_serves_route(&plan.to, plan.from.as_ref(), preselected)
+                    .await
             {
                 return Ok(preselected.clone());
             }
             tracing::warn!(
                 to = %plan.to.to_hex(),
                 gateway = %preselected.0,
-                "executor: the planned gateway no longer serves this move; re-resolving under the \
-                 same fee cap"
+                still_vetted,
+                "executor: the planned gateway no longer holds for this move; re-resolving under \
+                 the same fee cap"
             );
         }
         if !amount_is_final {
@@ -536,16 +575,13 @@ impl FedimintExecutor {
     /// cap against which routes can be compared economically.
     ///
     /// "None validates" is `Retryable`, NOT `Permanent`: a resume verb (`reconcile`/`await-move`)
-    /// carries no pinned gateway, so re-driving an intent that has none cached must leave it
-    /// `Pending` (re-drivable once the operator supplies one), never terminally `Failed`.
+    /// may carry no break-glass gateway, so re-driving an intent that has none cached must leave
+    /// it `Pending` (re-drivable once the operator supplies one), never terminally `Failed`.
     async fn resolve_gateway(
         &self,
         to: &FederationId,
         from: Option<FederationId>,
     ) -> Result<GatewayUrl, ExecError> {
-        if let Some(gateway) = &self.pinned_gateway {
-            return Ok(gateway.clone());
-        }
         let gateways = self.mc.gateways(to).await.map_err(retryable)?;
         for gateway in &gateways {
             if self.gateway_serves_route(to, from.as_ref(), gateway).await {
@@ -1229,7 +1265,6 @@ impl FedimintExecutor {
                 amount,
                 fee_cap,
                 payment_hash,
-                gateway,
                 ..
             } => {
                 if let Some(operation_id) = self
@@ -1279,13 +1314,13 @@ impl FedimintExecutor {
                 }
                 validate_raw_pay_invoice(invoice)?;
                 self.enforce_pre_fund_admission(intent).await?;
-                // Same precedence as `resolve_gateway`: the intent's own gateway, else the
-                // constructor pin (walletd.toml / standalone --gateway — devimint's LDK gateway
-                // is never in the registered list), else the fed's registered scan. The pin is
-                // deliberately NOT journaled into the intent, so a pin change applies to
-                // re-drives after a restart.
-                let candidates = match gateway.clone().or_else(|| self.pinned_gateway.clone()) {
-                    Some(gateway) => vec![gateway],
+                // The break-glass override for THIS key, else the fed's vetted scan. The
+                // `Action::Pay { gateway }` field is deliberately NOT consulted: the override is
+                // never journaled into the intent, so it applies to this invocation and to
+                // re-drives that repeat the flag, and vanishes when the operator stops passing it.
+                let break_glass = self.override_for(&intent.idempotency_key);
+                let candidates = match break_glass {
+                    Some(gateway) => vec![gateway.clone()],
                     None => self.mc.gateways(from).await.map_err(retryable)?,
                 };
                 // Scan ALL candidates and keep the CHEAPEST that fits the cap, not the first fitter.
@@ -1313,9 +1348,18 @@ impl FedimintExecutor {
                     cheapest_fitting =
                         keep_cheapest_fitting(cheapest_fitting, (Msat(total), candidate), *fee_cap);
                 }
-                let gateway = match cheapest_fitting {
-                    Some((_, gateway)) => gateway,
-                    None => {
+                let gateway = match (cheapest_fitting, break_glass) {
+                    (Some((_, gateway)), _) => gateway,
+                    // Name the break-glass gateway: a federation-wide "no quote" would read as a
+                    // vetted-list scan, and the operator needs to know THEIR gateway failed.
+                    (None, Some(gateway)) if lowest_quote.is_none() => {
+                        return Err(ExecError::Retryable(format!(
+                            "break-glass gateway {} produced no send fee quote for federation {}",
+                            gateway.0,
+                            from.to_hex()
+                        )));
+                    }
+                    (None, _) => {
                         return Err(raw_pay_quote_error(lowest_quote, *fee_cap, *from));
                     }
                 };
@@ -1350,7 +1394,6 @@ impl FedimintExecutor {
                 to,
                 amount,
                 fee_cap,
-                gateway,
                 ..
             } => {
                 if let Some(operation_id) = intent.operation_id {
@@ -1396,9 +1439,10 @@ impl FedimintExecutor {
                     return Ok(PerformOutcome::AwaitingAlreadyInFlight);
                 }
                 self.enforce_pre_fund_admission(intent).await?;
-                // Pin fallback as in the raw pay arm above (and `resolve_gateway`).
-                let candidates = match gateway.clone().or_else(|| self.pinned_gateway.clone()) {
-                    Some(gateway) => vec![gateway],
+                // Break-glass for this key, else the vetted scan — as in the raw pay arm above.
+                let break_glass = self.override_for(&intent.idempotency_key);
+                let candidates = match break_glass {
+                    Some(gateway) => vec![gateway.clone()],
                     None => self.mc.gateways(to).await.map_err(retryable)?,
                 };
                 let mut selected_gateway = None;
@@ -1455,10 +1499,18 @@ impl FedimintExecutor {
                         return Err(minimum_contract_error.expect("checked above"));
                     }
                     None => {
-                        return Err(ExecError::Retryable(format!(
-                            "no lnv2 gateway produced a receive fee quote for federation {}",
-                            to.to_hex()
-                        )));
+                        return Err(ExecError::Retryable(match break_glass {
+                            Some(gateway) => format!(
+                                "break-glass gateway {} produced no receive fee quote for \
+                                 federation {}",
+                                gateway.0,
+                                to.to_hex()
+                            ),
+                            None => format!(
+                                "no lnv2 gateway produced a receive fee quote for federation {}",
+                                to.to_hex()
+                            ),
+                        }));
                     }
                 };
                 let meta = serde_json::json!({
@@ -3179,16 +3231,31 @@ fn crash_point_matches(configured: Option<&str>, point: &str) -> bool {
     configured == Some(point)
 }
 
+/// The route a move REPLAYS, if it already has one. `None` means resolve afresh.
+///
+/// "Committed" is the line: a leg recorded on the cached record OR recovered from the op-log
+/// (the receive can commit in the client db before the post-receive cache write — the
+/// `before-move-record` killpoint). Once committed the recorded route is authoritative — the
+/// invoice was sized for that gateway — and it replays whether or not a break-glass is armed.
+/// Before that point a cached record is a DRAFT (the pre-receive write, or a pre-mint refusal):
+/// the break-glass for this intent takes it, and otherwise it is re-resolved rather than
+/// replayed, so a gateway chosen under a flag never outlives the invocation (ADR-0030) and a
+/// dead vetted gateway never sticks either. A committed route lost with the cache is not
+/// recoverable from the op-log for a send-required move (F7, `br-s0e`); that re-resolves too.
 fn gateway_from_cache_or_recovered(
+    override_gateway: Option<&GatewayUrl>,
     cached: Option<&MoveRecord>,
     plan: &MovePlan,
     key: &wallet_core::IdempotencyKey,
     artifacts: &[OpArtifact],
 ) -> Option<GatewayUrl> {
+    let recovered = artifacts.iter().any(|artifact| artifact.move_id == *key);
+    let committed = cached.is_some_and(has_move_artifact) || recovered;
+    if !committed {
+        return override_gateway.cloned();
+    }
     if let Some(rec) = cached {
-        if plan.send_required || has_move_artifact(rec) {
-            return Some(rec.gateway.clone());
-        }
+        return Some(rec.gateway.clone());
     }
     if !plan.send_required
         && artifacts.iter().any(|artifact| {
@@ -3958,7 +4025,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pin_beats_the_preselected_route_and_a_dead_hint_re_resolves() {
+    async fn the_break_glass_beats_the_preselected_route_and_a_dead_hint_re_resolves() {
         let db = MemDatabase::new().into_database();
         let journal_db = MemDatabase::new().into_database();
         let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
@@ -3974,26 +4041,25 @@ mod tests {
         };
         let planned = GatewayUrl("https://planned.example".into());
 
-        // §Q4: an operator pin is the HIGHEST precedence — it wins over `decide()`'s preselection
-        // without validating it, exactly as it already wins over the registered-set scan.
-        let pin = GatewayUrl("https://pinned.example".into());
-        let pinned = FedimintExecutor::new(mc.clone(), journal.clone(), Some(pin.clone()), None);
+        // ADR-0030: the break-glass is the HIGHEST precedence — it wins over `decide()`'s
+        // preselection without validating it, exactly as it wins over the vetted-list scan.
+        let override_gateway = GatewayUrl("https://break-glass.example".into());
+        let executor = FedimintExecutor::new(mc, journal, None, None);
         assert_eq!(
-            pinned
-                .resolve_move_gateway(&plan, Some(&planned), true)
+            executor
+                .resolve_move_gateway(&plan, Some(&override_gateway), Some(&planned), true)
                 .await
-                .expect("a pin never needs to resolve"),
-            pin
+                .expect("a break-glass gateway never needs to resolve"),
+            override_gateway
         );
 
-        // §Q2: with no pin, a preselected gateway that no longer serves the route (no federation
-        // is open here, so nothing validates) must NOT strand the move terminally — it falls
-        // through to re-resolution and, when that finds nothing either, stays RETRYABLE so a
-        // later tick can complete it. The move's `fee_cap` is untouched throughout: the cap, not
-        // gateway identity, is what bounds what a substitute may spend.
-        let unpinned = FedimintExecutor::new(mc, journal, None, None);
-        let error = unpinned
-            .resolve_move_gateway(&plan, Some(&planned), true)
+        // §Q2: with no override, a preselected gateway that no longer serves the route (no
+        // federation is open here, so nothing validates) must NOT strand the move terminally —
+        // it falls through to re-resolution and, when that finds nothing either, stays RETRYABLE
+        // so a later tick can complete it. The move's `fee_cap` is untouched throughout: the cap,
+        // not gateway identity, is what bounds what a substitute may spend.
+        let error = executor
+            .resolve_move_gateway(&plan, None, Some(&planned), true)
             .await
             .expect_err("no gateway can serve an unopened federation");
         assert!(
@@ -4061,13 +4127,65 @@ mod tests {
         assert_eq!(plan.from, None, "a direct inflow is receive-only");
 
         let error = executor
-            .resolve_move_gateway(&plan, None, true)
+            .resolve_move_gateway(&plan, None, None, true)
             .await
             .expect_err("no federation is open in this fixture");
         assert!(
             matches!(error, ExecError::Retryable(_)),
             "a receive-only inflow must stay re-drivable, not fail terminally: {error:?}"
         );
+    }
+
+    /// ADR-0030's structural property, proven at the executor boundary: an executor ARMED with a
+    /// break-glass applies it to the named key and to nothing else. An allocator-created
+    /// evacuation driven through the same executor resolves from the (empty) vetted list and
+    /// stays `Retryable`; the named key routes through the override; the daemon's unarmed
+    /// executor never sees it at all.
+    #[tokio::test]
+    async fn the_break_glass_applies_to_the_named_key_only() {
+        let db = MemDatabase::new().into_database();
+        let journal_db = MemDatabase::new().into_database();
+        let mnemonic = Mnemonic::from_entropy(&[0u8; 16]).expect("valid 12-word entropy");
+        let mc = Arc::new(MultiClient::new(db, journal_db.clone(), mnemonic).await);
+        let journal = Arc::new(FedimintJournal::new(journal_db.clone()));
+        let named = wallet_core::IdempotencyKey("move:manual:0".into());
+        let allocator_key = wallet_core::IdempotencyKey("evac:a:b:7".into());
+        let gateway = GatewayUrl("https://break-glass.example".into());
+        let armed = FedimintExecutor::new(
+            mc.clone(),
+            journal.clone(),
+            Some(BreakGlass {
+                key: named.clone(),
+                gateway: gateway.clone(),
+            }),
+            None,
+        );
+        assert_eq!(armed.override_for(&named), Some(&gateway));
+        assert_eq!(armed.override_for(&allocator_key), None);
+
+        let plan = MovePlan {
+            from: Some(FED_A),
+            to: FED_B,
+            amount: Msat(50_000),
+            fee_cap: Msat(1_000),
+            send_required: true,
+            fee_cap_components: None,
+        };
+        let error = armed
+            .resolve_move_gateway(&plan, armed.override_for(&allocator_key), None, false)
+            .await
+            .expect_err("an intent nobody named resolves from the vetted list, which is empty");
+        assert!(matches!(error, ExecError::Retryable(_)), "{error:?}");
+        assert_eq!(
+            armed
+                .resolve_move_gateway(&plan, armed.override_for(&named), None, false)
+                .await
+                .expect("the named key routes through the break-glass"),
+            gateway
+        );
+
+        let unarmed = FedimintExecutor::new(mc, journal, None, None);
+        assert_eq!(unarmed.override_for(&named), None);
     }
 
     #[tokio::test]
@@ -4152,7 +4270,7 @@ mod tests {
         }];
 
         assert_eq!(
-            gateway_from_cache_or_recovered(None, &plan, &key, &artifacts),
+            gateway_from_cache_or_recovered(None, None, &plan, &key, &artifacts),
             Some(recovered_receive_only_gateway())
         );
 
@@ -4162,7 +4280,7 @@ mod tests {
             ..plan
         };
         assert_eq!(
-            gateway_from_cache_or_recovered(None, &send_plan, &key, &artifacts),
+            gateway_from_cache_or_recovered(None, None, &send_plan, &key, &artifacts),
             None
         );
     }
@@ -4205,7 +4323,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_op_cached_gateway_pins_moves_but_not_receive_only_retries() {
+    fn a_draft_route_re_resolves_and_a_committed_route_replays() {
         let key = IdempotencyKey("direct-inflow:pre-op".into());
         let plan = MovePlan {
             from: None,
@@ -4234,7 +4352,7 @@ mod tests {
         };
 
         assert_eq!(
-            gateway_from_cache_or_recovered(Some(&cached), &plan, &key, &[]),
+            gateway_from_cache_or_recovered(None, Some(&cached), &plan, &key, &[]),
             None,
             "a receive-only gateway-only cache must not block an explicit retry from repinning"
         );
@@ -4248,16 +4366,72 @@ mod tests {
         move_cached.from = Some(FED_A);
         move_cached.send_required = true;
         assert_eq!(
-            gateway_from_cache_or_recovered(Some(&move_cached), &send_plan, &key, &[]),
+            gateway_from_cache_or_recovered(None, Some(&move_cached), &send_plan, &key, &[]),
+            None,
+            "a Move pre-receive draft is re-resolved, not replayed: nothing was minted for its \
+             gateway, and a gateway chosen under a break-glass must not outlive the invocation"
+        );
+
+        // The `before-move-record` killpoint: the receive committed in the client db but the
+        // cache write never happened. The op-log artifact is what marks the move committed, and
+        // the draft's gateway — the one the invoice was minted for — is then authoritative.
+        let recovered_receive = [OpArtifact {
+            move_id: key.clone(),
+            leg: Leg::Receive,
+            op_id: crate::types::OperationId([0x54; 32]),
+            amount: Msat(50_000),
+            fee_cap: None,
+            invoice: Some(Invoice("lnbc1recovered".into())),
+        }];
+        assert_eq!(
+            gateway_from_cache_or_recovered(
+                None,
+                Some(&move_cached),
+                &send_plan,
+                &key,
+                &recovered_receive
+            ),
             Some(GatewayUrl("https://stale.example".into())),
-            "a Move pre-op cache records the gateway chosen before non-idempotent receive"
+            "a receive recovered from the op-log commits the draft's gateway"
         );
 
         cached.invoice = Some(Invoice("lnbc1cached".into()));
         assert_eq!(
-            gateway_from_cache_or_recovered(Some(&cached), &plan, &key, &[]),
+            gateway_from_cache_or_recovered(None, Some(&cached), &plan, &key, &[]),
             Some(GatewayUrl("https://stale.example".into())),
             "once an invoice exists, the recorded gateway is part of the durable receive"
+        );
+
+        // ADR-0030: the break-glass takes a DRAFT (nothing committed — the stuck-on-a-dead-
+        // gateway incident) but never a COMMITTED route, whether the commit is on the record or
+        // only recoverable from the op-log.
+        let break_glass = GatewayUrl("https://break-glass.example".into());
+        assert_eq!(
+            gateway_from_cache_or_recovered(
+                Some(&break_glass),
+                Some(&move_cached),
+                &send_plan,
+                &key,
+                &[]
+            ),
+            Some(break_glass.clone()),
+            "an uncommitted draft yields to the break-glass"
+        );
+        assert_eq!(
+            gateway_from_cache_or_recovered(Some(&break_glass), Some(&cached), &plan, &key, &[]),
+            Some(GatewayUrl("https://stale.example".into())),
+            "a committed route replays without the flag, break-glass or not"
+        );
+        assert_eq!(
+            gateway_from_cache_or_recovered(
+                Some(&break_glass),
+                Some(&move_cached),
+                &send_plan,
+                &key,
+                &recovered_receive
+            ),
+            Some(GatewayUrl("https://stale.example".into())),
+            "a receive committed only in the op-log still pins the route against the break-glass"
         );
     }
 

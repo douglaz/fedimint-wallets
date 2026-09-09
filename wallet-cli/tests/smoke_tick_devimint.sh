@@ -149,6 +149,11 @@ fi
 command -v fedimint-cli >/dev/null || { echo "FAIL: fedimint-cli not on PATH (run inside dev-fed --exec)" >&2; exit 1; }
 
 GW="http://127.0.0.1:${FM_PORT_GW_LDK}/"
+# devimint never vets its LDK gateway; register it on every guardian of BOTH feds so the wallet
+# routes unpinned from the vetted lists (ADR-0030). See devimint_lib.sh for the verified command.
+source "$(dirname "${BASH_SOURCE[0]}")/devimint_lib.sh"
+register_lnv2_gateway "$GW" "$FM_INVITE_CODE"
+register_lnv2_gateway "$GW" "$FED_B_INVITE"
 FUND_MSAT=3000000        # fund A with 3,000 sat (must exceed both 1,000-sat targets + move fees)
 SPENDING_TARGET=1000000  # keep >=1,000 sat on the spending fed; the surplus funds the standby
 STANDBY_TARGET=1000000   # 1,000 sat clears the live route-economic floor at the 300-bps move cap
@@ -162,7 +167,7 @@ TICK_OUT="$(mktemp)"
 TICK_ERR="$(mktemp)"
 trap 'rm -rf "$DATA_DIR" "$DI_ERR" "$TICK_OUT" "$TICK_ERR"' EXIT
 
-wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" --gateway "$GW" "$@"; }
+wcli() { "$WALLET_CLI" --standalone --data-dir "$DATA_DIR" "$@"; }
 join_fed() {
   local started key state
   started=$(wcli join "$1") || return
@@ -237,11 +242,12 @@ fi
 echo "== TICK: probe -> score -> decide -> apply (must fund the empty standby B from A's surplus) =="
 # A is above its spending target, B is below its standby target: decide() must emit exactly one
 # fund-standby Move A->B of ~STANDBY_TARGET, and apply() must perform it. Pin the designation
-# (regtest feds are scorer-ineligible; see the WHY note at the top) and the shared gateway.
+# (regtest feds are scorer-ineligible; see the WHY note at the top); the route resolves from the
+# vetted lists registered above (automated routing is never pinned, ADR-0030).
 if ! wcli tick \
       --spending "$FED_A" --standby "$FED_B" \
       --spending-target "$SPENDING_TARGET" --standby-target "$STANDBY_TARGET" \
-      --max-fee "$MAX_FEE" --gateway "$GW" --occurrence 0 >"$TICK_OUT" 2>"$TICK_ERR"; then
+      --max-fee "$MAX_FEE" --occurrence 0 >"$TICK_OUT" 2>"$TICK_ERR"; then
   echo "FAIL: wallet-cli tick exited non-zero" >&2
   echo "  --- tick stdout ---" >&2; cat "$TICK_OUT" >&2
   echo "  --- tick stderr ---" >&2; cat "$TICK_ERR" >&2
@@ -301,7 +307,7 @@ STALE_STANDBY_TARGET=$(( B1 + STANDBY_TARGET ))  # strictly above B1 -> B is bel
 if wcli tick \
       --spending "$FED_A" --standby "$FED_B" \
       --spending-target "$SPENDING_TARGET" --standby-target "$STALE_STANDBY_TARGET" \
-      --max-fee "$MAX_FEE" --gateway "$GW" --occurrence 0 >"$TICK_OUT" 2>"$TICK_ERR"; then
+      --max-fee "$MAX_FEE" --occurrence 0 >"$TICK_OUT" 2>"$TICK_ERR"; then
   echo "FAIL: stale same-occurrence tick unexpectedly exited zero" >&2
   echo "  --- tick stdout ---" >&2; cat "$TICK_OUT" >&2
   exit 1

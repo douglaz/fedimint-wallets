@@ -276,6 +276,10 @@ pub enum Action {
         amount: Msat,
         fee_cap: Msat,
         payment_hash: [u8; 32],
+        /// NOT consulted for routing and always `None` in production (ADR-0030: the break-glass
+        /// override is never journaled into an intent). Kept only because `Action` rides live
+        /// stores without `serde(default)` here, so the previous build must still decode a row
+        /// this build writes.
         gateway: Option<GatewayUrl>,
     },
     /// Mint a raw receive invoice on one federation. `nonce` distinguishes deliberate
@@ -285,6 +289,7 @@ pub enum Action {
         amount: Msat,
         fee_cap: Msat,
         nonce: String,
+        /// As on `Pay`: not consulted, always `None`, retained for on-disk shape only.
         gateway: Option<GatewayUrl>,
     },
     /// Join a federation under the invite-derived operation identity.
