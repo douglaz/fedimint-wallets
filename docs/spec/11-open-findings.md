@@ -36,29 +36,29 @@ the deferred-funding case; the issue remains open pending confirmation that the 
 emitted on the live path. Open — `br-0vg`.
 
 **F3. The evacuation fallback in `ADR-0029` is half built.** The proportional cap exists
-(`ALC-20`). The second route — a real Lightning hop through two gateways when none serves both
-federations — does not. A dying federation with no shared gateway cannot be drained. Its
-specification (`br-s0e`) is 39,000 characters long and blocked on `F5`. Open —
-`br-s0e`.
-
-**F5. The sizing API cannot distinguish a proven structural refusal from an inconclusive
-bounded miss.** Both are `EvacuationSizing::Refused(String)`. The code is explicit that it
-computes no analytic proof — every structural verdict is two-point evidence on a non-monotone
-curve — while `ADR-0029` and `br-s0e` require the distinction. Open — `br-u4i`.
+(`ALC-20`). The second route — a real Lightning hop through two gateways on different nodes when
+none serves both federations — does not. A dying federation with no shared gateway cannot be
+drained. `ADR-0029` was rewritten 2026-09-09 (per-leg selection, evidence-based fallthrough, the
+node-key rule, a perform-failure record) and `br-s0e` rewritten to match; it depends on
+`br-routing-invariants-f6f7-dwx` (F6, F7) and is no longer blocked on F5. Open — `br-s0e`.
 
 **F6. Source-side vetted-list membership is not enforced, and the vetted list is a union.**
 Selection starts from the destination federation's list and validates the source end only by
-fetching `routing_info`; a gateway vetted by the destination alone, or revoked by the source
-since, can still carry an automated move. Separately the SDK's gateway list flattens every URL
-any responding guardian returned, so one misconfigured or malicious guardian can place a gateway
-in the automated candidate set. `ADR-0029` and `ADR-0030` record the target; `CONTEXT.md`'s
-**Serves**, **Vetted list** and **Route hint** entries each point here as the gap. Open — `br-gw-threshold-membership-k4t`,
-`br-s0e`.
+fetching `routing_info` (a route hint is now checked against the destination's list, not the
+source's); a gateway vetted by the destination alone, or revoked by the source since, can still
+carry an automated move. Separately the SDK's gateway list flattens every URL any responding
+guardian returned, so one misconfigured or malicious guardian can place a gateway in the
+automated candidate set. Decided 2026-09-09: shared candidates come from the intersection of both
+lists, and a list is the gateways at least `NumPeers::threshold()` guardians each return, read
+per guardian.
+`ADR-0029` and `ADR-0030` record the target; `CONTEXT.md`'s **Serves**, **Vetted list** and
+**Route hint** entries each point here as the gap. Open — `br-routing-invariants-f6f7-dwx`
+(the ingestion bound stays with `br-gw-threshold-membership-k4t`).
 
 **F7. The route is not persisted with a committed operation.** After cache loss the operation
 artifact carries no gateway, so reassembly resolves afresh and a restart can pay through a
 different gateway than the one the invoice was sized for. `ADR-0030` records the rule; `CONTEXT.md` **Committed route** points here as the gap.
-Open — part of `br-s0e`.
+Open — `br-routing-invariants-f6f7-dwx`.
 
 **F8. A receive refused after commit leaves the ledger row on the planned pair.** When the
 never-over check fails after `mc.receive` has committed, the intent terminalizes `Failed`, the
@@ -245,6 +245,13 @@ this is a second, architectural rather than a money hole.
 Open — `br-standalone-probe-bypasses-actor-253`.
 
 ## Closed since this document was first written
+
+**F5. The sizing API cannot distinguish a proven structural refusal from an inconclusive
+bounded miss.** Closed 2026-09-09 as dissolved, not fixed: the rewritten `ADR-0029` no longer
+requires the distinction. An empty bounded sizing result means the route does not serve THIS
+attempt, the hop is tried in the same tick, and the next fresh attempt starts swap-first again;
+`ALC-24`'s two-point evidence remains what it is and feeds only the supersession audit record.
+`br-u4i` closed.
 
 **F4. Automated routing still honours a pinned gateway.** Closed 2026-09-09: the `walletd.toml`
 `gateway` key is gone and rejected, the daemon constructs its runtime unarmed, and the standalone

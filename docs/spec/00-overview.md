@@ -99,8 +99,9 @@ in this version (`ADR-0004`, `ADR-0018`, `ADR-0013`, `docs/roadmap-to-v1.md`).
 and private receives, not network-level anonymity (`ADR-0002`, `CONTEXT.md` **Private**).
 
 **OVR-13** A two-gateway Lightning route is a non-goal for ordinary movement. Every move resolves
-one gateway that validates at both federations. Evacuation is the decided exception and that
-exception is unbuilt (`ADR-0029`, `F3`).
+one gateway that validates at both federations. Evacuation is the decided exception — a hop over
+two gateways on different Lightning nodes, each leg chosen from its own federation's vetted list
+— and that exception is unbuilt (`ADR-0029`, `F3`).
 
 **OVR-14** No compatibility shims, with one deliberate class of exceptions: types written to a
 live store gain fields only with `serde(default)` and never carry `deny_unknown_fields`

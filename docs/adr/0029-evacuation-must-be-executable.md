@@ -3,370 +3,187 @@ status: accepted
 ---
 # Evacuation must be executable: a proportional fee cap, and a second route when no gateway is shared
 
-Two changes so that draining a dying federation happens in AS FEW OPERATIONS AS THE ROUTE ALLOWS
-— one where the route can carry it — over a route that exists, rather than in ~27 fee-capped
-chunks or not at all when no gateway is shared. (The Amendment below records the one case where
-this deliberately stays multi-operation — a shared route serving only a small net still wins over
-a hop that could drain the balance, because the swap is cheaper — and the condition that makes
-that safe: every chunk must deliver at least what it costs, or the route does not serve at all.)
+> Rewritten 2026-09-09 to record the design as settled after the routing model changed
+> (ADR-0030). The earlier text specified the hop as a scan over source×destination gateway
+> PAIRS with a fixed bound, and required an "analytically proven" refusal before the hop could be
+> tried; two independent reviews found the pair space illusory (the legs are independent) and the
+> proof requirement not load-bearing. The history, including the fee-limit arithmetic that
+> br-y2j pinned, is in git and in `docs/spec/06-allocator-and-automation.md` (`ALC-20`..`ALC-24`).
 
-1. **`Evacuate`'s fee cap becomes base + proportional** — an absolute allowance plus a percentage
-   of the amount (starting point: **200 sats + 3%**), replacing today's single absolute
-   `snapshot.max_fee`.
-2. **`Evacuate` gains a second route**: when no gateway serves both federations, it may pay B's
-   invoice from A over real Lightning through two different gateways, instead of refusing (routing
-   IS a genuine refusal today — as the fee cap also is when NO amount fits, though it downsizes
-   first where it can). This is
-   a **best-effort fallback, tried only after the shared-gateway swap**, and it is explicitly NOT a
-   guarantee.
+Draining a dying federation must happen in as few operations as the route allows, over a route
+that exists. Two decisions make that true, and a third bounds what they may cost.
 
-`Move` is unchanged: it keeps the swap-only path and its proportional cap. Routine rebalancing can
-safely decline and wait; evacuation cannot.
+## 1. `Evacuate`'s fee cap is base + proportional
 
-This ADR supersedes, in part, Q1 and Q2 of
-[docs/archive/route-economics-decisions.md](../archive/route-economics-decisions.md): Q1's single
-`Option<GatewayUrl>` on `Action::Evacuate` (the hop needs a route kind plus two identities), and
-Q2's endpoint-only "use `action.gateway` iff it still validates" hint rule, which br-s0e replaces
-with a membership re-check for `Move` as well as `Evacuate`.
+An absolute allowance plus a percentage of the amount, starting at **200 sats + 3%**, replacing
+the single absolute `max_fee`. **Shipped** (`ALC-20`). The absolute cap failed both ways: with
+gateway bases below it a full-balance drain was silently chunked into ~27 operations; with bases
+above it no amount ever fit and the evacuation retried forever. A flat percentage would have
+refused exactly the small evacuations that are cheapest in absolute terms. Base + proportional
+tracks the way gateway fees are actually shaped. `Move` keeps its proportional-only cap: only
+evacuation must succeed.
 
-## Amendment: what "serves both ends" means, and what strict ordering costs
+Two facts about the SDK at the pinned revision govern the numbers and stay decisions here: the
+SDK's send/receive fee limits bound each leg's BASE (100 sats send, 50 receive) but not the ppm,
+because `PaymentFee` compares lexicographically on base first; and receive-side solvability is
+governed by the receive ppm alone. br-y2j owns the pinned fixture and every number in it.
 
-Both statements above turn on a gateway "serving" a route, which the original text used as if it
-were self-evident. It is not, and the loose reading is the one that livelocks.
+**Serving requires economic viability: `total_fee <= delivered net`**, checked as a post-check on
+the sizing result, never folded into the search. A route whose best chunk costs more than it
+delivers does not serve. Without this, the cap's base component admits a chunk that burns ~200
+sats to move 5, and a 75,000-sat balance drains in ~365 such chunks losing ~97%. With it, chunking
+is slow, not lossy. Accepted residual: a gateway pricing exactly at `fee == net` can still take up
+to half the balance across chunks; an aggregate per-evacuation fee budget is the named follow-up
+if that is ever judged unacceptable.
 
-**A gateway SERVES when it is on the relevant vetted list, VALIDATES, a viable amount can
-actually be sized over it, and it PERFORMS — completes every leg it quoted, both on a shared route.** Registry
-presence is not the test: a gateway that is listed but dead,
-or that cannot price the route, does not serve it, and treating it as though it did leaves a dying
-federation with a listed-but-useless gateway and no way out — precisely the incident the second
-route exists for. Quoting is not serving either (clause added 2026-09-08): a gateway that answers
-`routing_info` and fee quotes but then hangs or rejects the actual `receive`/`pay` does not
-serve, since otherwise strict swap-first reselects it every tick and a viable hop is never
-reached. The bounded per-gateway record of recent perform-level failures that makes this
-decidable is br-s0e's implementation work, not part of the definition.
+## 2. `Evacuate` gets a second route: a hop over two Lightning nodes
 
-*Which* vetted list depends on what is being served, and the shared route and the hop need
-different predicates: a **shared route** wants a gateway vetted by BOTH federations, while a **hop
-leg** needs only the one federation at its end, each leg judged separately. Note the shared-route
-half is the intent rather than today's behaviour — automated selection starts from the
-destination's list and validates the source end only by fetching `routing_info` — so closing that
-gap is implementation work this ADR names, not a property to assume. `CONTEXT.md` carries the
-canonical wording.
+When no gateway serves both federations, the evacuation may mint B's invoice through a gateway B
+vets and pay it from A through a gateway A vets, the payment travelling over Lightning between
+the two gateways' nodes. `Move` never hops.
 
-Being unable to fund the **full** ask is not a failure to serve. `InsufficientBalanceError` at the
-desired amount is the ordinary downsize signal, not a fall-through trigger; reading it as one
-would route every full-balance evacuation onto the dearer hop while a healthy shared gateway sat
-idle. This has a structural consequence: route selection can no longer precede sizing. Each
-candidate is sized with its own fee bases, and the fee charged at its resulting executed net is
-what gets compared against that route's cap — the cap — itself computed on the NET — bounds the fee, which is CHARGED ON THE GROSS
-(the two are different quantities; conflating them is the error recorded twice below), never
-the net itself.
+- **A hop is two gateways on two different Lightning NODES.** The SDK detects an internal swap by
+  comparing the invoice's payee node key with the sending gateway's own node key. Two URLs on one
+  node are one gateway: the sender would take the swap path, look for the incoming contract in its
+  own database, fail to find it, and refund, every attempt. Both `routing_info` responses carry
+  the node key, so the rule is one comparison.
+- **The legs are priced independently and paired only by the node-key rule.** Each leg's price
+  is its own: the destination leg's receive fee on B, the source leg's EXTERNAL send fee
+  (`send_fee_default`, not the swap discount) on A, both read from the `routing_info` already
+  fetched to validate, so every candidate's fee is in hand with no further network call. The
+  route is the combination with the MINIMUM composed cost at the ask over the validated
+  destination gateways and validated source gateways on DIFFERENT nodes, where the composed
+  cost is the FULL route cost `quote_fresh_send_required_cost` computes at the ask — the
+  destination's receive fee and federation receive fee grossing the ask up to the invoice, then
+  the source's external send fee and federation send fee on the contract that invoice implies
+  (`FreshMoveCost::total_fee()`) — never the two gateway schedules each read at the bare ask.
+  The federation fee quotes are local database reads, so this ranking costs no network calls.
+  Ties break on lower receive fee, then on the ordered pair of URLs. "Validated" means
+  the candidates examined before the class's time bound below, whether or not that is every
+  listed gateway; with none on either side, or no distinct-node combination among them, the
+  hop does not serve this attempt. That is a local comparison over two short lists already
+  in memory, not a scan: no pair bound, no diagonal rule, and no network cost beyond the
+  validations. Sizing then runs the existing search with that fee pair — and if the search
+  finds no viable amount, the NEXT combination in composed-cost order is sized, and so on
+  until one serves or the class's time bound is reached. Fee curves cross: the combination
+  cheapest at the ask can have no viable chunk while a dearer one fits at a smaller amount,
+  and since empty sizing writes no set-aside, stopping at the first would select the same
+  unusable pair every occurrence. Sizing is local arithmetic over quotes already in hand, so
+  this costs no network calls. (A "first destination with any compatible source" shortcut is
+  wrong for the same reason in the other direction: with destination fees X:1, Z:2 and source
+  fees X:1, Y:100 it picks X/Y at 101 over Z/X at 3.)
+- **Bounded, with settlement time reserved.** ONE per-attempt deadline is fixed when fresh
+  routing starts and passed through both classes in turn; each class's validations run against
+  the time remaining under it (the shape `resolve_fallback_move_gateway` already has, but
+  shared, not one bound per class), and the deadline itself sits far enough inside
+  `perform_timeout` that invoice creation and payment still fit after it. Today's fresh
+  evacuation path has no such bound at all. A scan that hits the deadline is journaled as
+  truncated, and the hop is chosen from the candidates examined. Without this,
+  enough slow-but-listed gateways consume the whole perform budget before anything is minted,
+  the driver is cancelled, and the next occurrence repeats the scan: a livelock that "attempted"
+  the hop without ever completing it.
+- **Whether the two nodes can reach each other is learned only by paying.** A refunded send leaves
+  the destination's contract to expire unclaimed, terminates that operation, and the next
+  occurrence emits a fresh evacuation; the invoice is single-use and is never re-paid. The
+  principal is not transferred but is not lost; the FEES are: the source federation charges
+  transaction and mint fees for each fund-and-refund cycle, so repeated failed attempts do
+  reduce the balance being rescued, and a stateless "cheapest" choice would repeat the same
+  failure every tick. Hence the record in §3, which exists to bound exactly that loss.
+- **Strict ordering: swap first, hop only when no shared gateway serves THIS attempt.** The swap
+  is cheaper (measured: 8,948 vs 16,064 msat per million on the pilot gateway). A shared gateway
+  that serves only a small chunk still wins and the source drains in several operations; §1's
+  viability rule is what makes that safe. The two classes are never sized to compare them.
+- **"Does not serve this attempt" is EVIDENCE, not proof.** A shared gateway is unavailable for
+  this attempt when it is absent from either federation's vetted list, fails validation, its
+  quotes error or time out, it is set aside by §3, or the bounded sizing search over it — run
+  AFTER the ordinary downsizing, so a full ask the source cannot fund is sized smaller, never
+  read as unavailability — ends with no viable amount, whichever shape that result takes
+  (`Refused` or `StructuralRefused`; both are "not this attempt"). That is inconclusive as a
+  statement about the route and that is fine: the hop is tried in the same tick, and the next
+  fresh attempt starts swap-first again. Structurally this means route selection and sizing
+  become ONE loop inside the fresh path — try a candidate, size it, on nothing viable try the
+  next, then the next class — replacing today's single resolution before sizing, whose
+  refusals return from `perform` before any other route is considered. What "proof"
+  would have bought is avoiding a ~0.7%-dearer route on a tick where the bounded search missed
+  a swap amount; what it cost was stranding a dying federation behind a distinction the code
+  could not compute. The earlier requirement is withdrawn, and `br-u4i` with it.
+- **Fallthrough happens only at fresh sizing.** Once a leg has committed, the recorded route is
+  authoritative through settlement (ADR-0030 rule 4); a minted invoice is bound to the gateway
+  that minted it, so a route is never switched mid-operation.
+- **Being unable to fund the full ask is not a failure to serve.** `InsufficientBalanceError` at
+  the desired amount is the downsize signal; reading it as a fall-through would route every
+  full-balance evacuation onto the dearer hop while a healthy shared gateway sat idle.
+- **No bar on the destination gateway** beyond vetting, validation, cap and viability. Both legs
+  stay hash-locked, so the hop adds no new trust; during an evacuation a worse counterparty beats
+  stranding the balance.
 
-**Strict ordering stays strict even when it costs operations — but only over routes that carry
-more than they cost.** With a base+proportional cap the two goals in this ADR can disagree: a
-high-ppm shared gateway has a narrow feasible window and may serve only a small net, while a hop
-pair would serve the full drain. The swap still wins, and the source drains in several operations.
+## 3. A gateway that quoted but did not perform is set aside
 
-"Chunking is slow, not lossy" is only true once a chunk must deliver at least what it costs, and
-that condition has to be enforced rather than assumed. The cap's BASE component is
-amount-independent, so at the lnv2 contract floor (5 sats) a 200-sat base cap admits a chunk that
-burns ~200 sats to move 5. The remainder re-emits every watch cycle with no minimum-progress
-guard, no attempt budget and no fee accounting, so a 75,000-sat balance drains in ~365 such
-chunks — delivering ~1,953 sats and burning ~73,047, a ~97.4% loss. That is not slow-but-safe; it is
-the evacuation destroying the balance it exists to rescue.
+A bounded, in-memory set-aside with a skip-until time, written on a PERFORM-level failure only
+and consulted by both route classes and by `Move`. Without it a gateway that answers
+`routing_info` and then hangs or refunds is reselected every tick and a viable alternative is
+never reached; that is the livelock the second route exists to prevent, moved one step along.
+The record is as wide as what the failure proved, and no wider:
+- an ENDPOINT failure — a rejected receive, a hang past the per-request timeout, a swap's
+  refunded send — marks `(federation, gateway)` at the end that failed (a swap failure marks
+  the gateway on both federations);
+- a HOP's refunded send proves only that this source NODE could not reach this destination
+  NODE, so it marks the ROUTE `(source node key, destination node key)` and nothing else —
+  node keys on both sides, because two URLs on one source node are one node, and marking a
+  URL would let its alias repeat the identical failed route. The same source stays eligible
+  for other destinations and for `Move`s, and another source node may still try that
+  destination.
+An empty sizing result does NOT write the record: it is a fact about one route at one amount on
+one attempt, the fallthrough already acts on it this tick, and a gateway-wide mark would wrongly
+suppress the same gateway on other routes, including `Move`s. Not persisted: a restart forgets,
+which is the right amount of memory for a liveness fact. The duration is a constant with a
+`ponytail:` note, not a policy field.
 
-**The parameterisation matters, and an earlier draft of this ADR got it wrong.** It said "base
-just under 200 sats", which CANNOT execute at the pin: `PaymentFee` derives a base-first
-lexicographic `PartialOrd` (`gateway_api.rs:190-200`), and the send leg is refused when its fee
-exceeds `SEND_FEE_LIMIT` (base 100 sats — `lnv2-client/src/lib.rs:590`, limit at
-`gateway_api.rs:209`) while the receive leg is refused against `RECEIVE_FEE_LIMIT` (base 50 sats —
-`lib.rs:905`, limit at `gateway_api.rs:223`). A 199-sat-base gateway therefore cannot execute, and the evacuation fails
-rather than burning — but WITH DIFFERENT TERMINAL CLASSES by split, and the send-heavy one is the
-worse shape. A receive-heavy split fails pre-commit in `MultiClient::receive` and maps `Retryable`.
-A send-heavy split fails at the send limit, and `GatewayFeeExceedsLimit` is a route rejection that
-`MultiClient::pay` identifies with `is_route_send_rejection` and maps to
-`SendError::RouteRejected`; the executor's `map_send_error` then classifies it
-**`Permanent`** — so the intent terminally FAILS with a committed receive
-outstanding, and because the occurrence advances each watch cycle and `idem_evac` embeds it, a
-fresh `Evacuate` is emitted and repeats the mint-then-fail loop. No burn either way; do not write
-a test or runbook expectation asserting `Retryable` for the send-heavy case. WHICH leg refuses depends on the split, and the
-send-heavy case is the one to reason from: a receive-heavy split (say 49 + 150) fails the receive
-limit before anything commits, but a send-heavy split (say 149 + 50, WITH A RECEIVE PPM AT OR UNDER 5,000 —
-at a receive base of exactly 50 the lexicographic `le` ties on base and falls through to the ppm,
-so a higher one refuses pre-commit and the example goes vacuous) PASSES the receive limit,
-mints and commits the receive leg, and strands at the send-limit check — with a committed receive
-already outstanding. Either way some leg of a 199-sat total must exceed its limit, since the
-compliant maximum is 100 + 50. What the SDK's limits
-do NOT prevent is the PPM: because the comparison is lexicographic on `base` first, a compliant
-base admits an arbitrary ppm.
+## What this rests on: vetted lists that mean something
 
-So the executable hostile shape is **bases 99 + 49 = 148 sats with an ASYMMETRIC, SEND-HEAVY ppm
-split: send 940,000 ppm, receive 10,000 ppm**, and the ~200 sats burned per chunk is the BASE
-PLUS THE PPM TERM, not a 200-sat base.
+Shared candidates come from the INTERSECTION of both federations' vetted lists, a hop leg from
+the list at its own end, and a route hint holds only while it is on every list it needs to be
+on. A federation's vetted list is the set of gateways that at least `NumPeers::threshold()` of
+its guardians each return, read per guardian — the SDK's own consensus threshold,
+`n − floor((n−1)/3)`, which is `2f+1` only when `n = 3f+1` (four guardians need three, five need
+four); the SDK's flattened union, where one guardian could admit a gateway, is not the list. Both are the routing-invariants work that ships before the
+hop. Enforcing the threshold can drop a thinly-registered production gateway from automated
+routing on ship day, so support is measured on the real federations first and gateways are
+registered on every reachable guardian.
 
-br-y2j owns the pinned fixture and every number in it: do not re-derive them here. Two facts
-belong in this ADR because they are decisions, not arithmetic — the SDK's limits bound each leg's
-BASE (100 sats send, 50 receive) but not the ppm, since the derived `PaymentFee` comparison is
-lexicographic on `base` first; and solvability is governed by the RECEIVE ppm alone, because the
-contract is `a − (rb + rp·a)`. Never cite a combined-ppm threshold.
+## Why not the alternatives
 
-**So serving requires ECONOMIC viability: `total_fee <= executed net`.** A route whose best
-available chunk costs more than it delivers does not serve, strict ordering falls through to the
-hop, and if neither class serves the evacuation stays `Retryable` — stranding rather than burning,
-which is the posture [ADR-0018](./0018-v1-evacuation-balance-cap.md) already accepts.
-
-Three properties of that rule worth stating, because each is easy to get wrong:
-- **It is a post-check on the search result, never a term in the fits predicate.** `fee(n) <= n`
-  is false at small `n` and true above `base/(1 - rate)`, so folding it into the bisection would
-  re-break the fits-then-doesn't monotonicity that search depends on.
-- **Check the search's top FIRST, but do not treat it as a proof.** For the affine model
-  `fee(n) = base + rate*n`, efficiency `fee(n)/n = base/n + rate` decreases monotonically in `n`,
-  so the largest fitting amount is also the most efficient — and that is the right place to look.
-  But the real quote is not affine: the two gateway fees, the two federation fees and the
-  per-note MINT fee each floor independently, and the note COUNT can change between adjacent
-  amounts, so `fee` can jump by more than the one-msat gain in `n`. At such a boundary the top
-  can fail `fee <= n` while a slightly smaller candidate passes.
-  So: if the top fails by AT MOST the oscillation bound `A` (the same `A` the robustness
-  contract uses) — `shortfall <= A`, equality included — probe candidates below it before
-  refusing the route. `A` bounds ONE vertical fee jump; it bounds neither the number of
-  discontinuities between a failing probe and a feasible window nor their horizontal spacing, so a
-  BOUNDED probe cannot guarantee "finds every amount that fits with `2A` of slack". Do not claim
-  it does. The contract is weakened deliberately: probe the adjacent note-selection boundaries,
-  bounded, and ACCEPT the residual that a feasible window separated from the probe by more
-  boundaries than are visited will be missed and the evacuation will keep retrying. That residual
-  is bounded in consequence (a retry, not a burn) and is the price of not scanning a
-  proven-complete boundary set. br-y2j carries a fixture whose feasible amount sits one boundary
-  from the failing probe; it demonstrates the mechanism, not completeness. Refuse only when the top fails by strictly MORE than `A` AND that is an analytically proven
-  structural refusal — `A` bounds ONE fee jump, so several boundaries can cumulatively exceed it
-  with a serving amount still beyond them; a bare shortfall over `A` is inconclusive, not proof —
-  or when the bounded probe finds nothing AND that emptiness is an analytically proven
-  structural refusal. Probe EXHAUSTION alone is inconclusive: it stays `Retryable` and must not
-  mark the route unavailable, which is the residual this ADR accepts a few lines above. The boundary belongs to the probe, not the refusal:
-  `br-y2j` must state the same `<=` or an implementation refuses an executable evacuation at
-  exactly `A` — refusing on
-  a single top-only reading would discard an executable evacuation at a note-count discontinuity.
-- **It applies per route class, including the hop.** The hop stacks two gateways' bases and is
-  ~80% dearer on the send leg, so its floor efficiency is worse, not better. The defect is in the
-  cap shape and the acceptance rule, not in which route is chosen.
-
-Accepted residual: a gateway pricing exactly at `fee == net` still extracts up to half the balance
-across chunks. An aggregate per-evacuation fee budget would bound that, at the cost of durable
-spend accounting and an episode identity across occurrence-keyed intents; it is the named
-follow-up if that residual is judged unacceptable, not part of this decision.
-
-**Nothing here concerns gateway pins.** Automated routing is never pinned; see
-[ADR-0030](./0030-automated-routing-is-never-pinned.md). An earlier draft of the implementing bead
-specified a four-case pin-precedence table for evacuation — that table is deleted, not answered.
-
-## Amendment (2026-08-18): structural-evidence evacuation supersession
-
-A bounded sizing probe that finds no fitting amount remains **`Retryable`**. Its emptiness is
-not proof that the route is unavailable, and this amendment neither records it as route
-unavailability nor weakens that retry rule. When the executor has fresh, typed structural
-samples, however, it durably records `EvacuationRefusalEvidence` on that pre-artifact
-retryable evacuation. That is operator/audit **evidence, not proof**.
-
-The narrow recovery is a component-wise monotone effective increase in the evacuation policy
-cap at the evidence's measured delivered-net sample. It permits only an **agent** evacuation
-whose refusal occurred before any artifact: the serialized actor atomically retires the old
-operation as `Failed`, creates a fresh `Pending` child with a distinct key and advanced
-occurrence, and writes forward and reverse supersession sidecars. Thus the old audit identity
-and its evidence remain preserved and linked; no row is rewritten. A `Pending -> Executing`
-claim consumes the marker, so it cannot later authorize replacement.
-
-Replacement planning is one-child exclusive: the child is the only decision admitted in that
-round. Executable ordinary decisions are retained separately from conflict suppression for
-pinned-input validation and a `tick-drop:`-keyed audit row with the explicit
-`replacement-exclusive` reason; they are never admitted, folded into reservations, or reported as
-accepted. Deferred `RefuseInflow` advisories instead retain their `refuse:` identity and
-diagnostics with the same replacement-exclusive error note.
-
-No child means no terminalization. A terminal parent, an artifact-bearing parent, an
-ambiguous authority/result, an equal/decreased/crossed cap edit, or a non-qualifying sample
-does not release the old intent. The standalone exclusive-DB path performs the same exchange
-but accepts it only when the supplied occurrence is advanced beyond the marked agent
-occurrence; the daemon advances occurrence through its scheduler. This is an evacuation
-exception, not a general policy-edit retry mechanism.
-
-## Why
-
-> Line references in this section cite the tree at `ed0d679`, where this ADR was recorded — the
-> code the diagnosis is ABOUT. Enforcement landed later (`e9cc97d`) and moved several of them.
-> They are deliberately NOT renumbered: today's `size_fresh_evacuation` no longer searches against
-> a constant `fee_cap`, so a citation pointing at today's lines would attribute the diagnosed
-> defect to the code that fixed it.
-
-**The absolute cap cannot fund a real evacuation, and it fails in TWO different ways depending on
-the gateway's fee shape.** Neither is what an earlier draft of this ADR claimed; both were
-established by reading the code rather than reasoning from the parameter.
-
-`size_fresh_evacuation` (`executor.rs:606-667`) searches for the largest net that satisfies
-`total_within_cap` — the sum of BOTH legs' quotes, each including the gateway's BASE fee, against
-`fee_cap` (`fee.rs:160-164`, `executor.rs:814-829`). What happens next depends entirely on whether
-any candidate clears that predicate:
-
-1. **Base fees below the cap → CHUNK-DRAIN.** A smaller net fits, so the evacuation is silently
-   downsized (`executor.rs:654-663` warns "reducing fresh evacuation amount"). The allocation
-   occurrence advances every watch cycle (`scheduler.rs:692-697`) and `idem_evac` embeds it
-   (`allocator.rs:629`), so a fresh `Evacuate` is emitted for the remainder. At the figures below
-   the federation drains in roughly 27 operations at essentially the same total fee. This is what
-   the pilot's MEASURED gateway does.
-2. **NO AMOUNT FITS THE CAP → GENUINE REFUSAL.** The condition is about the whole search, not
-   one quote: a single over-cap quote at the desired size is NOT a refusal, because
-   `size_fresh_evacuation` downsizes (see the sizing rules above). Genuine refusal is when no
-   amount fits at all — characteristically when the fixed component alone (the two legs' bases
-   plus the fee floor) already exceeds the cap, so shrinking the amount cannot help.
-   The per-quote test underneath it is: **a summed two-leg quote STRICTLY ABOVE the cap fails.** State it about the
-   QUOTE, not about base fees: `total_within_cap` compares `receive_quote + send_quote <= fee_cap`
-   (`wallet-fedimint/src/fee.rs:163`). Exact equality is ADMITTED — only cap-plus-one-msat
-   refuses, the same boundary as the `shortfall <= A` probe rule. Note the consequence for bases
-   specifically: bases summing to exactly the cap still refuse whenever ANY other component (the
-   ppm parts, federation or mint fees) is nonzero, because the comparison is on the total. "Base
-   fees at or above the cap" is wrong twice over — wrong term, wrong boundary. The base component does not shrink with
-   the amount, so if the two legs' bases alone exceed `fee_cap`, NO candidate ever fits and the
-   executor returns `Retryable` (`executor.rs:646-653`) on every tick — a livelock, not a terminal
-   failure, so it retries silently forever. A gateway is permitted bases summing to ~150 sats
-   against the runbook's 50-sat cap, so this is not hypothetical.
-
-Both defeat the intent. `allocator.rs` passes `fee_cap: snapshot.max_fee` for `Evacuate` directly
-beneath a comment stating that "route economics NEVER gates an evacuation — a dying federation must
-be drained even when the route prices badly". The parameter contradicts the intent. At the
-runbook's own suggested settings, using fees measured on the pilot gateway:
-
-| | |
-|---|---|
-| per-federation cap | 75,000,000 msat |
-| measured swap cost at 1,000,000 msat | 17,848 msat (1.78%) |
-| same rate on a full federation | ~1,338,600 msat |
-| `--max-fee` absolute cap | 50,000 msat |
-| | **~27× over — chunk-drain on this gateway; refusal on a higher-base one** |
-
-No evacuation has ever run in production, so neither failure mode has been observed with real
-funds.
-
-**A flat percentage would fail at the other end.** A gateway's INTENDED fee envelope is
-`SEND_FEE_LIMIT` (100 sats + 1.5%) plus `RECEIVE_FEE_LIMIT` (50 sats + 0.5%) — about 150 sats + 2%.
-Treat that as a design intent, NOT an enforced bound: at our pinned SDK revision the limits do not
-actually constrain a gateway, because `PaymentFee` derives a lexicographic `PartialOrd` over
-(`base`, `parts_per_million`) and the check is a single `.le(...)`, so a fee with a small base and
-an arbitrarily large ppm passes. (This is the upstream defect this project reported separately; our
-own cap is what really bounds us, which is another reason it must be shaped correctly.) The base
-component dominates at small amounts: a legitimate worst-case fee is 2.2% of a
-75,000-sat evacuation but 17% of a 1,000-sat one. A pure percentage refuses exactly the
-evacuations that are cheapest in absolute terms, which is the same defect mirrored. Base +
-proportional tracks the real cost at every size, which is why the fees themselves are shaped that
-way.
-
-**Relationship to [ADR-0018](./0018-v1-evacuation-balance-cap.md), which decided the adjacent
-question the other way.** ADR-0018 chose a hard low balance cap *instead of* an escape hatch,
-accepting that a dying federation may "strand a capped amount until/unless recovery", with a
-gateway-independent escape "pulled into EARLY v2". This ADR does not overturn that. What ADR-0018
-deferred was **gateway-independent** escape — on-chain peg-out. A two-gateway Lightning hop is
-still gateway-*dependent*: it relaxes "one gateway serves both federations" to "each federation has
-some gateway". That is a genuinely weaker requirement, it is Lightning-only so
-[ADR-0004](./0004-v1-lightning-only.md) still holds, and it appears not to have been weighed as an EXECUTABLE route. Provenance, to be fair to
-the earlier decision: ADR-0004 already names the ladder as "shared-gateway swap, then
-public-Lightning", so the rung was chosen there. What was never worked out is how to make it
-execute — the fee cap, the sizing, the route kind — which is what this ADR supplies.
-
-**The balance cap stays where it is.** The fallback still fails when NO vetted source-side gateway serves or is
-reachable — there is no singular "the federation's gateway"; each leg selects from that
-federation's vetted list — or if no gateway on either side has liquidity, so it reduces the probability of
-stranding without making evacuation reliable. Treating it as reliable would justify raising the
-per-federation cap, and that is the change that could actually lose money if the assumption proves
-optimistic. ADR-0018's low cap remains the real mitigation, and it is now unconditional:
-ADR-0018's Consequences RESOLVED the "refuse or warn" ambiguity on 2026-08-05 in favour of
-REFUSING wallet-controlled balance increases above the threshold, precisely so this sentence does
-not rest on something a user can click past.
+- **Sizing both classes and picking the cheaper.** Adds a full second sizing search to every
+  evacuation to save ~0.7% on the rare tick a swap serves only a small chunk. The strict ordering
+  plus viability is enough.
+- **A pair scan with a fixed bound (the earlier text).** Defended against an adversarial guardian
+  inflating a vetted list; that guardian is already inside the federation the user trusts with
+  custody and has cheaper levers. The pair space itself does not exist once the legs are seen
+  as independent.
+- **A proven-refusal gate before the hop (the earlier text).** Required a classification the
+  sizing code cannot compute and blocked the hop on a separate bead. Withdrawn above.
+- **On-chain peg-out.** ADR-0004 is Lightning-only; ADR-0018's gateway-independent escape stays
+  deferred. The hop relaxes "one gateway serves both" to "each federation has some gateway",
+  which is weaker but still gateway-dependent, so ADR-0018's low balance cap remains the real
+  mitigation and is not raised on the strength of this route.
+- **Reputation or liquidity bars on the destination gateway.** Every extra bar is another way
+  the escape hatch fails to open.
 
 ## Consequences
 
-- **The ledger reports the pair that EXECUTED, not the pair that was planned.** Because the cap
-  is recomputed at the net the evacuation sized down to, a row still showing the planned amount
-  and the planned cap describes a move that never happened, and a post-incident fee audit would
-  clear fees the enforced cap refused. The two are therefore refreshed together onto the ledger
-  row from the `MoveRecord` that holds them, never one alone: `amount = planned,
-  fee_cap = enforced` is internally false, since recomputing the cap from the displayed amount
-  yields a different number. They are refreshed only ONCE A LEG HAS COMMITTED — before that the
-  move row is a re-sized draft, and a pre-mint refusal would otherwise freeze a never-executed
-  pair onto an immutable terminal row.
-- **Reading the enforced cap back needs `--standalone`, today.** `wallet-cli --standalone show`
-  prints `amount_msat` and `fee_cap_msat` adjacent (`print_show_record`), and its `--json` emits
-  the whole `OperationRecord`. Neither daemon-backed view carries the cap: `history` has no cap
-  column, and client-mode `show` renders `OperationView` (`wallet-api/src/lib.rs`), which has
-  `amount`, `receive_fee` and `send_fee_quoted` and no `fee_cap` field at all. So the row is now
-  correct, but on a normal deployment an operator cannot yet see it — a gap this ADR's
-  implementation exposes rather than creates, tracked separately.
-- **`Evacuate` and `Move` no longer share a fee-cap shape.** A reader comparing them will find
-  `Move` proportional-only and `Evacuate` base + proportional; that asymmetry is deliberate and
-  exists because only one of them must succeed.
-- **The cap numbers are a starting point, not a derivation.** 200 sats + 3% covers the gateway's INTENDED
-  envelope (~150 sats + 2%) with headroom at every size. That envelope is not enforced at our pin
-  (see above), so this is not a proven bound on the wallet's total cost either: federation receive/send fees and mint-note fees also apply, and those are not bounded
-  here. Treat the constants as a pilot starting point, not a worst-case derivation. They should be
-  revisited if the per-federation cap changes or if measured gateway fees move.
-- **The fallback costs more.** Measured on the pilot gateway, the external send leg was 16,064
-  msat against 8,948 for the swap on the same 1,000,000 msat — roughly 80% dearer, because the
-  lnv2 internal-swap discount (`send_fee_minimum`) does not apply across two gateways. That is
-  accepted: it only applies when the alternative is not moving at all.
-- **The fallback adds no new trust.** Both legs remain hash-locked, and the destination client
-  derives the preimage, so a gateway on either side still cannot take funds without delivering.
-  See [ADR-0018](./0018-v1-evacuation-balance-cap.md) and the `Stranded` analysis for what remains
-  reachable — a Byzantine destination federation, which is the standard custodial assumption and
-  is unchanged by route count.
-- **Route ordering is strict, with ONE bounded exception.** The swap is always tried first
-  because it is cheaper; the hop is reached only when no gateway serves both ends — established
-  by examining the whole shared candidate set, not a prefix of it.
-  THE EXCEPTION covers BOTH truncation causes, because either can leave a serving shared
-  candidate unexamined: the candidate-COUNT bound (a guardian can inject entries without bound) and
-  the WALL-TIME bound (even a short, honest list can exhaust the per-class deadline if its
-  gateways answer slowly). In both cases the hop MAY be taken with a shared candidate unexamined —
-  an honest list is not guaranteed a complete scan, only a bounded one.
-  MIND THE HOP CLASS'S CARDINALITY, AND EXCLUDE THE DIAGONAL: the pair set is
-  `{(s, d) : s ∈ source, d ∈ destination, s ≠ d}`. `N` IS A FIXED CONSTANT, NOT THE PAIR COUNT —
-  sizing it FROM the product would make it attacker-controlled, since the union is unbounded.
-  Choose it to cover the honest pair space — two six-gateway lists give 36 when DISJOINT (30 only
-  if they fully overlap), so 36 is the floor if six-per-side is the design point and accept the same residual the shared class carries: beyond that, a viable pair can sit
-  outside the window and not be reached this tick. Covering the honest space is a sizing GOAL, not
-  a guarantee under attack. Where the two vetted lists overlap the raw
-  product contains `(g, g)`, which is NOT a hop — CONTEXT.md defines a hop as TWO gateways, and
-  pricing `(g, g)` with external-send assumptions would persist an unavailable shared gateway as
-  though it were one. The cardinality is therefore `|source| × |destination| − |overlap|`, so two honest six-gateway
-  lists already exceed a 32-candidate bound without any adversary at all. The bound must therefore
-  be sized against the PAIR space. The alternative of traversing the Cartesian product ACROSS
-  ticks is NOT available here: this design keeps no cross-tick state and takes a fresh prefix of
-  an order the SDK reshuffles per call, so there is nothing to advance. Without a product-sized
-  per-tick bound a sole viable low-support pair sits outside a support-ordered window every tick
-  and is never reached. "Honest lists fit one scan" is true of the shared class and false of the hop.
-  The count bound is —
-  count alone is not enough. Fetch `routing_info` ONCE PER UNIQUE `(federation, gateway)` LEG for
-  the whole perform, and reuse it across every pair that mentions that leg AND across both sizing
-  passes. Per-PAIR fetching repeats identical lookups — two six-gateway lists need 12 unique leg
-  snapshots but would make up to 72 calls — and at the 10-second request timeout that alone can
-  exhaust `perform_timeout` before the hop is ever reached,
-  cancelling the operation and restarting the scan from nothing. Bound the elapsed time per route
-  class so the hop is always attempted within the operation's budget — AND SO THAT SETTLEMENT
-  STILL FITS. A budget sized only to REACH the hop can consume `perform_timeout` before invoice
-  creation and payment, so the future is cancelled and the next tick restarts the scan: a livelock
-  that satisfies "the hop was attempted" while never completing. The scan deadlines must reserve
-  explicit time for commit, and the acceptance case must assert COMPLETION, not merely that the
-  hop was reached. A longer list is scanned
-  truncated —
-  the hop is therefore reachable without every shared candidate having been examined. A bounded, deliberate departure, stated precisely because the honest version is
-  weaker than "never a stranding". `gateways()` shuffles and then STABLE-sorts by how many peers
-  lack each URL, so the window is support-ordered and randomised only WITHIN equal-support ties.
-  Two consequences, and neither is "random sampling": a low-support serving candidate sitting
-  behind a full window of higher-support entries is excluded DETERMINISTICALLY, every tick, not
-  probabilistically; and conversely a single guardian's injected entries sort LAST and cannot
-  displace a widely-vetted serving candidate from the window at all. What follows in the ordinary case is a dearer route — the hop is
-  tried meanwhile, still capped and viability-checked. Stranding needs BOTH the shared candidate
-  to keep being missed AND no examined hop pair to work; that is unlikely but not excluded, and it
-  is the price of not carrying cross-tick state. During an evacuation a worse counterparty beats
-  stranding the balance, which is why the hop is tried rather than waiting for coverage. It is
-  NOT a licence to hop while an examined candidate serves.
-  No reputation or liquidity bar gates the
-  fallback: during an evacuation a worse counterparty beats stranding the balance, and every extra
-  bar is another way the escape hatch fails to open.
-- **Neither change makes evacuation reliable**, and no document should claim it does. The honest
-  statement remains: evacuation is best-effort, bounded by the balance cap, and dependent on at
-  least one gateway being reachable on each side.
+- Evacuation is best-effort: bounded by the balance cap, dependent on at least one vetted,
+  validating gateway on each side, and on the two nodes being able to reach each other. No
+  document may call it reliable.
+- The ledger reports the pair that EXECUTED and the cap enforced at that net, refreshed together
+  once a leg has committed (`ALC-20`); a hop row shows both gateways, and the operator can read
+  which route was taken from `history` / `show`.
+- The live gate needs two federations whose vetted gateways sit on different Lightning NODES
+  with no node vetted by both — node keys, not URLs, since two URLs can front one node. With
+  per-guardian registration (`wallet-cli/tests/devimint_lib.sh`) that is registering devimint's
+  LND gateway on federation A only and its LDK gateway on federation B only: `dev-fed` connects
+  both gateways to A, and the two-fed harness patch connects and funds only the LDK gateway on
+  B, so LDK is the one gateway that can serve B. The two run on distinct nodes by construction.
+  No harness change is needed.
+- The fee-cap constants are a pilot starting point, not a derivation: federation and mint fees
+  also apply and are not bounded here. Revisit if the per-federation cap or measured gateway
+  fees move.

@@ -170,8 +170,9 @@ low.net > 0`, `rise = high.fee − low.fee`, `cap_rise = bps × span`, `fee_rise
 and `fixed = low.fee − rise × low.net / span`: `fee_rises_no_faster_than_cap = cap_rise ≥
 fee_rise`; `fixed_component_exceeds_cap_base = fee_rise ≥ cap_rise && fixed > base && low.fee >
 cap.at(low.net)`; `is_structural` is the **OR** of the two. The caller must separately establish
-both samples are over their caps. It is two-point evidence on a non-monotone curve, not a proof
-(`F5`).
+both samples are over their caps. It is two-point evidence on a non-monotone curve, not a proof;
+since 2026-09-09 nothing requires a proof — the evidence feeds the supersession audit record only
+(`F5`, closed).
 
 ## Probes and discovery
 

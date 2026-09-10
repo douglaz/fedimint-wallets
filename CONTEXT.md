@@ -137,10 +137,13 @@ viable amount can be sized over it (total fee never exceeding what it delivers),
 **performs** — completes every leg it quoted, both legs on a **shared route**. A **shared route** is served only by a
 gateway on **both** federations' lists; each **hop** leg is served by a gateway on the list of the
 one federation at its end. Registry presence is not the test, and neither is a single miss:
-being unable to fund the full ask is an instruction to move less, one over-cap quote is not
-"no amount fits", and an empty bounded sizing result is inconclusive, not a refusal.
+being unable to fund the full ask is an instruction to move less, and one over-cap quote is not
+"no amount fits". An empty bounded sizing result does not refuse the **Evacuation**: it means
+that route does not serve THIS attempt, so the next route class is tried, and the next fresh
+attempt starts over. A gateway that quoted and then did not perform is set aside for a while
+rather than chosen again at once.
 Target per [ADR-0029](docs/adr/0029-evacuation-must-be-executable.md); the source-list and
-performs clauses are not built yet (open finding F6, `br-s0e`).
+performs clauses are not built yet (open finding F6).
 _Avoid_: "supports", "is available for" — both get read as registry presence.
 
 **Break-glass gateway override**:
@@ -168,12 +171,14 @@ not by this glossary. `direct-inflow` is the one an implementer is most likely t
 smokes fund through it, so classifying it as rejected or ignored breaks the funding step.
 
 **Vetted list**:
-The gateways a federation's guardians have admitted for lnv2, and the only input to automated
-route selection; an operator's **break-glass gateway override** deliberately steps outside it,
-and nothing automated ever does. Adding to it is a per-guardian action, not a wallet one, which
-is why the break-glass exists.
-Per [ADR-0030](docs/adr/0030-automated-routing-is-never-pinned.md). The list is still a union
-of guardian answers (F6, `br-gw-threshold-membership-k4t`).
+The gateways a federation has admitted for lnv2: those that a consensus threshold of its
+guardians (the same threshold every consensus answer needs, which is three of four guardians
+and four of five) each name, not every gateway any one guardian names. It is the only input to automated route selection; an operator's **break-glass
+gateway override** deliberately steps outside it, and nothing automated ever does. Each guardian
+keeps its own list and admits a gateway by its own admin action, so getting a gateway vetted
+means registering it on enough guardians, which is why the break-glass exists.
+Per [ADR-0030](docs/adr/0030-automated-routing-is-never-pinned.md); the threshold rule is the
+target (F6, `br-routing-invariants-f6f7-dwx`) — today's read is a union of guardian answers.
 _Avoid_: "registered gateways" when you mean routable ones — presence in the list is not
 **serving** a route.
 
@@ -207,12 +212,23 @@ _Avoid_: "pin"; "persisted route" (ADR-0030's earlier wording for the same thing
 
 **Shared route** / **Hop**:
 A **shared route** is one gateway serving both ends (an internal swap). A **hop** is
-two different gateways, one serving each end, bridged over Lightning. The distinction
-is economic, not one of trust: both legs stay hash-locked either way, and the hop
-simply costs more because the internal-swap discount does not apply across two
-gateways.
+two gateways on two DIFFERENT Lightning nodes, one serving each end, bridged over
+Lightning. "Different" is about the node behind the gateway, never the URL: two URLs on one
+node are one gateway, and treating them as a hop makes the sender look for a swap it cannot
+find. The distinction is economic, not one of trust: both legs stay hash-locked either way,
+and the hop simply costs more because the internal-swap discount does not apply across two
+nodes. Each leg's gateway comes from that end's **vetted list** and each end's fee schedule
+is read on its own, but the price of a hop is composed: the destination's receive fee sets the
+invoice, and the source's send fee is charged on that invoice, so the two are ranked together,
+cheapest composed cost among the different-node combinations first, and the next one is tried
+when the first, after ordinary downsizing, still sizes to nothing viable (being unable to fund
+the full ask is an instruction to move less, never a reason to move on). Whether the two nodes can actually reach each other over
+Lightning is learned only by paying; a failed hop payment sets aside that one node-to-node
+route for a while, not the gateways themselves, while a gateway that fails to **perform** at
+its own end is set aside as a gateway.
 _Avoid_: "direct" for the shared route — it invites the idea that the hop is
-indirect and therefore less safe, which is not the difference.
+indirect and therefore less safe, which is not the difference; "pair scan" for a hop — the
+legs are priced separately and only the node rule couples them.
 
 **Lightning Address**:
 A human-readable receive handle (`user@domain`) that resolves via LNURL-pay to
