@@ -276,21 +276,22 @@ shape with `occurrence = occurrence_from_nonce(nonce)`, and `MoveRequest.occurre
 head attaches to the probe's `Intent` and `MoveRecord` (`STO-6`, `DOM-16`, `OPS-8`). The
 separation is probabilistic, not excluded, and probe keys are reconstructible from a session that
 history exposes. An implementer building to `STO-6` today is building a key the fix will change.
-Two properties of the fix are settled and belong here; the design itself is the bead's.
+Two things are settled and belong here; the design is the bead's.
 
-No **legacy read** is needed whichever variant wins: that is the shim `OVR-14` forbids, and
-`STO-24` puts every move-shaped row in the never-repaired class, so rows already written keep
-their shape and go on being skipped. (The bead's earlier legacy-read requirement was withdrawn on
-2026-09-11.) A new `classify_key` prefix is needed only by the `probe-leg:` variant; a reserved
-occurrence range keeps the `move:` shape and the existing classification.
+**The repair path needs no change and no compatibility read.** `classify_key` already sends every
+unrecognised prefix to `Other`, the never-repaired class that `move:` rows land in today
+(`STO-24`), so neither a `probe-leg:` prefix nor a remapped occurrence requires touching it, and no
+old probe-leg key is ever read back there. (The bead's earlier legacy-read requirement was
+withdrawn on 2026-09-11.)
 
-And the **rollout is the hard part, in both directions**. A `ProbeSession` persists only the nonce
-and parameters, so each build reconstructs the leg key from the nonce — and every variant that
-actually closes the hole changes what gets reconstructed for a session already in flight, whether
-by changing the shape or only the occurrence. An upgrade or a rollback mid-probe can therefore
-strand or duplicate a leg, so a version field alone is not enough: it needs probes drained on both
-sides of the deploy, or two builds that each understand both mappings. Settle that in the bead
-before writing code.
+**The rollout is the hard part, in both directions.** A `ProbeSession` persists only the nonce and
+parameters, so each build reconstructs the leg key from it — and any fix that actually closes the
+hole changes what gets reconstructed for a session already in flight, whether by changing the shape
+or only the occurrence. An upgrade *or a rollback* mid-probe can therefore strand or duplicate a
+leg, and a version field does not help, since the older binary ignores it. Draining probes on both
+sides of the deploy is the only remedy that needs no compatibility read; a build that understands
+both mappings is one, and would need an explicit `OVR-14` exception. Settle that in the bead before
+writing code.
 Open — `br-probe-user-move-key-collision-fy7`.
 
 **F45. The gateway `routing_info` POST reaches any URL a guardian lists.** `FMI-11`'s validation
