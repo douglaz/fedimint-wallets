@@ -278,9 +278,15 @@ building to `STO-6` today is building the shape that is slated to change. `class
 new prefix but **no legacy read** — that would be the shim `OVR-14` forbids, and it would buy
 nothing, since `STO-24` puts every move-shaped row in the never-repaired class, so rows already
 written keep their shape and go on being skipped. The bead's earlier legacy-read requirement was
-withdrawn on 2026-09-11. What it still leaves open: a `ProbeSession` in flight across the upgrade
-holds leg keys in the old shape, so either probes are drained before deploying or the
-reserved-occurrence variant of the fix — which changes no key shape — is preferred.
+withdrawn on 2026-09-11. What it still leaves open is the rollout: a `ProbeSession` persists only
+the nonce and parameters, so an upgraded build recomputes each leg key from the nonce — and
+**both** candidate fixes change what it computes. A `probe-leg:` prefix changes the shape outright;
+a reserved occurrence range only separates the two populations if probe occurrences are *remapped*
+into it, which changes the key for every session whose nonce head fell outside the range (and
+rejecting user occurrences alone, without that remap, leaves today's probe occurrences collidable,
+so it does not close the hole). Either way an in-flight probe is stranded or duplicated across the
+deploy unless probes are drained first or `ProbeSession` is versioned and migrated. Neither variant
+is the key-shape-preserving option.
 Open — `br-probe-user-move-key-collision-fy7`.
 
 **F45. The gateway `routing_info` POST reaches any URL a guardian lists.** `FMI-11`'s validation
