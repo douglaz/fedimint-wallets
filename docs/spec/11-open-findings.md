@@ -234,8 +234,9 @@ wired yet"; a test comment claiming `Policy` is `deny_unknown_fields`; `fedimint
 `fedimint-mechanics.md`'s "hard fee cap" (now cites `FMI-19`) — were fixed 2026-09-10 in the
 spec review pass, and the `TimeoutExecutor` item is withdrawn 2026-09-11: its doc comment is
 accurate for the `Runtime`-direct paths that are the only ones to build it (`OPS-15`), so four
-code-comment items stand. The bead still lists all seven and a "stale `executor.rs` line
-citations" item this finding never carried; it needs a `br update` to match. Each is a one-line fix; none is a
+code-comment items stand, plus the runbook's and `fedimint-mechanics.md`'s stale line citations,
+which the bead carries and this finding had not. The bead was updated to match on 2026-09-11.
+Each is a one-line fix; none is a
 behaviour gap. Open — `br-stale-doc-comments-sweep-zjx`.
 
 **F40. `policy set` from an older CLI silently resets a field a newer daemon added.** The CLI
@@ -273,11 +274,14 @@ head attaches to the probe's `Intent` and `MoveRecord` (`STO-6`, `DOM-16`, `OPS-
 separation is probabilistic, not excluded, and probe keys are reconstructible from a session that
 history exposes. The fix namespaces probe legs, which moves the persisted key shape and
 `classify_key`'s prefix set (`STO-6`, `STO-24`) — an implementer
-building to `STO-6` today is building the shape that is slated to change. The bead requires that
-`classify_key` gain the new shape "with a legacy read"; that conflicts with `OVR-14`, which permits
-no compatibility shim beyond `serde(default)`, and `STO-24` puts every move-shaped row in the
-never-repaired class, so `classify_key` has nothing to read back. Resolve that in the bead before
-building. Open — `br-probe-user-move-key-collision-fy7`.
+building to `STO-6` today is building the shape that is slated to change. `classify_key` needs the
+new prefix but **no legacy read** — that would be the shim `OVR-14` forbids, and it would buy
+nothing, since `STO-24` puts every move-shaped row in the never-repaired class, so rows already
+written keep their shape and go on being skipped. The bead's earlier legacy-read requirement was
+withdrawn on 2026-09-11. What it still leaves open: a `ProbeSession` in flight across the upgrade
+holds leg keys in the old shape, so either probes are drained before deploying or the
+reserved-occurrence variant of the fix — which changes no key shape — is preferred.
+Open — `br-probe-user-move-key-collision-fy7`.
 
 **F45. The gateway `routing_info` POST reaches any URL a guardian lists.** `FMI-11`'s validation
 POSTs to `SafeUrl::parse(gateway).join("routing_info")` for every URL on a federation's vetted
