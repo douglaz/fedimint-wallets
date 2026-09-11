@@ -136,7 +136,8 @@ exception. The types that ride the **live stores** written by the running daemon
 `ProbeRecord`, `CandidateRecord`, `WatchState`, `Policy`, `EvacuationSupersessionRecord`, **every
 type serialized inside one of those** (transitively — a nested struct's new field is the row's
 new field), and `MoveMeta`, which rides the SDK operation log; that
-list, not this paragraph, is authoritative (`DEF-13`). New fields on those types use `#[serde(default)]` (with a *named* default function for
+list, not this paragraph, is authoritative (`DEF-13`), and `STO-32` records the historical
+no-default exceptions. New fields on those types use `#[serde(default)]` (with a *named* default function for
 numeric fields, since a bare default yields zero) so an existing row still decodes. A move
 record cannot be re-created by re-running a command. Do not remove these as cleanup; every
 other kind of back-compat shim is still unwelcome.

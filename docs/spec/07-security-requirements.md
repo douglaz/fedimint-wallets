@@ -46,7 +46,10 @@ early return on a length mismatch: the token's length is observable, its bytes a
 expires.
 
 **SEC-3** The bind address is configuration, not an invariant: `address` in `walletd.toml`
-accepts `0.0.0.0`. There is no TLS, no rate limiting, no CORS handling (`API-1`), and the daemon
+accepts `0.0.0.0`. There is no TLS, so on any non-loopback bind the bearer token crosses the
+network in cleartext and a passive observer can replay it against every route — the only safe
+deployments are the loopback default or an authenticated tunnel in front of it (the runbook's
+posture); the daemon does not enforce either. There is no rate limiting, no CORS handling (`API-1`), and the daemon
 installs no request timeout, body limit or connection cap of its own — the JSON extractor's
 default body limit and the two handler deadlines (invoice mint, await long-poll) are the only
 bounds. An operator who binds beyond loopback has extended the trust boundary to the network with

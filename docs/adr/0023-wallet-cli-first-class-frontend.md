@@ -13,7 +13,9 @@ amended-by: ADR-0028, ADR-0031
 > CLI's status as a permanent, shipped surface is unchanged.
 
 The wallet is an **engine** (`wallet-core` pure logic + `wallet-fedimint` SDK integration)
-with **two permanent, co-equal frontends** over its public API: the **Android app** (Slint UI,
+with — as originally decided — **two permanent, co-equal frontends** over its public API (now
+three: the web sidecar of the amendment above is the third, and the consequences below predate
+it): the **Android app** (Slint UI,
 the consumer product) and **`wallet-cli`** (headless, scriptable). `wallet-cli` is NOT a test
 shim — it is a shipped, maintained-forever wallet, as important as the app.
 

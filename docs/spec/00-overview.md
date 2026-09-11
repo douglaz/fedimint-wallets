@@ -95,8 +95,9 @@ the same engine and drive it from platform wakes; that seam is not yet built (`F
 **OVR-11** No on-chain evacuation (`ADR-0004`, `ADR-0018`), no Cashu, no iOS, no multi-device,
 and no LNURL/Lightning address in this version. The last is a deviation from `ADR-0004`, which
 placed Lightning Address and LNURL-pay **in** v1; the built scope defers them together with their
-provider, recurringd (`ADR-0013`), and the only record of that deferral is the roadmap's
-"Explicitly v2+" line (`docs/roadmap-to-v1.md`) — no ADR amends `ADR-0004`.
+provider, recurringd (`ADR-0013`); the deferral is recorded in the roadmap's "Explicitly v2+"
+line (`docs/roadmap-to-v1.md`) and in `ADR-0004`'s build note — the ADR's decision text
+itself is unamended.
 
 **OVR-12** No Tor. Reliability over network anonymity; "private" means no KYC, a blind provider,
 and private receives, not network-level anonymity (`ADR-0002`, `CONTEXT.md` **Private**).

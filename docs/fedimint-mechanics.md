@@ -54,9 +54,12 @@ ADR-0022 — see "What this means for us".
 
 ## 4. Send (the source/A side) — idempotency is client-local
 - `send(invoice, gateway?, meta) -> OperationId` (`lnv2-client/lib.rs:538`). The SDK's
-  `SEND_FEE_LIMIT` (100 sat + 1.5%) is enforced lexicographically on `(base, ppm)`, not as a
-  cap on the fee charged — see `FMI-19`; the SM self-refunds on gateway forfeit or expiry, with
-  the forfeit-promoted-to-success exception in `FMI-23`.
+  `SEND_FEE_LIMIT` (`base` 100 sat = 100,000 msat, `parts_per_million` 15,000) is enforced
+  lexicographically on `(base, ppm)`, not as a cap on the fee charged — `(99 sat, 50,000 ppm)`
+  passes, `(100 sat, 15,001 ppm)` fails, `(101 sat, 0 ppm)` fails — see `FMI-19`. Terminal
+  rule: gateway forfeit or invoice expiry enters `Refunding`; a successful refund ends
+  `Refunded`; refund outputs rejected but a valid preimage found ends `Success`; otherwise
+  `Failure` (`FMI-23`, `FMI-37`).
 - **The federation does NOT dedup by payment hash** (outgoing contracts keyed by funding
   outpoint, fresh keys per contract — `lnv2-server/lib.rs:552`). But the **client does**:
   the deterministic op id `from_encodable((invoice, attempt=0))` + an `operation_exists`

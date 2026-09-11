@@ -367,7 +367,7 @@ occupy the slot a later `restore-mnemonic` needs.
 ## Signals a federation emits, and what the wallet does with them
 
 **FMI-24** From the authenticated `ClientConfig`: `guardian_count = api_endpoints.len()`,
-`threshold` = the SDK's `NumPeers::threshold()`, which is `n − (n−1)/3` (equal to `2f+1` only
+`threshold` = the SDK's `NumPeers::threshold()`, which is `n − floor((n−1)/3)` in integer arithmetic (equal to `2f+1` only
 when `n ≡ 1 mod 3`; the `probe.rs` comment saying `2f+1` is stale), module kinds (the `kind`
 string of every entry in `config.modules`, in module-instance-id order), `has_lnv2`,
 wallet-module presence, `is_mainnet`. The scorer rejects a threshold below the BFT bound

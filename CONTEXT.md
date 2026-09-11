@@ -53,8 +53,8 @@ anonymity (no Tor in v1, see
 _Avoid_: "anonymous", "untraceable"
 
 **Silent backup / Recovery**:
-The seed and the user's joined federation invite codes are saved automatically via Android
-Block Store (E2E-encrypted to the user's Google account, keyed to the device
+**Target, not built** (`ADR-0003`; no Android frontend exists, F28): the seed and the user's
+joined federation invite codes are to be saved automatically via Android Block Store (E2E-encrypted to the user's Google account, keyed to the device
 lockscreen), with no seed-phrase ceremony at onboarding. On a new device the seed
 restores during setup and balances are rebuilt from it via Fedimint recovery. See
 [ADR-0003](./docs/adr/0003-recovery-silent-backup.md).
@@ -62,9 +62,9 @@ restores during setup and balances are rebuilt from it via Fedimint recovery. Se
 local stores.** Recovery rebuilds balances from the seed; it does not reinstate a
 point in time. Because the money is recoverable this way, losing the bookkeeping
 store loses records, not settled funds.
-Block Store is the Android target and is not built (no Android frontend exists, F28). On the
-headless daemon the backup unit is held by the operator: the seed via `walletd mnemonic` plus
-every joined invite (`SEC-24`).
+**Current supported path**: on the headless daemon the backup unit is held by the operator —
+the seed via `walletd mnemonic` plus every joined invite (`SEC-24`) — and recovery is
+`recover <invite>` per federation (`FMI-30`).
 _Avoid_: making "seed phrase backup" the default flow (it is an opt-in export);
 calling a copy of the local stores "the backup"
 

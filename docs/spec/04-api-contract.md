@@ -401,12 +401,13 @@ integers 0–255** on every DTO — `PayRequest.fed`, `MoveRequest.from/to`,
 `Policy.spending_fed/standby_fed`, `FederationView.id`, `CandidateView.id`,
 `WatchStatusView.discover_cursor`, `RefusalDiagnostics.source` — and is **64-character
 lower-hex** only inside the daemon-private `/v1/status` body (`API-15`); no route accepts hex
-in a request. `Msat` and `Occurrence` are bare unsigned integers (transparent newtypes,
-`STO-5`). `OperationStatusDto`, `ApiErrorKind` and `RefuseReason` are `snake_case`-renamed
+in a request. `Msat` and `Occurrence` are bare unsigned integers — newtype structs, which
+serde writes as the inner value with **no** attribute (`STO-5`); they are the only
+newtype-shaped wire values. `OperationStatusDto`, `ApiErrorKind` and `RefuseReason` are `snake_case`-renamed
 enums (`API-5`, `API-12`); `kind`, `actor`, `reason`, `source`, `state`, `structural` are plain
 strings whose vocabularies `API-12` and `API-17` list. Object keys are the Rust field names
-verbatim: no type in `wallet-api` carries `rename`, `rename_all` on a struct, `flatten` or
-`transparent`.
+verbatim: no struct in `wallet-api` carries `rename`, `rename_all`, `flatten` or
+`transparent` (the two newtypes above need none to serialize bare).
 
 **API-33** `OperationView` field table. "always" means the key is present in every response
 and is `null` when the value is absent; "omitted" means the key is absent from the JSON when

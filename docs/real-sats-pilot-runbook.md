@@ -100,8 +100,9 @@ money operation is safe to admit.
 Choose federations whose guardians speak the **WebSocket (WSS)** API transport. The iroh
 transport's long-poll can STALL on sustained waits — a cross-fed Move's receive-claim await
 over an iroh federation hung indefinitely in the 2026-07-19/20 incident, recovered only by
-the daemon's `perform` timeout re-driving it with a fresh await. WSS federations avoid that
-failure mode entirely. (The daemon still bounds each `perform` via
+the daemon's `perform` timeout re-driving it with a fresh await. The attribution to iroh is
+unreproduced (`FMI-38`); WSS federations have not shown the stall, which is a reason to prefer
+them, not a guarantee, so keep the perform timeout regardless. (The daemon still bounds each `perform` via
 `WALLETD_PERFORM_TIMEOUT_SECS`, default 600 s; the tracked unit file leaves it at the default,
 and no deployment manifest is tracked in this repository — `HST-20`. Set it lower where you
 deploy, e.g. 120 s, so an iroh stall self-recovers in ~2 min; but prefer WSS so the stall does

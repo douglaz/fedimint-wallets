@@ -925,7 +925,9 @@ fedimint-cli module lnv2 await-receive <op_id>                  # -> "Claimed"
   (ADR-0030 — there is no daemon pin; standalone `--gateway` is a one-operation break-glass).
   **Fix: REGISTER the gateway on every guardian at bring-up** (`CNF-52`), which is what
   `wallet-cli/tests/devimint_lib.sh`'s `register_lnv2_gateway "$GW" "$FM_INVITE_CODE"` does
-  (a two-fed smoke also registers it for `$FED_B_INVITE`). Per guardian `<peer>` in
+  (a two-fed smoke also registers it for `$FED_B_INVITE`) — with the two deliberate exceptions
+  `CNF-52` lists: `smoke_breakglass_devimint.sh` leaves federation B unregistered on purpose,
+  and `smoke_responsiveness_devimint.sh` registers its never-responding double instead. Per guardian `<peer>` in
   `0..FM_FED_SIZE-1`, against a client joined to that federation:
   ```bash
   fedimint-cli --data-dir "$CLIENT_DIR" --our-id "$peer" --password "$FM_PASSWORD_API" \
