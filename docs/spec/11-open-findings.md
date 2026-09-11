@@ -283,13 +283,15 @@ unrecognised prefix to `Other`, the never-repaired class that `move:` rows land 
 old probe-leg key is ever read back there. (The bead's earlier legacy-read requirement was
 withdrawn on 2026-09-11.)
 
-**A fix need not touch the key at all.** Admission can reject a user move whose key is currently
-owned by an active `ProbeSession` or a live `ReasonCode::ActiveProbe` intent, with probe creation
-regenerating its nonce when a prospective leg key is already taken. The actor holds what that
-needs: `decide_existing` has the stored `Intent`, and `validate_probe_leg_session` already reads
-the in-flight session and matches its nonce and source. This closes both the pre-journaling race
-and later attachment while leaving persisted key identity alone — so it carries none of the
-rollout cost below.
+**A fix need not touch the key at all.** Admission can reject a user move against any intent whose
+reason is `ReasonCode::ActiveProbe` — **at any status, not only a live one** — with probe creation
+regenerating its nonce when a prospective leg key is already taken. The status part is load-bearing:
+`decide_existing` answers a `Done` intent with a deduplicated 202 before it ever reaches
+`validate_probe_leg_session`, and `ALC-30`'s "live" is `Pending | Executing | Awaiting`, so a rule
+keyed on liveness would leave every *completed* probe key in history reusable. The actor holds what
+this needs — `decide_existing` has the stored `Intent`, and `validate_probe_leg_session` already
+reads the in-flight session and matches its nonce and source. It leaves persisted key identity
+alone, so it carries none of the rollout cost below.
 
 **If the key does change, the rollout is the hard part, in both directions.** A `ProbeSession`
 persists only the nonce and parameters, so each build reconstructs the leg key from it — and a
