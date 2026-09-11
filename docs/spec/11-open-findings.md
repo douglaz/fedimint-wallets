@@ -234,8 +234,11 @@ wired yet"; a test comment claiming `Policy` is `deny_unknown_fields`; `fedimint
 `fedimint-mechanics.md`'s "hard fee cap" (now cites `FMI-19`) — were fixed 2026-09-10 in the
 spec review pass, and the `TimeoutExecutor` item is withdrawn 2026-09-11: its doc comment is
 accurate for the `Runtime`-direct paths that are the only ones to build it (`OPS-15`), so four
-code-comment items stand, plus the runbook's and `fedimint-mechanics.md`'s stale line citations,
-which the bead carries and this finding had not. The bead was updated to match on 2026-09-11.
+code-comment items stand, plus `fedimint-mechanics.md`'s stale `executor.rs` line citations, which
+the bead carries and this finding had not. The bead was updated to match on 2026-09-11, and its
+runbook bullet was struck there: both halves of it — "shipped k8s config" and the `main.rs`
+lock-file citation — were fixed on 2026-09-10, and the runbook now names `check_db_lock` with no
+line number.
 Each is a one-line fix; none is a
 behaviour gap. Open — `br-stale-doc-comments-sweep-zjx`.
 
