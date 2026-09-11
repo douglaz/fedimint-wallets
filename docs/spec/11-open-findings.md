@@ -275,21 +275,22 @@ shape with `occurrence = occurrence_from_nonce(nonce)`, and `MoveRequest.occurre
 `u64`, so a user move with the same endpoints, amount and cap and an occurrence equal to a nonce
 head attaches to the probe's `Intent` and `MoveRecord` (`STO-6`, `DOM-16`, `OPS-8`). The
 separation is probabilistic, not excluded, and probe keys are reconstructible from a session that
-history exposes. The fix namespaces probe legs, which moves the persisted key shape and
-`classify_key`'s prefix set (`STO-6`, `STO-24`) — an implementer
-building to `STO-6` today is building the shape that is slated to change. `classify_key` needs the
-new prefix but **no legacy read** — that would be the shim `OVR-14` forbids, and it would buy
-nothing, since `STO-24` puts every move-shaped row in the never-repaired class, so rows already
-written keep their shape and go on being skipped. The bead's earlier legacy-read requirement was
-withdrawn on 2026-09-11. What it still leaves open is the rollout: a `ProbeSession` persists only
-the nonce and parameters, so an upgraded build recomputes each leg key from the nonce — and
-**both** candidate fixes change what it computes. A `probe-leg:` prefix changes the shape outright;
-a reserved occurrence range only separates the two populations if probe occurrences are *remapped*
-into it, which changes the key for every session whose nonce head fell outside the range (and
-rejecting user occurrences alone, without that remap, leaves today's probe occurrences collidable,
-so it does not close the hole). Either way an in-flight probe is stranded or duplicated across the
-deploy unless probes are drained first or `ProbeSession` is versioned and migrated. Neither variant
-is the key-shape-preserving option.
+history exposes. An implementer building to `STO-6` today is building a key the fix will change.
+Two properties of the fix are settled and belong here; the design itself is the bead's.
+
+No **legacy read** is needed whichever variant wins: that is the shim `OVR-14` forbids, and
+`STO-24` puts every move-shaped row in the never-repaired class, so rows already written keep
+their shape and go on being skipped. (The bead's earlier legacy-read requirement was withdrawn on
+2026-09-11.) A new `classify_key` prefix is needed only by the `probe-leg:` variant; a reserved
+occurrence range keeps the `move:` shape and the existing classification.
+
+And the **rollout is the hard part, in both directions**. A `ProbeSession` persists only the nonce
+and parameters, so each build reconstructs the leg key from the nonce — and every variant that
+actually closes the hole changes what gets reconstructed for a session already in flight, whether
+by changing the shape or only the occurrence. An upgrade or a rollback mid-probe can therefore
+strand or duplicate a leg, so a version field alone is not enough: it needs probes drained on both
+sides of the deploy, or two builds that each understand both mappings. Settle that in the bead
+before writing code.
 Open — `br-probe-user-move-key-collision-fy7`.
 
 **F45. The gateway `routing_info` POST reaches any URL a guardian lists.** `FMI-11`'s validation
