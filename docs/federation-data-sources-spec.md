@@ -27,8 +27,9 @@ queries, and `fedimint-cli` joins of real mainnet federations.
 The invite code (`fed1…`) carries `federation_id`, ≥ f+1 guardian API URLs, optional
 api_secret. Fetching the `ClientConfig` from a guardian quorum yields:
 - **Guardian set** `api_endpoints: PeerId → {url, name}`. Count N = `len`.
-- **Threshold** is NOT transmitted; derive it: `f = (N-1)/3`, `threshold = 2f+1`
-  (`NumPeers`). N=4 ⇒ 3-of-4; N=1 ⇒ 1-of-1 (no fault tolerance — a red flag).
+- **Threshold** is NOT transmitted; derive it as the SDK's `NumPeers::threshold()` =
+  `N − (N−1)/3` (`FMI-24`; equal to `2f+1` only when `N ≡ 1 mod 3`). N=4 ⇒ 3-of-4;
+  N=1 ⇒ 1-of-1 (no fault tolerance — a red flag).
 - **Modules present** (mint, ln, lnv2, wallet, meta, stability_pool…), **consensus
   version**, **network** (mainnet/signet), **legacy `global.meta`**.
 - `federation_id` = consensus hash of the endpoint set; the config is authenticated
@@ -101,11 +102,11 @@ claims bounded by client-side ceilings.
 
 | Probe | How | Pass / signal |
 |---|---|---|
-| Quorum liveness | `request_current_consensus(session_count)` + `status` | Passes only if 2f+1 guardians agree. `status` gives `peers_online`, `peers_flagged` (want 0), `scheduled_shutdown`. |
+| Quorum liveness | `request_current_consensus(session_count)` + `status` | Passes only if a `NumPeers::threshold()` = `N − (N−1)/3` of guardians agree (`FMI-24`; §A). `status` gives `peers_online`, `peers_flagged` (want 0), `scheduled_shutdown`. |
 | LN round-trip | gateway `/create_bolt11_invoice` → pay → federation `await_incoming_contract` + `await_preimage` | Invoice issued AND preimage observed within timeout; which stage stalls localizes the fault. |
 | Gateway availability | `gateways` (consensus) + per-gw `/routing_info` | ≥1 gateway returns `RoutingInfo` with a live `lightning_public_key`; numeric: fees, latency, peer-vettedness count. |
 | Peg-out reachability | `block_count` (chain lag), `peg_out_fees(addr,amt)` (quotable?), `wallet_summary` (capacity) | `peg_out_fees = Some`, consensus height tracks the tip, spendable capacity > 0. |
-| Latency / degraded quorum | per-guardian `version` RTT, `consensus_ord_latency` | Healthy ≥ 2f+1 reachable+agreeing; degraded f+1…2f; dead ≤ f. |
+| Latency / degraded quorum | per-guardian `version` RTT, `consensus_ord_latency` | Healthy ≥ threshold (`N − (N−1)/3`) reachable+agreeing; degraded f+1 … threshold−1; dead ≤ f. |
 
 ## Shutdown-notice sources (Evacuation trigger, ADR-0004/0006)
 1. **`status.scheduled_shutdown: Option<u64>`** — consensus-reported, strong. Primary.

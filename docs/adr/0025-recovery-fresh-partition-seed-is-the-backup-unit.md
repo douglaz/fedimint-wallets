@@ -6,14 +6,14 @@ status: accepted
 Two decisions define how a funded wallet is rebuilt. They are recorded together because
 the second follows from the first plus one fact about the SDK.
 
-**1. The backup unit is the seed plus the joined federation IDs — never the local stores.**
+**1. The backup unit is the seed plus the joined federations' invite codes — never the local stores.** (Originally written "federation IDs"; an id is a 32-byte hash with no guardian endpoints, and `recover` takes an invite — `SEC-24`, `API-22`.)
 [ADR-0003](./0003-recovery-silent-backup.md) already established *what* is backed up; this
 adds what is *not*. The wallet's two local stores (the client store holding ecash and the
 seed, and the bookkeeping store holding the ledger, policy, and federation registry) carry
 **no cross-store point-in-time guarantee**. They are restored together from a single
 snapshot, or not at all. A mismatched pair — one store from one moment, the other from
 another — is **out of contract**, and the wallet does not defend against it. When a store
-is lost, the supported path is Recovery from the seed and federation IDs, not a store copy.
+is lost, the supported path is Recovery from the seed and each federation's invite code, not a store copy.
 
 **2. Recovery always targets a fresh client partition; it never wipes or reuses one, and it
 refuses any federation that is still registered.**

@@ -1,8 +1,9 @@
 # fedimint-wallets — Executive summary
 
 *A single-file orientation to the as-built specification, for a reader who has never seen the
-code. Written 2026-09-07 against `main` `1e44487` plus PR #40, both now merged as `ee4ba1c`: six Rust crates, about 80,000
-lines of which roughly 40% is test code, 1,071 tests, 16 live smoke gates, 31 ADRs.*
+code. Written 2026-09-07 against `main` `1e44487` plus PR #40, both now merged as `ee4ba1c`, and
+re-read in full against `7225114` (PR #49, #50) on 2026-09-10: six Rust crates, about 80,000
+lines of which roughly 40% is test code, 1,071 tests (measured at `ab52094`, `CNF-5`), 17 live smoke gates, 31 ADRs.*
 
 ---
 
@@ -96,7 +97,7 @@ The CLI's `--standalone` mode drives the same engine one-shot under the same loc
 
 ## 5. What has been validated, and against what
 
-The unit suite is the floor and is green. Sixteen live smokes against a two-federation devimint
+The unit suite is the floor and was green at `ab52094` (`CNF-5`). Seventeen live smokes against a two-federation devimint
 harness cover the money path, the crash gate, the tick, evacuation, discovery, the probe,
 history, recovery, the daemon path, the autonomous chain, responsiveness, a 24-hour soak, and
 supersession. Only the supersession smoke records its last green run in its header; the others
@@ -104,7 +105,7 @@ carry launch blocks, and their last runs live in issue close notes. **None runs 
 policy.
 
 One daemon has been running the 2026-07-26 build on two mainnet federations with a small real
-balance. It is a **test deployment**, not a pilot, and it runs a build 220 commits behind `main`.
+balance. It is a **test deployment**, not a pilot, and it runs a build 240 commits behind `main` (`HST-24`).
 It has demonstrated restart survival, a cross-federation move, and an external Lightning send and
 receive with fees reconciling exactly. It has never evacuated, never stranded a move, and has sat
 for the whole period on one silent withheld shortfall.
@@ -120,5 +121,6 @@ of that: one place that says what is built, with a gate on its identifiers and a
 tied one-to-one to the issues.
 
 It does not replace the ADRs (they are the decisions), the runbooks (they are the procedures), or
-the glossary (it is the vocabulary, though `F6`/`F7` say which entries need trimming). It has not
-been reviewed. Read the function before you rely on the sentence.
+the glossary (it is the vocabulary, though `F6`/`F7` say which entries need trimming). It was
+re-read against the code and panel-reviewed on 2026-09-10 (`README.md`, "How much to trust
+this"); that reviewed the text, not the code. Read the function before you rely on the sentence.

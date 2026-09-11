@@ -12,11 +12,11 @@ ADR-0022 — see "What this means for us".
   clients over two DBs. There is no cross-federation client object anywhere in fedimint.
 - Both reference wallets hold a `Map<FederationId, Client>`, all clients live, addressed by
   id — no "active" client (harbor `lib.rs:278`; Fedi `crates/federations/src/lib.rs:30`).
-- **One seed, many feds:** the per-fed client secret is derived deterministically —
-  `get_default_client_secret(root_secret, federation_id, device_index)` (harbor
-  `fedimint_client.rs:110`, Fedi `federation_v2/mod.rs:636`). `device_index` exists so two
-  devices on the same seed don't reuse note-derivation indices (double-spend risk); single
-  device → index 0.
+- **One seed, many feds:** the per-fed client secret is derived deterministically from the
+  root by `get_default_client_secret(root_secret, federation_id)`; the exact path this wallet
+  relies on is `FMI-7` in `docs/spec/02-fedimint-integration.md`. (Harbor and Fedi call an
+  older signature with a `device_index` so two devices on one seed don't reuse note-derivation
+  indices; the pinned SDK has no such parameter and this wallet derives as a single device.)
 - **Storage (lift Fedi's shape):** one global DB (RocksDB on Android) with per-federation
   **key prefixes** — prefix 0 = app state, 1.. = each fed (`runtime/src/storage.rs:31-35`).
   One fsync domain, cheap on mobile. (Harbor instead serializes each fed's KV into one
@@ -53,8 +53,10 @@ ADR-0022 — see "What this means for us".
   move's amount.
 
 ## 4. Send (the source/A side) — idempotency is client-local
-- `send(invoice, gateway?, meta) -> OperationId` (`lnv2-client/lib.rs:538`). Hard fee cap
-  100 sat + 1.5% (`SEND_FEE_LIMIT`); the SM self-refunds on gateway forfeit or expiry.
+- `send(invoice, gateway?, meta) -> OperationId` (`lnv2-client/lib.rs:538`). The SDK's
+  `SEND_FEE_LIMIT` (100 sat + 1.5%) is enforced lexicographically on `(base, ppm)`, not as a
+  cap on the fee charged — see `FMI-19`; the SM self-refunds on gateway forfeit or expiry, with
+  the forfeit-promoted-to-success exception in `FMI-23`.
 - **The federation does NOT dedup by payment hash** (outgoing contracts keyed by funding
   outpoint, fresh keys per contract — `lnv2-server/lib.rs:552`). But the **client does**:
   the deterministic op id `from_encodable((invoice, attempt=0))` + an `operation_exists`

@@ -108,8 +108,12 @@ Revisit alongside passkeys, as the Consequences section suggests for the parity 
   second process that can spend. Public-internet exposure should wait for ADR-0026.
 - **One daemon change** is owed by this work — the `?status=open` filter together with its
   skipped-undecodable-row signal, which is the same endpoint, the same handler, and equally
-  read-only, landed as one reviewable diff; everything else is additive in a
-  new crate. A consequence of holding that line: the web operation-detail page cannot show a
+  read-only, to land as one reviewable diff; everything else is additive in a
+  new crate. **Status (2026-09-10):** neither the filter nor the sidecar's routes have landed —
+  `walletd` still accepts only `limit` and `before_seq` on `/v1/history`, and `wallet-web` is the
+  configuration and login-hash skeleton only (`F27` in `docs/spec/11-open-findings.md`; the
+  filter is `br-2aa`). The "in production" wording under "Why" above predates the decision to
+  treat the long-running deployment as a test rig (`08-hosts-and-deployment.md`). A consequence of holding that line: the web operation-detail page cannot show a
   `Stranded` move's preimage or leg op-ids, because the wire `OperationView` carries neither and
   the rich move record is `--standalone` only. That costs nothing real: stranding is today an
   EVIDENCE-PRESERVATION path, not a recovery one. The preimage is evidence that the send leg

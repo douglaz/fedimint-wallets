@@ -14,7 +14,9 @@ referenced from `phase6a-plan.md` and the README, so it keeps its number.
   like `wallet-cli`: HTTP to `127.0.0.1`, bearer token read from a token path. It NEVER opens
   `client.db` or `journal.db` — the daemon holds those locks exclusively, and two writers on one
   RocksDB deadlock by design (6a.0).
-- **P1 — the daemon is money-critical and in production.** This phase is permitted **exactly one**
+- **P1 — the daemon is money-critical** (and, when this was written, "in production"; the
+  long-running deployment has since been reclassified a test rig — `HST-23`, `ADR-0028`'s
+  build note — which changes nothing about the constraint). This phase is permitted **exactly one**
   daemon change: the `?status=open` filter (6c.4). Everything else is additive in the new crate.
   No actor changes, no new money paths, no SSE.
 - **P2 — the browser holds no wallet state.** Every page reconstructs from the daemon. There is no
@@ -139,7 +141,8 @@ parties.
 `wallet-cli` parity, and the spec previously overclaimed. `wallet-cli` refuses these in client mode
 because they have no daemon endpoint, so a sidecar cannot offer them either:
 `discover`, `probe`, `tick` (agent verbs), `history --fed`, `show` by numeric sequence, and
-`status` with policy overrides (`wallet-cli/src/main.rs:576-592`). They stay CLI+`--standalone`
+`status` with policy overrides (`run_client` in `wallet-cli/src/main.rs`; the as-built refusal
+list is `API-25` in `docs/spec/04-api-contract.md`). They stay CLI+`--standalone`
 only. Everything the daemon does expose:
 
 | Area | Daemon routes |
@@ -174,6 +177,14 @@ UI affordance, not an auth gate — ADR-0028 chose no step-up, and this does not
 **Operations initiated here are `Actor::User`.** No `Actor` change (ADR-0028).
 
 ## 6c.4 Long-running operations — the one daemon change
+
+> **Status (2026-09-10): NOT LANDED.** Neither the `?status=open` filter nor `skipped_rows`
+> exists in `wallet-daemon`; `GET /v1/history` still reads only `limit` and `before_seq` and
+> silently ignores every other query parameter, so a `?status=open` request today returns the
+> unfiltered page with `200`. The as-built contract is `API-10` in
+> `docs/spec/04-api-contract.md`; the gap is tracked as `F27` in `docs/spec/11-open-findings.md`.
+> ADR-0028's "landed as one reviewable diff" describes this section's plan, not the code.
+> Everything below remains the specification of the change to make.
 
 Lightning payments can hold for **hours or days** (ADR-0024). A browser tab cannot track that:
 background timers are throttled and mobile pages are suspended. So:
@@ -225,7 +236,8 @@ background timers are throttled and mobile pages are suspended. So:
 recent activity) · Send (invoice paste, decoded preview, fee cap, confirm) · Receive (amount →
 invoice + QR) · Activity (paginated history; the only filter is
 the operation status the daemon actually supports — outstanding versus all — since `HistoryQuery`
-exposes `limit`, `before_seq` and `status` and nothing else, so richer filtering would require a
+exposes `limit` and `before_seq` today (`API-10`) and gains only `status` under 6c.4, so richer
+filtering would require a
 second daemon change this phase does not budget) · Operation detail · Federations (list, join,
 candidates, approve) · Policy (view + edit) · Admin (reconcile, diagnostics — **no recover**, per
 §6c.3) · Settings

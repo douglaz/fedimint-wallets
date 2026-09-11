@@ -24,17 +24,25 @@ rebuildable by design, refusals and raw `receive`/`pay` leave no durable trace a
 ## 2. Data model
 
 All types in `wallet-core` (pure, serde). Storage in `wallet-fedimint` next to the journal.
-**Authority split:** this spec is normative for the MODEL (structure separation, write
-discipline, correlation-key rules); the exact field-level shapes as built are in
-[docs/spec/05-persistence.md](./spec/05-persistence.md) (`STO-15`–`STO-17`); the historical
-derivation is [phase4-implementation-spec.md](./archive/phase4-implementation-spec.md) §7, which refines the
-sketch below (notably: `reason` is mandatory — user verbs carry `ReasonCode::UserInitiated`
-— and gateways are `Option`), **and its §7/§10 REFINE this spec's write discipline and
-repair rules**: terminal immutability gains exactly one principled exception (a
-REPAIR-written terminal row carries `repaired: true` and may be superseded once by an
-AUTHORITATIVE evidence-carrying write), and the rule-5/6 negative repairs below are
-age-gated (1 hour) SOFT failures, not immediate hard ones. Where this section and the impl
-spec disagree, the impl spec wins.
+**Authority:** this document is the historical requirement and the motivation for the ledger.
+It is **not** authoritative for any shape, key, string or rule: the as-built specification in
+[docs/spec/05-persistence.md](./spec/05-persistence.md) owns them — the JSON encoding
+(`STO-5`), the correlation-key shapes (`STO-6`), the row type and every `OperationKind`
+payload (`STO-15`), the write discipline and the pure `advance` rule (`STO-16`), the refresh
+from the move record (`STO-17`), the sequence fence (`STO-18`), `history` (`STO-19`), the
+`0x06` index (`STO-20`), repair (`STO-24`), evacuation supersession (`STO-25`), the op-log
+metadata (`STO-33`, `STO-34`) and the verbatim error strings (`STO-35`). The sketch below is
+kept as the original derivation; where it and the `STO` rules differ, the `STO` rule is what
+the code does and this sketch is simply out of date. (Known differences: `reason` is mandatory
+— user verbs carry `ReasonCode::UserInitiated`; gateways are `Option`; `OperationRecord` has a
+`repaired: bool` and terminal immutability has exactly one exception for a repair-written
+terminal; the rule-5/6 negative repairs are age-gated (1 hour) soft failures; `Receive` is
+`amount_invoiced`; `Pay` carries `payment_hash: Option<[u8;32]>` and `invoice_amount` is
+`Option`; `DirectInflow`/`Move` gateways are `Option`; `Refusal` carries `diagnostics`; there
+are `Recover`, `Probe`, `Discover`, `AutoJoin` and `Approve` kinds; and the raw-op keys are
+`pay:<payment_hash>` / `recv:<to>:<amount>:<nonce>`, not the nonce-only forms below.) The
+archived [phase4-implementation-spec.md](./archive/phase4-implementation-spec.md) is history
+only and is not a tiebreaker.
 
 ```rust
 /// One row per user-meaningful operation. Append-only: a row is created once, its
@@ -46,10 +54,14 @@ pub struct OperationRecord {
     /// Joins ledger <-> journal <-> MoveRecord. For journaled ops this IS the intent's
     /// IdempotencyKey. Raw/tick ops use PER-ATTEMPT, NONCE-ONLY keys, constructible from
     /// the RAW input BEFORE any parsing or side effect (crash-safety, §3 rule 5 — a
-    /// malformed invoice's failed attempt must still be a durable row):
-    /// `pay:<fed>:<nonce>` and `recv:<fed>:<nonce>` (nonce pre-generated, embedded in the
-    /// op's `custom_meta`; dedup/grouping rides on the recorded op_id, not the key),
-    /// `join:<fed>:<nonce>`, `tick:<occurrence>:<nonce>` (each tick invocation is its own
+    /// malformed invoice's failed attempt must still be a durable row).
+    /// AS BUILT the shapes are `STO-6`'s: `pay:<payment_hash>` (no nonce — paying the same
+    /// invoice twice attaches to one operation) and `recv:<to>:<amount>:<nonce>`; the key
+    /// that rides in the op's `custom_meta` is the per-attempt correlation key of `STO-34`.
+    /// The `pay:<fed>:<nonce>` / `recv:<fed>:<nonce>` forms this sketch originally proposed
+    /// were never built. Also as built:
+    /// `join:<fed>:<sha256(invite)>` for a user/API join (the `join:<fed>:<nonce>` form is
+    /// only the agent's auto-join ledger row), `tick:<occurrence>:<nonce>` (each tick invocation is its own
     /// row, created `Started` before deciding, advanced to terminal with the counts; the
     /// tick's individual moves remain covered by their own intent-keyed rows).
     /// Per-attempt keys keep append-only semantics under retry: a crashed/failed attempt

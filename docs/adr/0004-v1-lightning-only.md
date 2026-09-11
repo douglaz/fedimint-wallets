@@ -8,6 +8,11 @@ Address / LNURL-pay, receive via invoice / Lightning Address. There is no
 user-facing on-chain send or receive (peg-in / peg-out) in v1; explicit on-chain
 steps are added later. This keeps the wallet WoS-simple and focuses the build.
 
+> **Build note (2026-09-10).** The Lightning-only half stands. The Lightning Address / LNURL-pay
+> half did not ship: the built wallet pays BOLT11 and receives by invoice only, and the roadmap
+> defers LNURL/Lightning Address with their provider recurringd (ADR-0013) to v2+. `OVR-11` in
+> `docs/spec/00-overview.md` records the as-built scope; no ADR has amended this one.
+
 ## Consequences
 
 - Funding is Lightning-only at first. A user whose money is on-chain (some

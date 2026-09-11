@@ -322,7 +322,7 @@ reads (`STO-1`), and MUST be watched red before it is trusted (`CNF-2`).
 ### DEF-25 — The live evacuation smoke could not detect a regression to the flat cap
 
 It set the flat cap far above the fee it asserted, so an evacuation reverting to the old sizing
-would have passed unchanged. Still open as `br-vvo` (`F23`).
+would have passed unchanged. Still open as `br-vvo` (`F22`).
 
 **Prohibition** — a live gate MUST discriminate: its parameters MUST be chosen so the old
 behaviour fails and the new one passes (`CNF-3`).

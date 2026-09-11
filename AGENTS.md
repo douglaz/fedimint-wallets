@@ -130,9 +130,13 @@ and — where the change alters a money path — a live devimint gate. Unit test
 necessary and not sufficient; see [docs/devimint-runbook.md](./docs/devimint-runbook.md).
 
 **This repo is greenfield and does not carry compatibility shims** — with one deliberate
-exception. `Policy`, `Action`, the move records, and **ledger rows** (`OperationRecord` and
-every `OperationKind` variant) ride **live production stores** written by the running daemon,
-so new fields on those types use `#[serde(default)]` (with a *named* default function for
+exception. The types that ride the **live stores** written by the running daemon are the
+`STO-29` list in `docs/spec/05-persistence.md` — `Intent` (and every `Action` variant),
+`MoveRecord`, `FederationInfo`, `OperationRecord` (and every `OperationKind` variant),
+`ProbeRecord`, `CandidateRecord`, `WatchState`, `Policy`, `EvacuationSupersessionRecord`, **every
+type serialized inside one of those** (transitively — a nested struct's new field is the row's
+new field), and `MoveMeta`, which rides the SDK operation log; that
+list, not this paragraph, is authoritative (`DEF-13`). New fields on those types use `#[serde(default)]` (with a *named* default function for
 numeric fields, since a bare default yields zero) so an existing row still decodes. A move
 record cannot be re-created by re-running a command. Do not remove these as cleanup; every
 other kind of back-compat shim is still unwelcome.

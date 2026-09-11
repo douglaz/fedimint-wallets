@@ -66,7 +66,8 @@ allocator goals (`DOM-17`).
 **DOM-10** A **move record** is the derived cache of a two-leg operation: both legs' operation
 ids, the invoice, the gateway, the enforced fee cap, the quoted fees, the preimage, and a
 `MovePhase ∈ Created, Invoiced, Sending, Settled, Refunded, Failed, Stranded`. It is partially
-rebuildable from the fedimint op-log (`STO-11`). **Stranded** means exactly: the send settled
+rebuildable from the fedimint op-log (`STO-11`, which owns the exact field list; `STO-33` owns
+the op-log metadata it is rebuilt from). **Stranded** means exactly: the send settled
 with a preimage and the receive reached an op-terminal non-claim (`OPS-27`). It is not a gateway
 failure and the preimage does not recover it (`DEF-20`).
 
@@ -89,11 +90,12 @@ Rejected, Discovered, AutoJoined, UserApproved`. `UserApproved` is the state a u
 `approve` confers and it cannot be demoted (`STO-26`). A joined federation with no
 `UserApproved` row is **probe-gated** (`DOM-3`).
 
-**DOM-13** A **probe record** per federation holds up to 256 `ProbeAttempt`s (`at_ms, ok, from,
-amount, leg_fee_cap, error?`) and at most one in-flight `ProbeSession`. An **active-probe
-verdict** ∈ `Passed, NeverProbed, Insufficient, Expired, Failed, FailedSinceLastPass` is
-computed, never stored, from the attempts, the source federation and the policy's window
-(`ALC-25`).
+**DOM-13** A **probe record** per federation holds up to 256 `ProbeAttempt`s — `{at_ms: u64,
+ok: bool, from: FederationId, amount_msat: u64, leg_fee_cap_msat: u64, error: String?}`, the
+persisted field names verbatim — and at most one in-flight `ProbeSession` (`STO-26` owns both
+shapes and the pruning rule). An **active-probe verdict** ∈ `Passed, NeverProbed, Insufficient,
+Expired, Failed, FailedSinceLastPass` is computed, never stored, from the attempts, the source
+federation and the policy's window (`ALC-25`).
 
 **DOM-14** Two different things are called a probe. The **light probe** (`FedimintProbeRunner`)
 runs every cycle on every open federation and spends nothing: structural facts, one threshold
@@ -112,7 +114,11 @@ budget; scheduler cadence; discovery caps; `auto_join`; `require_mainnet`.
 **DOM-16** An **occurrence** is the allocation epoch stamped into every agent decision's key.
 The daemon allocates one per cycle by a checked increment of `WatchState.occurrence`; the
 standalone tick takes it from `--occurrence` and records it as a floor; probe legs derive theirs
-from the session nonce. The floor never decreases, is raised in the same transaction as any
+from the session nonce — the first sixteen hex characters of the 32-hex-char nonce read as a
+`u64` (`occurrence_from_nonce`, `STO-6`), so a probe occurrence is a 64-bit random head that
+is reconstructible from the stored `ProbeSession` alone and is separated from the small
+integers the two other sources hand out only probabilistically — a user-supplied `--occurrence`
+is any `u64`, and nothing namespaces the two (`STO-6`). The floor never decreases, is raised in the same transaction as any
 agent ledger append, and is fail-closed once it reaches `u64::MAX`: the daemon runs that one
 cycle and then fails every later one (`ALC-33`, `STO-12`, `STO-21`).
 
@@ -132,11 +138,16 @@ at every amount; `Routable` carries the economic floor.
 
 ## Evacuation refusal evidence and supersession
 
-**DOM-19** `EvacFeeCap {base_msat, bps}` with `at(net) = base + floor(net × bps / 10 000)`.
-`EvacuationRefusalEvidence` is two freshly quoted delivered-net samples (`low`, `high`, each
-`{delivered_net, total_fee, fee_cap}`) plus the cap components admitted with, the requested net,
-the source's spendable balance, a diagnostic string, and a timestamp. It is **evidence** that a
-refusal looks structural, never proof a route is unavailable (`ALC-24`).
+**DOM-19** `EvacFeeCap {base_msat: Msat, bps: u16}` with `at(net) = base_msat + floor(net ×
+bps / 10 000)`, computed in `u128` and **saturated** into `u64` (no `(base, bps)` pair can wrap
+into a small cap). `EvacuationRefusalEvidence {cap_components: EvacFeeCap, requested_net: Msat,
+source_spendable: Msat, low: EvacuationQuoteSample, high: EvacuationQuoteSample, diagnostic:
+String, measured_at_ms: u64}` is two freshly quoted delivered-net samples (`low`, `high`, each
+`EvacuationQuoteSample {delivered_net: Msat, total_fee: Msat, fee_cap: Msat}`) plus the cap
+components admitted with, the requested net, the source's spendable balance, a diagnostic
+string, and a unix-millisecond timestamp. It is **evidence** that a refusal looks structural,
+never proof a route is unavailable (`ALC-24`). It is persisted on the intent (`STO-9`) and in
+the supersession sidecar (`STO-25`).
 
 **DOM-20** An **evacuation supersession** retires a marked pre-artifact agent evacuation as
 `Failed` and admits a linked `Pending` child at a fresh occurrence and distinct key under a
