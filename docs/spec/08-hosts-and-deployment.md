@@ -135,7 +135,13 @@ fail-closed startup, and serves **zero routes**. Specifically:
   `~/.config/wallet-web/wallet-web.toml`). It **refuses to run if the config file already
   exists** (`sidecar config <path> already exists; …`), checked before the prompt: there is no
   password-rotation path short of deleting the file. It then prompts for a password twice on
-  the controlling TTY (`rpassword`, never stdin; Ctrl-C aborts cleanly with nothing written),
+  the controlling TTY (`rpassword` 7.5.4, never stdin). Ctrl-C at the prompt aborts with nothing
+  written — **measured 2026-09-11** under a Python `pty` with `target/debug/wallet-web init
+  --config <tmp>/wallet-web.toml --token-path <tmp>/tok --public-origin http://127.0.0.1:9737`:
+  the prompt `New wallet-web password: ` appeared with the slave's `ECHO` flag clear; writing
+  `\x03` to the pty produced exit **1** (`WIFEXITED`, not signalled), stderr `Error: reading the
+  password with echo disabled (…)` / `Caused by: interrupted`, `ECHO` set again after exit, and
+  no `wallet-web.toml` in the directory. It
   enforces at least 12 **characters** and at most 1,024 **bytes** (bytes checked first), hashes
   with Argon2id v19 (m = 19456 KiB, t = 2, p = 1, fresh 16-byte salt), validates the whole
   config through the same path startup uses, and writes the file `0600` atomically (`HST-19`)

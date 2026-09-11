@@ -307,9 +307,12 @@ WSS-transport federations") hung until the
 daemon's per-intent perform timeout (`FMI-22`) re-drove the intent with a fresh await; it was
 attributed to the iroh transport by the operator and has not been reproduced or isolated, so
 "iroh stalls" is a working hypothesis, not a measured fact. Two bounds exist and they do
-different things: the **perform** deadline (`FMI-22`; standalone `--perform-timeout`, default
-600 s, `0` disables, `HST-9`) returns `Retryable` and resets an `Executing` intent to `Pending`
-for the next reconcile; an await verb's `--timeout` (default 600 s, `API-38`) only makes
+different things, and the perform deadline itself behaves differently per host: in the
+**daemon** it wraps the whole drive future and **drops** it on expiry, discarding the result,
+so the intent stays `Executing` until the next `reconcile_durable` normalizes it to `Pending`
+(`OPS-15`); in **standalone** mode the `TimeoutExecutor` returns `Retryable` and the executor
+resets the intent to `Pending` itself (`--perform-timeout`, default 600 s, `0` disables,
+`HST-9`). An await verb's `--timeout` (default 600 s, `API-38`) only makes
 `resolve_await` return `Timeout` (exit 4) and leaves the row `Awaiting` — no journal transition,
 nothing for reconcile to re-drive. The fork's long-poll patch (`FMI-1`) does not
 remove this. The runbook therefore prefers WebSocket-transport federations
