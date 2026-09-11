@@ -275,23 +275,30 @@ shape with `occurrence = occurrence_from_nonce(nonce)`, and `MoveRequest.occurre
 `u64`, so a user move with the same endpoints, amount and cap and an occurrence equal to a nonce
 head attaches to the probe's `Intent` and `MoveRecord` (`STO-6`, `DOM-16`, `OPS-8`). The
 separation is probabilistic, not excluded, and probe keys are reconstructible from a session that
-history exposes. An implementer building to `STO-6` today is building a key the fix will change.
-Two things are settled and belong here; the design is the bead's.
+history exposes. Three things are settled and belong here; the design is the bead's.
 
 **The repair path needs no change and no compatibility read.** `classify_key` already sends every
 unrecognised prefix to `Other`, the never-repaired class that `move:` rows land in today
-(`STO-24`), so neither a `probe-leg:` prefix nor a remapped occurrence requires touching it, and no
+(`STO-24`), so no namespacing variant requires touching it, and no
 old probe-leg key is ever read back there. (The bead's earlier legacy-read requirement was
 withdrawn on 2026-09-11.)
 
-**The rollout is the hard part, in both directions.** A `ProbeSession` persists only the nonce and
-parameters, so each build reconstructs the leg key from it — and any fix that actually closes the
-hole changes what gets reconstructed for a session already in flight, whether by changing the shape
-or only the occurrence. An upgrade *or a rollback* mid-probe can therefore strand or duplicate a
-leg, and a version field does not help, since the older binary ignores it. Draining probes on both
-sides of the deploy is the only remedy that needs no compatibility read; a build that understands
-both mappings is one, and would need an explicit `OVR-14` exception. Settle that in the bead before
-writing code.
+**A fix need not touch the key at all.** Admission can reject a user move whose key is currently
+owned by an active `ProbeSession` or a live `ReasonCode::ActiveProbe` intent, with probe creation
+regenerating its nonce when a prospective leg key is already taken. The actor holds what that
+needs: `decide_existing` has the stored `Intent`, and `validate_probe_leg_session` already reads
+the in-flight session and matches its nonce and source. This closes both the pre-journaling race
+and later attachment while leaving persisted key identity alone — so it carries none of the
+rollout cost below.
+
+**If the key does change, the rollout is the hard part, in both directions.** A `ProbeSession`
+persists only the nonce and parameters, so each build reconstructs the leg key from it — and a
+namespacing fix changes what gets reconstructed for a session already in flight, whether by
+changing the shape or only the occurrence. An upgrade *or a rollback* mid-probe can then strand or
+duplicate a leg, and a version field does not help, since the older binary ignores it. Draining
+probes on both sides of the deploy is the only remedy that needs no compatibility read; a build
+that understands both mappings is one, and would need an explicit `OVR-14` exception. Settle the
+variant in the bead before writing code.
 Open — `br-probe-user-move-key-collision-fy7`.
 
 **F45. The gateway `routing_info` POST reaches any URL a guardian lists.** `FMI-11`'s validation
