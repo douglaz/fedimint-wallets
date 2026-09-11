@@ -83,8 +83,10 @@ runtime through the wallet's own surfaces and never through a host config file (
 ```
 
 **OVR-9** One process owns the wallet. The daemon is the only resident host; the CLI's
-`--standalone` mode is a one-shot process that takes the same lock and drives the same engine,
-and is the documented exception to "admission goes through the actor" (`ADR-0031`, `HST-9`).
+`--standalone` mode is a one-shot process that takes the same lock and drives the same engine. Its
+money, await and `reconcile` verbs run the actor like the daemon; only `tick` is the documented
+exception to "admission goes through the actor", and `probe` is an undocumented second one
+(`ADR-0031`, `HST-9`, `OPS-12`, `F42`).
 
 **OVR-10** The daemon is a **host**, not the engine (`CONTEXT.md` **Host**/**Engine**). It owns
 cadence, restart and config; the engine owns every decision. A future Android host would embed

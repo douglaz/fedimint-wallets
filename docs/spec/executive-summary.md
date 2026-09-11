@@ -49,7 +49,8 @@ session (`05-persistence.md`, `CNF-15`).
 **The allocator only ever spends what a probe has proven.** A federation the wallet discovered
 on its own is fundable only after a sustained window of real, sats-spending round-trip probes
 has passed; reputation feeds and metadata can demote a candidate but never promote one. A
-federation the user joined by hand is trusted as the user's own decision (`ADR-0017`,
+federation the user joined by hand is trusted as the user's own decision — unless the agent had
+already auto-joined it, in which case only the audited `approve` verb releases the gate (`ADR-0017`,
 `06-allocator-and-automation.md`).
 
 ## 3. What is built, in one paragraph each

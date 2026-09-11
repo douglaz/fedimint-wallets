@@ -83,8 +83,14 @@ restarts it.
 
 ## The standalone mode
 
-**HST-9** `wallet-cli --standalone` is a one-shot process that takes the exclusive lock, opens
-both stores, and drives `Runtime` directly. Only its `tick` verb is the documented admission
+**HST-9** `wallet-cli --standalone` is a one-shot process that takes the exclusive lock and opens
+both stores. The agent verbs `tick`, `probe` and `discover` drive `Runtime` directly — and with
+them the `TimeoutExecutor`, where a perform timeout returns `Retryable` and resets the intent to
+`Pending`; the live reads (`balance`, `list-feds`, `status`) are `Runtime`-direct too but perform
+nothing, so no deadline applies to them (`OPS-7`, `ALC-44`, `HST-11`);
+the money, await and `reconcile` verbs run the actor, where the deadline instead drops the drive
+future and leaves the intent `Executing` for reconcile (`OPS-15`, `FMI-38`). Only its `tick` verb is
+the documented admission
 exception in `ADR-0031` (`OPS-12`); the standalone money verbs run the actor, and `probe`'s
 bypass is the undocumented second exception `F42` tracks. It resolves `data_dir` from `--data-dir`, else `walletd.toml` (parsed with the
 daemon's own closed schema, so a stale `gateway` key fails here too), else the default; then
@@ -99,8 +105,10 @@ restarting?) …` (exit 1). Whether that bound is *observable* is unmeasured: th
 `RocksDb::open` runs the blocking open inside `block_in_place`, which a `tokio` timeout cannot
 pre-empt, so a daemon that takes the lock in the gap may hold the standalone process until it
 releases the lock rather than producing that error. `--perform-timeout <secs>`
-(default 600, `0` disables) bounds each executor `perform` exactly as `WALLETD_PERFORM_TIMEOUT_SECS`
-does for the daemon (`HST-2`); the env variable is not read by the CLI.
+(default 600, `0` disables) bounds each executor `perform` as `WALLETD_PERFORM_TIMEOUT_SECS` does
+for the daemon (`HST-2`) — identically on the actor-backed verbs, and through the `TimeoutExecutor`
+on the `Runtime`-direct ones, which differ in what a timeout leaves behind (above); the env
+variable is not read by the CLI.
 
 **HST-10** The standalone-only verb shapes and flags are the set `API-25` enumerates (client
 mode refuses exactly those with exit 1); this rule owns the break-glass. `--gateway` is accepted on `pay`,

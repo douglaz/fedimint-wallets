@@ -191,7 +191,8 @@ Open — `br-h34`.
 
 ## Found while writing this set
 
-These were surfaced by the code extraction on 2026-09-07 and filed the same day.
+These were surfaced by the code extraction on 2026-09-07 and filed the same day, except `F44` and
+`F45`, which the 2026-09-11 spec review surfaced and filed that day.
 
 **F32. A failed `ReconcileDecide` is not reported as blocked.** When the tick-plan token cannot
 be issued (a poisoned authority, or a lease live at that instant) the cycle skips the tick row,
@@ -225,13 +226,16 @@ claim that no row predates them (`STO-32`). The long-running deployment's store 
 checked. Open — `br-deployed-store-missing-defaults-cts`.
 
 **F39. Stale doc comments the extraction found** that a reader would act on: `IntentStatus::
-Awaiting` "DirectInflow only"; `TimeoutExecutor` "leaves it Pending"; `journal.rs`'s header
+Awaiting` "DirectInflow only"; `journal.rs`'s header
 listing seven of thirteen tags and describing one database; `Policy`'s "no seed-recovery path
 wired yet"; a test comment claiming `Policy` is `deny_unknown_fields`; `fedimint-mechanics.md`'s
 "hard fee cap"; the runbook's "shipped k8s config". The four prose items — the runbook's
 "shipped k8s config" and "pages on transition" claims, its stale lock-file line citation, and
 `fedimint-mechanics.md`'s "hard fee cap" (now cites `FMI-19`) — were fixed 2026-09-10 in the
-spec review pass; the five code-comment items remain. Each is a one-line fix; none is a
+spec review pass, and the `TimeoutExecutor` item is withdrawn 2026-09-11: its doc comment is
+accurate for the `Runtime`-direct paths that are the only ones to build it (`OPS-15`), so four
+code-comment items stand. The bead still lists all seven and a "stale `executor.rs` line
+citations" item this finding never carried; it needs a `br update` to match. Each is a one-line fix; none is a
 behaviour gap. Open — `br-stale-doc-comments-sweep-zjx`.
 
 **F40. `policy set` from an older CLI silently resets a field a newer daemon added.** The CLI
@@ -261,6 +265,27 @@ msat), while the daemon and standalone `tick`/`status` plan against the stored
 stored cap can still have a standalone probe leg mint above it. Fix is to build that cap from the stored
 policy as `build_standalone_tick_policy` does and delete `operator_hard_cap`. Open —
 `br-standalone-probe-hard-cap-default-o6b`.
+
+**F44. A user move can attach to an active probe leg.** Probe legs use the user-move `move:` key
+shape with `occurrence = occurrence_from_nonce(nonce)`, and `MoveRequest.occurrence` accepts any
+`u64`, so a user move with the same endpoints, amount and cap and an occurrence equal to a nonce
+head attaches to the probe's `Intent` and `MoveRecord` (`STO-6`, `DOM-16`, `OPS-8`). The
+separation is probabilistic, not excluded, and probe keys are reconstructible from a session that
+history exposes. The fix namespaces probe legs, which moves the persisted key shape and
+`classify_key`'s prefix set (`STO-6`, `STO-24`) — an implementer
+building to `STO-6` today is building the shape that is slated to change. The bead requires that
+`classify_key` gain the new shape "with a legacy read"; that conflicts with `OVR-14`, which permits
+no compatibility shim beyond `serde(default)`, and `STO-24` puts every move-shaped row in the
+never-repaired class, so `classify_key` has nothing to read back. Resolve that in the bead before
+building. Open — `br-probe-user-move-key-collision-fy7`.
+
+**F45. The gateway `routing_info` POST reaches any URL a guardian lists.** `FMI-11`'s validation
+POSTs to `SafeUrl::parse(gateway).join("routing_info")` for every URL on a federation's vetted
+lnv2 list, and `SafeUrl` only wraps `Url::parse`: loopback, link-local, RFC1918 and
+cloud-metadata hosts are not rejected, and the client honours the system proxy environment
+(`HST-2`). A guardian that lists `http://169.254.169.254/` or a loopback admin port makes the
+wallet host issue that request. `FMI-11` describes the mechanism; nothing restricts the egress.
+Open — `br-gateway-url-ssrf-egress-qqg`.
 
 ## Closed since this document was first written
 

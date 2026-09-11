@@ -48,7 +48,7 @@ names (`CONTEXT.md` **Intent**).
 | `Evacuate {from, to, amount, fee_cap, gateway?, fee_cap_components?}` | allocator only | `fee_cap` is the planning cap; the components recompute it |
 | `Pay {from, invoice, amount, fee_cap, payment_hash, gateway?}` | user | |
 | `Receive {to, amount, fee_cap, nonce, gateway?}` | user | fees deducted from `amount` |
-| `Join {federation, invite, membership_preexisting}` | user, auto-join | |
+| `Join {federation, invite, membership_preexisting}` | user only — auto-join writes a nonce-keyed ledger row and calls the SDK directly, it builds no intent (`STO-6`, `FMI-8`, `ALC-4`) | |
 | `Recover {federation, invite}` | user only | the allocator never emits it, by convention |
 | `RefuseInflow {fed, reason, diagnostics}` | allocator | **not executable**; becomes a refusal row, never an intent |
 
@@ -86,8 +86,8 @@ LowReputation, UneconomicRoute, UserInitiated, ActiveProbe, StandingInstruction`
 
 **DOM-12** A **candidate** is a federation discovery has seen: `id`, `invite`, `source ∈
 Observer, Nostr (unimplemented), Manual`, `structural ∈ Passed | Rejected(reason)`, and `state ∈
-Rejected, Discovered, AutoJoined, UserApproved`. `UserApproved` is the state a user `join` or
-`approve` confers and it cannot be demoted (`STO-26`). A joined federation with no
+Rejected, Discovered, AutoJoined, UserApproved`. `UserApproved` is the state `approve` confers —
+and a user `join` only from a state that is not already `AutoJoined` (`OPS-42`) — and it cannot be demoted (`STO-26`). A joined federation with no
 `UserApproved` row is **probe-gated** (`DOM-3`).
 
 **DOM-13** A **probe record** per federation holds up to 256 `ProbeAttempt`s — `{at_ms: u64,
@@ -118,7 +118,7 @@ from the session nonce — the first sixteen hex characters of the 32-hex-char n
 `u64` (`occurrence_from_nonce`, `STO-6`), so a probe occurrence is a 64-bit random head that
 is reconstructible from the stored `ProbeSession` alone and is separated from the small
 integers the two other sources hand out only probabilistically — a user-supplied `--occurrence`
-is any `u64`, and nothing namespaces the two (`STO-6`). The floor never decreases, is raised in the same transaction as any
+is any `u64`, and nothing namespaces the two (`STO-6`; a defect, `F44`). The floor never decreases, is raised in the same transaction as any
 agent ledger append, and is fail-closed once it reaches `u64::MAX`: the daemon runs that one
 cycle and then fails every later one (`ALC-33`, `STO-12`, `STO-21`).
 

@@ -139,7 +139,8 @@ u64::from_str_radix(&nonce[..16], 16)` — the first sixteen hex characters read
 namespaced away from user moves: `MoveRequest.occurrence` accepts any `u64`, so a user move with
 the same endpoints, amount and cap and an occurrence equal to a nonce head would attach to that
 leg. The separation is probabilistic (a random 64-bit head against the small occurrences users
-and the scheduler actually supply), not excluded (`DOM-16`).
+and the scheduler actually supply), not excluded (`DOM-16`); that is a defect, not a settled
+shape, and namespacing it moves this key shape and `STO-24`'s `classify_key` prefix set (`F44`).
 
 `pay:` keys carry the payment hash and no nonce, so paying the same invoice twice attaches to
 one operation (`OPS-8`). `docs/operation-history-spec.md` §2's `pay:<fed>:<nonce>` is not
@@ -297,8 +298,12 @@ Msat?, amount: Msat?, conflict_suppressed: bool (serde default), min_move: Msat?
 `RefusalDiagnostics` compares equal to any other, so refusal identity is `(fed, reason)`. A
 commit-time drop of an executable decision (`ALC-34`, `record_tick_dropped_refusal`) is also
 an `OperationKind::Refusal` row: keyed `tick-drop:<occurrence>:<decision-key>`, `fed` is the
-decision's `Move.to` / `Evacuate.from` / `DirectInflow.to` / `Receive.to` / `Pay.from` /
-`Join.federation`, `actor Agent{occurrence}`, `reason` = the dropped decision's reason,
+decision's `Move.to` or `Evacuate.from` — the only two arms a stored row can take, since `decide`
+emits no `DirectInflow`, `Join`, `Recover`, `Pay` or `Receive` (`ALC-4`) and a refusal never
+reaches commit; the writer's match covers all eight variants anyway
+(`DirectInflow.to` / `Receive.to` / `Pay.from` / `Join.federation` / `Recover.federation` /
+`RefuseInflow.fed`) — `actor Agent{occurrence}`, `reason` = the dropped
+decision's reason,
 **`status Succeeded`** (the drop itself succeeded; the money did not move), `fees` default,
 `error = "commit-time admission refused <decision-key>: <message>"`, `repaired false`, and
 `diagnostics` all-`None` except that a nonzero conflict-suppressed candidate records
@@ -346,7 +351,9 @@ cap (`DEF-4`). Refreshing one without the other is forbidden: an auditor recompu
 from a planned amount would derive a number nobody enforced. Precisely (`refresh_from_move`):
 on a `Move` kind `send_op`/`recv_op` are copied when `Some` on the record, `gateway` is set to
 `Some(record.gateway)` unconditionally, and `amount`/`fees.fee_cap` are stamped only when the
-artifact exists; on a `DirectInflow` kind the same for `recv_op`; on every kind
+artifact exists; a `DirectInflow` kind is treated identically — `recv_op` copied when `Some`,
+`gateway` set unconditionally, `amount`/`fees.fee_cap` stamped once the artifact exists, so the
+`DEF-4` pairing holds there too; on every kind
 `fees.receive_fee`/`fees.send_fee_quoted` are copied when `Some`. After that,
 `refresh_from_intent_artifact` sets a `Pay`/`Receive` kind's `op_id` to `Intent.operation_id`
 whenever that is `Some`.
@@ -390,7 +397,11 @@ re-read of `seq`, federation, role, op and status inside its own transaction:
 attempt, else the newest within ±60 s of `joined_at`, else the newest, soft-Succeeded; losers
 soft-Failed "superseded"; absent and older than one hour → soft-Failed "not registered");
 `pay:`/`recv:` rows are observed from the op-log by correlation key (the op whose `custom_meta`
-`correlation_key` equals the row's key, `STO-34`), else by payment hash (a repair write with a
+`correlation_key` equals the **attempt** correlation key of `STO-34` — the backing intent's
+`operation_correlation_key()`, which is the row's key only on attempt 0 and
+`retry:<len>:<key>:<attempt>` after a manual retry; a raw row with no backing intent falls
+back to the row's key — the historical `Runtime`-direct raw writers, test-only or legacy today,
+since every standalone money verb goes through the actor, `OPS-5`), else by payment hash (a repair write with a
 dedup note; an in-flight or failed original is never adopted for a later attempt), else after
 one hour soft-Failed "never reached the federation"; `tick:` and discovery rows older than one
 hour → soft-Failed "interrupted". The classes are decided by key prefix alone
@@ -471,7 +482,7 @@ it), `MoveRecord`, `FederationInfo`, `OperationRecord` (and every `OperationKind
 `ProbeRecord`, `CandidateRecord`, `WatchState`, `Policy`, `EvacuationSupersessionRecord` —
 **and every type serialized inside one of them**, transitively (`FeeBreakdown`,
 `RefusalDiagnostics`, `EvacuationRefusalEvidence` and its samples, `ProbeAttempt`,
-`ProbeSession`, `SupersessionAudit`, …), because a field added to a nested type is a field
+`ProbeSession`, `EvacFeeCap`, …), because a field added to a nested type is a field
 added to the row — plus `MoveMeta`, which rides the SDK operation log rather than the journal
 (`STO-33`). A type is on this list because the daemon writes it, directly or embedded
 (`DEF-13`).

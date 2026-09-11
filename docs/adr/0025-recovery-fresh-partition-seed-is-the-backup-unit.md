@@ -36,8 +36,11 @@ recovery runs only where no surviving intent can exist. The corrupt-partition-wi
 bookkeeping case becomes an operator incident (stop, back up, deliberately clear the
 bookkeeping store, then recover), never auto-recovered.
 
-Recovery also confers **user ownership**: it records the same durable user-approval a manual
-join does, so the recovered federation is eligible for automated allocation. Otherwise the
+Recovery also confers **user ownership**: it records the durable user-approval state, so the
+recovered federation is eligible for automated allocation. Its write promotes *any* prior candidate
+state, including `AutoJoined` (`STO-26`) — which a re-`join` does not (`OPS-42`) — but that is
+defensive, not a second release path for the probe gate: by §2 above recovery never runs on a
+federation that still has a registry row, and auto-join always writes one. Otherwise the
 funds return but the allocator, treating the federation as merely agent-discovered, would
 never spend from it.
 

@@ -197,8 +197,13 @@ Rules (load-bearing):
    (`repaired: true`, rule 2's exception), per impl spec §10.3 — rather than leaving it
    ambiguous forever. A retry is a NEW attempt row (§2), so this terminal marking never
    blocks recovery.
-6. **`Join` repairs from the registry, and idempotent re-joins are not rows.** The CLI
-   checks the federation registry first: already joined → the join verb just (re)opens the
+6. **`Join` repairs from the registry.** (The "idempotent re-joins are not rows" rule below is
+   NOT what was built: neither the CLI nor the daemon gates on the registry synchronously —
+   every join writes an attempt row pre-call (`join:<fed>:<sha256(invite)>` for a user or API
+   join; `join:<fed>:<nonce>` is only the agent's auto-join row, `STO-6`) and lets the driver
+   decide (`API-22`), and a no-op re-open terminalizes that row `Succeeded` carrying
+   `JOIN_NOOP_REOPEN_NOTE` (`STO-35`). The as-built rules are `docs/spec/`'s.)
+   As planned: already joined → the join verb just (re)opens the
    client, NO ledger row (nothing happened). Not joined → new `join:<fed>:<nonce>` attempt
    row pre-call, updated to terminal post-call. Reconcile repairs a stranded `Started` join
    row from the registry (the authority on membership), PER ATTEMPT with timestamp

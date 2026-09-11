@@ -362,8 +362,10 @@ substrings nor the three pinned-SDK deterministic send rejections. `Stranded`, `
 
 **ALC-37** The **probe gate**: a joined federation with no `UserApproved` candidate row is
 auto-joined and fundable only when its active-probe verdict is `Passed`; a missing or poison
-candidate row gates fail-closed. `approve` (`API-23`) or a user `join` writes `UserApproved` and
-exempts it. A pin does not bypass the gate.
+candidate row gates fail-closed. `approve` (`API-23`) writes `UserApproved` and exempts it; a user
+`join` writes it only when no `AutoJoined` row already exists, because
+`mark_candidate_user_approved` leaves an `AutoJoined` row agent-owned (`OPS-42`) — re-joining an
+auto-joined federation does **not** release this gate. A pin does not bypass the gate.
 
 **ALC-28** A discovery pass
 (`run_discover_pass_bounded_with_rotation_and_probe_policy_with_membership_lease`):

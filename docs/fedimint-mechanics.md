@@ -58,7 +58,8 @@ ADR-0022 — see "What this means for us".
   lexicographically on `(base, ppm)`, not as a cap on the fee charged — `(99 sat, 50,000 ppm)`
   passes, `(100 sat, 15,001 ppm)` fails, `(101 sat, 0 ppm)` fails — see `FMI-19`. Terminal
   rule: gateway forfeit or invoice expiry enters `Refunding`; a successful refund ends
-  `Refunded`; refund outputs rejected but a valid preimage found ends `Success`; otherwise
+  `Refunded`; refund outputs that fail to finalize (rejected, or accepted with note issuance
+  then failing) but a valid preimage found ends `Success`; otherwise
   `Failure` (`FMI-23`, `FMI-37`).
 - **The federation does NOT dedup by payment hash** (outgoing contracts keyed by funding
   outpoint, fresh keys per contract — `lnv2-server/lib.rs:552`). But the **client does**:

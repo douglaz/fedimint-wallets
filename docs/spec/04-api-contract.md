@@ -56,8 +56,16 @@ The nine unit variants serialise as bare strings: `"insufficient_after_reservati
 `"storage_error"`, `"policy_invalid"`, `"policy_superseded"`, `"conflict"`. The one struct
 variant serialises as an object: `{"sizing_conflict":{"field":"<name>"}}` with two emitted
 values: `"amount"` from the daemon handler when a pay's `amount` disagrees with the invoice
-(`API-18`), and `"request sizing"` from the actor's `validate_live_attach` when a live pay or
-receive key is re-submitted with a different fee cap (`OPS-8`). How an actor-side
+(`API-18`), and `"request sizing"` from the actor's `validate_live_attach` when a live operation
+key is re-submitted with **any** sizing field changed (`OPS-8`). That check covers every action
+kind the actor admits — `Pay`, `Receive`, `Move`, `Evacuate`, `DirectInflow`, `Join`, `Recover`
+(the match also has a `RefuseInflow` arm, unreachable because a refusal is never an intent,
+`DOM-6`) — and compares each kind's whole identity (endpoints, `amount`, `fee_cap`, payment
+hash, nonce, invite), not the fee cap alone; a `POST /v1/direct-inflow` re-sent with the same
+`nonce` and a different `fee_cap` is refused here, because `dinflow:<to>:<amount>:<nonce>`
+(`STO-6`) does not embed the cap. The actor sets that reason directly; the same reason also
+arrives by substring from the core's own `validate_attach`, which runs after the actor's checks
+(`OPS-8`, `OPS-39`). How an actor-side
 `RefuseReason` is chosen from an `ExecError` message is
 `OPS-39`.
 
@@ -219,7 +227,9 @@ ordering is a CLI convenience (`API-40`), not a wire property.
 ### Money verbs
 
 Every money verb builds one `AllocatorDecision` with `reason: user_initiated`, `actor: User`,
-samples the source federation's balance, and submits it to the actor as one command (`OPS-5`).
+samples the balance of every open federation it names — `pay`: `from`; `move`: `from` and `to`;
+`receive` and `direct-inflow`: `to` — and submits it to the actor as one command (`OPS-5`,
+`API-36`).
 The response discards whether the admission was fresh or attached to an in-flight operation with
 the same key; a caller cannot distinguish the two from the status code.
 

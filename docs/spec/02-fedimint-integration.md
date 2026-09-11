@@ -83,12 +83,17 @@ else preview the config under a 60-second bound (`FMI-21`) → allocate the next
 (`STO-3`) → `preview.join(partition, root_secret)`, removing the partition best-effort on
 failure → the joined id must equal the invite's → write the registry row → insert the handle.
 In the daemon the last two steps run under an actor membership lease that bumps the world
-generation so an in-flight tick plan is refused (`ALC-32`). The daemon and auto-join call
-`join_before_deadline` with a caller budget: the lock wait, the preview and `preview.join` are
+generation so an in-flight tick plan is refused (`ALC-32`). **Auto-join** — and only auto-join —
+calls `join_before_deadline` with a caller budget (the remaining discovery pass budget, `FMI-22`):
+the lock wait, the preview and `preview.join` are
 each bounded by the remaining budget, whichever of it and the 60-second preview bound is tighter
 fires first, and an elapsed budget returns the distinct outcome `DeadlineElapsed` (not an
 error); a budget that elapses inside `preview.join` removes the fresh partition best-effort
-exactly as a failed join does.
+exactly as a failed join does. A user `POST /v1/join` has **no** such budget: it calls
+`join_with_membership_lease`, which installs no deadline at all (`DeadlineElapsed` is
+unreachable on that path), and the driver exempts `Join` from the per-intent perform timeout
+(`FMI-22`), so the 60-second preview bound is the only bound a user join carries and its
+`join_lock` wait is unbounded.
 
 **FMI-9** `open_all` at startup is best-effort per federation: a partition that fails to open is
 warned and skipped, and that federation is registered-but-unopened (`DOM-2`). The scheduler
@@ -137,7 +142,9 @@ means the gateway serves that federation, `None` (a `200` with `null`) means it 
 does not, and a transport failure, **any non-200 status** (an lnv1-only gateway's 404 included)
 or a decode failure is an error. The public `validate_gateway(fed, gw)` collapses that to
 `Result<()>`: "does not serve" and a transport fault both arrive as `Err`, so a caller cannot
-tell them apart through it.
+tell them apart through it. Nothing restricts where that POST goes: `SafeUrl` only wraps
+`Url::parse`, so any URL a guardian lists — loopback, link-local, RFC1918, cloud metadata — is
+requested by the wallet host, through the system proxy if one is set (`HST-2`, `F45`).
 
 **FMI-12** Automated selection MUST choose the **cheapest** validated candidate (`DEF-5`).
 The candidate set is one federation's vetted list (`FMI-10`), or the single break-glass gateway
@@ -259,7 +266,7 @@ own caps (`OPS-29`) are the only fee bounds that bind on the amount.
 | auto-join | the remaining discovery pass budget, as `join_before_deadline` (`FMI-8`) |
 | `routing_info` HTTP | 5 s connect / 10 s total |
 | invoice expiry | 3,600 s |
-| per-intent perform (daemon) | `WALLETD_PERFORM_TIMEOUT_SECS`, default 600 s, `0` disables; never applied to join or recover |
+| per-intent perform (any actor-backed path: the daemon, and every standalone money or await verb — `FMI-38`) | `WALLETD_PERFORM_TIMEOUT_SECS` in the daemon, `--perform-timeout` standalone (`HST-9`), default 600 s, `0` disables; never applied to join or recover |
 | daemon receive-invoice wait | 30 s |
 | daemon long-poll | 60 s |
 | fallback route scan | 10 s |
@@ -274,8 +281,10 @@ after 3,600 seconds (a direct inflow stays `Awaiting` until then); a send funded
 completed is refunded by the SDK's send state machine on gateway forfeit or expiry, and the move
 terminalizes `Refunded`; a send that succeeds while the receive reaches a terminal non-claim is
 `Stranded` (`OPS-27`). "Forfeit ⇒ `Refunded`" is the normal case, not a guarantee: in the SDK's
-`Refunding` branch, if the refund outputs are **rejected** (the gateway incorrectly claimed the
-outgoing contract), the state machine re-reads `await_preimage(outpoint)` one last time and, if
+`Refunding` branch, if the refund outputs do not finalize — **rejected** (the gateway incorrectly
+claimed the outgoing contract) or accepted with note issuance then failing, which
+`await_primary_module_outputs` cannot tell apart (`FMI-37`) — the state machine re-reads
+`await_preimage(outpoint)` one last time and, if
 a preimage verifying against the contract is there, yields `Success(preimage)`; a forfeited
 send can therefore be promoted to a settled send and, meeting a non-claimed receive, land
 `Stranded`. If neither the refund nor a preimage is available the send yields `Failure`
@@ -288,7 +297,7 @@ operation state:
 
 | Leg | `Failure` is reached when | Money position |
 |---|---|---|
-| send | (a) `SendSMState::Rejected` — the **funding** transaction was rejected, nothing was funded; or (b) `Refunding` and the refund outputs were rejected **and** no verifying preimage was available (`FMI-23`) | (a) nothing moved; (b) the outgoing contract WAS funded and its position is unresolved |
+| send | (a) `SendSMState::Rejected` — the **funding** transaction was rejected, nothing was funded; or (b) `Refunding` and `await_primary_module_outputs` on the refund outputs failed — either the **refund** transaction was rejected or it was accepted and mint note issuance then failed (`MintOutputStates::Aborted` / `Failed`, both `Err` from `await_output_finalized`) — **and** no verifying preimage was available (`FMI-23`) | (a) nothing moved; (b) the outgoing contract WAS funded and its position is unresolved |
 | receive | `ReceiveSMState::Claiming` and `await_primary_module_outputs` on the claim's outputs failed — either the **claim** transaction was rejected (this wallet claimed nothing, which does not prove the contract is unclaimed) or it was accepted and mint note issuance then failed | unknown whether the incoming contract was consumed |
 
 The wallet records the send case as `SendState::Failed(SEND_FAILURE_DETAIL)` and the receive
@@ -307,10 +316,13 @@ WSS-transport federations") hung until the
 daemon's per-intent perform timeout (`FMI-22`) re-drove the intent with a fresh await; it was
 attributed to the iroh transport by the operator and has not been reproduced or isolated, so
 "iroh stalls" is a working hypothesis, not a measured fact. Two bounds exist and they do
-different things, and the perform deadline itself behaves differently per host: in the
-**daemon** it wraps the whole drive future and **drops** it on expiry, discarding the result,
-so the intent stays `Executing` until the next `reconcile_durable` normalizes it to `Pending`
-(`OPS-15`); in **standalone** mode the `TimeoutExecutor` returns `Retryable` and the executor
+different things, and the perform deadline itself behaves differently by **execution path**, not
+by host: on an **actor-backed** path — the daemon, and every standalone money or await verb, which
+`run_standalone_actor` drives through the same `WalletService` (`HST-9`) — `spawn_intent` wraps the
+whole drive future and **drops** it on expiry, discarding the result, so the intent stays
+`Executing` until the next `reconcile_durable` normalizes it to `Pending`
+(`OPS-15`); on a **`Runtime`-direct** path — standalone `tick`, `probe`, `discover` — the
+`TimeoutExecutor` returns `Retryable` and the executor
 resets the intent to `Pending` itself (`--perform-timeout`, default 600 s, `0` disables,
 `HST-9`). An await verb's `--timeout` (default 600 s, `API-38`) only makes
 `resolve_await` return `Timeout` (exit 4) and leaves the row `Awaiting` — no journal transition,
@@ -349,7 +361,7 @@ the invite's → shut the recovery-phase handle down, **reopen** the partition t
 open path (the recovery-phase handle omits recovered modules), drain active state machines with
 `wait_for_all_active_state_machines` → re-take
 the lock, re-check → one journal transaction writes the registry row, terminalizes the intent
-`Done`, and writes a `UserApproved` candidate (`STO-14`) → insert the handle with no await
+`Done`, and writes a `UserApproved` candidate (`STO-26`) → insert the handle with no await
 between.
 
 **FMI-32** What is recovered is what the SDK's module recovery rebuilds from the seed by

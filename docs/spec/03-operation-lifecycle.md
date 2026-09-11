@@ -52,8 +52,11 @@ error, never a `Failed` intent.
 **OPS-5** Every user verb — in the daemon and in the CLI's standalone mode alike — builds one
 `AllocatorDecision` (`reason: UserInitiated`, `actor: User`), samples balances off the actor
 (`pay`: `from`; `move`: `from` and `to`; `receive` and `direct-inflow`: `to`; `join` and
-`recover`: none), sets `dest_unavailable` only for `move`, `receive` and `direct-inflow` when
-`to` is joined but unopened, and submits one `OpRequest` to the actor. The CLI's standalone money
+`recover`: none) and submits one `OpRequest` to the actor. The **daemon** handlers set
+`dest_unavailable` for `move`, `receive` and `direct-inflow` when `to` is joined but unopened; the
+standalone verbs pass `None` for every verb — they run `open_all` at startup, so the dest-side
+503 fail-fast is a daemon-HTTP concern (`API-19`, `API-37`) and the actor's
+`DestinationUnavailable` refusal is unreachable from standalone. The CLI's standalone money
 verbs run the same actor without a scheduler; `Runtime::pay/receive/join/await_move` have no
 production caller. Two paths bypass the actor: `Runtime::tick` (`OPS-12`) and the standalone
 `probe` verb, whose two money legs go through `Runtime::do_move` with no service client (`F42`).
@@ -196,10 +199,14 @@ generation-coalesced, that runs `ReconcileDurable` (marker policy `PreservePlann
 actor stops. Cross-restart exactly-once rests on SDK
 operation ids, lnv2 dedup and op-log backfill, not on this registry (`ADR-0024`).
 
-**OPS-15** The daemon's per-intent perform timeout wraps the whole drive future and **drops** it
+**OPS-15** The per-intent perform timeout on an **actor-backed** path — the daemon, and every
+standalone money or await verb, which runs the same `WalletService` (`HST-9`) — wraps the whole
+drive future and **drops** it
 on expiry; the intent stays `Executing` until the next `reconcile_durable` normalizes it to
 `Pending`. The `TimeoutExecutor` doc comment says a timeout leaves the intent `Pending` via the
-retryable path; that is true only of the standalone executor. Join and recover are never timed
+retryable path; that is true only of the `Runtime`-direct paths that build it
+(`Runtime::driving_executor`: standalone `tick`, `probe`, `discover`), not of standalone as a
+host. Join and recover are never timed
 out.
 
 **OPS-16** An **awaiter task** owns an `Awaiting` intent. For a raw `Pay` or `Receive` it MUST:
@@ -550,8 +557,13 @@ gateway (`OPS-20`, `F7`) and pays the recovered invoice through whatever it reso
 **OPS-42** `Join`: parse (`Permanent`), `mc.join` under a membership lease in the daemon (error
 → `Retryable`), compute `newly_joined = !membership_preexisting && (sdk_reported_new ||
 registered_invite == the intent's invite)` where `registered_invite` is the registry row's invite,
-read only when neither of the first two terms holds; mark the candidate `UserApproved` if the
-actor is `User`; `record_join_outcome` in the ledger (a stale attempt → `Retryable`); return
+read only when neither of the first two terms holds; if the actor is `User`, mark the candidate
+`UserApproved` — **but only from a state that is neither `AutoJoined` nor already `UserApproved`**:
+`mark_candidate_user_approved` returns without writing on both, so a user `join` of an
+already-auto-joined federation leaves the row agent-owned and only the audited `approve` verb
+(`API-23`) releases its probe gate and unproven slot (`ALC-37`, `ALC-29`) — seed recovery promotes
+any candidate state in code (`STO-26`) but refuses a federation that still has a registry row
+(`FMI-31`), which auto-join always writes, so it is not a release path here; `record_join_outcome` in the ledger (a stale attempt → `Retryable`); return
 `Done`. `Recover`: parse, `mc.recover` under the lease, **any** error → `Permanent`, `Done`.
 Neither has a fee cap or a reservation.
 
@@ -605,11 +617,16 @@ diagnostics with no would-run decisions.
 (`Pending | Executing`) per pass; despite its name, `drive_to_terminal` does not loop. A step that
 returns `Retryable` or a structural refusal leaves the intent `Pending` for a later pass. It never
 touches `Awaiting`, `Done` or `Failed`. Re-performing an `Executing` intent
-relies on the executor's idempotency (`OPS-17`–`OPS-27`, `OPS-43`). The standalone
-`Runtime::reconcile` first runs `backfill_move_record` for every `pending()` and `awaiting()`
+relies on the executor's idempotency (`OPS-17`–`OPS-27`, `OPS-43`). `Runtime::reconcile` — reached
+only from the `watch_once` dev/test harness, **not** from the standalone `reconcile` verb, which is
+actor-backed and mirrors the daemon handler (`reconcile_durable`, then `repair_ledger_with_actor`,
+whose O(ledger) scan and row repair run off actor while its raw `Pay`/`Receive` terminal write is
+routed through the actor, `OPS-37`, `ADR-0031`) — first runs `backfill_move_record` for every `pending()` and
+`awaiting()`
 intent (a failure is logged and that intent skipped), then core `reconcile` under the
 `TimeoutExecutor`, then a best-effort `repair_ledger` (`STO-24`), then reports the `awaiting()`
-set and goal blockers from a fresh `pending()` scan. Standalone `await_move` refuses a `Pending |
+set and goal blockers from a fresh `pending()` scan. `Runtime::await_move`, which likewise has no
+production caller (`OPS-5`), refuses a `Pending |
 Executing` intent ("intent {key} is {status}, not awaiting — run `direct-inflow`/`reconcile`
 first").
 
@@ -636,7 +653,9 @@ keys a live driver owns, and planner-owned markers under the preserve or capture
 reservation-releasing write the repair scan routes through the actor, fenced on ledger seq, op,
 role, status and intent attempt, `Pay | Receive` only; `backfill_move_record` from the op-log;
 `Runtime::direct_inflow` completing an `Awaiting` intent whose record is already terminal
-(a crash between `settle_move` and `finalize`).
+(a crash between `settle_move` and `finalize`) — that last one is reached only by tests
+(`STO-6`); the standalone verb builds a `dinflow:` key through the actor, so no production
+caller takes this repair path today.
 
 ## Errors
 
@@ -665,8 +684,10 @@ match on the message**, tested in this order:
 A `ServiceError::Storage` raised on the admission path (the key read, the goal-blocker scan, a
 probe-record read) is re-wrapped as `Refused{StorageError}` (`storage_refusal`). Reasons the
 actor assigns directly, not by substring: `Conflict` (goal conflict, the driver cap, the
-live-attach, retry-anchor and terminal-anchor refusals of `OPS-8`/`OPS-10`, replacement
-occurrence and lease conflicts), `FedHeldByProbe`, `PolicySuperseded`, `PolicyInvalid`,
+retry-anchor and terminal-anchor refusals of `OPS-8`/`OPS-10`, replacement
+occurrence and lease conflicts), `SizingConflict{field: "request sizing"}` for the **live-attach**
+refusal — `validate_live_attach` sets that reason itself, it is not a `Conflict` (`OPS-8`,
+`API-5`) — `FedHeldByProbe`, `PolicySuperseded`, `PolicyInvalid`,
 `BudgetExhausted`. The HTTP status per reason is `API-6`. These strings and prefixes are a
 load-bearing contract, not decoration; a rewording changes the wire.
 

@@ -16,8 +16,10 @@ much the design defends against them:
    quote without performing; the wallet bounds the loss to one operation's amount and terminalizes
    honestly (`FMI-23`). It cannot strand a move alone and cannot open the preimage (`DEF-20`).
 3. **A malicious or misconfigured guardian.** Can place a gateway in the vetted list on its
-   own (`SEC-17`), can serve a false shutdown notice through the overridable meta field (the
-   wallet requires corroboration, `FMI-26`), cannot forge the authenticated config.
+   own (`SEC-17`), and by listing any URL can make the wallet host POST to an address of its
+   choosing — loopback, link-local, RFC1918, cloud metadata — because the `routing_info` call
+   restricts nothing (`FMI-11`, `F45`); can serve a false shutdown notice through the overridable
+   meta field (the wallet requires corroboration, `FMI-26`), cannot forge the authenticated config.
 4. **A poisoned discovery feed.** Every candidate's config is re-fetched and structurally scored,
    the Sybil check requires three ids to agree, and nothing is funded before a sats-spending
    probe passes (`ALC-28`, `ALC-37`).
@@ -134,8 +136,14 @@ bookkeeping and is not part of the unit (`ADR-0025`).
 **SEC-7** Every fee cap that binds **on the amount** is the wallet's own (`OPS-29`). The SDK
 also enforces its `SEND_FEE_LIMIT` / `RECEIVE_FEE_LIMIT` at the pin, but lexicographically on
 `(base, ppm)` (`FMI-19`): a gateway posting a base above 100 sat (send) or 50 sat (receive) is
-refused before any wallet cap is consulted, and one under that base passes with any ppm — an
-admission filter on the gateway's posted fee, not a bound on what a payment costs. A move is
+refused, and one under that base passes with any ppm — an
+admission filter on the gateway's posted fee, not a bound on what a payment costs. That check runs
+**after** the wallet's own, not before it, and no wallet crate reads either limit: the executor
+quotes the candidates, keeps the cheapest that fits the wallet's cap, and only then calls
+`mc.pay` / `mc.receive`, inside which the SDK checks the **already-selected** gateway. A gateway
+over the base limit therefore fails the attempt rather than being skipped in favour of the next
+candidate — `GatewayFeeExceedsLimit` → `RouteRejected` → `Permanent` for a send, and the receive
+refusal → `Retryable` (`FMI-17`, `OPS-17`, `OPS-18`). A move is
 refused before minting if the receive leg alone exceeds
 the cap, and again before paying if both legs do.
 
@@ -163,7 +171,9 @@ reaches a scoring or funding decision without a re-fetched, authenticated config
 
 **SEC-16** A federation the agent joined is fundable only after a sustained window of real
 round-trip probes, and a pin does not bypass that gate (`ALC-37`). A user's own `join` is
-trusted as the user's decision.
+trusted as the user's decision — **except** over a federation the agent already auto-joined, whose
+candidate row stays agent-owned and probe-gated until the audited `approve` verb releases it
+(`OPS-42`; seed recovery cannot, since it refuses a registered federation, `FMI-31`).
 
 **SEC-17** The vetted gateway list is a union of what each responding guardian returned, so one
 Byzantine or misconfigured guardian can place a gateway in the automated candidate set, and
