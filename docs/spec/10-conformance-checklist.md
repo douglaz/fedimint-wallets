@@ -26,7 +26,7 @@ by `docs/devimint-runbook.md` §1.
       it is called correct (`DEF-15`, `DEF-19`). The failure signature is recorded verbatim.
 - [ ] **CNF-39** Every smoke header records its complete launch block and its last green run with
       the figures observed. As built only `smoke_evacuate_supersede_devimint.sh` does; the other
-      fifteen carry a launch block and no run record, and their last green runs live in issue
+      sixteen carry a launch block and no run record, and their last green runs live in issue
       close notes and `docs/archive/drive-br-n8o-2026-08.md`, not beside the script.
 
 ## Build and unit gates
@@ -84,7 +84,29 @@ by `docs/devimint-runbook.md` §1.
 
 - [x] **CNF-27** The two-federation harness is `docs/devimint-two-fed-harness.patch` applied to a
       checkout at the **pinned** SDK revision, not an arbitrary one (a different commit can be
-      protocol-incompatible with the client), built release.
+      protocol-incompatible with the client), built release. The patch is what makes the harness
+      two-federation at all: vanilla `dev-fed --num-feds 2` only reserves ports and never stands
+      federation B up. The patched harness starts B, connects the LDK gateway to it, pegs in
+      B-side liquidity, and exports `FED_B_INVITE` to the `--exec` script; a harness that does
+      not provide those four things is not equivalent.
+- [x] **CNF-52** Every routed smoke registers the LDK gateway on **every guardian** of each
+      federation it uses, right after bring-up, and then runs unpinned (`devimint_lib.sh`
+      `register_lnv2_gateway`) — with two deliberate exceptions that must not be "fixed":
+      `smoke_breakglass_devimint.sh` registers on A only, leaves B's vetted list empty, and drives
+      B through `--gateway`; `smoke_responsiveness_devimint.sh` registers its never-responding
+      double instead of the LDK gateway. devimint never adds its gateway to the vetted lnv2 list, and
+      automated routing resolves from that list and nothing else (`FMI-10`, `ADR-0030`), so an
+      unregistered harness makes every routed money path refuse. Registration is one
+      authenticated admin write per guardian — `module lnv2 gateways add <url>` with `--our-id
+      <peer>` for each peer in `0..FM_FED_SIZE-1` against a client joined to that federation —
+      and performs no liveness check of the URL, which is why the responsiveness gate can register
+      its never-responding double (`CNF-25`).
+- [x] **CNF-53** `smoke_breakglass_devimint.sh` (the seventeenth smoke, PR #49): with federation
+      B's vetted list empty throughout, an unpinned move to B stays `Pending`; `await-move KEY
+      --gateway GW` completes exactly that move; `tick`/`probe --gateway` are usage errors;
+      `move`/`receive --to B`/`pay --fed B` each route through the override for that ONE key; a
+      second key created without the flag is still `Pending` at the end. This is the live gate
+      `ADR-0030` rests on. Carries a launch block and no run record (`CNF-39`).
 - [x] **CNF-28** The harness environment exports `FM_ENABLE_MODULE_LNV2=1`,
       `FM_ENABLE_MODULE_MINT=1` and `FM_ENABLE_MODULE_WALLET=1`; without the last two every smoke
       that reads a balance dies with "Primary module not available" (`DEF-19`).

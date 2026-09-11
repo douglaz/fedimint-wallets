@@ -47,44 +47,22 @@ The one long-running deployment is a test rig holding a small real-sats balance,
 ## Allocator policy
 
 The standing instructions the Allocator runs against live in one stored `Policy`, edited
-field-by-field with `wallet-cli policy set` and printed by `wallet-cli policy get`. The
-balance knobs are `--per-fed-cap`, `--spending-target`, and `--standby-target` (all msat);
-the two fee caps are deliberately different shapes:
+field-by-field with `wallet-cli policy set` and printed by `wallet-cli policy get`. The rules
+are owned by [`docs/spec/06-allocator-and-automation.md`](./docs/spec/06-allocator-and-automation.md);
+this section only maps the flags to them.
 
-- `--max-fee` - ABSOLUTE fee cap in msat (a flat ceiling, not scaled by the amount). It bounds
-  NO move the Allocator emits: funding moves use `--max-fee-bps-of-move` and evacuations use the
-  `--evac-fee-*` pair below. **In an evacuation incident this is not the knob to turn.** It is
-  still the default `--fee-cap` for the manual `pay`/`move`/`receive`/`direct-inflow`
-  commands, so setting it very low refuses those too.
-- `--evac-fee-base-msat` + `--evac-fee-bps` - the EVACUATION cap, `base + floor(delivered *
-  bps / 10_000)`, default 200 sats + 3%. The base is msat; the second flag is BASIS POINTS,
-  `0`-`10000` — `300` is 3%, not 300 msat, and entering a bps value as msat silently widens the
-  cap by orders of magnitude. Zero bps is accepted and means a base-only cap, valid only
-  alongside a non-zero base. It is computed from the net the destination is actually CREDITED,
-  not the amount asked for. An admitted evacuation normally keeps its cap pair. The narrow
-  exception is an Agent evacuation that is still pre-artifact and carries durable typed evidence
-  of a structural refusal: a component-wise monotone cap edit that is effectively larger at a
-  recorded delivered-net sample lets the daemon atomically retire it and admit a linked successor
-  under the new pair. Standalone recovery requires a tick occurrence newer than the marked
-  evacuation; ordinary, equal, decreased, or crossed cap edits do not release it.
-- `--max-fee-bps-of-move` - PROPORTIONAL fee cap for funding moves (top-up and standby), in
-  basis points of the amount moved, `1`-`10000`; default `300` (3%). Funding sizing reserves
-  it from the source, so `amount + amount * bps / 10000` always fits the source budget and a
-  positive surplus is never refused for being smaller than a flat cap.
+| Flag | What it bounds | Rule |
+|---|---|---|
+| `--per-fed-cap`, `--spending-target`, `--standby-target` (msat) | balances | `ALC-2`, `ALC-9` |
+| `--max-fee` (msat, absolute) | the manual `pay`/`move`/`receive`/`direct-inflow` default `--fee-cap`, **and** the per-leg fee cap of every daemon-scheduled active probe (`PolicyExt::probe_policy`); **no allocator-emitted move**, so it is not the knob in an evacuation incident | `ALC-3`, `ALC-25`, `DEF-1`, `DEF-21` |
+| `--max-fee-bps-of-move` (basis points, `1`–`10000`, default 300) | funding moves, proportional; sizing reserves `amount + cap` from the source | `ALC-7`, `ALC-8` |
+| `--evac-fee-base-msat` + `--evac-fee-bps` (msat + basis points, default 200 sats + 3%) | evacuations, `base + floor(delivered × bps / 10 000)`, computed from what the destination is credited | `ALC-20`–`ALC-22`, `OPS-25` |
 
-A `--max-fee-bps-of-move` of `0` (every funding move would get a zero cap and fail) or above
-`10000` is rejected by policy validation. Before each committable tick, if live allocator work has
-not conflict-blocked the designated funding pair, the allocator attempts to price it. Candidates
-come from the destination federation's vetted list and nothing else — automated routing is never
-pinned (ADR-0030). Pricing validates `routing_info` at both ends and picks the
-cheapest validated candidate, but source-side vetted-list membership is not yet enforced
-(`br-s0e`). A pair priced `Routable` waits until its shortfall clears that route's economic
-floor or the protocol `min_move` floor, whichever is greater. `Unroutable` blocks the move;
-`UneconomicAtAnySize` also records an
-`uneconomic_route` refusal in `wallet-cli history`. An absent candidate list, bounded-scan miss,
-quote error, or indeterminate floor can instead leave the pair unpriced, in which case allocation
-permissively falls back to the protocol `min_move` floor. The perform-time cap remains the final
-money backstop if quotes change.
+`300` bps is 3%, not 300 msat; a bps value entered as msat silently widens the cap by orders of
+magnitude. A qualifying raise of the evacuation pair can release a structurally refused
+evacuation into a linked successor (`OPS-30`). Route pricing, the per-pair economic floor and the
+refusal rows it writes are `ALC-10`–`ALC-13`; automated routing resolves from the vetted list
+and is never pinned (`ADR-0030`, `F6` for what is not yet enforced).
 
 See [docs/real-sats-pilot-runbook.md](./docs/real-sats-pilot-runbook.md) for suggested
 pilot values.

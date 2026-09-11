@@ -1,7 +1,8 @@
 # fedimint-wallets — as-built specification
 
-A description of the wallet **as it exists in this repository on 2026-09-07**, at `main`
-`ee4ba1c` (which contains PR #40 and PR #45). Not a plan, not a roadmap, and not a record of what was
+A description of the wallet **as it exists in this repository on 2026-09-10**, at `main`
+`7225114` (which contains PR #40, #45, #49 and #50; first written against `ee4ba1c` on
+2026-09-07 and re-read in full against `7225114`). Not a plan, not a roadmap, and not a record of what was
 intended: where a plan document, an ADR, a code comment or the glossary says one thing and the
 code does another, this set records what the code does and files the difference in
 [`11-open-findings.md`](./11-open-findings.md).
@@ -28,7 +29,7 @@ the documents keep the function names so a reader can go and look.
 | [`10-conformance-checklist.md`](./10-conformance-checklist.md) | What has been demonstrated, by which gate, and what has not |
 | [`11-open-findings.md`](./11-open-findings.md) | **Read before planning.** The gaps between documents and code, each tied to the issue that tracks it |
 | [`../../CONTEXT.md`](../../CONTEXT.md) | The glossary. Entries define the ADR-accepted target and carry a one-line pointer to the gap where the code lags; `F6` and `F7` list them |
-| [`../adr/`](../adr/) | The thirty-one decisions and what was rejected to reach them. Canonical where they conflict with older prose; **not** canonical where they describe unbuilt behaviour (`ADR-0029` half, `ADR-0030`, `ADR-0031` items 2–3) |
+| [`../adr/`](../adr/) | The thirty-one decisions and what was rejected to reach them. Canonical where they conflict with older prose; **not** canonical where they describe unbuilt behaviour. Unbuilt in whole or in part: `ADR-0003` (Android silent backup), `ADR-0011` (Keystore, scoped to Android), `ADR-0013` (recurringd), `ADR-0014`'s gating acknowledgement (only a reason-code label exists), `ADR-0016`/`ADR-0017`'s reputation weighting and trust-anchor set (no Nostr source, `FMI-29`), `ADR-0018`'s stranded-funds UI, `ADR-0026` (`F11`), `ADR-0027` (`F13`), `ADR-0028` beyond the config skeleton (`F27`), `ADR-0029`'s hop and set-aside record (`F3`), the threshold-vetted list `ADR-0029` "What this rests on" decides (`F6`) and the persisted committed route (`F7`; `ADR-0030` itself is built, `F4` closed), `ADR-0031` items 2–3 (`F17`), and `ADR-0004`'s Lightning-Address/LNURL send (deferred by the roadmap; `OVR-11`) |
 
 Read `00`, `01` and `03` first. `03` is the part that distinguishes this wallet from a thin
 fedimint client: a money operation is a durable, idempotency-keyed intent that survives a crash
@@ -39,22 +40,27 @@ at any of four named points without double-paying, and everything else is built 
 Every requirement wears the same costume — a MUST, a stable identifier — and the confidence
 behind them is not uniform.
 
-- **Every requirement describes code that exists** and was read on 2026-09-07. The unit suite
-  (1,071 tests) is green on that code, but a requirement is not a test: `10-conformance-checklist.md`
+- **Every requirement describes code that exists** and was read on 2026-09-07, then re-read
+  against `7225114` on 2026-09-10 by six slice reviewers and a codex + Claude review panel. The unit suite
+  was green at `ab52094` (1,071 tests, `CNF-5`); no run is recorded at `7225114`, and a requirement
+  is not a test either way: `10-conformance-checklist.md`
   says which behaviour a gate actually exercises, and `HST-23`–`HST-25` and the unchecked `CNF`
   items describe facts no suite touches.
 - **Most money paths have also been exercised live** against a two-federation devimint harness
   by the smokes in `10-conformance-checklist.md`. That document says which, and which not.
 - **Nothing after build `b5f46de` (2026-07-26) has run against a real federation.** The one
-  long-running deployment is a test rig at that build; `main` is 220 commits past it. Everything
+  long-running deployment is a test rig at that build; `main` is 240 commits past it (`HST-24`). Everything
   the evacuation-cap, supersession, watch-suppression and persistence-fix work changed has only
   devimint evidence (`HST-24`).
 - **The extraction notes flagged `[verify]` where a fact was inferred rather than read.** Those
   were either resolved by a second read or dropped; none survive as a requirement. `[gap]` items
   became findings.
-- **This set has not itself been reviewed.** It is a first draft written in one sitting from six
-  extraction passes. Treat a claim you are about to rely on as a pointer to the function it names,
-  and read the function.
+- **How this set was reviewed.** The first draft was written in one sitting from six extraction
+  passes and was not reviewed. On 2026-09-10 six slice reviewers re-read every document against
+  the code it describes and a two-model panel (codex + Claude) reviewed the resulting diff over
+  six passes, each finding verified against the source before it was fixed. That is a review of
+  the *text against the code*, not a test of the code: treat a claim you are about to rely on as
+  a pointer to the function it names, and read the function.
 
 ## Requirement conventions
 

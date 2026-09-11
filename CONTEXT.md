@@ -53,15 +53,18 @@ anonymity (no Tor in v1, see
 _Avoid_: "anonymous", "untraceable"
 
 **Silent backup / Recovery**:
-The seed and the user's joined federation IDs are saved automatically via Android
-Block Store (E2E-encrypted to the user's Google account, keyed to the device
+**Target, not built** (`ADR-0003`; no Android frontend exists, F28): the seed and the user's
+joined federation invite codes are to be saved automatically via Android Block Store (E2E-encrypted to the user's Google account, keyed to the device
 lockscreen), with no seed-phrase ceremony at onboarding. On a new device the seed
 restores during setup and balances are rebuilt from it via Fedimint recovery. See
 [ADR-0003](./docs/adr/0003-recovery-silent-backup.md).
-**The backup unit is the seed plus the joined federation IDs — never the wallet's
+**The backup unit is the seed plus the joined federations' invite codes (an id alone carries no guardian endpoints, `SEC-24`) — never the wallet's
 local stores.** Recovery rebuilds balances from the seed; it does not reinstate a
 point in time. Because the money is recoverable this way, losing the bookkeeping
 store loses records, not settled funds.
+**Current supported path**: on the headless daemon the backup unit is held by the operator —
+the seed via `walletd mnemonic` plus every joined invite (`SEC-24`) — and recovery is
+`recover <invite>` per federation (`FMI-30`).
 _Avoid_: making "seed phrase backup" the default flow (it is an opt-in export);
 calling a copy of the local stores "the backup"
 
@@ -70,7 +73,7 @@ Copying the wallet's local stores back onto a host — an operator action, not t
 product's backup path. The stores are one live unit and carry **no cross-store
 point-in-time guarantee**, so they are restored **together from a single snapshot,
 or not at all**; a mismatched pair is out of contract. When a store is lost, the
-supported path is Recovery from the seed and federation IDs, not a store copy.
+supported path is Recovery from the seed and each federation's invite code, not a store copy.
 _Avoid_: using "restore" for seed-based Recovery; implying the stores can be
 restored from different moments
 
@@ -129,7 +132,9 @@ everywhere they are compared, or a move can be admitted under one and refused un
 other after its receive leg has already committed.
 _Avoid_: "executed net" — it reads as the **sized ask** to one reader and the **delivered
 net** to another, and that ambiguity is exactly how the same defect reached five separate
-call sites. Say which one you mean.
+call sites. Say which one you mean. The code still uses the phrase at four sites for a
+different contrast — what executed versus what `decide()` planned — and whether that earns its
+own entry or a rename is open (F30, `br-7xc`).
 
 **Serves** (of a gateway, with respect to a route or a leg):
 A gateway **serves** when it is on the relevant **vetted list**, validates, an economically
@@ -169,6 +174,9 @@ that observes state or drives the automated lanes. Exactly four: `pay`, `receive
 applies to is a dispatch rule owned by [ADR-0030](docs/adr/0030-automated-routing-is-never-pinned.md),
 not by this glossary. `direct-inflow` is the one an implementer is most likely to misclassify — it reads like plumbing, but it funds a federation and most devimint
 smokes fund through it, so classifying it as rejected or ignored breaks the funding step.
+`--standalone probe` also moves real sats (a 20-sat inbound leg, then a smaller return leg sized from what arrived minus a 1,000 msat margin) but is an
+agent-lane verb, not a money verb: it drives the automated machinery on the operator's behalf,
+resolves its route from the vetted list only, and rejects the override (ADR-0030).
 
 **Vetted list**:
 The gateways a federation has admitted for lnv2: those that a consensus threshold of its
@@ -177,8 +185,10 @@ and four of five) each name, not every gateway any one guardian names. It is the
 gateway override** deliberately steps outside it, and nothing automated ever does. Each guardian
 keeps its own list and admits a gateway by its own admin action, so getting a gateway vetted
 means registering it on enough guardians, which is why the break-glass exists.
-Per [ADR-0030](docs/adr/0030-automated-routing-is-never-pinned.md); the threshold rule is the
-target (F6, `br-routing-invariants-f6f7-dwx`) — today's read is a union of guardian answers.
+Resolution from the list is [ADR-0030](docs/adr/0030-automated-routing-is-never-pinned.md);
+the threshold rule is [ADR-0029](docs/adr/0029-evacuation-must-be-executable.md) "What this
+rests on" and is the target (F6, `br-routing-invariants-f6f7-dwx`) — today's read is a union of
+guardian answers.
 _Avoid_: "registered gateways" when you mean routable ones — presence in the list is not
 **serving** a route.
 
@@ -195,7 +205,7 @@ affordability sizing, so a holding hint can still prove unaffordable and be re-r
 gateway that quoted and then did not perform never keeps its hint.
 Target per [ADR-0029](docs/adr/0029-evacuation-must-be-executable.md); destination-list
 membership is checked, the source-list and perform-record halves of "holds" are not yet (F6,
-`br-s0e`).
+`br-routing-invariants-f6f7-dwx`).
 _Avoid_: "pin" — a hint is the opposite of one; "serves" for "holds" — it would silently demand
 a sizing pass the hint path does not run.
 
@@ -207,7 +217,7 @@ operation — equal to the **route hint** only when the hint was retained, never
 re-resolved; a **break-glass gateway override** chooses a route but never travels on the intent,
 so a committed break-glass route replays without the flag.
 Target per [ADR-0030](docs/adr/0030-automated-routing-is-never-pinned.md); after cache loss the
-operation artifact carries no gateway yet (F7, `br-s0e`).
+operation artifact carries no gateway yet (F7, `br-routing-invariants-f6f7-dwx`).
 _Avoid_: "pin"; "persisted route" (ADR-0030's earlier wording for the same thing).
 
 **Shared route** / **Hop**:
@@ -235,6 +245,7 @@ A human-readable receive handle (`user@domain`) that resolves via LNURL-pay to
 fresh invoices. On Fedimint it is provided by **recurringd**, not a
 wallet-operated LNURL server. Reusable and linkable, so it is the "easy" (less
 private) receive path; a fresh QR invoice is the "private" path (see "Private").
+Not built: no LNURL or Lightning Address path exists in this version (`OVR-11`).
 _Avoid_: treating a Lightning Address as a fully-private receive
 
 **recurringd**:
@@ -247,7 +258,8 @@ custody-safe. Prefer the **stateless v2** (`recurringdv2`, LNv2) — it joins no
 federation and persists nothing — but it still sees receive metadata in transit
 (handle → federation → amount → time). The device chooses among several
 public/community recurringds; we may run one but only as **one of many**, never a
-sticky default (see [ADR-0013](./docs/adr/0013-recurringd-one-of-many.md)).
+sticky default (see [ADR-0013](./docs/adr/0013-recurringd-one-of-many.md)). Not built: the
+wallet talks to no recurringd today (`OVR-11`).
 
 **Standing instruction**:
 The user's one-time, upfront, gating acknowledgement (before any funds are
@@ -255,6 +267,10 @@ received) authorizing the on-device software to auto-manage funds across
 federations on a best-effort, no-guarantees basis. It is what makes the Allocator
 the user's own on-device agent rather than a service that controls funds (see
 [ADR-0014](./docs/adr/0014-on-device-agent-standing-instruction.md)).
+The gating acknowledgement is not built: nothing records it and nothing waits for it. What
+exists is the instruction's parameters as the stored **Policy** (`OVR-8`) and a
+`standing_instruction` reason-code label on ledger rows; whether the engine ships on by default
+is still open (`11-open-findings.md`, product question 2).
 _Avoid_: "terms of service" (this is a specific in-app consent gate, recorded)
 
 **Incoming contract**:
@@ -283,9 +299,9 @@ lifecycle: an idempotency-keyed, decision-driven record that may be `Pending`,
 and is crash-resumable via reconcile. Reconcile does not re-perform `Awaiting`
 work. NOT money-only — `Action::Join`
 and `Action::Recover` pass `Action::is_executable` through `Intent::action`; they are `Intent`s
-too, which is why ADR-0030's await
-provenance rule has to distinguish "user-initiated" from "resolves a route"
-rather than treating those as the same test. Never appears in API type names or user copy.
+too, which is why "user-initiated" and "resolves a route" are different tests: ADR-0030 binds
+the break-glass to one operation key by verb, not by intent actor. Never appears in API type
+names or user copy.
 _Avoid_: exposing "intent" outside the engine
 
 **Policy**:

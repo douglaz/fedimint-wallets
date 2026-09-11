@@ -29,8 +29,14 @@ gateway-independent escape) is pulled into EARLY v2.
   [`docs/phase4-implementation-spec.md` §15.2](../archive/phase4-implementation-spec.md),
   which still disables `hard_cap` and tests that the over-cap operation SUCCEEDS. That escape
   hatch is incompatible with this resolution: whoever implements the refusal must retire it and
-  its test rather than leave two live contracts. NO OPEN BEAD OWNS THIS YET: `--allow-over-cap`
-  and `operator_hard_cap` still disable the cap, so whichever bead implements the refusal must
-  also carry their removal, or the "unconditional" cap ships with a live bypass.
+  its test rather than leave two live contracts. **Resolved as built (noted 2026-09-10):** the
+  `--allow-over-cap` flag no longer exists on any verb; the refusal is `OPS-7` in
+  `docs/spec/03-operation-lifecycle.md`. What remains is the `operator_hard_cap` helper, which
+  the standalone `probe` and `discover` verbs call with the override permanently off — it
+  supplies those two verbs the compile-time default `per_fed_cap` rather than the stored
+  policy's; only `probe` spends under it (`discover`'s auto-join never probes) — stated by
+  `OPS-7`, tracked as `F43` in `docs/spec/11-open-findings.md`
+  (`br-standalone-probe-hard-cap-default-o6b`).
 - The per-federation balance/data model must support the cap and the
-  stranded-funds UI from v1.
+  stranded-funds UI from v1. The stranded-funds UI is not built; no frontend beyond the CLI
+  exists (`F27`, `F28`), and a stranded move is visible only as a failed row's error string.

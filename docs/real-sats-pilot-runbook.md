@@ -28,7 +28,10 @@ NOT put them in cloud storage or a password manager synced to one.
 ### 2. Back up the federation set (whenever it changes)
 
 The seed recovers ecash *within* a federation; recovery needs each federation's invite
-code. Record them alongside (not with) the seed words:
+code (`SEC-24` is the obligation; this is the procedure). An invite is public metadata **unless
+it carries an `api_secret` part** — that one is a live guardian credential (`SEC-24`) and is
+stored and shared as a secret, never pasted into a ticket or a shared note. Record them
+alongside (not with) the seed words:
 
 ```bash
 wallet-cli list-feds      # one line per fed: <id> invite=<fed1...> joined_at=<ts>
@@ -47,9 +50,10 @@ federation's guardians), but without it recovery means hunting guardians down by
   or its client-side send dedup. Recovery performed while a send was in flight can
   double-pay (the one real hazard, `docs/fedimint-mechanics.md` §4). Prefer keeping the
   disk alive over re-seeding.
-- **Never run two wallets from one seed.** Two clients on the same seed are two
+- **Never run two wallets from one seed** (`SEC-23`). Two clients on the same seed are two
   processes spending the same notes; the federation will let exactly one win and the
-  bookkeeping of both is garbage. One seed, one live `client.db`, one daemon.
+  bookkeeping of both is garbage. One seed, one live `client.db`, one daemon. The store lock
+  does not enforce this across directories: a restored copy at another path is a second wallet.
 
 ### 3a. Ledger integrity alerts: preserve, repair, then retry
 
@@ -96,12 +100,15 @@ money operation is safe to admit.
 Choose federations whose guardians speak the **WebSocket (WSS)** API transport. The iroh
 transport's long-poll can STALL on sustained waits — a cross-fed Move's receive-claim await
 over an iroh federation hung indefinitely in the 2026-07-19/20 incident, recovered only by
-the daemon's `perform` timeout re-driving it with a fresh await. WSS federations avoid that
-failure mode entirely. (The daemon still bounds each `perform` via
-`WALLETD_PERFORM_TIMEOUT_SECS` — 120s in the shipped k8s config — so even an iroh stall
-self-recovers in ~2 min, but prefer WSS so the stall does not happen in the first place.)
+the daemon's `perform` timeout re-driving it with a fresh await. The attribution to iroh is
+unreproduced (`FMI-38`); WSS federations have not shown the stall, which is a reason to prefer
+them, not a guarantee, so keep the perform timeout regardless. (The daemon still bounds each `perform` via
+`WALLETD_PERFORM_TIMEOUT_SECS`, default 600 s; the tracked unit file leaves it at the default,
+and no deployment manifest is tracked in this repository — `HST-20`. Set it lower where you
+deploy, e.g. 120 s, so an iroh stall self-recovers in ~2 min; but prefer WSS so the stall does
+not happen in the first place.)
 
-### 3b. "decisions: none" is two different states — read `deferred:` to tell them apart
+### 3c. "decisions: none" is two different states — read `deferred:` to tell them apart
 
 A tick that finds nothing to do and a tick that *wants* to rebalance and permanently cannot look
 identical from the outside. Both print `decisions: none`, both write no ledger row, and neither
@@ -250,7 +257,9 @@ ops/walletd-watch.py --state ~/.cache/walletd-watch.state   # 0 quiet · 1 alert
 
 It pages on `scheduler_alive=false`, `automation_ready=false` (with the blocking reason), any
 route-floor deferral, and an unreachable daemon; it reports balance changes as notes. A standing
-problem pages on transition, not every pass — delete the state file to force a re-page.
+problem is printed, exits 1 and is posted to the webhook on **every** pass; `--state` only
+silences the quiet case (no alert and nothing changed), so a cron that mails on non-zero exit
+will mail every run until the alert clears (`HST-22`).
 
 Two behaviours worth knowing before you trust it:
 
@@ -363,10 +372,11 @@ scheduler-dead daemon as healthy.
   and treat it as a bug (the known upstream trigger is fixed at our pin; a new firing has
   a new cause).
 - **A stranded move** (found by check 1 above — it appears as a `failed` move whose `show`
-  error reads "send settled but receive was not credited"). **This entry is the canonical
-  account of what `Stranded` means.** Code comments deliberately point here instead of carrying
-  their own explanation, because every previous attempt to enumerate causes in a comment was
-  later shown to be wrong. The state has never been observed in the pilot.
+  error reads "send settled but receive was not credited"). What `Stranded` **means** is
+  defined once, by `DOM-10` in `docs/spec/01-domain-model.md`; this entry is the operator's
+  account of how it can arise and what to do (`OPS-40`). Code comments deliberately point here
+  instead of carrying their own explanation, because every previous attempt to enumerate causes
+  in a comment was later shown to be wrong. The state has never been observed in the pilot.
 
   **What it asserts.** Exactly one observation: the send leg reached a SETTLED terminal, and the
   receive leg reached an op-terminal NON-claim (the invoice expired, or lnv2 yielded its single
@@ -422,9 +432,9 @@ scheduler-dead daemon as healthy.
      takes duplicated in-flight client state or explicit access to the contract and claim
      material.
 
-     *How to run it.* (a) What the store lock does and does NOT rule out. The lock is a FILE
-     INSIDE the data directory (`<data_dir>/client.db.lock`, `wallet-cli/src/main.rs:1222-1240`),
-     so it only excludes two processes opening **that same directory**: a second `walletd` waits
+     *How to run it.* (a) What the store lock does and does NOT rule out (`SEC-23`). The lock is
+     a FILE INSIDE the data directory (`<data_dir>/client.db.lock`, probed by `check_db_lock` in
+     `wallet-cli`), so it only excludes two processes opening **that same directory**: a second `walletd` waits
      for the lock and resumes only after the owner exits, and `wallet-cli --standalone` fails
      immediately with "another process owns the wallet store." It does NOT make the host safe. A
      restored backup or cloned volume mounted at a DIFFERENT path on this same host has its own
@@ -463,7 +473,7 @@ scheduler-dead daemon as healthy.
   the SIBLING exit of the forfeit block, and it does not land in `Stranded`. If the refund does not
   complete and no preimage is available either, the SDK yields send-`Failure`
   (`lnv2-client/lib.rs:725`), which this wallet records as a plain `MovePhase::Failed`
-  (`wallet-fedimint/src/executor.rs:1583-1585`) — the same terminal it uses for a send whose
+  (`map_send_state` / `send_terminal` in `wallet-fedimint/src/multi_client.rs`, `FMI-37`) — the same terminal it uses for a send whose
   funding transaction was simply rejected. In that second case nothing was ever funded and no
   money moved; in the first the outgoing contract WAS funded and its position is unresolved. The
   operation state does not say which one happened. So a `failed` move whose error starts with

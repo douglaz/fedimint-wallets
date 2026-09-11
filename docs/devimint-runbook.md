@@ -923,9 +923,11 @@ fedimint-cli module lnv2 await-receive <op_id>                  # -> "Claimed"
   (`fed_count: 1`) but devimint does NOT auto-register it into the federation's vetted lnv2
   `gateways list`, and the wallet's automated routing resolves from that list and nothing else
   (ADR-0030 — there is no daemon pin; standalone `--gateway` is a one-operation break-glass).
-  **Fix: REGISTER the gateway on every guardian at bring-up**, which is what
+  **Fix: REGISTER the gateway on every guardian at bring-up** (`CNF-52`), which is what
   `wallet-cli/tests/devimint_lib.sh`'s `register_lnv2_gateway "$GW" "$FM_INVITE_CODE"` does
-  (a two-fed smoke also registers it for `$FED_B_INVITE`). Per guardian `<peer>` in
+  (a two-fed smoke also registers it for `$FED_B_INVITE`) — with the two deliberate exceptions
+  `CNF-52` lists: `smoke_breakglass_devimint.sh` leaves federation B unregistered on purpose,
+  and `smoke_responsiveness_devimint.sh` registers its never-responding double instead. Per guardian `<peer>` in
   `0..FM_FED_SIZE-1`, against a client joined to that federation:
   ```bash
   fedimint-cli --data-dir "$CLIENT_DIR" --our-id "$peer" --password "$FM_PASSWORD_API" \
@@ -943,7 +945,7 @@ fedimint-cli module lnv2 await-receive <op_id>                  # -> "Claimed"
 - **`supports_lnv2()` is true by DEFAULT** (unset env → enabled); set `FM_ENABLE_MODULE_LNV2=1`
   to be explicit. (`devimint/src/util.rs::supports_lnv2` at the pinned revision.)
 - **Vanilla `dev-fed` NEVER stands up a second federation — `--num-feds 2` only reserves
-  ports.** (An earlier version of this note claimed fed-1 comes up unjoined; wrong — it does
+  ports** (`CNF-27`). (An earlier version of this note claimed fed-1 comes up unjoined; wrong — it does
   not come up at all.) For a real two-fed test, use the exact-pinned patch-and-release-build
   procedure in §1, then the absolute release-binary invocation in §2; do not apply the patch
   to an arbitrary checkout or use a `devimint` resolved from PATH. The patched harness stands
@@ -970,7 +972,9 @@ in the session scratchpad (`tv3.sh`, `lnv2swap.sh`).
 
 ## 7. Inspecting a structural evacuation marker
 
-Use `wallet-cli show <operation-key> --json` (or daemon `GET /v1/operations/<key>`) and require
+The field's contract is `API-12`/`API-33` in `docs/spec/04-api-contract.md` (semantics in
+`OPS-31`); this is the
+operator reading of it. Use `wallet-cli show <operation-key> --json` (or daemon `GET /v1/operations/<key>`) and require
 `"evacuation_refusal_active": true` before treating `evacuation_refusal` as a live replacement
 marker. A superseded Failed parent deliberately retains its historical `evacuation_refusal`
 evidence and reports `"evacuation_refusal_active": false`. The field is omitted when `show` cannot

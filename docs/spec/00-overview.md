@@ -83,8 +83,10 @@ runtime through the wallet's own surfaces and never through a host config file (
 ```
 
 **OVR-9** One process owns the wallet. The daemon is the only resident host; the CLI's
-`--standalone` mode is a one-shot process that takes the same lock and drives the same engine,
-and is the documented exception to "admission goes through the actor" (`ADR-0031`, `HST-9`).
+`--standalone` mode is a one-shot process that takes the same lock and drives the same engine. Its
+money, await and `reconcile` verbs run the actor like the daemon; only `tick` is the documented
+exception to "admission goes through the actor", and `probe` is an undocumented second one
+(`ADR-0031`, `HST-9`, `OPS-12`, `F42`).
 
 **OVR-10** The daemon is a **host**, not the engine (`CONTEXT.md` **Host**/**Engine**). It owns
 cadence, restart and config; the engine owns every decision. A future Android host would embed
@@ -92,8 +94,12 @@ the same engine and drive it from platform wakes; that seam is not yet built (`F
 
 ## Non-goals, decided
 
-**OVR-11** No on-chain evacuation, no Cashu, no iOS, no LNURL/Lightning address, no multi-device
-in this version (`ADR-0004`, `ADR-0018`, `ADR-0013`, `docs/roadmap-to-v1.md`).
+**OVR-11** No on-chain evacuation (`ADR-0004`, `ADR-0018`), no Cashu, no iOS, no multi-device,
+and no LNURL/Lightning address in this version. The last is a deviation from `ADR-0004`, which
+placed Lightning Address and LNURL-pay **in** v1; the built scope defers them together with their
+provider, recurringd (`ADR-0013`); the deferral is recorded in the roadmap's "Explicitly v2+"
+line (`docs/roadmap-to-v1.md`) and in `ADR-0004`'s build note — the ADR's decision text
+itself is unamended.
 
 **OVR-12** No Tor. Reliability over network anonymity; "private" means no KYC, a blind provider,
 and private receives, not network-level anonymity (`ADR-0002`, `CONTEXT.md` **Private**).

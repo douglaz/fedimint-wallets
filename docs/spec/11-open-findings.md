@@ -5,7 +5,8 @@ names the issue that tracks it (`br-…` in `.beads/issues.jsonl`), or says why 
 two cannot drift apart silently; when an issue closes, its finding here is marked closed with the pull request, not
 deleted.
 
-Written 2026-09-07 against `main` at `1e44487` plus PR #40, both merged as `ee4ba1c` on 2026-09-08. Items are
+Written 2026-09-07 against `main` at `1e44487` plus PR #40, both merged as `ee4ba1c` on 2026-09-08;
+re-checked against `7225114` on 2026-09-10. Items are
 grouped by what they cost if left alone, not by the order they were found.
 
 ## The questions still open at the product level
@@ -15,9 +16,9 @@ built so that either answer remains possible.
 
 1. **Is the long-running deployment a test or a pilot?** The daemon has been running the
    2026-07-26 build `b5f46de` on two mainnet federations with a small real-sats balance. The
-   repository's `AGENTS.md`, its release issues (`br-prod-canary-nab`, `br-recanary-y2j-ujs`) and
-   its alerting issue (`br-rky`) all treat it as production; the operator has since said it is a
-   test rig. Every P1 release/ops item in the backlog inherits its priority from the first
+   repository's release issues (`br-prod-canary-nab`, `br-recanary-y2j-ujs`) and its alerting
+   issue (`br-rky`) still treat it as production; the operator has since said it is a test rig,
+   and `AGENTS.md` was changed to say so on 2026-09-08. Every P1 release/ops item in the backlog inherits its priority from the first
    reading. This set records the second, and `08-hosts-and-deployment.md` describes the
    deployment as a test.
 2. **Does the engine ship ON by default?** `docs/roadmap-to-v1.md` defers this to Phase 8: a
@@ -53,7 +54,8 @@ lists, and a list is the gateways at least `NumPeers::threshold()` guardians eac
 per guardian.
 `ADR-0029` and `ADR-0030` record the target; `CONTEXT.md`'s **Serves**, **Vetted list** and
 **Route hint** entries each point here as the gap. Open — `br-routing-invariants-f6f7-dwx`
-(the ingestion bound stays with `br-gw-threshold-membership-k4t`).
+(a bound on each guardian's response stays with `br-gw-threshold-membership-k4t`; no ADR
+records that bound — the rewritten `ADR-0030` no longer mentions it, and `SEC-17` says so).
 
 **F7. The route is not persisted with a committed operation.** After cache loss the operation
 artifact carries no gateway, so reassembly resolves afresh and a restart can pay through a
@@ -121,12 +123,16 @@ across every admission path. Open — `br-e29`.
 
 **F19. The workspace pins a fork carrying three patches**, with a fourth proposed. iroh long-poll,
 recovery complete-or-fail, the single-share TPE fix (`FMI-1`); lnv2 claim-retry is proposed in `F20`. Repointing to
-upstream requires every one of them to have landed there (`FMI-2`). Open — `br-jga`.
+upstream requires every one of them to have landed there (`FMI-2`). The long-poll patch does not
+remove the iroh stall itself (`FMI-38`), and the transport a federation is reached over is decided
+by its invite and config, not the wallet (`FMI-36`), so a repoint changes which patches are carried
+but not that exposure. Open — `br-jga`.
 
 **F20. A move that reaches `Stranded` has no recovery procedure.** The pinned lnv2 client parks a
 receive whose claim transaction was rejected, permanently. Upstream PR #8935 adds bounded claim
 retry and a `reclaim_receive` path, retroactively applicable to records our pin wrote. Not
-adopted. Open — `br-adopt-lnv2-claim-retry-d3d`.
+adopted. The operator response until then is evidence preservation (`HST-28`). Open —
+`br-adopt-lnv2-claim-retry-d3d`.
 
 ## Tests and gates
 
@@ -185,7 +191,8 @@ Open — `br-h34`.
 
 ## Found while writing this set
 
-These were surfaced by the code extraction on 2026-09-07 and filed the same day.
+These were surfaced by the code extraction on 2026-09-07 and filed the same day, except `F44` and
+`F45`, which the 2026-09-11 spec review surfaced and filed that day.
 
 **F32. A failed `ReconcileDecide` is not reported as blocked.** When the tick-plan token cannot
 be issued (a poisoned authority, or a lease live at that instant) the cycle skips the tick row,
@@ -219,11 +226,17 @@ claim that no row predates them (`STO-32`). The long-running deployment's store 
 checked. Open — `br-deployed-store-missing-defaults-cts`.
 
 **F39. Stale doc comments the extraction found** that a reader would act on: `IntentStatus::
-Awaiting` "DirectInflow only"; `TimeoutExecutor` "leaves it Pending"; `journal.rs`'s header
+Awaiting` "DirectInflow only"; `journal.rs`'s header
 listing seven of thirteen tags and describing one database; `Policy`'s "no seed-recovery path
 wired yet"; a test comment claiming `Policy` is `deny_unknown_fields`; `fedimint-mechanics.md`'s
-"hard fee cap"; the runbook's "shipped k8s config". Each is a one-line fix; none is a behaviour
-gap. Open — `br-stale-doc-comments-sweep-zjx`.
+"hard fee cap"; the runbook's "shipped k8s config". The four prose items — the runbook's
+"shipped k8s config" and "pages on transition" claims, its stale lock-file line citation, and
+`fedimint-mechanics.md`'s "hard fee cap" (now cites `FMI-19`) — were fixed 2026-09-10 in the
+spec review pass, and the `TimeoutExecutor` item is withdrawn 2026-09-11: its doc comment is
+accurate for the `Runtime`-direct paths that are the only ones to build it (`OPS-15`), so four
+code-comment items stand. The bead still lists all seven and a "stale `executor.rs` line
+citations" item this finding never carried; it needs a `br update` to match. Each is a one-line fix; none is a
+behaviour gap. Open — `br-stale-doc-comments-sweep-zjx`.
 
 **F40. `policy set` from an older CLI silently resets a field a newer daemon added.** The CLI
 round-trips a typed `Policy`, so an unknown key is dropped on GET, omitted on PUT, and defaulted by
@@ -243,6 +256,36 @@ funds and the destination cap are still checked, by the probe preflight and by t
 pre-fund admission (`OPS-5`, `OPS-7`, `OPS-12`). `ADR-0031` documents one exception (`tick`);
 this is a second, architectural rather than a money hole.
 Open — `br-standalone-probe-bypasses-actor-253`.
+
+**F43. Standalone `probe` enforces the compile-time `per_fed_cap`, not the stored policy's.**
+`probe` (and `discover`, whose auto-join never probes and so spends nothing under it) builds its
+runtime with `operator_hard_cap(false)` = `TickPolicy::default().per_fed_cap` (5,000,000,000
+msat), while the daemon and standalone `tick`/`status` plan against the stored
+`Policy.per_fed_cap` (default 1,500,000,000; `OPS-7`, `ALC-3`). An operator who lowers the
+stored cap can still have a standalone probe leg mint above it. Fix is to build that cap from the stored
+policy as `build_standalone_tick_policy` does and delete `operator_hard_cap`. Open —
+`br-standalone-probe-hard-cap-default-o6b`.
+
+**F44. A user move can attach to an active probe leg.** Probe legs use the user-move `move:` key
+shape with `occurrence = occurrence_from_nonce(nonce)`, and `MoveRequest.occurrence` accepts any
+`u64`, so a user move with the same endpoints, amount and cap and an occurrence equal to a nonce
+head attaches to the probe's `Intent` and `MoveRecord` (`STO-6`, `DOM-16`, `OPS-8`). The
+separation is probabilistic, not excluded, and probe keys are reconstructible from a session that
+history exposes. The fix namespaces probe legs, which moves the persisted key shape and
+`classify_key`'s prefix set (`STO-6`, `STO-24`) — an implementer
+building to `STO-6` today is building the shape that is slated to change. The bead requires that
+`classify_key` gain the new shape "with a legacy read"; that conflicts with `OVR-14`, which permits
+no compatibility shim beyond `serde(default)`, and `STO-24` puts every move-shaped row in the
+never-repaired class, so `classify_key` has nothing to read back. Resolve that in the bead before
+building. Open — `br-probe-user-move-key-collision-fy7`.
+
+**F45. The gateway `routing_info` POST reaches any URL a guardian lists.** `FMI-11`'s validation
+POSTs to `SafeUrl::parse(gateway).join("routing_info")` for every URL on a federation's vetted
+lnv2 list, and `SafeUrl` only wraps `Url::parse`: loopback, link-local, RFC1918 and
+cloud-metadata hosts are not rejected, and the client honours the system proxy environment
+(`HST-2`). A guardian that lists `http://169.254.169.254/` or a loopback admin port makes the
+wallet host issue that request. `FMI-11` describes the mechanism; nothing restricts the egress.
+Open — `br-gateway-url-ssrf-egress-qqg`.
 
 ## Closed since this document was first written
 

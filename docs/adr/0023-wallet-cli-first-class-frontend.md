@@ -1,10 +1,21 @@
 ---
 status: accepted
+amended-by: ADR-0028, ADR-0031
 ---
 # wallet-cli is a first-class, permanent frontend — co-equal with the Android app
 
+> **Amended.** The two-frontend picture here became three with the web sidecar
+> ([ADR-0028](./0028-web-frontend-localhost-sidecar-session-auth.md)), and
+> [ADR-0031](./0031-one-engine-hosts-drive-frontends-talk.md) fixed what "over the same public
+> API" means: every resident frontend sits on one service actor, hosted by `walletd` or embedded
+> in-process on Android, and `wallet-cli`'s default mode is a client of `walletd` rather than an
+> in-process engine. Its `--standalone` mode survives as the documented one-shot exception. The
+> CLI's status as a permanent, shipped surface is unchanged.
+
 The wallet is an **engine** (`wallet-core` pure logic + `wallet-fedimint` SDK integration)
-with **two permanent, co-equal frontends** over its public API: the **Android app** (Slint UI,
+with — as originally decided — **two permanent, co-equal frontends** over its public API (now
+three: the web sidecar of the amendment above is the third, and the consequences below predate
+it): the **Android app** (Slint UI,
 the consumer product) and **`wallet-cli`** (headless, scriptable). `wallet-cli` is NOT a test
 shim — it is a shipped, maintained-forever wallet, as important as the app.
 

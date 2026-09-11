@@ -24,17 +24,25 @@ rebuildable by design, refusals and raw `receive`/`pay` leave no durable trace a
 ## 2. Data model
 
 All types in `wallet-core` (pure, serde). Storage in `wallet-fedimint` next to the journal.
-**Authority split:** this spec is normative for the MODEL (structure separation, write
-discipline, correlation-key rules); the exact field-level shapes as built are in
-[docs/spec/05-persistence.md](./spec/05-persistence.md) (`STO-15`–`STO-17`); the historical
-derivation is [phase4-implementation-spec.md](./archive/phase4-implementation-spec.md) §7, which refines the
-sketch below (notably: `reason` is mandatory — user verbs carry `ReasonCode::UserInitiated`
-— and gateways are `Option`), **and its §7/§10 REFINE this spec's write discipline and
-repair rules**: terminal immutability gains exactly one principled exception (a
-REPAIR-written terminal row carries `repaired: true` and may be superseded once by an
-AUTHORITATIVE evidence-carrying write), and the rule-5/6 negative repairs below are
-age-gated (1 hour) SOFT failures, not immediate hard ones. Where this section and the impl
-spec disagree, the impl spec wins.
+**Authority:** this document is the historical requirement and the motivation for the ledger.
+It is **not** authoritative for any shape, key, string or rule: the as-built specification in
+[docs/spec/05-persistence.md](./spec/05-persistence.md) owns them — the JSON encoding
+(`STO-5`), the correlation-key shapes (`STO-6`), the row type and every `OperationKind`
+payload (`STO-15`), the write discipline and the pure `advance` rule (`STO-16`), the refresh
+from the move record (`STO-17`), the sequence fence (`STO-18`), `history` (`STO-19`), the
+`0x06` index (`STO-20`), repair (`STO-24`), evacuation supersession (`STO-25`), the op-log
+metadata (`STO-33`, `STO-34`) and the verbatim error strings (`STO-35`). The sketch below is
+kept as the original derivation; where it and the `STO` rules differ, the `STO` rule is what
+the code does and this sketch is simply out of date. (Known differences: `reason` is mandatory
+— user verbs carry `ReasonCode::UserInitiated`; gateways are `Option`; `OperationRecord` has a
+`repaired: bool` and terminal immutability has exactly one exception for a repair-written
+terminal; the rule-5/6 negative repairs are age-gated (1 hour) soft failures; `Receive` is
+`amount_invoiced`; `Pay` carries `payment_hash: Option<[u8;32]>` and `invoice_amount` is
+`Option`; `DirectInflow`/`Move` gateways are `Option`; `Refusal` carries `diagnostics`; there
+are `Recover`, `Probe`, `Discover`, `AutoJoin` and `Approve` kinds; and the raw-op keys are
+`pay:<payment_hash>` / `recv:<to>:<amount>:<nonce>`, not the nonce-only forms below.) The
+archived [phase4-implementation-spec.md](./archive/phase4-implementation-spec.md) is history
+only and is not a tiebreaker.
 
 ```rust
 /// One row per user-meaningful operation. Append-only: a row is created once, its
@@ -44,19 +52,27 @@ pub struct OperationRecord {
     /// The ordering authority — robust to clock skew; wall-clock is for display.
     pub seq: u64,
     /// Joins ledger <-> journal <-> MoveRecord. For journaled ops this IS the intent's
-    /// IdempotencyKey. Raw/tick ops use PER-ATTEMPT, NONCE-ONLY keys, constructible from
-    /// the RAW input BEFORE any parsing or side effect (crash-safety, §3 rule 5 — a
-    /// malformed invoice's failed attempt must still be a durable row):
-    /// `pay:<fed>:<nonce>` and `recv:<fed>:<nonce>` (nonce pre-generated, embedded in the
-    /// op's `custom_meta`; dedup/grouping rides on the recorded op_id, not the key),
-    /// `join:<fed>:<nonce>`, `tick:<occurrence>:<nonce>` (each tick invocation is its own
+    /// IdempotencyKey. This sketch proposed per-attempt, nonce-only keys for raw ops; AS BUILT
+    /// the correlation key is the intent key, a manual retry keeps that key at `attempt + 1`
+    /// and appends a FRESH ledger row (the failed row stays; `0x06` repoints to the new one —
+    /// `STO-9`, `STO-20`), and the per-attempt identity in the op's `custom_meta` is the
+    /// `retry:<len>:<key>:<attempt>` correlation key (`STO-34`). The crash-safety property
+    /// survives: the key is constructible from the RAW input before any side effect (§3 rule 5).
+    /// AS BUILT the shapes are `STO-6`'s: `pay:<payment_hash>` (no nonce — paying the same
+    /// invoice twice attaches to one operation) and `recv:<to>:<amount>:<nonce>`; the key
+    /// that rides in the op's `custom_meta` is the per-attempt correlation key of `STO-34`.
+    /// The `pay:<fed>:<nonce>` / `recv:<fed>:<nonce>` forms this sketch originally proposed
+    /// were never built. Also as built:
+    /// `join:<fed>:<sha256(invite)>` for a user/API join (the `join:<fed>:<nonce>` form is
+    /// only the agent's auto-join ledger row), `tick:<occurrence>:<nonce>` (each tick invocation is its own
     /// row, created `Started` before deciding, advanced to terminal with the counts; the
     /// tick's individual moves remain covered by their own intent-keyed rows).
-    /// Per-attempt keys keep append-only semantics under retry: a crashed/failed attempt
-    /// and its retry are two truthful rows. Retries that lnv2 DEDUPS to the same
+    /// Append-only under retry AS BUILT: a manual retry appends a fresh row and the failed
+    /// attempt's row stays as its audit record — two truthful rows (`STO-9`, `STO-20`); only a
+    /// `Retryable` re-drive of the SAME attempt advances the existing row (`STO-16`). Retries that lnv2 DEDUPS to the same
     /// underlying payment (`AlreadyInFlight`/`AlreadyPaid`) still record the SHARED
     /// `op_id`; aggregation (fee/amount sums) groups by `op_id` so shared-op attempt rows
-    /// are never double-counted. Exactly one ledger row per correlation key.
+    /// are never double-counted. `0x06` maps a correlation key to exactly one CURRENT row (`STO-20`).
     pub correlation_key: IdempotencyKey,
     pub kind: OperationKind,
     /// Who initiated it — THE audit discriminator ADR-0014 needs.
@@ -181,8 +197,13 @@ Rules (load-bearing):
    (`repaired: true`, rule 2's exception), per impl spec §10.3 — rather than leaving it
    ambiguous forever. A retry is a NEW attempt row (§2), so this terminal marking never
    blocks recovery.
-6. **`Join` repairs from the registry, and idempotent re-joins are not rows.** The CLI
-   checks the federation registry first: already joined → the join verb just (re)opens the
+6. **`Join` repairs from the registry.** (The "idempotent re-joins are not rows" rule below is
+   NOT what was built: neither the CLI nor the daemon gates on the registry synchronously —
+   every join writes an attempt row pre-call (`join:<fed>:<sha256(invite)>` for a user or API
+   join; `join:<fed>:<nonce>` is only the agent's auto-join row, `STO-6`) and lets the driver
+   decide (`API-22`), and a no-op re-open terminalizes that row `Succeeded` carrying
+   `JOIN_NOOP_REOPEN_NOTE` (`STO-35`). The as-built rules are `docs/spec/`'s.)
+   As planned: already joined → the join verb just (re)opens the
    client, NO ledger row (nothing happened). Not joined → new `join:<fed>:<nonce>` attempt
    row pre-call, updated to terminal post-call. Reconcile repairs a stranded `Started` join
    row from the registry (the authority on membership), PER ATTEMPT with timestamp
