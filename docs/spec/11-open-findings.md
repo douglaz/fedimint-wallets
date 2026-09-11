@@ -234,8 +234,12 @@ wired yet"; a test comment claiming `Policy` is `deny_unknown_fields`; `fedimint
 `fedimint-mechanics.md`'s "hard fee cap" (now cites `FMI-19`) — were fixed 2026-09-10 in the
 spec review pass, and the `TimeoutExecutor` item is withdrawn 2026-09-11: its doc comment is
 accurate for the `Runtime`-direct paths that are the only ones to build it (`OPS-15`), so four
-code-comment items stand. The bead still lists all seven and a "stale `executor.rs` line
-citations" item this finding never carried; it needs a `br update` to match. Each is a one-line fix; none is a
+code-comment items stand, plus `fedimint-mechanics.md`'s stale `executor.rs` line citations, which
+the bead carries and this finding had not. The bead was updated to match on 2026-09-11, and its
+runbook bullet was struck there: both halves of it — "shipped k8s config" and the `main.rs`
+lock-file citation — were fixed on 2026-09-10, and the runbook now names `check_db_lock` with no
+line number.
+Each is a one-line fix; none is a
 behaviour gap. Open — `br-stale-doc-comments-sweep-zjx`.
 
 **F40. `policy set` from an older CLI silently resets a field a newer daemon added.** The CLI
@@ -271,13 +275,31 @@ shape with `occurrence = occurrence_from_nonce(nonce)`, and `MoveRequest.occurre
 `u64`, so a user move with the same endpoints, amount and cap and an occurrence equal to a nonce
 head attaches to the probe's `Intent` and `MoveRecord` (`STO-6`, `DOM-16`, `OPS-8`). The
 separation is probabilistic, not excluded, and probe keys are reconstructible from a session that
-history exposes. The fix namespaces probe legs, which moves the persisted key shape and
-`classify_key`'s prefix set (`STO-6`, `STO-24`) — an implementer
-building to `STO-6` today is building the shape that is slated to change. The bead requires that
-`classify_key` gain the new shape "with a legacy read"; that conflicts with `OVR-14`, which permits
-no compatibility shim beyond `serde(default)`, and `STO-24` puts every move-shaped row in the
-never-repaired class, so `classify_key` has nothing to read back. Resolve that in the bead before
-building. Open — `br-probe-user-move-key-collision-fy7`.
+history exposes. Three things are settled and belong here; the design is the bead's.
+
+**The repair path needs no change and no compatibility read.** `classify_key` already sends every
+unrecognised prefix to `Other`, the never-repaired class that `move:` rows land in today
+(`STO-24`), so no namespacing variant requires touching it, and no
+old probe-leg key is ever read back there. (The bead's earlier legacy-read requirement was
+withdrawn on 2026-09-11.)
+
+**A fix need not touch the key at all.** An admission-time rule — refusing a user move against an
+intent whose reason is `ReasonCode::ActiveProbe`, at **any** status, since `decide_existing` answers
+a `Done` intent with a deduplicated 202 and `ALC-30`'s "live" excludes terminal — leaves persisted
+key identity alone and so carries none of the rollout cost below. Whether admission alone also
+closes the window between the umbrella row that exposes the nonce and leg IN being journaled
+(`runtime.rs:2751-2801`) is an open design question. That design, and that question, are the
+bead's; this set records only that a no-migration option exists.
+
+**If the key does change, the rollout is the hard part, in both directions.** A `ProbeSession`
+persists only the nonce and parameters, so each build reconstructs the leg key from it — and a
+namespacing fix changes what gets reconstructed for a session already in flight, whether by
+changing the shape or only the occurrence. An upgrade *or a rollback* mid-probe can then strand or
+duplicate a leg, and a version field does not help, since the older binary ignores it. Draining
+probes on both sides of the deploy is the only remedy that needs no compatibility read; a build
+that understands both mappings is one, and would need an explicit `OVR-14` exception. Settle the
+variant in the bead before writing code.
+Open — `br-probe-user-move-key-collision-fy7`.
 
 **F45. The gateway `routing_info` POST reaches any URL a guardian lists.** `FMI-11`'s validation
 POSTs to `SafeUrl::parse(gateway).join("routing_info")` for every URL on a federation's vetted
