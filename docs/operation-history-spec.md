@@ -72,7 +72,7 @@ pub struct OperationRecord {
     /// `Retryable` re-drive of the SAME attempt advances the existing row (`STO-16`). Retries that lnv2 DEDUPS to the same
     /// underlying payment (`AlreadyInFlight`/`AlreadyPaid`) still record the SHARED
     /// `op_id`; aggregation (fee/amount sums) groups by `op_id` so shared-op attempt rows
-    /// are never double-counted. Exactly one ledger row per correlation key.
+    /// are never double-counted. `0x06` maps a correlation key to exactly one CURRENT row (`STO-20`).
     pub correlation_key: IdempotencyKey,
     pub kind: OperationKind,
     /// Who initiated it — THE audit discriminator ADR-0014 needs.
