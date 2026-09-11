@@ -53,10 +53,11 @@ pub struct OperationRecord {
     pub seq: u64,
     /// Joins ledger <-> journal <-> MoveRecord. For journaled ops this IS the intent's
     /// IdempotencyKey. This sketch proposed per-attempt, nonce-only keys for raw ops; AS BUILT
-    /// the ledger key is the intent key (one row per operation), a retry is a new ATTEMPT on
-    /// the same key (`STO-9`), and per-attempt identity rides only in the op's `custom_meta`
-    /// correlation key (`STO-34`). The crash-safety property survives: the key is constructible
-    /// from the RAW input before any side effect (§3 rule 5).
+    /// the correlation key is the intent key, a manual retry keeps that key at `attempt + 1`
+    /// and appends a FRESH ledger row (the failed row stays; `0x06` repoints to the new one —
+    /// `STO-9`, `STO-20`), and the per-attempt identity in the op's `custom_meta` is the
+    /// `retry:<len>:<key>:<attempt>` correlation key (`STO-34`). The crash-safety property
+    /// survives: the key is constructible from the RAW input before any side effect (§3 rule 5).
     /// AS BUILT the shapes are `STO-6`'s: `pay:<payment_hash>` (no nonce — paying the same
     /// invoice twice attaches to one operation) and `recv:<to>:<amount>:<nonce>`; the key
     /// that rides in the op's `custom_meta` is the per-attempt correlation key of `STO-34`.
@@ -66,8 +67,9 @@ pub struct OperationRecord {
     /// only the agent's auto-join ledger row), `tick:<occurrence>:<nonce>` (each tick invocation is its own
     /// row, created `Started` before deciding, advanced to terminal with the counts; the
     /// tick's individual moves remain covered by their own intent-keyed rows).
-    /// Append-only under retry AS BUILT: a retry advances the SAME row to a new attempt
-    /// (`STO-9`, `STO-16`); the sketch's two-rows-per-retry never shipped. Retries that lnv2 DEDUPS to the same
+    /// Append-only under retry AS BUILT: a manual retry appends a fresh row and the failed
+    /// attempt's row stays as its audit record — two truthful rows (`STO-9`, `STO-20`); only a
+    /// `Retryable` re-drive of the SAME attempt advances the existing row (`STO-16`). Retries that lnv2 DEDUPS to the same
     /// underlying payment (`AlreadyInFlight`/`AlreadyPaid`) still record the SHARED
     /// `op_id`; aggregation (fee/amount sums) groups by `op_id` so shared-op attempt rows
     /// are never double-counted. Exactly one ledger row per correlation key.
