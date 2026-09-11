@@ -284,7 +284,10 @@ failure is an alert rather than fatal), and exits `0` quiet, `1` on any alert, `
 unreachable or when `WALLETD_TOKEN` and `WALLETD_TOKEN_FILE` are both unset or empty. The token
 comes from `WALLETD_TOKEN`, else the contents of the file named by `WALLETD_TOKEN_FILE`
 (trimmed) — a missing or unreadable file is an uncaught `OSError`: a traceback and exit `1`,
-not `2`; the URL from `--url` /
+not `2` (**measured 2026-09-11**, Python 3.14.7, `WALLETD_TOKEN` unset,
+`WALLETD_TOKEN_FILE=/nonexistent/token`: exit **1**, stdout 0 bytes, stderr ends
+`FileNotFoundError: [Errno 2] No such file or directory: '/nonexistent/token'`; control with
+both unset: exit **2**, stderr `walletd-watch: set WALLETD_TOKEN or WALLETD_TOKEN_FILE`); the URL from `--url` /
 `WALLETD_URL` (default `http://127.0.0.1:9736`); `--state` / `WALLETD_WATCH_STATE`,
 `--webhook` / `WALLETD_WATCH_WEBHOOK`, `--timeout` (seconds, default 10). It alerts on `scheduler_alive == false`, on
 `automation_ready == false` (with the reason and detail), and on every deferred funding goal
@@ -294,7 +297,13 @@ alert and nothing changed; `--always-report` prints even then. A **standing aler
 every pass**, so the script's own docstring ("pages on transition") overstates it. The webhook
 is an unvalidated `urllib` URL — any scheme `urllib` opens — receiving a JSON `{"text": …}`
 POST; a `URLError` / `TimeoutError` delivery failure is a note, not an exit code, but a
-malformed or unsupported URL (`not-a-url`) raises `ValueError` uncaught: traceback, exit `1`.
+malformed or unsupported URL (`not-a-url`) raises `ValueError` uncaught: traceback, exit `1`
+(**measured 2026-09-11**, Python 3.14.7, against a loopback stub daemon answering
+`/v1/health`, `/v1/balance`, `/v1/status` with healthy JSON, no `--state` so the first pass
+counts as changed: `--webhook not-a-url` → exit **1**, stdout the one-line report, stderr a
+traceback ending `ValueError: unknown url type: 'not-a-url'`; control `--webhook
+http://127.0.0.1:1` → exit **0**, stdout `note  webhook delivery failed: <urlopen error [Errno
+111] Connection refused>`, stderr 0 bytes).
 **Nothing runs it** (`F14`).
 
 ## The long-running deployment
