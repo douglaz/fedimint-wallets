@@ -14,7 +14,7 @@ ADR-0022 — see "What this means for us".
   id — no "active" client (harbor `lib.rs:278`; Fedi `crates/federations/src/lib.rs:30`).
 - **One seed, many feds:** the per-fed client secret is derived deterministically from the
   root by `get_default_client_secret(root_secret, federation_id)`; the exact path this wallet
-  relies on is `FMI-7` in the specification repository's `02-fedimint-integration.md`. (Harbor and Fedi call an
+  relies on is `FMI-7` in [`02-fedimint-integration.md`](https://github.com/douglaz/fedimint-wallets-spec/blob/main/02-fedimint-integration.md) in the specification repository. (Harbor and Fedi call an
   older signature with a `device_index` so two devices on one seed don't reuse note-derivation
   indices; the pinned SDK has no such parameter and this wallet derives as a single device.)
 - **Storage (lift Fedi's shape):** one global DB (RocksDB on Android) with per-federation

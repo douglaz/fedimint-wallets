@@ -136,7 +136,7 @@ necessary and not sufficient; see [docs/devimint-runbook.md](./docs/devimint-run
 
 **This repo is greenfield and does not carry compatibility shims** — with one deliberate
 exception. The types that ride the **live stores** written by the running daemon are the
-`STO-29` list in the specification repository's `05-persistence.md` — `Intent` (and every `Action` variant),
+`STO-29` list in [`05-persistence.md`](https://github.com/douglaz/fedimint-wallets-spec/blob/main/05-persistence.md) in the specification repository — `Intent` (and every `Action` variant),
 `MoveRecord`, `FederationInfo`, `OperationRecord` (and every `OperationKind` variant),
 `ProbeRecord`, `CandidateRecord`, `WatchState`, `Policy`, `EvacuationSupersessionRecord`, **every
 type serialized inside one of those** (transitively — a nested struct's new field is the row's

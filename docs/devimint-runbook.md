@@ -972,7 +972,7 @@ in the session scratchpad (`tv3.sh`, `lnv2swap.sh`).
 
 ## 7. Inspecting a structural evacuation marker
 
-The field's contract is `API-12`/`API-33` in the specification repository's `04-api-contract.md` (semantics in
+The field's contract is `API-12`/`API-33` in [`04-api-contract.md`](https://github.com/douglaz/fedimint-wallets-spec/blob/main/04-api-contract.md) in the specification repository (semantics in
 `OPS-31`); this is the
 operator reading of it. Use `wallet-cli show <operation-key> --json` (or daemon `GET /v1/operations/<key>`) and require
 `"evacuation_refusal_active": true` before treating `evacuation_refusal` as a live replacement

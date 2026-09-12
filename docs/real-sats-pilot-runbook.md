@@ -373,7 +373,7 @@ scheduler-dead daemon as healthy.
   a new cause).
 - **A stranded move** (found by check 1 above — it appears as a `failed` move whose `show`
   error reads "send settled but receive was not credited"). What `Stranded` **means** is
-  defined once, by `DOM-10` in the specification repository's `01-domain-model.md`; this entry is the operator's
+  defined once, by `DOM-10` in [`01-domain-model.md`](https://github.com/douglaz/fedimint-wallets-spec/blob/main/01-domain-model.md) in the specification repository; this entry is the operator's
   account of how it can arise and what to do (`OPS-40`). Code comments deliberately point here
   instead of carrying their own explanation, because every previous attempt to enumerate causes
   in a comment was later shown to be wrong. The state has never been observed in the pilot.
