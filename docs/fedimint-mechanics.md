@@ -122,7 +122,7 @@ documented `Retryable`, NOT `Permanent` at `:333-335`), so the intent stays `Pen
 re-tried every tick: a silent livelock, not a failure the operator is told about.
 
 A second gateway remains an explicit non-goal for routine `Move`s. It is NO LONGER the permanent
-shape for evacuation: [ADR-0029](./adr/0029-evacuation-must-be-executable.md) accepts a
+shape for evacuation: [ADR-0029](https://github.com/douglaz/fedimint-wallets-spec/blob/main/docs/adr/0029-evacuation-must-be-executable.md) accepts a
 two-gateway Lightning hop as a best-effort fallback for `Evacuate` only. That is decided but NOT
 yet built; this section describes the code as it stands today.
 

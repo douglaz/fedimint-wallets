@@ -2,7 +2,7 @@
 
 The third frontend over the same public API (ADR-0023): a sidecar process that renders HTML.
 `wallet-cli` in a browser — the everyday surface for a self-hosting user before the Android app
-exists. **The security posture is fixed by [ADR-0028](./adr/0028-web-frontend-localhost-sidecar-session-auth.md);
+exists. **The security posture is fixed by [ADR-0028](https://github.com/douglaz/fedimint-wallets-spec/blob/main/docs/adr/0028-web-frontend-localhost-sidecar-session-auth.md);
 this spec does not re-open it.**
 
 Numbering note: this is 6c but ships *before* 6b (Android). 6b's identifier is already
