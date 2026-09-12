@@ -93,9 +93,6 @@ jobs:
       - name: test
         run: nix develop . --no-update-lock-file --command cargo test --workspace --locked
 
-      - name: spec identifiers
-        run: nix develop . --no-update-lock-file --command bash docs/spec/tools/check-all.sh
-
   # Proves the SHIPPED artifacts build, which the devshell gate above does not: `nix build`
   # goes through the flakebox derivation rather than the dev profile, so it can fail while
   # `cargo build` succeeds. Separate job so it runs in parallel with the gate and gives an

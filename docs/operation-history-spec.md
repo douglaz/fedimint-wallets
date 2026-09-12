@@ -26,7 +26,7 @@ rebuildable by design, refusals and raw `receive`/`pay` leave no durable trace a
 All types in `wallet-core` (pure, serde). Storage in `wallet-fedimint` next to the journal.
 **Authority:** this document is the historical requirement and the motivation for the ledger.
 It is **not** authoritative for any shape, key, string or rule: the as-built specification in
-[docs/spec/05-persistence.md](./spec/05-persistence.md) owns them — the JSON encoding
+[`05-persistence.md`](https://github.com/douglaz/fedimint-wallets-spec/blob/main/05-persistence.md) in the specification repository owns them — the JSON encoding
 (`STO-5`), the correlation-key shapes (`STO-6`), the row type and every `OperationKind`
 payload (`STO-15`), the write discipline and the pure `advance` rule (`STO-16`), the refresh
 from the move record (`STO-17`), the sequence fence (`STO-18`), `history` (`STO-19`), the
@@ -202,7 +202,7 @@ Rules (load-bearing):
    every join writes an attempt row pre-call (`join:<fed>:<sha256(invite)>` for a user or API
    join; `join:<fed>:<nonce>` is only the agent's auto-join row, `STO-6`) and lets the driver
    decide (`API-22`), and a no-op re-open terminalizes that row `Succeeded` carrying
-   `JOIN_NOOP_REOPEN_NOTE` (`STO-35`). The as-built rules are `docs/spec/`'s.)
+   `JOIN_NOOP_REOPEN_NOTE` (`STO-35`). The as-built rules are the specification repository's.)
    As planned: already joined → the join verb just (re)opens the
    client, NO ledger row (nothing happened). Not joined → new `join:<fed>:<nonce>` attempt
    row pre-call, updated to terminal post-call. Reconcile repairs a stranded `Started` join

@@ -111,7 +111,7 @@ struct FreshMoveCost {
 
 impl FreshMoveCost {
     /// The DELIVERED NET this quote actually credits the destination: the fixed invoice minus
-    /// the receive-side fee quoted against it (CONTEXT.md, "Delivered net").
+    /// the receive-side fee quoted against it (fedimint-wallets-spec CONTEXT.md, "Delivered net").
     ///
     /// **This is the only amount a fee cap may be computed from.** The SIZED ASK — the candidate
     /// the search is probing — is an intention; it is what we will request an invoice for, not
@@ -2601,7 +2601,7 @@ where
         let candidate = Msat(candidate);
         // Cap at what this candidate DELIVERS, matching `fits_cap` and the executor. The
         // viability half (`total_fee <= delivered`) moves with it: a route "serves" when it
-        // delivers at least what it costs (CONTEXT.md, "Serves"), and the thing it delivers is
+        // delivers at least what it costs (fedimint-wallets-spec CONTEXT.md, "Serves"), and the thing it delivers is
         // the delivered net, not the amount we asked for.
         let delivered = cost.delivered_net();
         if evacuation_cost_fits(cost, cap.at(delivered), spendable)

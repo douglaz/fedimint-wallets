@@ -16,9 +16,9 @@ either outcome (the ledger, hardening, UI, and recovery serve a single-fed walle
 ## Where we are
 
 Everything through Phase 6a, plus seed recovery and route economics, is complete and
-devimint-validated. The system as built is described in [docs/spec/](./spec/README.md): what
+devimint-validated. The system as built is described in the specification repository, [douglaz/fedimint-wallets-spec](https://github.com/douglaz/fedimint-wallets-spec): what
 each phase delivered, and the evidence for it, is in its executive summary and
-[conformance checklist](./spec/10-conformance-checklist.md); the phase plans themselves are in
+[conformance checklist](https://github.com/douglaz/fedimint-wallets-spec/blob/main/10-conformance-checklist.md); the phase plans themselves are in
 [docs/archive/](./archive/README.md). Next: Phase 6c (the web sidecar), Phase 7 (seed
 encryption, app-state backup), then 6b and 8 below.
 

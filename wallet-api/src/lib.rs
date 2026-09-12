@@ -64,13 +64,13 @@ pub struct Policy {
     /// BASE component of the evacuation fee cap, in millisatoshis. With `evac_fee_bps` it is the
     /// cap actually ENFORCED on an evacuation, computed as `base + bps * delivered_net / 10_000`
     /// against what the destination is credited — never against the amount that was asked for
-    /// (CONTEXT.md, "Delivered net"). The named serde default keeps older stored rows from
+    /// (fedimint-wallets-spec CONTEXT.md, "Delivered net"). The named serde default keeps older stored rows from
     /// decoding this numeric field as zero.
     #[serde(default = "default_evac_fee_base_msat")]
     pub evac_fee_base_msat: Msat,
     /// PROPORTIONAL component of the evacuation fee cap, in basis points of the net DELIVERED to
     /// the destination — `invoice - receive_quote`, not the amount requested, which is larger
-    /// whenever the gross-up settles a hair under (CONTEXT.md, "Delivered net"). Applied with
+    /// whenever the gross-up settles a hair under (fedimint-wallets-spec CONTEXT.md, "Delivered net"). Applied with
     /// integer FLOOR division, so `cap = base + floor(delivered * bps / 10_000)`. (0..=10000).
     #[serde(default = "default_evac_fee_bps")]
     pub evac_fee_bps: u16,

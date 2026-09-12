@@ -4,10 +4,14 @@ Instructions for coding agents working in this repository.
 
 This is a **multi-federation Bitcoin wallet**. Its one long-running deployment is a test rig
 holding a small real-sats balance on two mainnet federations — not production, but the money is
-real, so money-path changes are still reviewed and live-gated (below). Read [docs/spec/](./docs/spec/README.md) for what is built (the as-built specification;
-start at its executive summary) and
-[docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md) for what is next. The ADRs under
-[docs/adr/](./docs/adr/) are canonical wherever they conflict with older text.
+real, so money-path changes are still reviewed and live-gated (below). Read the specification
+repository, [douglaz/fedimint-wallets-spec](https://github.com/douglaz/fedimint-wallets-spec),
+for what is built (the as-built specification; start at its executive summary),
+[docs/open-findings.md](./docs/open-findings.md) for what it says the code does not yet do, and
+[docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md) for what is next. The ADRs under the
+specification repository's `docs/adr/` are canonical wherever they conflict with older text. A
+code change that changes what a requirement describes is followed by a pull request there naming
+this repository's merge commit; the findings file is where the two may disagree in between.
 
 <!-- agent-discipline-v1 -->
 ## Working agreement
@@ -113,7 +117,8 @@ any assertion notices.
 
 Gate for this repo: `nix develop -c bash -c 'cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'`
 
-A change under `docs/spec/` also runs `bash docs/spec/tools/check-all.sh` (CI does too).
+The specification and its identifier gate live in `douglaz/fedimint-wallets-spec`; a change there
+runs that repository's `bash tools/check-all.sh`.
 <!-- end-agent-discipline -->
 
 ## Project-specific notes
@@ -131,7 +136,7 @@ necessary and not sufficient; see [docs/devimint-runbook.md](./docs/devimint-run
 
 **This repo is greenfield and does not carry compatibility shims** — with one deliberate
 exception. The types that ride the **live stores** written by the running daemon are the
-`STO-29` list in `docs/spec/05-persistence.md` — `Intent` (and every `Action` variant),
+`STO-29` list in the specification repository's `05-persistence.md` — `Intent` (and every `Action` variant),
 `MoveRecord`, `FederationInfo`, `OperationRecord` (and every `OperationKind` variant),
 `ProbeRecord`, `CandidateRecord`, `WatchState`, `Policy`, `EvacuationSupersessionRecord`, **every
 type serialized inside one of those** (transitively — a nested struct's new field is the row's

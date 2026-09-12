@@ -68,7 +68,7 @@ pub struct GrossUp {
 }
 
 impl GrossUp {
-    /// The DELIVERED NET this solve credits the recipient (CONTEXT.md, "Delivered net").
+    /// The DELIVERED NET this solve credits the recipient (fedimint-wallets-spec CONTEXT.md, "Delivered net").
     ///
     /// This type is where the invariant is MAINTAINED, which is why the definition lives here:
     /// `receive_quote` is documented above as `invoice_amount − net`, and the executor's
