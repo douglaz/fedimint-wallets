@@ -1,8 +1,8 @@
 # Route economics (`route_economics_by_pair`): the five settled questions
 
 Status: DESIGN DECISION (br-ljj.3). **Q4 is SUPERSEDED OUTRIGHT by
-[ADR-0030](../adr/0030-automated-routing-is-never-pinned.md); Q1 and Q2 are superseded IN PART
-by [ADR-0029](../adr/0029-evacuation-must-be-executable.md) and ADR-0030.** No production code ships from
+[ADR-0030](https://github.com/douglaz/fedimint-wallets-spec/blob/main/docs/adr/0030-automated-routing-is-never-pinned.md); Q1 and Q2 are superseded IN PART
+by [ADR-0029](https://github.com/douglaz/fedimint-wallets-spec/blob/main/docs/adr/0029-evacuation-must-be-executable.md) and ADR-0030.** No production code ships from
 this doc. It authorises an implementation bead. All file:line refs were verified against `main`
 post br-ljj.2 and have not been re-verified since.
 

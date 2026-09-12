@@ -8,7 +8,7 @@ document is history.
 **This is not the same as [`../superseded/`](../superseded/).** That directory holds work that
 turned out to be *wrong or was retracted*. This one holds work that was *right and is done*.
 
-Looking for what's current? Start at [`../spec/`](../spec/README.md) for what is built and
+Looking for what's current? Start at [`../spec/`](https://github.com/douglaz/fedimint-wallets-spec) for what is built and
 [`../roadmap-to-v1.md`](../roadmap-to-v1.md) for what is next.
 
 ## Completed phase plans and specs
@@ -28,8 +28,8 @@ authority on what actually completed.
 | [phase2-plan.md](./phase2-plan.md) | Sense and decide: probe → score → snapshot → decide → apply |
 | [phase3-plan.md](./phase3-plan.md) | Evacuation execution |
 | [phase4-plan.md](./phase4-plan.md) | Engine hardening and the operation ledger |
-| [phase4-implementation-spec.md](./phase4-implementation-spec.md) | Its buildable companion. Archived 2026-09-08: the as-built field-level shapes are now `STO-15`–`STO-17` in [`../spec/05-persistence.md`](../spec/05-persistence.md); this remains the derivation |
-| [phase6a-plan.md](./phase6a-plan.md) | The 24/7 daemon and local API, the buildable spec for what became `walletd`. Archived 2026-09-08; [`../spec/`](../spec/README.md) describes the runtime as built |
+| [phase4-implementation-spec.md](./phase4-implementation-spec.md) | Its buildable companion. Archived 2026-09-08: the as-built field-level shapes are now `STO-15`–`STO-17` in [`../spec/05-persistence.md`](https://github.com/douglaz/fedimint-wallets-spec/blob/main/05-persistence.md); this remains the derivation |
+| [phase6a-plan.md](./phase6a-plan.md) | The 24/7 daemon and local API, the buildable spec for what became `walletd`. Archived 2026-09-08; [`../spec/`](https://github.com/douglaz/fedimint-wallets-spec) describes the runtime as built |
 | [drive-br-n8o-2026-08.md](./drive-br-n8o-2026-08.md) | The working journal of the evacuation-supersession drive (August 2026): gate figures, the 2026-08-23 carve-out, and the live-store inspection that `DEF-12` in the spec cites. A session record, kept for provenance |
 | [phase5-plan.md](./phase5-plan.md) | The active probe and federation discovery |
 
@@ -43,7 +43,7 @@ ADR-0025 does not carry). Those citations were repointed here rather than droppe
 finished, not unread.
 
 - [wallet-recovery-spec.md](./wallet-recovery-spec.md) — seed-based recovery (`br-m9m`). The
-  shipped behaviour is described by [ADR-0025](../adr/0025-recovery-fresh-partition-seed-is-the-backup-unit.md);
+  shipped behaviour is described by [ADR-0025](https://github.com/douglaz/fedimint-wallets-spec/blob/main/docs/adr/0025-recovery-fresh-partition-seed-is-the-backup-unit.md);
   the remaining gap is recorded in [recovery-failure-gate-analysis.md](../recovery-failure-gate-analysis.md).
 - [route-economics-decisions.md](./route-economics-decisions.md) — the per-pair economic move
   floor. Its own header notes that no production code ships from it.
@@ -60,5 +60,5 @@ fixed or promoted into ADRs, so read them as history rather than as a to-do list
 
 - [SIMPLE-FEDIMINT-WALLET-REPORT.md](./SIMPLE-FEDIMINT-WALLET-REPORT.md) — the original survey of
   four existing Fedimint wallets that motivated this project. The decisions it fed are now in
-  [`../adr/`](../adr/); its most durable finding, that every surveyed wallet fails at seed
-  protection, is what [ADR-0026](../adr/0026-seed-at-rest-encryption-headless.md) exists to answer.
+  [`../adr/`](https://github.com/douglaz/fedimint-wallets-spec/tree/main/docs/adr); its most durable finding, that every surveyed wallet fails at seed
+  protection, is what [ADR-0026](https://github.com/douglaz/fedimint-wallets-spec/blob/main/docs/adr/0026-seed-at-rest-encryption-headless.md) exists to answer.
