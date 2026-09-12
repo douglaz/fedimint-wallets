@@ -16,9 +16,9 @@ either outcome (the ledger, hardening, UI, and recovery serve a single-fed walle
 ## Where we are
 
 Everything through Phase 6a, plus seed recovery and route economics, is complete and
-devimint-validated. The system as built is described in [docs/spec/](./spec/README.md): what
+devimint-validated. The system as built is described in the specification repository, [douglaz/fedimint-wallets-spec](https://github.com/douglaz/fedimint-wallets-spec): what
 each phase delivered, and the evidence for it, is in its executive summary and
-[conformance checklist](./spec/10-conformance-checklist.md); the phase plans themselves are in
+[conformance checklist](https://github.com/douglaz/fedimint-wallets-spec/blob/main/10-conformance-checklist.md); the phase plans themselves are in
 [docs/archive/](./archive/README.md). Next: Phase 6c (the web sidecar), Phase 7 (seed
 encryption, app-state backup), then 6b and 8 below.
 
@@ -80,7 +80,7 @@ browser, and the everyday surface for a self-hosting user before the Android app
 `127.0.0.1`; remote access is the operator's job via their own overlay or reverse proxy. Every
 route outside a three-entry allowlist (`GET`/`POST /login`, `GET /healthz`) is behind a password
 login (Argon2id + session cookie); parity with what the daemon API exposes; fail-closed
-provisioning. Security posture fixed by [ADR-0028](./adr/0028-web-frontend-localhost-sidecar-session-auth.md);
+provisioning. Security posture fixed by [ADR-0028](https://github.com/douglaz/fedimint-wallets-spec/blob/main/docs/adr/0028-web-frontend-localhost-sidecar-session-auth.md);
 build plan in [phase6c-web-frontend-plan.md](./phase6c-web-frontend-plan.md). Requires exactly one
 daemon change: a `?status=open` filter on `/v1/history`, so an operation held for hours or days
 stays visible however much history accumulates behind it. **Gate:** receive → pay → outstanding
@@ -115,7 +115,7 @@ IDs/invites rebuild each federation's balance with complete-or-fail semantics, l
 devimint (ADR-0025).
 What remains, deferred: seed encryption AT REST — for the headless daemon a
 passphrase-derived or KMS/HSM key, NOT the mobile Android Keystore path
-([ADR-0026](./adr/0026-seed-at-rest-encryption-headless.md)) — and the encrypted
+([ADR-0026](https://github.com/douglaz/fedimint-wallets-spec/blob/main/docs/adr/0026-seed-at-rest-encryption-headless.md)) — and the encrypted
 app-state/history backup below.
 What all four surveyed wallets got wrong: seed encrypted at rest (Android Keystore +
 BiometricPrompt), silent backup of the federation set + standing instruction (ADR-0003).
@@ -162,7 +162,7 @@ What that makes permanent, rather than temporary:
   source-list membership is not yet enforced. There is no implemented two-gateway path today; the
   evacuation-only fallback described next remains unbuilt.
 - **Evacuation is the one exception, per
-  [ADR-0029](./adr/0029-evacuation-must-be-executable.md):** when no gateway validates on both
+  [ADR-0029](https://github.com/douglaz/fedimint-wallets-spec/blob/main/docs/adr/0029-evacuation-must-be-executable.md):** when no gateway validates on both
   federations it is intended to fall back to a real Lightning hop through two different gateways.
   That evacuation-only fallback is still unbuilt; when implemented it will be best-effort, not a
   guarantee, and will not change the balance cap. `Move` keeps the swap-only path.

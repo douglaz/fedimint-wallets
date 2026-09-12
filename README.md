@@ -9,8 +9,11 @@ The Android Slint app is still planned, not built.
 
 ## Current status
 
-The system as built is described in [docs/spec/](./docs/spec/README.md); start at its
-[executive summary](./docs/spec/executive-summary.md). In one line: the headless engine, the
+The system as built is described in the specification repository,
+[douglaz/fedimint-wallets-spec](https://github.com/douglaz/fedimint-wallets-spec); start at its
+[executive summary](https://github.com/douglaz/fedimint-wallets-spec/blob/main/executive-summary.md).
+What that specification says and the code does not yet do is
+[docs/open-findings.md](./docs/open-findings.md), kept here beside the code. In one line: the headless engine, the
 `walletd` daemon, discovery, seed recovery and route economics are built and devimint-validated;
 the web sidecar is a skeleton; there is no phone app; the seed is plaintext on disk. What is next
 is in [docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md).
@@ -48,7 +51,7 @@ The one long-running deployment is a test rig holding a small real-sats balance,
 
 The standing instructions the Allocator runs against live in one stored `Policy`, edited
 field-by-field with `wallet-cli policy set` and printed by `wallet-cli policy get`. The rules
-are owned by [`docs/spec/06-allocator-and-automation.md`](./docs/spec/06-allocator-and-automation.md);
+are owned by [`06-allocator-and-automation.md`](https://github.com/douglaz/fedimint-wallets-spec/blob/main/06-allocator-and-automation.md) in the specification repository;
 this section only maps the flags to them.
 
 | Flag | What it bounds | Rule |
@@ -102,18 +105,22 @@ registering the LDK gateway with the guardians, and known gotchas.
 
 ## Design docs
 
-- [docs/spec/](./docs/spec/README.md) - the as-built specification: what the code does today, with
-  stable requirement identifiers, known defects, conformance evidence, and open findings. Start at
-  its executive summary. It supersedes the status list above and the plans below as the
-  description of the system.
-- [CONTEXT.md](./CONTEXT.md) - canonical product language and domain definitions.
+- [douglaz/fedimint-wallets-spec](https://github.com/douglaz/fedimint-wallets-spec) - the
+  as-built specification: what the code does today, with stable requirement identifiers, known
+  defects, conformance evidence, the ADRs and the glossary (`CONTEXT.md`). Start at its executive
+  summary. It supersedes the status list above and the plans below as the description of the
+  system. It moved out of this repository on 2026-09-12 so that a specification change and a
+  code change are two pull requests against two gates.
+- [docs/open-findings.md](./docs/open-findings.md) - what the specification says and the code
+  does not yet do, one finding per tracked issue. Stays here because a finding is about this tree.
 - [docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md) - current build sequence and
   definition of "fully featured v1".
 - [docs/phase6c-web-frontend-plan.md](./docs/phase6c-web-frontend-plan.md) - the browser
   frontend, specced and next to build.
 - [docs/operation-history-spec.md](./docs/operation-history-spec.md) - append-only
   ledger semantics.
-- [docs/adr/](./docs/adr/) - architecture decisions. These are canonical when they
+- [docs/adr/](https://github.com/douglaz/fedimint-wallets-spec/tree/main/docs/adr) in the
+  specification repository - architecture decisions. These are canonical when they
   conflict with older report text.
 
 ## Original wallet survey
@@ -131,4 +138,4 @@ vendored here and are gitignored when cloned locally for analysis.
 ## License
 
 AGPL-3.0-or-later. See [LICENSE](./LICENSE) and
-[ADR-0009](./docs/adr/0009-license-agpl.md).
+[ADR-0009](https://github.com/douglaz/fedimint-wallets-spec/blob/main/docs/adr/0009-license-agpl.md).

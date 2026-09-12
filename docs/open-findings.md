@@ -1,9 +1,16 @@
-# 11 — Open findings
+# Open findings
 
 What the code does not yet do that a document, an ADR, or a review said it should. Each finding
 names the issue that tracks it (`br-…` in `.beads/issues.jsonl`), or says why none exists, so the
 two cannot drift apart silently; when an issue closes, its finding here is marked closed with the pull request, not
 deleted.
+
+The documents this file measures the code against live in the specification repository,
+[`douglaz/fedimint-wallets-spec`](https://github.com/douglaz/fedimint-wallets-spec): an
+unqualified `00-overview.md` … `10-conformance-checklist.md`, `CONTEXT.md` or `ADR-nnnn` below
+names a file there, and every requirement id (`OVR-n`, `STO-n`, …) is defined there. This file
+stays beside the code because a finding is a statement about *this* tree and closes with a pull
+request against it. Until 2026-09-12 it was `docs/spec/11-open-findings.md` in this repository.
 
 Written 2026-09-07 against `main` at `1e44487` plus PR #40, both merged as `ee4ba1c` on 2026-09-08;
 re-checked against `7225114` on 2026-09-10. Items are
@@ -11,21 +18,11 @@ grouped by what they cost if left alone, not by the order they were found.
 
 ## The questions still open at the product level
 
-These are not findings against the code. They are decisions nobody has taken, and the code is
-built so that either answer remains possible.
-
-1. **Is the long-running deployment a test or a pilot?** The daemon has been running the
-   2026-07-26 build `b5f46de` on two mainnet federations with a small real-sats balance. The
-   repository's release issues (`br-prod-canary-nab`, `br-recanary-y2j-ujs`) and its alerting
-   issue (`br-rky`) still treat it as production; the operator has since said it is a test rig,
-   and `AGENTS.md` was changed to say so on 2026-09-08. Every P1 release/ops item in the backlog inherits its priority from the first
-   reading. This set records the second, and `08-hosts-and-deployment.md` describes the
-   deployment as a test.
-2. **Does the engine ship ON by default?** `docs/roadmap-to-v1.md` defers this to Phase 8: a
-   fee-vs-risk expected-value computation at $50–$500 balances plus a legal opinion on the
-   `ADR-0014` posture. Nothing in Phases 4–7 depends on the answer.
-3. **Which frontend is next?** The roadmap says the web sidecar (6c) ships before Android (6b).
-   6c's issues were cut on 2026-07-30 and have not moved; the work since went into `F1`–`F9`.
+Not findings against the code: decisions nobody has taken, kept where the decisions are —
+[`11-open-questions.md`](https://github.com/douglaz/fedimint-wallets-spec/blob/main/11-open-questions.md)
+in the specification repository. Three are open there as of 2026-09-12: whether the long-running
+deployment is a test or a pilot, whether the engine ships on by default, and which frontend is
+next.
 
 ## Money paths that are narrower than their documents claim
 

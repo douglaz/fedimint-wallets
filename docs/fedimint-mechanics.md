@@ -14,7 +14,7 @@ ADR-0022 — see "What this means for us".
   id — no "active" client (harbor `lib.rs:278`; Fedi `crates/federations/src/lib.rs:30`).
 - **One seed, many feds:** the per-fed client secret is derived deterministically from the
   root by `get_default_client_secret(root_secret, federation_id)`; the exact path this wallet
-  relies on is `FMI-7` in `docs/spec/02-fedimint-integration.md`. (Harbor and Fedi call an
+  relies on is `FMI-7` in [`02-fedimint-integration.md`](https://github.com/douglaz/fedimint-wallets-spec/blob/main/02-fedimint-integration.md) in the specification repository. (Harbor and Fedi call an
   older signature with a `device_index` so two devices on one seed don't reuse note-derivation
   indices; the pinned SDK has no such parameter and this wallet derives as a single device.)
 - **Storage (lift Fedi's shape):** one global DB (RocksDB on Android) with per-federation
@@ -122,7 +122,7 @@ documented `Retryable`, NOT `Permanent` at `:333-335`), so the intent stays `Pen
 re-tried every tick: a silent livelock, not a failure the operator is told about.
 
 A second gateway remains an explicit non-goal for routine `Move`s. It is NO LONGER the permanent
-shape for evacuation: [ADR-0029](./adr/0029-evacuation-must-be-executable.md) accepts a
+shape for evacuation: [ADR-0029](https://github.com/douglaz/fedimint-wallets-spec/blob/main/docs/adr/0029-evacuation-must-be-executable.md) accepts a
 two-gateway Lightning hop as a best-effort fallback for `Evacuate` only. That is decided but NOT
 yet built; this section describes the code as it stands today.
 

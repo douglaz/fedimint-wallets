@@ -2,7 +2,7 @@
 
 The third frontend over the same public API (ADR-0023): a sidecar process that renders HTML.
 `wallet-cli` in a browser — the everyday surface for a self-hosting user before the Android app
-exists. **The security posture is fixed by [ADR-0028](./adr/0028-web-frontend-localhost-sidecar-session-auth.md);
+exists. **The security posture is fixed by [ADR-0028](https://github.com/douglaz/fedimint-wallets-spec/blob/main/docs/adr/0028-web-frontend-localhost-sidecar-session-auth.md);
 this spec does not re-open it.**
 
 Numbering note: this is 6c but ships *before* 6b (Android). 6b's identifier is already
@@ -142,7 +142,7 @@ parties.
 because they have no daemon endpoint, so a sidecar cannot offer them either:
 `discover`, `probe`, `tick` (agent verbs), `history --fed`, `show` by numeric sequence, and
 `status` with policy overrides (`run_client` in `wallet-cli/src/main.rs`; the as-built refusal
-list is `API-25` in `docs/spec/04-api-contract.md`). They stay CLI+`--standalone`
+list is `API-25` in [`04-api-contract.md`](https://github.com/douglaz/fedimint-wallets-spec/blob/main/04-api-contract.md) in the specification repository). They stay CLI+`--standalone`
 only. Everything the daemon does expose:
 
 | Area | Daemon routes |
@@ -182,7 +182,7 @@ UI affordance, not an auth gate — ADR-0028 chose no step-up, and this does not
 > exists in `wallet-daemon`; `GET /v1/history` still reads only `limit` and `before_seq` and
 > silently ignores every other query parameter, so a `?status=open` request today returns the
 > unfiltered page with `200`. The as-built contract is `API-10` in
-> `docs/spec/04-api-contract.md`; the gap is tracked as `F27` in `docs/spec/11-open-findings.md`.
+> [`04-api-contract.md`](https://github.com/douglaz/fedimint-wallets-spec/blob/main/04-api-contract.md) in the specification repository; the gap is tracked as `F27` in `docs/open-findings.md`.
 > ADR-0028's "landed as one reviewable diff" describes this section's plan, not the code.
 > Everything below remains the specification of the change to make.
 

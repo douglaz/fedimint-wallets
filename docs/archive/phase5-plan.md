@@ -21,9 +21,9 @@ probe, and today's `round_trip_ok` is a free proxy (gateway availability), fine 
 user-joined feds only. 5.1/5.2 are plan-level below; their buildable specs follow after
 5.0 lands.
 
-Grounding: [ADR-0017](../adr/0017-sybil-resistant-selection-probes-gate.md) (probes GATE,
+Grounding: [ADR-0017](https://github.com/douglaz/fedimint-wallets-spec/blob/main/docs/adr/0017-sybil-resistant-selection-probes-gate.md) (probes GATE,
 for THIS device, over a SUSTAINED window; reputation only demotes),
-[ADR-0019/0020](../adr/0019-federation-signals-trust-model.md) (discovery inputs are
+[ADR-0019/0020](https://github.com/douglaz/fedimint-wallets-spec/blob/main/docs/adr/0019-federation-signals-trust-model.md) (discovery inputs are
 untrusted), [federation-data-sources-spec.md](../federation-data-sources-spec.md) (the
 probe set; Nostr = discovery only), and the pinned SDK — the Cargo pin
 `douglaz/fedimint @ b108ec66ab…` (Cargo.lock is authoritative; the local `~/p/fedimint`

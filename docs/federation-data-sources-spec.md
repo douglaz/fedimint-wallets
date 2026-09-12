@@ -129,7 +129,7 @@ Hints only (never gate or promote):
 - Meta labels, advertised gateway fees. (Nostr is discovery-only — not a scoring input.)
 
 ## Open decisions (for the scorer build)
-1. ~~Observer-as-source vs. own-collection~~ — **RESOLVED ([ADR-0020](./adr/0020-observer-untrusted-prior.md)):**
+1. ~~Observer-as-source vs. own-collection~~ — **RESOLVED ([ADR-0020](https://github.com/douglaz/fedimint-wallets-spec/blob/main/docs/adr/0020-observer-untrusted-prior.md)):**
    own probes + structural config are the trust gate (on-device); the Observer is an
    optional, untrusted, swappable prior behind the gate (discovery, pre-filter, historical
    depth), never load-bearing. The wallet is correct if the Observer is wrong/down/gone.
