@@ -3,7 +3,10 @@
 The **non-conformances** of this tree against the specification: each requirement in the
 specification repository that the code does not yet meet, one item per tracked issue (`ADR-0032`,
 "Traceability inverts"), plus the review findings that have no requirement behind them, which
-say so. Each finding
+say so. The items below are being re-read under that posture one chapter at a time (beads
+labelled `spec-handoff`, one per chapter of the specification); until a chapter's bead lands,
+its items still read as written before 2026-09-12 — a gap against a decision, which may since
+have become a requirement, a product question, or nothing the specification asks for. Each finding
 names the issue that tracks it (`br-…` in `.beads/issues.jsonl`), or says why none exists, so the
 two cannot drift apart silently; when an issue closes, its finding here is marked closed with the pull request, not
 deleted.
