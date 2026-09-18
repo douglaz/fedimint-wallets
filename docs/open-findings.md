@@ -1,6 +1,12 @@
 # Open findings
 
-What the code does not yet do that a document, an ADR, or a review said it should. Each finding
+The **non-conformances** of this tree against the specification: each requirement in the
+specification repository that the code does not yet meet, one item per tracked issue (`ADR-0032`,
+"Traceability inverts"), plus the review findings that have no requirement behind them, which
+say so. The items below are being re-read under that posture one chapter at a time (beads
+labelled `spec-handoff`, one per chapter of the specification); until a chapter's bead lands,
+its items still read as written before 2026-09-12 — a gap against a decision, which may since
+have become a requirement, a product question, or nothing the specification asks for. Each finding
 names the issue that tracks it (`br-…` in `.beads/issues.jsonl`), or says why none exists, so the
 two cannot drift apart silently; when an issue closes, its finding here is marked closed with the pull request, not
 deleted.
@@ -20,9 +26,10 @@ grouped by what they cost if left alone, not by the order they were found.
 
 Not findings against the code: decisions nobody has taken, kept where the decisions are —
 [`11-open-questions.md`](https://github.com/douglaz/fedimint-wallets-spec/blob/main/11-open-questions.md)
-in the specification repository. Three are open there as of 2026-09-12: whether the long-running
-deployment is a test or a pilot, whether the engine ships on by default, and which frontend is
-next.
+in the specification repository. Two are open there as of 2026-09-18: whether the engine ships
+on by default, and whether the wallet's total balance is capped. The deployment question and
+the frontend-order question left that file under `ADR-0032`: one described a deployment, the
+other is roadmap order, which is this repository's (`docs/roadmap-to-v1.md`).
 
 ## Money paths that are narrower than their documents claim
 
