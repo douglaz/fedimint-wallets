@@ -17,6 +17,9 @@ unqualified `00-overview.md` … `10-conformance-checklist.md`, `CONTEXT.md` or 
 names a file there, and every requirement id (`OVR-n`, `STO-n`, …) is defined there. This file
 stays beside the code because a finding is a statement about *this* tree and closes with a pull
 request against it. Until 2026-09-12 it was `docs/spec/11-open-findings.md` in this repository.
+Which conformance scenarios (`CNF-n`) this tree has passed, and at which revision, is
+[`conformance-results.md`](./conformance-results.md); a scenario not passed there is a finding here,
+or names the bead that will write one.
 
 Written 2026-09-07 against `main` at `1e44487` plus PR #40, both merged as `ee4ba1c` on 2026-09-08;
 re-checked against `7225114` on 2026-09-10. Items are

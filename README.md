@@ -113,6 +113,8 @@ registering the LDK gateway with the guardians, and known gotchas.
   code change are two pull requests against two gates.
 - [docs/open-findings.md](./docs/open-findings.md) - what the specification says and the code
   does not yet do, one finding per tracked issue. Stays here because a finding is about this tree.
+- [docs/conformance-results.md](./docs/conformance-results.md) - which of the specification's
+  conformance scenarios (`CNF-n`) this tree has passed, at which revision, by which gate or smoke.
 - [docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md) - current build sequence and
   definition of "fully featured v1".
 - [docs/phase6c-web-frontend-plan.md](./docs/phase6c-web-frontend-plan.md) - the browser
