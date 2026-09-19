@@ -1,7 +1,7 @@
 # Defects history
 
 The provenance of every `DEF-n`: the failure as it was written down when it was found, the issue
-that recorded it, and the change that closed it. The rules themselves are not here. Each surviving
+that recorded it, and the change that closed it, where one has. The rules themselves are not here. Each surviving
 `DEF-n` is a prohibition in `09-known-defects.md` in
 [`douglaz/fedimint-wallets-spec`](https://github.com/douglaz/fedimint-wallets-spec), which this
 file never restates; each entry points at its id there instead. Most shipped and were fixed;
@@ -296,4 +296,4 @@ would have passed unchanged. Still open as `br-vvo` (`F22`).
 
 _Withdrawn from the specification: A gap in one implementation's conformance evidence (`F22`), not a wallet behaviour; the scenario that closes it — an evacuation whose cap discriminates the basis — is `CNF-43`._
 
-*Provenance: `br-vvo`.*
+*Provenance: `br-vvo`; `F22` open.*

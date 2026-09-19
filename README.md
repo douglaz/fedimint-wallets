@@ -116,7 +116,7 @@ registering the LDK gateway with the guardians, and known gotchas.
 - [docs/conformance-results.md](./docs/conformance-results.md) - which of the specification's
   conformance scenarios (`CNF-n`) this tree has passed, at which revision, by which gate or smoke.
 - [docs/defects-history.md](./docs/defects-history.md) - the provenance of every `DEF-n`: the
-  failure as it was found, the issue that recorded it, and the change that closed it.
+  failure as it was found, the issue that recorded it, and the change that closed it, where one has.
 - [docs/roadmap-to-v1.md](./docs/roadmap-to-v1.md) - current build sequence and
   definition of "fully featured v1".
 - [docs/phase6c-web-frontend-plan.md](./docs/phase6c-web-frontend-plan.md) - the browser
